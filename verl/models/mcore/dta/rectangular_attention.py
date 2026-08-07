@@ -22,6 +22,7 @@ configuration path.  It does not read or mutate the process-wide
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
 from torch import Tensor
@@ -29,6 +30,21 @@ from torch import Tensor
 _RIGHT_DOWN_CAUSAL_MODE = 3
 _TND_LAYOUT = "TND"
 _DEFAULT_PRE_TOKENS = 2**31 - 1
+_COMPRESSED_CAUSAL_MASK_SIZE = 2048
+
+
+@lru_cache(maxsize=None)
+def _compressed_causal_mask(device: torch.device) -> Tensor:
+    """Build the compressed bool mask expected by CANN sparse modes 2/3."""
+
+    return torch.triu(
+        torch.ones(
+            (_COMPRESSED_CAUSAL_MASK_SIZE, _COMPRESSED_CAUSAL_MASK_SIZE),
+            dtype=torch.bool,
+            device=device,
+        ),
+        diagonal=1,
+    )
 
 
 def _validate_inputs(query: Tensor, key: Tensor, value: Tensor, dropout_p: float) -> tuple[int, int, int, int]:
@@ -113,6 +129,7 @@ def rectangular_causal_attention(
     query_tnd = query.squeeze(1).contiguous()
     key_tnd = key.squeeze(1).contiguous()
     value_tnd = value.squeeze(1).contiguous()
+    attention_mask = _compressed_causal_mask(query.device)
 
     output = torch_npu.npu_fusion_attention(
         query_tnd,
@@ -122,7 +139,7 @@ def rectangular_causal_attention(
         _TND_LAYOUT,
         pse=None,
         padding_mask=None,
-        atten_mask=None,
+        atten_mask=attention_mask,
         scale=softmax_scale,
         pre_tockens=pre_tokens,
         next_tockens=0,
