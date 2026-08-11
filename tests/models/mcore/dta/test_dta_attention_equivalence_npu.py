@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.spec_utils import build_module
@@ -68,6 +70,11 @@ class _NpuGlobalMemoryBuffer:
                 requires_grad=False,
             )
         return self.buffer[key][:required_length].view(*tensor_shape)
+
+
+class _ZeroDropoutRngTracker:
+    def fork(self, *args, **kwargs):
+        return nullcontext()
 
 
 def _make_attention(device, dtype):
@@ -163,8 +170,9 @@ def _assert_close(actual, expected, *, atol, rtol, label):
         (4096, 1),
     ],
 )
-def test_real_megatron_attention_full_vs_external_kv(prefix_length, suffix_length):
+def test_real_megatron_attention_full_vs_external_kv(prefix_length, suffix_length, monkeypatch):
     torch.manual_seed(2026)
+    monkeypatch.setattr(tensor_parallel, "get_cuda_rng_tracker", lambda: _ZeroDropoutRngTracker())
     device = torch.device("npu")
     dtype = torch.bfloat16
     full_length = prefix_length + suffix_length
