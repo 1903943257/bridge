@@ -16,6 +16,7 @@
 
 from .attention import DTASelfAttention
 from .context import TreeAttentionContext, get_tree_attention_context, use_tree_attention_context
+from .module_spec import replace_self_attention_with_dta
 from .rectangular_attention import rectangular_causal_attention
 from .rope import build_suffix_rotary_pos_emb
 
@@ -25,5 +26,6 @@ __all__ = [
     "build_suffix_rotary_pos_emb",
     "get_tree_attention_context",
     "rectangular_causal_attention",
+    "replace_self_attention_with_dta",
     "use_tree_attention_context",
 ]
