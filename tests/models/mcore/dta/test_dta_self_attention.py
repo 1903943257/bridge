@@ -129,6 +129,44 @@ def test_tree_forward_selects_layer_kv_collects_new_kv_and_preserves_prefix_grad
     assert other_layer_kv[1].grad is None
 
 
+def test_tree_forward_with_zero_prefix_uses_only_new_kv(monkeypatch):
+    suffix_length = 6
+    query = torch.randn(suffix_length, 1, 4, 8, requires_grad=True)
+    new_key = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
+    new_value = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
+    rope = torch.zeros(suffix_length, 1, 1, 8)
+    captured = {}
+
+    monkeypatch.setattr(dta_attention, "apply_rotary_pos_emb", lambda tensor, *args, **kwargs: tensor)
+
+    def fake_rectangular(query_arg, key_arg, value_arg, **kwargs):
+        captured.update(query=query_arg, key=key_arg, value=value_arg)
+        kv_dependency = key_arg.sum() + value_arg.sum()
+        return query_arg.reshape(suffix_length, 1, -1) + kv_dependency
+
+    monkeypatch.setattr(dta_attention, "rectangular_causal_attention", fake_rectangular)
+    attention = _StubDTASelfAttention(query, new_key, new_value)
+    context = TreeAttentionContext(
+        prefix_length=0,
+        suffix_length=suffix_length,
+        suffix_rotary_pos_emb=rope,
+    )
+
+    with use_tree_attention_context(context):
+        output, bias = attention(torch.randn(suffix_length, 1, 32), attention_mask=None)
+    output.sum().backward()
+
+    assert bias is None
+    assert captured["query"] is query
+    assert captured["key"] is new_key
+    assert captured["value"] is new_value
+    assert captured["key"].shape[0] == suffix_length
+    assert context.new_key_values[2][0] is new_key
+    assert context.new_key_values[2][1] is new_value
+    assert new_key.grad is not None and torch.count_nonzero(new_key.grad)
+    assert new_value.grad is not None and torch.count_nonzero(new_value.grad)
+
+
 def test_tree_forward_rejects_missing_suffix_rope_before_qkv():
     attention = _StubDTASelfAttention(None, None, None)
     context = TreeAttentionContext(prefix_length=0, suffix_length=3)
@@ -140,4 +178,3 @@ def test_tree_forward_rejects_missing_suffix_rope_before_qkv():
             assert "suffix_rotary_pos_emb" in str(exc)
         else:
             raise AssertionError("missing suffix RoPE must be rejected")
-
