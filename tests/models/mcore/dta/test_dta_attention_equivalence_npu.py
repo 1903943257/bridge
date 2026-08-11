@@ -48,13 +48,30 @@ class _SingleProcessGroup:
         return 0
 
 
+class _NpuGlobalMemoryBuffer:
+    """Standalone-test equivalent of Megatron's CUDA-hardcoded scratch buffer."""
+
+    def __init__(self, device):
+        self.device = device
+        self.buffer = {}
+
+    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context=None):
+        required_length = 1
+        for dimension in tensor_shape:
+            required_length *= dimension
+        key = (name, dtype)
+        if key not in self.buffer or self.buffer[key].numel() < required_length:
+            self.buffer[key] = torch.empty(
+                required_length,
+                dtype=dtype,
+                device=self.device,
+                requires_grad=False,
+            )
+        return self.buffer[key][:required_length].view(*tensor_shape)
+
+
 def _make_attention(device, dtype):
-    try:
-        parallel_state.get_global_memory_buffer()
-    except AssertionError as exc:
-        if "global memory buffer is not initialized" not in str(exc):
-            raise
-        parallel_state._set_global_memory_buffer()
+    parallel_state._GLOBAL_MEMORY_BUFFER = _NpuGlobalMemoryBuffer(device)
 
     config = TransformerConfig(
         num_layers=1,
