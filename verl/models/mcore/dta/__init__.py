@@ -14,10 +14,12 @@
 
 """Model-side primitives for depth-first tree attention training."""
 
+from .attention import DTASelfAttention
 from .context import TreeAttentionContext, get_tree_attention_context, use_tree_attention_context
 from .rectangular_attention import rectangular_causal_attention
 
 __all__ = [
+    "DTASelfAttention",
     "TreeAttentionContext",
     "get_tree_attention_context",
     "rectangular_causal_attention",
