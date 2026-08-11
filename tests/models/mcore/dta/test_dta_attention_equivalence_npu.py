@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.spec_utils import build_module
@@ -48,6 +49,13 @@ class _SingleProcessGroup:
 
 
 def _make_attention(device, dtype):
+    try:
+        parallel_state.get_global_memory_buffer()
+    except AssertionError as exc:
+        if "global memory buffer is not initialized" not in str(exc):
+            raise
+        parallel_state._set_global_memory_buffer()
+
     config = TransformerConfig(
         num_layers=1,
         hidden_size=128,
@@ -260,4 +268,3 @@ def test_real_megatron_attention_full_vs_external_kv(prefix_length, suffix_lengt
             rtol=_GRAD_RTOL,
             label=f"parameter gradient {name}",
         )
-
