@@ -22,6 +22,7 @@ from megatron.core import parallel_state
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.tensor_parallel import mappings as tensor_parallel_mappings
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from verl.models.mcore.dta import (
@@ -173,6 +174,12 @@ def _assert_close(actual, expected, *, atol, rtol, label):
 def test_real_megatron_attention_full_vs_external_kv(prefix_length, suffix_length, monkeypatch):
     torch.manual_seed(2026)
     monkeypatch.setattr(tensor_parallel, "get_cuda_rng_tracker", lambda: _ZeroDropoutRngTracker())
+    original_reduce = tensor_parallel_mappings._reduce
+    monkeypatch.setattr(
+        tensor_parallel_mappings,
+        "_reduce",
+        lambda tensor, group: tensor if group is None else original_reduce(tensor, group),
+    )
     device = torch.device("npu")
     dtype = torch.bfloat16
     full_length = prefix_length + suffix_length
