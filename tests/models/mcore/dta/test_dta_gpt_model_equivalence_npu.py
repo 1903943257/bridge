@@ -107,7 +107,6 @@ def _make_config(dtype):
         sequence_parallel=False,
         apply_rope_fusion=False,
         bias_dropout_fusion=False,
-        position_embedding_type="rope",
     )
 
 
@@ -324,4 +323,3 @@ def test_dta_gpt_model_state_dict_is_strictly_compatible(monkeypatch):
     dta_model.load_state_dict(ordinary_state, strict=True)
     for name, ordinary_tensor in ordinary_state.items():
         assert torch.equal(dta_model.state_dict()[name], ordinary_tensor), name
-
