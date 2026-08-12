@@ -24,12 +24,25 @@ from test_dta_gpt_model_equivalence_npu import (
 )
 
 _LEARNING_RATE = 5e-2
-_UPDATE_RELATIVE_L2_TOL = 5e-2
-_UPDATE_MAX_ABS_RATIO_TOL = 1e-1
+_UPDATE_RELATIVE_L2_TOL = 1e-2
+_UPDATE_MAX_ABS_RATIO_TOL = 3e-2
 
 
-def _parameter_snapshot(model):
-    return {name: parameter.detach().float().clone() for name, parameter in model.named_parameters()}
+def _make_fp32_master_parameters(model):
+    return {
+        name: torch.nn.Parameter(parameter.detach().float().clone())
+        for name, parameter in model.named_parameters()
+    }
+
+
+def _copy_model_grads_to_master(model, master_parameters):
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None, f"missing model gradient for {name}"
+        master_parameters[name].grad = parameter.grad.detach().float().clone()
+
+
+def _master_snapshot(master_parameters):
+    return {name: parameter.detach().clone() for name, parameter in master_parameters.items()}
 
 
 def _normalized_backward(logits, upstream_gradient):
@@ -46,6 +59,7 @@ def _full_step(model, optimizer, input_ids, prefix_length, suffix_length, upstre
         attention_mask=_causal_mask(full_length, input_ids.device),
     )
     _normalized_backward(logits[:, prefix_length:, :], upstream_gradient)
+    _copy_model_grads_to_master(model, optimizer.param_groups[0]["params_by_name"])
     optimizer.step()
 
 
@@ -86,6 +100,7 @@ def _external_kv_step(model, optimizer, input_ids, prefix_length, suffix_length,
         )
     suffix_context.assert_new_kv_layers([1, 2])
     _normalized_backward(suffix_logits, upstream_gradient)
+    _copy_model_grads_to_master(model, optimizer.param_groups[0]["params_by_name"])
     optimizer.step()
 
 
@@ -118,10 +133,15 @@ def test_tiny_gpt_single_optimizer_step_matches_external_kv(
     reference_model = _make_model(device, dtype, dta=True)
     candidate_model = _make_model(device, dtype, dta=True)
     candidate_model.load_state_dict(reference_model.state_dict(), strict=True)
-    initial_parameters = _parameter_snapshot(reference_model)
-
-    reference_optimizer = torch.optim.SGD(reference_model.parameters(), lr=_LEARNING_RATE)
-    candidate_optimizer = torch.optim.SGD(candidate_model.parameters(), lr=_LEARNING_RATE)
+    reference_master = _make_fp32_master_parameters(reference_model)
+    candidate_master = _make_fp32_master_parameters(candidate_model)
+    initial_parameters = _master_snapshot(reference_master)
+    reference_optimizer = torch.optim.SGD(reference_master.values(), lr=_LEARNING_RATE)
+    candidate_optimizer = torch.optim.SGD(candidate_master.values(), lr=_LEARNING_RATE)
+    # Keep the name mapping alongside the param group so the step helpers can
+    # transfer BF16 model gradients to their corresponding FP32 master tensors.
+    reference_optimizer.param_groups[0]["params_by_name"] = reference_master
+    candidate_optimizer.param_groups[0]["params_by_name"] = candidate_master
     full_length = prefix_length + suffix_length
     input_ids = torch.arange(17, 17 + full_length, dtype=torch.long, device=device).unsqueeze(0)
     torch.manual_seed(2027)
@@ -146,8 +166,8 @@ def test_tiny_gpt_single_optimizer_step_matches_external_kv(
         upstream_gradient,
     )
 
-    reference_parameters = _parameter_snapshot(reference_model)
-    candidate_parameters = _parameter_snapshot(candidate_model)
+    reference_parameters = _master_snapshot(reference_master)
+    candidate_parameters = _master_snapshot(candidate_master)
     assert reference_parameters.keys() == candidate_parameters.keys() == initial_parameters.keys()
     changed_parameter_count = 0
     for name, initial in initial_parameters.items():
