@@ -21,6 +21,7 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel import layers as tensor_parallel_layers
 from megatron.core.tensor_parallel import mappings as tensor_parallel_mappings
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -85,6 +86,12 @@ def _install_single_rank_test_runtime(monkeypatch, device):
         tensor_parallel_mappings,
         "_reduce",
         lambda tensor, group: tensor if group is None else original_reduce(tensor, group),
+    )
+    original_gather = tensor_parallel_layers.gather_from_tensor_model_parallel_region
+    monkeypatch.setattr(
+        tensor_parallel_layers,
+        "gather_from_tensor_model_parallel_region",
+        lambda tensor, group=None: tensor if group is None else original_gather(tensor, group),
     )
 
 
