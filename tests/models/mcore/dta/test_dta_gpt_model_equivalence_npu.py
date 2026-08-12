@@ -41,8 +41,8 @@ _VOCAB_SIZE = 2048
 _MAX_SEQUENCE_LENGTH = 512
 _LOGIT_ATOL = 2e-2
 _LOGIT_RTOL = 2e-2
-_GRAD_ATOL = 3e-2
-_GRAD_RTOL = 3e-2
+_GRAD_RELATIVE_L2_TOL = 1e-2
+_GRAD_MAX_ABS_RATIO_TOL = 3e-2
 
 
 class _SingleProcessGroup:
@@ -206,6 +206,23 @@ def _assert_close(actual, expected, *, atol, rtol, label):
         ) from exc
 
 
+def _assert_gradient_close(actual, expected, *, label):
+    actual_float = actual.detach().float()
+    expected_float = expected.detach().float()
+    difference = actual_float - expected_float
+    max_abs = difference.abs().max().item()
+    reference_max_abs = expected_float.abs().max().item()
+    relative_l2 = (
+        torch.linalg.vector_norm(difference)
+        / torch.linalg.vector_norm(expected_float).clamp_min(1e-12)
+    ).item()
+    max_abs_ratio = max_abs / max(reference_max_abs, 1e-12)
+    assert relative_l2 <= _GRAD_RELATIVE_L2_TOL and max_abs_ratio <= _GRAD_MAX_ABS_RATIO_TOL, (
+        f"{label} mismatch: max_abs={max_abs:.6g}, "
+        f"max_abs_ratio={max_abs_ratio:.6g}, relative_l2={relative_l2:.6g}"
+    )
+
+
 def _assert_collected_kv(context, expected_length):
     context.assert_new_kv_layers([1, 2])
     for layer_number, (key, value) in context.new_key_values.items():
@@ -315,11 +332,9 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
 
     assert dta_parameter_grads.keys() == reference_parameter_grads.keys()
     for name in reference_parameter_grads:
-        _assert_close(
+        _assert_gradient_close(
             dta_parameter_grads[name],
             reference_parameter_grads[name],
-            atol=_GRAD_ATOL,
-            rtol=_GRAD_RTOL,
             label=f"parameter gradient {name}",
         )
 
