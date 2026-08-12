@@ -142,6 +142,13 @@ def _make_model(device, dtype, *, dta):
     )
     model = model.to(device=device, dtype=dtype)
     model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.to(device)
+    # Megatron's compatibility helper returns None whenever torch.distributed is
+    # uninitialized, even when an explicit process group was supplied.  This test
+    # intentionally runs as a single process, so restore the rank-one test group
+    # on modules which use ``tp_group.size()`` directly in forward.
+    for module in model.modules():
+        if hasattr(module, "tp_group") and module.tp_group is None:
+            module.tp_group = model.pg_collection.tp
     model.train()
     expected_type = DTASelfAttention if dta else SelfAttention
     assert len(model.decoder.layers) == 2
@@ -321,5 +328,10 @@ def test_dta_gpt_model_state_dict_is_strictly_compatible(monkeypatch):
     dta_state = dta_model.state_dict()
     assert ordinary_state.keys() == dta_state.keys()
     dta_model.load_state_dict(ordinary_state, strict=True)
+    loaded_state = dta_model.state_dict()
     for name, ordinary_tensor in ordinary_state.items():
-        assert torch.equal(dta_model.state_dict()[name], ordinary_tensor), name
+        loaded_tensor = loaded_state[name]
+        if ordinary_tensor is None:
+            assert loaded_tensor is None, name
+        else:
+            assert torch.equal(loaded_tensor, ordinary_tensor), name
