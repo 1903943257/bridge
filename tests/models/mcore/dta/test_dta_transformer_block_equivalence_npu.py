@@ -281,8 +281,10 @@ def test_two_layer_transformer_block_full_vs_external_kv(
     with use_tree_attention_context(suffix_context):
         dta_suffix_output = block(hidden_states=suffix_hidden, attention_mask=None)
     _assert_collected_kv(suffix_context, suffix_length)
-    for layer_number, pair in retained_past.items():
-        assert suffix_context.get_past_kv(layer_number) is pair
+    for layer_number, (retained_key, retained_value) in retained_past.items():
+        context_key, context_value = suffix_context.get_past_kv(layer_number)
+        assert context_key is retained_key
+        assert context_value is retained_value
     dta_suffix_output.backward(upstream_gradient)
     dta_parameter_grads = _all_parameter_grads(block)
 
@@ -325,4 +327,3 @@ def test_two_layer_transformer_block_full_vs_external_kv(
             rtol=_GRAD_RTOL,
             label=f"parameter gradient {name}",
         )
-
