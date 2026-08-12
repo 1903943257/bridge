@@ -91,7 +91,9 @@ def _install_single_rank_test_runtime(monkeypatch, device):
     monkeypatch.setattr(
         tensor_parallel_layers,
         "gather_from_tensor_model_parallel_region",
-        lambda tensor, group=None: tensor if group is None else original_gather(tensor, group),
+        lambda tensor, group=None: (
+            tensor if group is None or group.size() == 1 else original_gather(tensor, group)
+        ),
     )
 
 
