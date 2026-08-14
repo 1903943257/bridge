@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -129,7 +129,7 @@ def _make_process_groups():
     )
 
 
-def _make_model(device, dtype, *, dta):
+def _make_model(device, dtype, *, dta, max_sequence_length=_MAX_SEQUENCE_LENGTH):
     config = _make_config(dtype)
     original_spec = get_gpt_decoder_block_spec(
         config,
@@ -141,7 +141,7 @@ def _make_model(device, dtype, *, dta):
         config=config,
         transformer_layer_spec=model_spec,
         vocab_size=_VOCAB_SIZE,
-        max_sequence_length=_MAX_SEQUENCE_LENGTH,
+        max_sequence_length=max_sequence_length,
         pre_process=True,
         post_process=True,
         parallel_output=False,
@@ -183,10 +183,65 @@ def _all_parameter_grads(model):
             continue
         if parameter.grad is None:
             raise AssertionError(f"missing gradient for {name}")
+        _assert_finite(parameter.grad, f"parameter gradient {name}")
         gradients[name] = parameter.grad.detach().float().clone()
     if not gradients:
         raise AssertionError("GPTModel has no trainable parameter gradients")
     return gradients
+
+
+def _assert_finite(tensor, label):
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"{label} must be a tensor, got {type(tensor)}")
+    finite = torch.isfinite(tensor)
+    if bool(finite.all().item()):
+        return
+    nan_count = int(torch.isnan(tensor).sum().item())
+    posinf_count = int(torch.isposinf(tensor).sum().item())
+    neginf_count = int(torch.isneginf(tensor).sum().item())
+    finite_values = tensor.detach()[finite].float()
+    max_abs_finite = finite_values.abs().max().item() if finite_values.numel() else float("nan")
+    raise AssertionError(
+        f"{label} is non-finite: nan={nan_count}, +inf={posinf_count}, "
+        f"-inf={neginf_count}, max_abs_finite={max_abs_finite:.6g}"
+    )
+
+
+def _check_finite_tree(value, label):
+    if torch.is_tensor(value):
+        _assert_finite(value, label)
+    elif isinstance(value, (tuple, list)):
+        for index, item in enumerate(value):
+            _check_finite_tree(item, f"{label}[{index}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _check_finite_tree(item, f"{label}[{key!r}]")
+
+
+@contextmanager
+def _finite_forward_hooks(model, phase):
+    modules = [("embedding", model.embedding)]
+    modules.extend(
+        (f"decoder.layers.{index}", layer) for index, layer in enumerate(model.decoder.layers)
+    )
+    final_layernorm = getattr(model.decoder, "final_layernorm", None)
+    if final_layernorm is not None:
+        modules.append(("decoder.final_layernorm", final_layernorm))
+    modules.append(("output_layer", model.output_layer))
+    handles = []
+    for name, module in modules:
+        handles.append(
+            module.register_forward_hook(
+                lambda _module, _inputs, output, module_name=name: _check_finite_tree(
+                    output, f"{phase} {module_name} output"
+                )
+            )
+        )
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def _assert_close(actual, expected, *, atol, rtol, label):
@@ -229,22 +284,47 @@ def _assert_collected_kv(context, expected_length):
         expected_shape = (expected_length, 1, 2, 32)
         assert key.shape == expected_shape, f"layer {layer_number} K shape is {key.shape}"
         assert value.shape == expected_shape, f"layer {layer_number} V shape is {value.shape}"
+        _assert_finite(key, f"layer {layer_number} new K")
+        _assert_finite(value, f"layer {layer_number} new V")
 
 
 @pytest.mark.parametrize(
     ("prefix_length", "suffix_length"),
-    [(0, 32), (64, 16), (256, 32)],
+    [
+        (0, 64),
+        (128, 32),
+        (1024, 64),
+        (4096, 1),
+        (1024, 128),
+        (2048, 128),
+        (4096, 128),
+        (8192, 128),
+        (16384, 128),
+        (16384, 1),
+    ],
 )
 def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkeypatch):
     torch.manual_seed(2026)
     device = torch.device("npu")
     dtype = torch.bfloat16
     _install_single_rank_test_runtime(monkeypatch, device)
-    model = _make_model(device, dtype, dta=True)
     full_length = prefix_length + suffix_length
+    model = _make_model(
+        device,
+        dtype,
+        dta=True,
+        max_sequence_length=max(_MAX_SEQUENCE_LENGTH, full_length),
+    )
+    for name, parameter in model.named_parameters():
+        _assert_finite(parameter, f"initial parameter {name}")
 
-    # Unique IDs make prefix and suffix embedding-gradient attribution unambiguous.
-    full_input_ids = torch.arange(17, 17 + full_length, dtype=torch.long, device=device).unsqueeze(0)
+    # Keep long-context cases inside the vocabulary. Token uniqueness is not
+    # required by this end-to-end equivalence test.
+    full_input_ids = (
+        torch.arange(17, 17 + full_length, dtype=torch.long, device=device) % _VOCAB_SIZE
+    ).unsqueeze(0)
+    assert 0 <= full_input_ids.min().item()
+    assert full_input_ids.max().item() < _VOCAB_SIZE
     full_position_ids = _position_ids(0, full_length, device)
     upstream_gradient = torch.randn(
         1,
@@ -253,13 +333,17 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
         device=device,
         dtype=dtype,
     )
-    reference_logits = model(
-        input_ids=full_input_ids,
-        position_ids=full_position_ids,
-        attention_mask=_causal_mask(full_length, device),
-    )
+    _assert_finite(upstream_gradient, "upstream gradient")
+    with _finite_forward_hooks(model, "reference full forward"):
+        reference_logits = model(
+            input_ids=full_input_ids,
+            position_ids=full_position_ids,
+            attention_mask=_causal_mask(full_length, device),
+        )
     assert reference_logits.shape == (1, full_length, _VOCAB_SIZE)
+    _assert_finite(reference_logits, "reference full logits")
     reference_suffix_logits = reference_logits[:, prefix_length:, :]
+    _assert_finite(reference_suffix_logits, "reference suffix logits")
     reference_suffix_logits.backward(upstream_gradient)
     reference_parameter_grads = _all_parameter_grads(model)
 
@@ -276,15 +360,17 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
                 suffix_length=prefix_length,
             ),
         )
-        with use_tree_attention_context(prefix_context):
-            prefix_logits = model(
-                input_ids=full_input_ids[:, :prefix_length],
-                position_ids=_position_ids(0, prefix_length, device),
-                attention_mask=None,
-            )
+        with _finite_forward_hooks(model, "DTA prefix forward"):
+            with use_tree_attention_context(prefix_context):
+                prefix_logits = model(
+                    input_ids=full_input_ids[:, :prefix_length],
+                    position_ids=_position_ids(0, prefix_length, device),
+                    attention_mask=None,
+                )
         assert prefix_logits.shape == (1, prefix_length, _VOCAB_SIZE)
-        del prefix_logits
+        _assert_finite(prefix_logits, "DTA prefix logits")
         _assert_collected_kv(prefix_context, prefix_length)
+        del prefix_logits
         past_key_values = prefix_context.new_key_values
         for layer_number, (past_key, past_value) in past_key_values.items():
             past_key.retain_grad()
@@ -301,13 +387,15 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
             suffix_length=suffix_length,
         ),
     )
-    with use_tree_attention_context(suffix_context):
-        dta_suffix_logits = model(
-            input_ids=full_input_ids[:, prefix_length:],
-            position_ids=_position_ids(prefix_length, suffix_length, device),
-            attention_mask=None,
-        )
+    with _finite_forward_hooks(model, "DTA suffix forward"):
+        with use_tree_attention_context(suffix_context):
+            dta_suffix_logits = model(
+                input_ids=full_input_ids[:, prefix_length:],
+                position_ids=_position_ids(prefix_length, suffix_length, device),
+                attention_mask=None,
+            )
     assert dta_suffix_logits.shape == (1, suffix_length, _VOCAB_SIZE)
+    _assert_finite(dta_suffix_logits, "DTA suffix logits")
     _assert_collected_kv(suffix_context, suffix_length)
     for layer_number in retained_past:
         context_key, context_value = suffix_context.get_past_kv(layer_number)
@@ -323,11 +411,15 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
         label="suffix logits",
     )
     for layer_number, (past_key, past_value) in retained_past.items():
-        assert past_key.grad is not None and past_key.grad.float().norm() > 0, (
-            f"layer {layer_number} past K did not receive a gradient"
+        assert past_key.grad is not None, f"layer {layer_number} past K gradient is None"
+        assert past_value.grad is not None, f"layer {layer_number} past V gradient is None"
+        _assert_finite(past_key.grad, f"layer {layer_number} past K gradient")
+        _assert_finite(past_value.grad, f"layer {layer_number} past V gradient")
+        assert torch.count_nonzero(past_key.grad).item() > 0, (
+            f"layer {layer_number} past K gradient is finite but all zero"
         )
-        assert past_value.grad is not None and past_value.grad.float().norm() > 0, (
-            f"layer {layer_number} past V did not receive a gradient"
+        assert torch.count_nonzero(past_value.grad).item() > 0, (
+            f"layer {layer_number} past V gradient is finite but all zero"
         )
 
     assert dta_parameter_grads.keys() == reference_parameter_grads.keys()
