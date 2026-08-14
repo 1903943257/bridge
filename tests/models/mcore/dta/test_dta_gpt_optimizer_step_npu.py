@@ -17,6 +17,7 @@ from verl.models.mcore.dta import (
 
 from test_dta_gpt_model_equivalence_npu import (
     _VOCAB_SIZE,
+    _assert_finite,
     _causal_mask,
     _install_single_rank_test_runtime,
     _make_model,
@@ -29,16 +30,21 @@ _UPDATE_MAX_ABS_RATIO_TOL = 3e-2
 
 
 def _make_fp32_master_parameters(model):
-    return {
+    master_parameters = {
         name: torch.nn.Parameter(parameter.detach().float().clone())
         for name, parameter in model.named_parameters()
     }
+    for name, parameter in master_parameters.items():
+        _assert_finite(parameter, f"initial FP32 master parameter {name}")
+    return master_parameters
 
 
-def _copy_model_grads_to_master(model, master_parameters):
+def _copy_model_grads_to_master(model, master_parameters, *, phase):
     for name, parameter in model.named_parameters():
-        assert parameter.grad is not None, f"missing model gradient for {name}"
+        assert parameter.grad is not None, f"{phase}: missing model gradient for {name}"
+        _assert_finite(parameter.grad, f"{phase} model gradient {name}")
         master_parameters[name].grad = parameter.grad.detach().float().clone()
+        _assert_finite(master_parameters[name].grad, f"{phase} FP32 master gradient {name}")
 
 
 def _master_snapshot(master_parameters):
@@ -58,9 +64,15 @@ def _full_step(model, optimizer, input_ids, prefix_length, suffix_length, upstre
         position_ids=_position_ids(0, full_length, input_ids.device),
         attention_mask=_causal_mask(full_length, input_ids.device),
     )
+    _assert_finite(logits, "reference full logits")
+    _assert_finite(logits[:, prefix_length:, :], "reference suffix logits")
     _normalized_backward(logits[:, prefix_length:, :], upstream_gradient)
-    _copy_model_grads_to_master(model, optimizer.param_groups[0]["params_by_name"])
+    _copy_model_grads_to_master(
+        model, optimizer.param_groups[0]["params_by_name"], phase="reference"
+    )
     optimizer.step()
+    for name, parameter in optimizer.param_groups[0]["params_by_name"].items():
+        _assert_finite(parameter, f"reference FP32 master parameter after step {name}")
 
 
 def _external_kv_step(model, optimizer, input_ids, prefix_length, suffix_length, upstream_gradient):
@@ -74,13 +86,18 @@ def _external_kv_step(model, optimizer, input_ids, prefix_length, suffix_length,
             ),
         )
         with use_tree_attention_context(prefix_context):
-            model(
+            prefix_logits = model(
                 input_ids=input_ids[:, :prefix_length],
                 position_ids=_position_ids(0, prefix_length, input_ids.device),
                 attention_mask=None,
             )
+        _assert_finite(prefix_logits, "DTA prefix logits")
         prefix_context.assert_new_kv_layers([1, 2])
+        for layer_number, (key, value) in prefix_context.new_key_values.items():
+            _assert_finite(key, f"DTA prefix layer {layer_number} new K")
+            _assert_finite(value, f"DTA prefix layer {layer_number} new V")
         past_key_values = prefix_context.new_key_values
+        del prefix_logits
 
     suffix_context = TreeAttentionContext(
         prefix_length=prefix_length,
@@ -99,12 +116,22 @@ def _external_kv_step(model, optimizer, input_ids, prefix_length, suffix_length,
             attention_mask=None,
         )
     suffix_context.assert_new_kv_layers([1, 2])
+    _assert_finite(suffix_logits, "DTA suffix logits")
+    for layer_number, (key, value) in suffix_context.new_key_values.items():
+        _assert_finite(key, f"DTA suffix layer {layer_number} new K")
+        _assert_finite(value, f"DTA suffix layer {layer_number} new V")
     _normalized_backward(suffix_logits, upstream_gradient)
-    _copy_model_grads_to_master(model, optimizer.param_groups[0]["params_by_name"])
+    _copy_model_grads_to_master(
+        model, optimizer.param_groups[0]["params_by_name"], phase="DTA"
+    )
     optimizer.step()
+    for name, parameter in optimizer.param_groups[0]["params_by_name"].items():
+        _assert_finite(parameter, f"DTA FP32 master parameter after step {name}")
 
 
 def _assert_update_close(actual, expected, *, name):
+    _assert_finite(actual, f"candidate parameter update {name}")
+    _assert_finite(expected, f"reference parameter update {name}")
     difference = actual - expected
     max_abs = difference.abs().max().item()
     expected_max_abs = expected.abs().max().item()
@@ -121,7 +148,21 @@ def _assert_update_close(actual, expected, *, name):
     )
 
 
-@pytest.mark.parametrize(("prefix_length", "suffix_length"), [(0, 32), (256, 32)])
+@pytest.mark.parametrize(
+    ("prefix_length", "suffix_length"),
+    [
+        (0, 64),
+        (128, 32),
+        (1024, 64),
+        (4096, 1),
+        (1024, 128),
+        (2048, 128),
+        (4096, 128),
+        (8192, 128),
+        (16384, 128),
+        (16384, 1),
+    ],
+)
 def test_tiny_gpt_single_optimizer_step_matches_external_kv(
     prefix_length, suffix_length, monkeypatch
 ):
@@ -130,8 +171,13 @@ def test_tiny_gpt_single_optimizer_step_matches_external_kv(
     _install_single_rank_test_runtime(monkeypatch, device)
 
     torch.manual_seed(2026)
-    reference_model = _make_model(device, dtype, dta=True)
-    candidate_model = _make_model(device, dtype, dta=True)
+    full_length = prefix_length + suffix_length
+    reference_model = _make_model(
+        device, dtype, dta=True, max_sequence_length=full_length
+    )
+    candidate_model = _make_model(
+        device, dtype, dta=True, max_sequence_length=full_length
+    )
     candidate_model.load_state_dict(reference_model.state_dict(), strict=True)
     reference_master = _make_fp32_master_parameters(reference_model)
     candidate_master = _make_fp32_master_parameters(candidate_model)
@@ -142,12 +188,16 @@ def test_tiny_gpt_single_optimizer_step_matches_external_kv(
     # transfer BF16 model gradients to their corresponding FP32 master tensors.
     reference_optimizer.param_groups[0]["params_by_name"] = reference_master
     candidate_optimizer.param_groups[0]["params_by_name"] = candidate_master
-    full_length = prefix_length + suffix_length
-    input_ids = torch.arange(17, 17 + full_length, dtype=torch.long, device=device).unsqueeze(0)
+    input_ids = (
+        torch.arange(17, 17 + full_length, dtype=torch.long, device=device) % _VOCAB_SIZE
+    ).unsqueeze(0)
+    assert 0 <= input_ids.min().item()
+    assert input_ids.max().item() < _VOCAB_SIZE
     torch.manual_seed(2027)
     upstream_gradient = torch.randn(
         1, suffix_length, _VOCAB_SIZE, device=device, dtype=dtype
     )
+    _assert_finite(upstream_gradient, "upstream gradient")
 
     _full_step(
         reference_model,
