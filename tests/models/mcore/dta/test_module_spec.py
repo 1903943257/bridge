@@ -18,7 +18,11 @@ import pytest
 
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
-from verl.models.mcore.dta import DTASelfAttention, replace_self_attention_with_dta
+from verl.models.mcore.dta import (
+    DTASelfAttention,
+    make_dta_module_spec_provider,
+    replace_self_attention_with_dta,
+)
 
 
 class _TransformerLayer:
@@ -157,3 +161,31 @@ def test_rejects_invalid_spec_structures(spec, exception, match):
     with pytest.raises(exception, match=match):
         replace_self_attention_with_dta(spec)
 
+
+def test_dta_spec_provider_wraps_callable_without_vp_stage():
+    original = _layer_spec()
+
+    def provider(config):
+        assert config == "config"
+        return original
+
+    wrapped = make_dta_module_spec_provider(provider)
+    converted = wrapped("config")
+
+    assert _attention_spec(converted).module is DTASelfAttention
+    assert _attention_spec(original).module is SelfAttention
+
+
+def test_dta_spec_provider_forwards_vp_stage():
+    original = _layer_spec()
+    calls = []
+
+    def provider(config, vp_stage=None):
+        calls.append((config, vp_stage))
+        return original
+
+    wrapped = make_dta_module_spec_provider(provider)
+    converted = wrapped("config", vp_stage=3)
+
+    assert calls == [("config", 3)]
+    assert _attention_spec(converted).module is DTASelfAttention

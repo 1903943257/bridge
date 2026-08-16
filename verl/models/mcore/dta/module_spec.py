@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import copy
+import inspect
+from collections.abc import Callable
 from dataclasses import replace
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, get_module
@@ -75,6 +77,22 @@ def replace_self_attention_with_dta(transformer_layer_spec: _SpecT) -> _SpecT:
     return copied_spec
 
 
+def make_dta_module_spec_provider(
+    original: _SpecT | Callable[..., _SpecT],
+) -> _SpecT | Callable[..., _SpecT]:
+    """Wrap a Megatron-Bridge layer-spec provider with the DTA replacement."""
+
+    if not callable(original):
+        return replace_self_attention_with_dta(original)
+    accepts_vp_stage = "vp_stage" in inspect.signature(original).parameters
+
+    def dta_spec_provider(config: Any, vp_stage: int | None = None) -> _SpecT:
+        spec = original(config, vp_stage=vp_stage) if accepts_vp_stage else original(config)
+        return replace_self_attention_with_dta(spec)
+
+    return dta_spec_provider
+
+
 def _get_layer_specs(transformer_layer_spec: object) -> list[ModuleSpec]:
     if isinstance(transformer_layer_spec, ModuleSpec):
         submodules = transformer_layer_spec.submodules
@@ -98,4 +116,3 @@ def _get_layer_specs(transformer_layer_spec: object) -> list[ModuleSpec]:
     if not isinstance(layer_specs, list) or not layer_specs:
         raise ValueError("layer_specs must be a non-empty list")
     return layer_specs
-

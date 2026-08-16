@@ -1,0 +1,41 @@
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index 059bf392..6ac86bce 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -207,6 +207,7 @@ class McoreEngineConfig(EngineConfig):
+     use_mbridge: bool = True
+     vanilla_mbridge: bool = False
+     use_megatron_fsdp: bool = False
++    dta_enabled: bool = False
+     strategy: str = "megatron"
+     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
+ 
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 207f4458..a5f441c6 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -348,6 +348,11 @@ class MegatronEngine(BaseEngine):
+         )
+         override_ddp_config = self._resolve_override_ddp_config()
+ 
++        if self.engine_config.dta_enabled:
++            from verl.models.mcore.dta.megatron_adapter import install_dta_module_spec
++
++            install_dta_module_spec(self.provider)
++
+         module, updated_tf_config = make_megatron_module(
+             wrap_config=wrap_config,
+             tf_config=self.tf_config,
+@@ -691,6 +696,12 @@ class MegatronEngine(BaseEngine):
+         return torch.tensor(input_ids.numel(), device=input_ids.device)
+ 
+     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
++        dta_request = tu.get_non_tensor_data(data, key="dta_forward_backward_request", default=None)
++        if dta_request is not None:
++            from verl.models.mcore.dta.megatron_adapter import run_dta_forward_backward
++
++            return run_dta_forward_backward(self, dta_request, forward_only=forward_only)
++
+         self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
+         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
+ 
