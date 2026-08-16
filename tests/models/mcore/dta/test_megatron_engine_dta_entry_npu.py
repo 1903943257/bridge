@@ -30,7 +30,6 @@ from test_segment_push_pop_npu import _install_single_rank_runtime, _make_model,
 from verl.models.mcore.dta import DTA_REQUEST_KEY, DTAForwardBackwardRequest
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
-from verl.workers.engine.megatron.transformer_impl import MegatronEngine
 
 if not is_torch_npu_available(check_device=True):
     pytest.skip("Requires an Ascend NPU", allow_module_level=True)
@@ -41,6 +40,10 @@ def test_megatron_engine_dta_thin_entry_runs_hooks_once(monkeypatch):
     device = torch.device("npu")
     _install_single_rank_runtime(monkeypatch, device)
     model = _make_model(device)
+    # Importing the MindSpeed-backed engine patches the global norm spec to
+    # PTNorm. Build this tiny Apex-free fixture first, as the model-side tests do.
+    from verl.workers.engine.megatron.transformer_impl import MegatronEngine
+
     prefix = _tokens(17, _PREFIX_LENGTH, device)
     suffix_1 = _tokens(1100, _SUFFIX_1_LENGTH, device)
     suffix_2 = _tokens(1700, _SUFFIX_2_LENGTH, device)
@@ -96,4 +99,3 @@ def test_megatron_engine_dta_thin_entry_runs_hooks_once(monkeypatch):
     assert output["metrics"]["dta_segment_count"] == 3
     assert torch.isfinite(torch.tensor(output["loss"]))
     _parameter_grads(model)
-
