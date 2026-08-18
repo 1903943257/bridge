@@ -49,7 +49,7 @@ from verl.models.mcore.dta import (
     DTASelfAttention,
     replace_self_attention_with_dta,
 )
-from verl.models.mcore.config_converter import hf_to_mcore_config_dense
+from verl.models.mcore.config_converter import get_hf_rope_theta, hf_to_mcore_config_dense
 from verl.models.mcore.mbridge import AutoBridge
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
@@ -167,7 +167,7 @@ def _make_qwen_model(
         parallel_output=False,
         share_embeddings_and_output_weights=hf_config.tie_word_embeddings,
         position_embedding_type="rope",
-        rotary_base=hf_config.rope_theta,
+        rotary_base=get_hf_rope_theta(hf_config),
         pg_collection=pg_collection,
     ).to(device=device, dtype=torch.bfloat16)
     model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.to(device)
@@ -223,7 +223,7 @@ def test_qwen3_real_checkpoint_matches_reference_and_dta(monkeypatch):
     assert hf_config.head_dim == 128
     assert hf_config.vocab_size == QWEN_VOCAB_SIZE
     assert hf_config.tie_word_embeddings
-    assert hf_config.rope_theta == 1_000_000
+    assert get_hf_rope_theta(hf_config) == 1_000_000
 
     full_length = _PREFIX_LENGTH + _SUFFIX_LENGTH
     reference_model = _make_qwen_model(
