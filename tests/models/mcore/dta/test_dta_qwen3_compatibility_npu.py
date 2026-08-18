@@ -17,9 +17,9 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +27,8 @@ from tensordict import TensorDict
 from transformers import AutoConfig
 
 from megatron.core import parallel_state as mpu
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.spec_utils import ModuleSpec
 from test_dta_engine_profile_npu import (
     _ProfileFusedCausalAttention,
@@ -45,9 +47,10 @@ from verl.models.mcore.dta import (
     DTA_REQUEST_KEY,
     DTAForwardBackwardRequest,
     DTASelfAttention,
+    replace_self_attention_with_dta,
 )
-from verl.models.mcore.dta.megatron_adapter import install_dta_module_spec
-from verl.models.mcore.bridge import AutoBridge
+from verl.models.mcore.config_converter import hf_to_mcore_config_dense
+from verl.models.mcore.mbridge import AutoBridge
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 
@@ -91,9 +94,7 @@ def _validate_checkpoint_files(model_path):
         raise FileNotFoundError(f"no safetensors weights found under {model_path}")
 
 
-def _controlled_attention_spec_provider(original):
-    accepts_vp_stage = callable(original) and "vp_stage" in inspect.signature(original).parameters
-
+def _replace_core_attention(original):
     def replace_core_attention(spec):
         copied = copy.deepcopy(spec)
         if isinstance(copied, ModuleSpec):
@@ -109,15 +110,7 @@ def _controlled_attention_spec_provider(original):
             attention_spec = layer_spec.submodules.self_attention
             attention_spec.submodules.core_attention = _ProfileFusedCausalAttention
         return copied
-
-    if not callable(original):
-        return replace_core_attention(original)
-
-    def provider(config, vp_stage=None):
-        spec = original(config, vp_stage=vp_stage) if accepts_vp_stage else original(config)
-        return replace_core_attention(spec)
-
-    return provider
+    return replace_core_attention(original)
 
 
 def _make_qwen_model(
@@ -134,35 +127,52 @@ def _make_qwen_model(
     _validate_checkpoint_files(QWEN_MODEL_PATH)
     _initialize_single_rank_megatron()
 
-    bridge = AutoBridge.from_hf_pretrained(str(QWEN_MODEL_PATH), trust_remote_code=True)
-    provider = bridge.to_megatron_provider(load_weights=False)
-    provider.apply_overrides_and_finalize(
-        dtype=torch.bfloat16,
-        overrides={
-            "tensor_model_parallel_size": 1,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-            "expert_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "attention_dropout": 0.0,
-            "hidden_dropout": 0.0,
-            "apply_rope_fusion": False,
-            "bias_dropout_fusion": False,
-            "use_cpu_initialization": True,
-        },
+    hf_config = AutoConfig.from_pretrained(str(QWEN_MODEL_PATH), trust_remote_code=True)
+    config = hf_to_mcore_config_dense(
+        hf_config,
+        torch.bfloat16,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        sequence_parallel=False,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        apply_rope_fusion=False,
+        bias_dropout_fusion=False,
+        use_cpu_initialization=True,
     )
-    provider.transformer_layer_spec = _controlled_attention_spec_provider(
-        provider.transformer_layer_spec
+    spec = get_gpt_decoder_block_spec(
+        config,
+        use_transformer_engine=False,
+        pp_rank=0,
     )
+    spec = _replace_core_attention(spec)
     if dta:
-        install_dta_module_spec(provider)
+        spec = replace_self_attention_with_dta(spec)
 
-    chunks = provider.provide_distributed_model(wrap_with_ddp=False)
-    chunks = chunks if isinstance(chunks, list) else [chunks]
-    if len(chunks) != 1:
-        raise RuntimeError(f"single-rank Qwen fixture expected one model chunk, got {len(chunks)}")
-    model = chunks[0].to(device=device, dtype=torch.bfloat16)
-    bridge.load_hf_weights([model], str(QWEN_MODEL_PATH))
+    pg_collection = SimpleNamespace(
+        tp=mpu.get_tensor_model_parallel_group(),
+        cp=mpu.get_context_parallel_group(),
+        pp=mpu.get_pipeline_model_parallel_group(),
+        embd=mpu.get_embedding_group(),
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=spec,
+        vocab_size=hf_config.vocab_size,
+        max_sequence_length=hf_config.max_position_embeddings,
+        pre_process=True,
+        post_process=True,
+        parallel_output=False,
+        share_embeddings_and_output_weights=hf_config.tie_word_embeddings,
+        position_embedding_type="rope",
+        rotary_base=hf_config.rope_theta,
+        pg_collection=pg_collection,
+    ).to(device=device, dtype=torch.bfloat16)
+    model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.to(device)
+    bridge = AutoBridge.from_config(hf_config, dtype=torch.bfloat16)
+    bridge.load_weights([model], str(QWEN_MODEL_PATH))
     model.train()
     return model
 
