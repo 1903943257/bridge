@@ -328,19 +328,23 @@ def _profile_runs(run, zero_grad):
 def _install_module_timing_hooks(model, recorder):
     handles = []
 
-    def add_hooks(module, category):
+    def add_hooks(module, category, *, measure_backward=True):
         handles.append(module.register_forward_pre_hook(lambda *_: recorder.begin(f"{category}_forward")))
         handles.append(module.register_forward_hook(lambda *_: recorder.end(f"{category}_forward")))
-        handles.append(
-            module.register_full_backward_pre_hook(
-                lambda *_: recorder.begin(f"{category}_backward")
+        if measure_backward:
+            handles.append(
+                module.register_full_backward_pre_hook(
+                    lambda *_: recorder.begin(f"{category}_backward")
+                )
             )
-        )
-        handles.append(
-            module.register_full_backward_hook(lambda *_: recorder.end(f"{category}_backward"))
-        )
+            handles.append(
+                module.register_full_backward_hook(lambda *_: recorder.end(f"{category}_backward"))
+            )
 
-    add_hooks(model, "model")
+    # A root-module backward hook only measures its boundary callback when the
+    # integer token inputs do not require gradients; it does not bracket the
+    # complete autograd graph. The real backward entry is timed separately.
+    add_hooks(model, "model", measure_backward=False)
     for layer in model.decoder.layers:
         add_hooks(layer.self_attention, "attention")
         add_hooks(layer.mlp, "mlp")
@@ -361,18 +365,34 @@ def _collect_breakdown(run, zero_grad, model, *, dta):
         original_push = SegmentExecutor.push
         original_visit_leaf = SegmentExecutor.visit_leaf
         original_pop = SegmentExecutor.pop
+        original_autograd_backward = torch.autograd.backward
+        active_dta_phase = [None]
+
+        def call_in_phase(phase, function, *args, **kwargs):
+            previous_phase = active_dta_phase[0]
+            active_dta_phase[0] = phase
+            try:
+                return recorder.call(phase, function, *args, **kwargs)
+            finally:
+                active_dta_phase[0] = previous_phase
 
         def timed_push(executor, segment_id):
-            return recorder.call("root_push", original_push, executor, segment_id)
+            return call_in_phase("root_push", original_push, executor, segment_id)
 
         def timed_visit_leaf(executor, segment_id):
-            return recorder.call("leaf_visit", original_visit_leaf, executor, segment_id)
+            return call_in_phase("leaf_visit", original_visit_leaf, executor, segment_id)
 
         def timed_pop(executor, segment_id):
-            return recorder.call("root_pop", original_pop, executor, segment_id)
+            return call_in_phase("root_pop", original_pop, executor, segment_id)
+
+        def timed_autograd_backward(*args, **kwargs):
+            phase = active_dta_phase[0]
+            category = f"{phase}_backward" if phase is not None else "reference_backward"
+            return recorder.call(category, original_autograd_backward, *args, **kwargs)
 
         try:
             with ExitStack() as stack:
+                stack.enter_context(patch.object(torch.autograd, "backward", timed_autograd_backward))
                 if dta:
                     stack.enter_context(patch.object(SegmentExecutor, "push", timed_push))
                     stack.enter_context(
@@ -549,9 +569,11 @@ def _print_breakdown(name, breakdown, *, sibling_count):
     ordered_categories = (
         "root_push",
         "leaf_visit",
+        "leaf_visit_backward",
         "root_pop",
+        "root_pop_backward",
         "model_forward",
-        "model_backward",
+        "reference_backward",
         "attention_forward",
         "attention_backward",
         "mlp_forward",
@@ -568,9 +590,26 @@ def _print_breakdown(name, breakdown, *, sibling_count):
             f"  {category:<20} {item['median_ms']:>10.3f} ms "
             f"({item['calls']} calls{suffix})"
         )
-    model_device_ms = sum(
+    if "leaf_visit" in categories and "leaf_visit_backward" in categories:
+        leaf_non_backward = (
+            categories["leaf_visit"]["median_ms"]
+            - categories["leaf_visit_backward"]["median_ms"]
+        )
+        print(f"  leaf non-backward    {leaf_non_backward:>10.3f} ms (derived)")
+    if "root_pop" in categories and "root_pop_backward" in categories:
+        root_pop_non_backward = (
+            categories["root_pop"]["median_ms"]
+            - categories["root_pop_backward"]["median_ms"]
+        )
+        print(f"  root_pop non-backward {root_pop_non_backward:>9.3f} ms (derived)")
+    backward_categories = (
+        "reference_backward",
+        "leaf_visit_backward",
+        "root_pop_backward",
+    )
+    model_device_ms = categories.get("model_forward", {}).get("median_ms", 0.0) + sum(
         categories[category]["median_ms"]
-        for category in ("model_forward", "model_backward")
+        for category in backward_categories
         if category in categories
     )
     approximate_remainder = breakdown["wall_median_ms"] - model_device_ms
