@@ -127,8 +127,7 @@ def run_dta_forward_backward(
             "dta_loss": loss,
             "dta_loss_sum": result.loss_sum.item(),
             "dta_peak_path_tokens": result.peak_path_tokens,
-            "dta_segment_count": result.pushed_segment_count,
+            "dta_segment_count": result.executed_segment_count,
+            "dta_direct_leaf_count": result.direct_leaf_count,
         },
     }
-
-

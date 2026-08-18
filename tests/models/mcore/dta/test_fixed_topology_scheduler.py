@@ -18,6 +18,8 @@ import torch
 from test_segment_executor import _FakeDTAModel
 from verl.models.mcore.dta import (
     FixedTopologyScheduler,
+    PhysicalExecution,
+    PhysicalExecutionKind,
     PopSegment,
     PushSegment,
     SchedulerState,
@@ -92,9 +94,18 @@ def test_fixed_scheduler_executes_branching_dfs_and_aggregates_results():
         PopSegment(2),
         PopSegment(0),
     )
-    assert [item.segment_id for item in result.forward_results] == [0, 1, 2]
-    assert [item.segment_id for item in result.backward_results] == [1, 2, 0]
-    assert result.pushed_segment_count == result.popped_segment_count == 3
+    assert [item.segment_id for item in result.forward_results] == [0]
+    assert [item.segment_id for item in result.backward_results] == [0]
+    assert [item.forward.segment_id for item in result.direct_leaf_results] == [1, 2]
+    assert result.execution_trace == (
+        PhysicalExecution(PhysicalExecutionKind.PUSH, 0),
+        PhysicalExecution(PhysicalExecutionKind.VISIT_LEAF, 1),
+        PhysicalExecution(PhysicalExecutionKind.VISIT_LEAF, 2),
+        PhysicalExecution(PhysicalExecutionKind.POP, 0),
+    )
+    assert result.pushed_segment_count == result.popped_segment_count == 1
+    assert result.direct_leaf_count == 2
+    assert result.executed_segment_count == 3
     assert result.peak_path_tokens == _PREFIX_LENGTH + _SUFFIX_1_LENGTH
     assert plan.total_loss_weight == _TOTAL_LOSS_WEIGHT
     torch.testing.assert_close(result.normalized_loss, result.loss_sum / _TOTAL_LOSS_WEIGHT)
@@ -150,5 +161,3 @@ def test_execution_failure_marks_scheduler_failed():
         scheduler.run()
     assert scheduler.state is SchedulerState.FAILED
     assert executor.failed
-
-

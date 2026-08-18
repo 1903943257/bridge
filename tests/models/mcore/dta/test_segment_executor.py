@@ -144,6 +144,72 @@ def test_loss_scale_hook_scales_gradients_without_scaling_reported_loss():
     torch.testing.assert_close(scaled_model.scale.grad, baseline_grad * 8.0)
 
 
+def test_visit_leaf_matches_push_pop_and_does_not_push_leaf_kv():
+    baseline_model = _FakeDTAModel()
+    baseline = SegmentExecutor(baseline_model, _plan(), expected_layer_numbers=(1, 2))
+    baseline.push(0)
+    baseline.push(1)
+    baseline_result = baseline.pop(1)
+    baseline_parameter_grad = baseline_model.scale.grad.detach().clone()
+    baseline_parent_grads = {
+        layer: (key.clone(), value.clone())
+        for layer, (key, value) in baseline.kv_stack.get_new_kv_gradients(0).items()
+    }
+
+    direct_model = _FakeDTAModel()
+    direct = SegmentExecutor(direct_model, _plan(), expected_layer_numbers=(1, 2))
+    direct.push(0)
+    direct_result = direct.visit_leaf(1)
+
+    assert direct.kv_stack.segment_ids == (0,)
+    assert direct_result.forward.segment_id == direct_result.backward.segment_id == 1
+    torch.testing.assert_close(direct_result.backward.normalized_loss, baseline_result.normalized_loss)
+    torch.testing.assert_close(direct_model.scale.grad, baseline_parameter_grad)
+    direct_parent_grads = direct.kv_stack.get_new_kv_gradients(0)
+    assert direct_parent_grads.keys() == baseline_parent_grads.keys()
+    for layer, (expected_key, expected_value) in baseline_parent_grads.items():
+        actual_key, actual_value = direct_parent_grads[layer]
+        torch.testing.assert_close(actual_key, expected_key)
+        torch.testing.assert_close(actual_value, expected_value)
+
+
+def test_visit_leaf_accumulates_sibling_parent_kv_gradients():
+    base_plan = _plan()
+    second_leaf = SegmentSpec(
+        2,
+        0,
+        torch.tensor([4, 3, 2]),
+        position_start=4,
+        prefix_length=4,
+        loss_terms=(SegmentLossTerm(0, 3, weight=3.0),),
+    )
+    plan = SegmentPlan([base_plan.get(0), base_plan.get(1), second_leaf], root_id=0)
+
+    def one_leaf_parent_grads(segment_id):
+        model = _FakeDTAModel()
+        executor = SegmentExecutor(model, plan, expected_layer_numbers=(1, 2))
+        executor.push(0)
+        executor.visit_leaf(segment_id)
+        return {
+            layer: (key.clone(), value.clone())
+            for layer, (key, value) in executor.kv_stack.get_new_kv_gradients(0).items()
+        }
+
+    first = one_leaf_parent_grads(1)
+    second = one_leaf_parent_grads(2)
+
+    combined_model = _FakeDTAModel()
+    combined = SegmentExecutor(combined_model, plan, expected_layer_numbers=(1, 2))
+    combined.push(0)
+    combined.visit_leaf(1)
+    combined.visit_leaf(2)
+    accumulated = combined.kv_stack.get_new_kv_gradients(0)
+
+    for layer, (actual_key, actual_value) in accumulated.items():
+        torch.testing.assert_close(actual_key, first[layer][0] + second[layer][0])
+        torch.testing.assert_close(actual_value, first[layer][1] + second[layer][1])
+
+
 def test_wrong_pop_marks_executor_failed_without_popping_stack():
     executor = SegmentExecutor(_FakeDTAModel(), _plan(), expected_layer_numbers=(1, 2))
     executor.push(0)
@@ -166,4 +232,3 @@ def test_failed_push_does_not_write_kv_stack_and_closes_executor():
     assert executor.failed
     with pytest.raises(RuntimeError, match="failed"):
         executor.push(0)
-

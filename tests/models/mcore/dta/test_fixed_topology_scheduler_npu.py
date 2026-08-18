@@ -141,7 +141,9 @@ def test_fixed_branching_schedule_matches_two_full_trajectories(monkeypatch):
     result = FixedTopologyScheduler(plan, executor).run()
     dta_gradients = _parameter_grads(model)
 
-    assert result.pushed_segment_count == result.popped_segment_count == 3
+    assert result.pushed_segment_count == result.popped_segment_count == 1
+    assert result.direct_leaf_count == 2
+    assert result.executed_segment_count == 3
     assert result.peak_path_tokens == _PREFIX_LENGTH + _SUFFIX_1_LENGTH
     assert executor.root_relayed_gradients is not None
     assert set(executor.root_relayed_gradients) == {1, 2}
@@ -158,5 +160,3 @@ def test_fixed_branching_schedule_matches_two_full_trajectories(monkeypatch):
         rtol=2e-2,
     )
     _assert_gradients_close(dta_gradients, reference_gradients)
-
-

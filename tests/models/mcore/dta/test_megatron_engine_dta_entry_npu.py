@@ -97,5 +97,6 @@ def test_megatron_engine_dta_thin_entry_runs_hooks_once(monkeypatch):
     assert output["loss"] == output["metrics"]["dta_loss"]
     assert output["metrics"]["dta_peak_path_tokens"] == _PREFIX_LENGTH + _SUFFIX_1_LENGTH
     assert output["metrics"]["dta_segment_count"] == 3
+    assert output["metrics"]["dta_direct_leaf_count"] == 2
     assert torch.isfinite(torch.tensor(output["loss"]))
     _parameter_grads(model)

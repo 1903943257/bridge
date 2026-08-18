@@ -46,6 +46,14 @@ class SegmentBackwardResult:
     relayed_layer_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class LeafVisitResult:
+    """One physical leaf execution replacing an adjacent logical Push/Pop pair."""
+
+    forward: SegmentForwardResult
+    backward: SegmentBackwardResult
+
+
 class SegmentExecutor:
     """Execute graph-free Push and gradient-carrying Pop for a SegmentPlan.
 
@@ -163,6 +171,67 @@ class SegmentExecutor:
                 normalized_loss=normalized_loss.detach(),
                 loss_term_count=len(segment.loss_terms),
                 relayed_layer_count=len(relayed_gradients),
+            )
+        except Exception:
+            self._failed = True
+            raise
+
+    def visit_leaf(self, segment_id: SegmentId) -> LeafVisitResult:
+        """Forward/backward one leaf without writing its new KV to the path stack."""
+
+        self._ensure_healthy()
+        try:
+            segment = self.plan.get(segment_id)
+            if self.plan.children_of(segment_id):
+                raise ValueError(f"segment {segment_id} is not a leaf")
+
+            expected_parent = self.kv_stack.top().segment.segment_id if len(self.kv_stack) else None
+            if segment.parent_id != expected_parent:
+                raise RuntimeError(
+                    f"cannot visit leaf {segment_id}: expected parent on stack {segment.parent_id}, "
+                    f"got {expected_parent}"
+                )
+            if segment.prefix_length != self.kv_stack.prefix_length:
+                raise RuntimeError(
+                    f"cannot visit leaf {segment_id}: stack prefix length is {self.kv_stack.prefix_length}, "
+                    f"got {segment.prefix_length}"
+                )
+
+            anchors = self.kv_stack.build_past_anchors()
+            context, logits = self._forward(segment, past_key_values=anchors.key_values, no_grad=False)
+            context.assert_new_kv_layers(self.expected_layer_numbers)
+            loss_sum, normalized_loss = self._compute_loss(segment, logits)
+
+            if segment.loss_terms:
+                backward_loss = (
+                    normalized_loss if self.loss_scale_func is None else self.loss_scale_func(normalized_loss)
+                )
+                if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
+                    raise TypeError("loss_scale_func must return a scalar tensor")
+            else:
+                # First-version leaf-direct deliberately still performs one
+                # grad-enabled FWD+BWD for an empty-loss leaf. Keep the zero
+                # connected to the graph; a no-op fast path is a later concern.
+                backward_loss = logits.float().sum() * 0.0
+
+            torch.autograd.backward(backward_loss)
+            if anchors.key_values:
+                self.kv_stack.accumulate_anchor_gradients(anchors)
+
+            return LeafVisitResult(
+                forward=SegmentForwardResult(
+                    segment_id=segment_id,
+                    prefix_length=segment.prefix_length,
+                    suffix_length=segment.length,
+                    layer_count=len(context.new_key_values),
+                ),
+                backward=SegmentBackwardResult(
+                    segment_id=segment_id,
+                    loss_sum=loss_sum.detach(),
+                    normalized_loss=normalized_loss.detach(),
+                    loss_term_count=len(segment.loss_terms),
+                    relayed_layer_count=0,
+                ),
             )
         except Exception:
             self._failed = True

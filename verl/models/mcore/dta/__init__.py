@@ -17,12 +17,18 @@
 from .attention import DTASelfAttention
 from .context import TreeAttentionContext, get_tree_attention_context, use_tree_attention_context
 from .engine_adapter import DTA_REQUEST_KEY, DTAForwardBackwardRequest
-from .fixed_topology_scheduler import FixedTopologyScheduler, SchedulerState, TreeScheduleResult
+from .fixed_topology_scheduler import (
+    FixedTopologyScheduler,
+    PhysicalExecution,
+    PhysicalExecutionKind,
+    SchedulerState,
+    TreeScheduleResult,
+)
 from .kv_stack import KVStack, KVStackEntry, PastKVAnchors, PastKVSlice, SegmentKV
 from .module_spec import make_dta_module_spec_provider, replace_self_attention_with_dta
 from .rectangular_attention import rectangular_causal_attention
 from .rope import build_suffix_rotary_pos_emb
-from .segment_executor import SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
+from .segment_executor import LeafVisitResult, SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
 from .segment_plan import (
     PopSegment,
     PushSegment,
@@ -40,8 +46,11 @@ __all__ = [
     "FixedTopologyScheduler",
     "KVStack",
     "KVStackEntry",
+    "LeafVisitResult",
     "PastKVAnchors",
     "PastKVSlice",
+    "PhysicalExecution",
+    "PhysicalExecutionKind",
     "SegmentKV",
     "SchedulerState",
     "TreeAttentionContext",
