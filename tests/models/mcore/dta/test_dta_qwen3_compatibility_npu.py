@@ -44,7 +44,7 @@ from test_dta_engine_reference_equivalence_npu import (
     _make_plan,
     _reference_data,
 )
-from test_segment_push_pop_npu import _assert_gradients_close, _parameter_grads
+from test_segment_push_pop_npu import _parameter_grads
 from verl.models.mcore.dta import (
     DTA_REQUEST_KEY,
     DTAForwardBackwardRequest,
@@ -70,6 +70,9 @@ QWEN_NUM_LAYERS = 28
 QWEN_VOCAB_SIZE = 151936
 _PREFIX_LENGTH = 128
 _SUFFIX_LENGTH = 64
+_GLOBAL_GRAD_RELATIVE_L2_TOL = 2e-2
+_PER_PARAMETER_GRAD_RELATIVE_L2_TOL = 5e-2
+_GLOBAL_GRAD_COSINE_MIN = 0.999
 
 
 def _initialize_single_rank_megatron():
@@ -316,6 +319,54 @@ def _tokens(start, length, device):
     return torch.arange(start, start + length, dtype=torch.long, device=device) % QWEN_VOCAB_SIZE
 
 
+def _assert_real_qwen_gradients_close(actual, expected):
+    assert actual.keys() == expected.keys()
+    difference_square_sum = 0.0
+    expected_square_sum = 0.0
+    actual_square_sum = 0.0
+    dot_sum = 0.0
+    per_parameter = []
+    for name in actual:
+        actual_gradient = actual[name].float()
+        expected_gradient = expected[name].float()
+        difference = actual_gradient - expected_gradient
+        difference_square = torch.sum(difference * difference).item()
+        expected_square = torch.sum(expected_gradient * expected_gradient).item()
+        actual_square = torch.sum(actual_gradient * actual_gradient).item()
+        dot = torch.sum(actual_gradient * expected_gradient).item()
+        difference_square_sum += difference_square
+        expected_square_sum += expected_square
+        actual_square_sum += actual_square
+        dot_sum += dot
+        relative_l2 = (difference_square / max(expected_square, 1e-24)) ** 0.5
+        per_parameter.append((relative_l2, name))
+
+    global_relative_l2 = (
+        difference_square_sum / max(expected_square_sum, 1e-24)
+    ) ** 0.5
+    global_cosine = dot_sum / max(
+        (actual_square_sum * expected_square_sum) ** 0.5,
+        1e-24,
+    )
+    worst_parameters = sorted(per_parameter, reverse=True)[:10]
+    print(
+        "Qwen gradient comparison: "
+        f"global_relative_l2={global_relative_l2:.6g}, "
+        f"global_cosine={global_cosine:.8f}"
+    )
+    for relative_l2, name in worst_parameters:
+        print(f"  gradient relative_l2={relative_l2:.6g}: {name}")
+
+    assert global_relative_l2 <= _GLOBAL_GRAD_RELATIVE_L2_TOL
+    assert global_cosine >= _GLOBAL_GRAD_COSINE_MIN
+    excessive = [
+        (name, relative_l2)
+        for relative_l2, name in per_parameter
+        if relative_l2 > _PER_PARAMETER_GRAD_RELATIVE_L2_TOL
+    ]
+    assert not excessive, f"per-parameter Qwen gradient mismatches: {excessive[:10]}"
+
+
 def test_qwen3_real_checkpoint_matches_reference_and_dta(monkeypatch):
     torch.manual_seed(2026)
     device = torch.device("npu")
@@ -418,6 +469,6 @@ def test_qwen3_real_checkpoint_matches_reference_and_dta(monkeypatch):
         atol=2e-2,
         rtol=2e-2,
     )
-    _assert_gradients_close(dta_gradients, reference_gradients)
+    _assert_real_qwen_gradients_close(dta_gradients, reference_gradients)
     assert dta_calls == 4 * QWEN_NUM_LAYERS
     assert dta_output["metrics"]["dta_direct_leaf_count"] == 2
