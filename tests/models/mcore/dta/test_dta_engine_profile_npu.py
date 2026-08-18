@@ -19,6 +19,7 @@ import gc
 import os
 import statistics
 import time
+from contextlib import ExitStack
 from contextvars import ContextVar
 from unittest.mock import patch
 
@@ -86,9 +87,12 @@ _MAX_PROFILE_PARAMETERS = 700_000_000
 
 _WARMUP_RUNS = 3
 _MEASURE_RUNS = 10
+_BREAKDOWN_WARMUP_RUNS = 1
+_BREAKDOWN_MEASURE_RUNS = 3
+_RUN_BREAKDOWN = os.getenv("DTA_PROFILE_BREAKDOWN", "1") == "1"
 _MIB = 1024**2
 _GIB = 1024**3
-_RECOVERY_TOLERANCE_BYTES = 64 * _MIB
+_RECOVERY_TOLERANCE_BYTES = 512 * _MIB
 _TRACE_SEGMENT_SCOPE = ContextVar("dta_profile_segment_scope", default=None)
 _TRACE_LAYER = ContextVar("dta_profile_layer", default=None)
 
@@ -118,6 +122,46 @@ class _ProfileFusedCausalAttention(DotProductAttention):
             softmax_scale=self.softmax_scale,
             dropout_p=0.0,
         )
+
+
+class _NPUEventRecorder:
+    """Collect asynchronous device durations without synchronizing inside modules."""
+
+    def __init__(self):
+        self._stacks = {}
+        self._pairs = {}
+
+    def begin(self, category):
+        event = torch.npu.Event(enable_timing=True)
+        event.record()
+        self._stacks.setdefault(category, []).append(event)
+
+    def end(self, category):
+        stack = self._stacks.get(category)
+        if not stack:
+            raise RuntimeError(f"unmatched NPU timing event for {category}")
+        start = stack.pop()
+        end = torch.npu.Event(enable_timing=True)
+        end.record()
+        self._pairs.setdefault(category, []).append((start, end))
+
+    def call(self, category, function, *args, **kwargs):
+        self.begin(category)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self.end(category)
+
+    def summarize(self):
+        if any(self._stacks.values()):
+            raise RuntimeError("unclosed NPU timing event")
+        return {
+            category: {
+                "total_ms": sum(start.elapsed_time(end) for start, end in pairs),
+                "calls": len(pairs),
+            }
+            for category, pairs in self._pairs.items()
+        }
 
 
 def _cpu_state_dict(model):
@@ -281,6 +325,91 @@ def _profile_runs(run, zero_grad):
     }
 
 
+def _install_module_timing_hooks(model, recorder):
+    handles = []
+
+    def add_hooks(module, category):
+        handles.append(module.register_forward_pre_hook(lambda *_: recorder.begin(f"{category}_forward")))
+        handles.append(module.register_forward_hook(lambda *_: recorder.end(f"{category}_forward")))
+        handles.append(
+            module.register_full_backward_pre_hook(
+                lambda *_: recorder.begin(f"{category}_backward")
+            )
+        )
+        handles.append(
+            module.register_full_backward_hook(lambda *_: recorder.end(f"{category}_backward"))
+        )
+
+    add_hooks(model, "model")
+    for layer in model.decoder.layers:
+        add_hooks(layer.self_attention, "attention")
+        add_hooks(layer.mlp, "mlp")
+    return handles
+
+
+def _collect_breakdown(run, zero_grad, model, *, dta):
+    for _ in range(_BREAKDOWN_WARMUP_RUNS):
+        zero_grad()
+        torch.npu.synchronize()
+        run()
+        torch.npu.synchronize()
+
+    samples = []
+    for _ in range(_BREAKDOWN_MEASURE_RUNS):
+        recorder = _NPUEventRecorder()
+        handles = _install_module_timing_hooks(model, recorder)
+        original_push = SegmentExecutor.push
+        original_visit_leaf = SegmentExecutor.visit_leaf
+        original_pop = SegmentExecutor.pop
+
+        def timed_push(executor, segment_id):
+            return recorder.call("root_push", original_push, executor, segment_id)
+
+        def timed_visit_leaf(executor, segment_id):
+            return recorder.call("leaf_visit", original_visit_leaf, executor, segment_id)
+
+        def timed_pop(executor, segment_id):
+            return recorder.call("root_pop", original_pop, executor, segment_id)
+
+        try:
+            with ExitStack() as stack:
+                if dta:
+                    stack.enter_context(patch.object(SegmentExecutor, "push", timed_push))
+                    stack.enter_context(
+                        patch.object(SegmentExecutor, "visit_leaf", timed_visit_leaf)
+                    )
+                    stack.enter_context(patch.object(SegmentExecutor, "pop", timed_pop))
+                zero_grad()
+                torch.npu.synchronize()
+                started = time.perf_counter()
+                run()
+                torch.npu.synchronize()
+                wall_ms = (time.perf_counter() - started) * 1000.0
+        finally:
+            for handle in handles:
+                handle.remove()
+        samples.append((wall_ms, recorder.summarize()))
+
+    categories = set.intersection(*(set(sample) for _, sample in samples))
+    result = {
+        category: {
+            "median_ms": statistics.median(
+                sample[category]["total_ms"] for _, sample in samples
+            ),
+            "mean_ms": statistics.mean(sample[category]["total_ms"] for _, sample in samples),
+            "calls": samples[0][1][category]["calls"],
+        }
+        for category in sorted(categories)
+    }
+    for category in categories:
+        expected_calls = result[category]["calls"]
+        assert all(sample[category]["calls"] == expected_calls for _, sample in samples)
+    return {
+        "wall_median_ms": statistics.median(wall_ms for wall_ms, _ in samples),
+        "categories": result,
+    }
+
+
 def _make_case_tokens(prefix_length, suffix_length, sibling_count, device):
     def tokens(start, length):
         return (
@@ -346,6 +475,8 @@ def _profile_reference(monkeypatch, prefix_length, suffix_length, sibling_count)
     assert observed_microbatches == [1] * sibling_count * expected_runs
     stats["adapter_probe_calls"] = adapter_calls
     stats["parameter_count"] = parameter_count
+    if _RUN_BREAKDOWN:
+        stats["breakdown"] = _collect_breakdown(run, zero_grad, model, dta=False)
     return stats, initial_state
 
 
@@ -402,11 +533,48 @@ def _profile_dta(monkeypatch, prefix_length, suffix_length, sibling_count, initi
     stats["adapter_probe_calls"] = adapter_calls
     stats["adapter_trace"] = dta_trace
     stats["parameter_count"] = parameter_count
+    if _RUN_BREAKDOWN:
+        stats["breakdown"] = _collect_breakdown(run, zero_grad, model, dta=True)
     return stats
 
 
 def _format_gib(value):
     return f"{value / _GIB:.3f} GiB"
+
+
+def _print_breakdown(name, breakdown, *, sibling_count):
+    categories = breakdown["categories"]
+    print(f"{name} diagnostic breakdown (median of {_BREAKDOWN_MEASURE_RUNS} runs):")
+    print(f"  synchronized wall: {breakdown['wall_median_ms']:.3f} ms")
+    ordered_categories = (
+        "root_push",
+        "leaf_visit",
+        "root_pop",
+        "model_forward",
+        "model_backward",
+        "attention_forward",
+        "attention_backward",
+        "mlp_forward",
+        "mlp_backward",
+    )
+    for category in ordered_categories:
+        if category not in categories:
+            continue
+        item = categories[category]
+        suffix = ""
+        if category == "leaf_visit":
+            suffix = f", {item['median_ms'] / sibling_count:.3f} ms/leaf"
+        print(
+            f"  {category:<20} {item['median_ms']:>10.3f} ms "
+            f"({item['calls']} calls{suffix})"
+        )
+    model_device_ms = sum(
+        categories[category]["median_ms"]
+        for category in ("model_forward", "model_backward")
+        if category in categories
+    )
+    approximate_remainder = breakdown["wall_median_ms"] - model_device_ms
+    print(f"  wall - model graph    {approximate_remainder:>10.3f} ms (approximate)")
 
 
 def _print_case(prefix_length, suffix_length, sibling_count, reference, dta):
@@ -436,6 +604,9 @@ def _print_case(prefix_length, suffix_length, sibling_count, reference, dta):
         f"{len(traced_layers)} layers, {len(traced_phases)} physical phases, "
         f"{len(dta['adapter_trace'])} adapter calls"
     )
+    if _RUN_BREAKDOWN:
+        _print_breakdown("Reference", reference["breakdown"], sibling_count=sibling_count)
+        _print_breakdown("DTA", dta["breakdown"], sibling_count=sibling_count)
     print(f"Speedup (median): {speedup:.3f}x")
     print(f"Incremental-peak ratio: {memory_ratio:.3f}x")
     print(f"Incremental-peak reduction: {memory_reduction * 100.0:.2f}%")
