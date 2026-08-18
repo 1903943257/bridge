@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import load_file
 from tensordict import TensorDict
 from transformers import AutoConfig
 
@@ -50,7 +52,6 @@ from verl.models.mcore.dta import (
     replace_self_attention_with_dta,
 )
 from verl.models.mcore.config_converter import get_hf_rope_theta, hf_to_mcore_config_dense
-from verl.models.mcore.mbridge import AutoBridge
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 
@@ -92,6 +93,112 @@ def _validate_checkpoint_files(model_path):
     weight_files = tuple(model_path.glob("*.safetensors"))
     if not weight_files:
         raise FileNotFoundError(f"no safetensors weights found under {model_path}")
+
+
+def _load_hf_state_dict(model_path):
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        shard_names = sorted(set(index["weight_map"].values()))
+    else:
+        shard_names = [path.name for path in sorted(model_path.glob("*.safetensors"))]
+    state_dict = {}
+    for shard_name in shard_names:
+        state_dict.update(load_file(str(model_path / shard_name), device="cpu"))
+    return state_dict
+
+
+@torch.no_grad()
+def _load_qwen3_torch_spec_weights(model, hf_config, model_path):
+    state_dict = _load_hf_state_dict(model_path)
+    loaded_parameter_ids = set()
+
+    def copy_weight(target, source_name):
+        if source_name not in state_dict:
+            raise KeyError(f"missing Qwen checkpoint tensor: {source_name}")
+        source = state_dict[source_name]
+        if tuple(source.shape) != tuple(target.shape):
+            raise ValueError(
+                f"Qwen weight shape mismatch for {source_name}: "
+                f"checkpoint={tuple(source.shape)}, model={tuple(target.shape)}"
+            )
+        target.copy_(source.to(device=target.device, dtype=target.dtype))
+        loaded_parameter_ids.add(id(target))
+
+    copy_weight(model.embedding.word_embeddings.weight, "model.embed_tokens.weight")
+    head_dim = hf_config.head_dim
+    num_query_heads = hf_config.num_attention_heads
+    num_query_groups = hf_config.num_key_value_heads
+    queries_per_group = num_query_heads // num_query_groups
+
+    for layer_index, layer in enumerate(model.decoder.layers):
+        prefix = f"model.layers.{layer_index}"
+        copy_weight(layer.input_layernorm.weight, f"{prefix}.input_layernorm.weight")
+
+        q = state_dict[f"{prefix}.self_attn.q_proj.weight"].view(
+            num_query_groups,
+            queries_per_group * head_dim,
+            hf_config.hidden_size,
+        )
+        k = state_dict[f"{prefix}.self_attn.k_proj.weight"].view(
+            num_query_groups,
+            head_dim,
+            hf_config.hidden_size,
+        )
+        v = state_dict[f"{prefix}.self_attn.v_proj.weight"].view(
+            num_query_groups,
+            head_dim,
+            hf_config.hidden_size,
+        )
+        qkv = torch.cat((q, k, v), dim=1).reshape(-1, hf_config.hidden_size)
+        target_qkv = layer.self_attention.linear_qkv.weight
+        if tuple(qkv.shape) != tuple(target_qkv.shape):
+            raise ValueError(
+                f"QKV shape mismatch at layer {layer_index}: "
+                f"checkpoint={tuple(qkv.shape)}, model={tuple(target_qkv.shape)}"
+            )
+        target_qkv.copy_(qkv.to(device=target_qkv.device, dtype=target_qkv.dtype))
+        loaded_parameter_ids.add(id(target_qkv))
+
+        copy_weight(
+            layer.self_attention.q_layernorm.weight,
+            f"{prefix}.self_attn.q_norm.weight",
+        )
+        copy_weight(
+            layer.self_attention.k_layernorm.weight,
+            f"{prefix}.self_attn.k_norm.weight",
+        )
+        copy_weight(
+            layer.self_attention.linear_proj.weight,
+            f"{prefix}.self_attn.o_proj.weight",
+        )
+        copy_weight(
+            layer.pre_mlp_layernorm.weight,
+            f"{prefix}.post_attention_layernorm.weight",
+        )
+
+        gate = state_dict[f"{prefix}.mlp.gate_proj.weight"]
+        up = state_dict[f"{prefix}.mlp.up_proj.weight"]
+        fc1 = torch.cat((gate, up), dim=0)
+        target_fc1 = layer.mlp.linear_fc1.weight
+        if tuple(fc1.shape) != tuple(target_fc1.shape):
+            raise ValueError(
+                f"MLP FC1 shape mismatch at layer {layer_index}: "
+                f"checkpoint={tuple(fc1.shape)}, model={tuple(target_fc1.shape)}"
+            )
+        target_fc1.copy_(fc1.to(device=target_fc1.device, dtype=target_fc1.dtype))
+        loaded_parameter_ids.add(id(target_fc1))
+        copy_weight(layer.mlp.linear_fc2.weight, f"{prefix}.mlp.down_proj.weight")
+
+    copy_weight(model.decoder.final_layernorm.weight, "model.norm.weight")
+    missing_parameters = [
+        name
+        for name, parameter in model.named_parameters()
+        if id(parameter) not in loaded_parameter_ids
+    ]
+    if missing_parameters:
+        raise RuntimeError(f"Qwen torch-spec loader missed parameters: {missing_parameters}")
+    del state_dict
 
 
 def _replace_core_attention(original):
@@ -171,8 +278,7 @@ def _make_qwen_model(
         pg_collection=pg_collection,
     ).to(device=device, dtype=torch.bfloat16)
     model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.to(device)
-    bridge = AutoBridge.from_config(hf_config, dtype=torch.bfloat16)
-    bridge.load_weights([model], str(QWEN_MODEL_PATH))
+    _load_qwen3_torch_spec_weights(model, hf_config, QWEN_MODEL_PATH)
     model.train()
     return model
 
