@@ -22,6 +22,7 @@ import test_dta_engine_profile_npu as synthetic_profile
 from test_dta_qwen3_compatibility_npu import (
     QWEN_NUM_LAYERS,
     QWEN_VOCAB_SIZE,
+    _initialize_single_rank_megatron,
     _make_qwen_model,
 )
 from verl.utils.device import is_torch_npu_available
@@ -51,6 +52,9 @@ _QWEN_PROFILE_CASES = (
 
 
 def test_real_qwen3_dta_engine_profile(monkeypatch):
+    # Initialize Megatron before the synthetic profile installs its test-only
+    # global memory buffer; otherwise model construction attempts a second init.
+    _initialize_single_rank_megatron()
     monkeypatch.setattr(synthetic_profile, "_make_model", _make_qwen_model)
     monkeypatch.setattr(synthetic_profile, "_PROFILE_CASES", _QWEN_PROFILE_CASES)
     monkeypatch.setattr(synthetic_profile, "_PROFILE_NUM_LAYERS", QWEN_NUM_LAYERS)
