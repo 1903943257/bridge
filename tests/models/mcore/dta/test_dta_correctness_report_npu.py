@@ -75,10 +75,17 @@ def _logprob_metrics(actual, expected):
     }
 
 
-def _gradient_metrics(actual_model, expected_model):
-    actual_parameters = dict(actual_model.named_parameters())
-    expected_parameters = dict(expected_model.named_parameters())
-    assert actual_parameters.keys() == expected_parameters.keys()
+def _gradient_snapshot(model):
+    snapshot = {}
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None, f"missing gradient: {name}"
+        assert torch.isfinite(parameter.grad).all().item(), f"non-finite gradient: {name}"
+        snapshot[name] = parameter.grad.detach().cpu().clone()
+    return snapshot
+
+
+def _gradient_metrics(actual_gradients, expected_gradients):
+    assert actual_gradients.keys() == expected_gradients.keys()
 
     difference_sq = 0.0
     actual_sq = 0.0
@@ -88,13 +95,10 @@ def _gradient_metrics(actual_model, expected_model):
     worst_name = None
     worst_relative_l2 = -1.0
 
-    for name, expected_parameter in expected_parameters.items():
-        actual_gradient = actual_parameters[name].grad
-        expected_gradient = expected_parameter.grad
-        assert actual_gradient is not None, f"DTA missing gradient: {name}"
-        assert expected_gradient is not None, f"Reference missing gradient: {name}"
-        assert torch.isfinite(actual_gradient).all().item(), f"DTA non-finite gradient: {name}"
-        assert torch.isfinite(expected_gradient).all().item(), f"Reference non-finite gradient: {name}"
+    for name, expected_gradient in expected_gradients.items():
+        actual_gradient = actual_gradients[name]
+        assert torch.isfinite(actual_gradient).all().item(), f"actual non-finite gradient: {name}"
+        assert torch.isfinite(expected_gradient).all().item(), f"expected non-finite gradient: {name}"
 
         actual_float = actual_gradient.float()
         expected_float = expected_gradient.float()
@@ -120,7 +124,7 @@ def _gradient_metrics(actual_model, expected_model):
     relative_l2 = math.sqrt(difference_sq) / max(math.sqrt(expected_sq), 1e-12)
     cosine = dot / max(math.sqrt(actual_sq * expected_sq), 1e-12)
     return {
-        "parameter_count": len(actual_parameters),
+        "parameter_count": len(actual_gradients),
         "relative_l2": relative_l2,
         "cosine": cosine,
         "max_abs": max_abs,
@@ -180,14 +184,44 @@ def test_dta_correctness_report(monkeypatch):
         )
         return loss_sum / data["batch_num_tokens"], {}
 
-    reference_output = reference_engine.forward_backward_batch(
+    reference_output_a = reference_engine.forward_backward_batch(
         _reference_data(*trajectories),
         loss_function=reference_loss_function,
         forward_only=False,
     )
-    assert observed_microbatches == [1] * _SIBLING_COUNT
-    reference_logprobs = torch.cat(reference_logprobs, dim=0)
-    reference_loss = sum(reference_output["loss"])
+    reference_logprobs_a = torch.cat(reference_logprobs, dim=0)
+    reference_loss_a = sum(reference_output_a["loss"])
+    reference_gradients_a = _gradient_snapshot(reference_model)
+
+    reference_model.zero_grad(set_to_none=True)
+    reference_logprobs.clear()
+    reference_output_b = reference_engine.forward_backward_batch(
+        _reference_data(*trajectories),
+        loss_function=reference_loss_function,
+        forward_only=False,
+    )
+    assert observed_microbatches == [1] * (_SIBLING_COUNT * 2)
+    reference_logprobs_b = torch.cat(reference_logprobs, dim=0)
+    reference_loss_b = sum(reference_output_b["loss"])
+    reference_gradients_b = _gradient_snapshot(reference_model)
+
+    torch.testing.assert_close(
+        reference_logprobs_b,
+        reference_logprobs_a,
+        atol=_LOGPROB_ATOL,
+        rtol=_LOGPROB_RTOL,
+    )
+    torch.testing.assert_close(
+        torch.tensor(reference_loss_b),
+        torch.tensor(reference_loss_a),
+        atol=_LOSS_ATOL,
+        rtol=_LOSS_RTOL,
+    )
+    reference_repeat_logprob = _logprob_metrics(reference_logprobs_b, reference_logprobs_a)
+    reference_repeat_gradients = _gradient_metrics(reference_gradients_b, reference_gradients_a)
+    assert reference_repeat_gradients["relative_l2"] <= _GLOBAL_GRAD_RELATIVE_L2_TOL
+    assert reference_repeat_gradients["cosine"] >= _GLOBAL_GRAD_COSINE_MIN
+    del reference_gradients_b
 
     dta_logprobs = torch.full(
         (_SIBLING_COUNT, full_length - 1),
@@ -223,43 +257,73 @@ def test_dta_correctness_report(monkeypatch):
     dta_data = TensorDict({}, batch_size=[])
     tu.assign_non_tensor(dta_data, **{DTA_REQUEST_KEY: DTAForwardBackwardRequest(plan)})
     dta_output = dta_engine.forward_backward_batch(dta_data, loss_function=None, forward_only=False)
+    dta_gradients = _gradient_snapshot(dta_model)
 
     assert not torch.isnan(dta_logprobs).any().item(), "DTA logprob reconstruction is incomplete"
     torch.testing.assert_close(
         dta_logprobs,
-        reference_logprobs,
+        reference_logprobs_a,
         atol=_LOGPROB_ATOL,
         rtol=_LOGPROB_RTOL,
     )
     torch.testing.assert_close(
         torch.tensor(dta_output["loss"]),
-        torch.tensor(reference_loss),
+        torch.tensor(reference_loss_a),
         atol=_LOSS_ATOL,
         rtol=_LOSS_RTOL,
     )
-    logprob = _logprob_metrics(dta_logprobs, reference_logprobs)
-    gradients = _gradient_metrics(dta_model, reference_model)
-    assert gradients["relative_l2"] <= _GLOBAL_GRAD_RELATIVE_L2_TOL
-    assert gradients["cosine"] >= _GLOBAL_GRAD_COSINE_MIN
+    dta_logprob = _logprob_metrics(dta_logprobs, reference_logprobs_a)
+    dta_gradients = _gradient_metrics(dta_gradients, reference_gradients_a)
+    assert dta_gradients["relative_l2"] <= _GLOBAL_GRAD_RELATIVE_L2_TOL
+    assert dta_gradients["cosine"] >= _GLOBAL_GRAD_COSINE_MIN
 
-    loss_abs = abs(dta_output["loss"] - reference_loss)
-    loss_relative = loss_abs / max(abs(reference_loss), 1e-12)
+    reference_repeat_loss_abs = abs(reference_loss_b - reference_loss_a)
+    reference_repeat_loss_relative = reference_repeat_loss_abs / max(abs(reference_loss_a), 1e-12)
+    dta_loss_abs = abs(dta_output["loss"] - reference_loss_a)
+    dta_loss_relative = dta_loss_abs / max(abs(reference_loss_a), 1e-12)
     print(f"Model parameters: {parameter_count / 1e9:.3f}B")
     print(f"Case: P={_PREFIX_LENGTH}, S={_SUFFIX_LENGTH}, N={_SIBLING_COUNT}")
-    print("Target-token logprob:")
-    print(f"  max abs diff:  {logprob['max_abs']:.6e}")
-    print(f"  mean abs diff: {logprob['mean_abs']:.6e}")
-    print(f"  relative L2:   {logprob['relative_l2']:.6e}")
-    print(f"  cosine:        {logprob['cosine']:.9f}")
-    print("Loss:")
-    print(f"  Reference:     {reference_loss:.9f}")
-    print(f"  DTA:           {dta_output['loss']:.9f}")
-    print(f"  abs diff:      {loss_abs:.6e}")
-    print(f"  relative diff: {loss_relative:.6e}")
-    print("All parameter gradients:")
-    print(f"  tensors:       {gradients['parameter_count']}")
-    print(f"  relative L2:   {gradients['relative_l2']:.6e}")
-    print(f"  cosine:        {gradients['cosine']:.9f}")
-    print(f"  max abs diff:  {gradients['max_abs']:.6e}")
-    print(f"  worst tensor:  {gradients['worst_name']}")
-    print(f"  worst rel L2:  {gradients['worst_relative_l2']:.6e}")
+    print("Noise-floor comparison:")
+    print("                                      Ref A vs Ref B      DTA vs Ref A")
+    print(
+        "  Logprob relative L2              "
+        f"{reference_repeat_logprob['relative_l2']:>14.6e}  {dta_logprob['relative_l2']:>14.6e}"
+    )
+    print(
+        "  Logprob cosine                   "
+        f"{reference_repeat_logprob['cosine']:>14.9f}  {dta_logprob['cosine']:>14.9f}"
+    )
+    print(
+        "  Logprob max abs diff             "
+        f"{reference_repeat_logprob['max_abs']:>14.6e}  {dta_logprob['max_abs']:>14.6e}"
+    )
+    print(
+        "  Loss relative diff               "
+        f"{reference_repeat_loss_relative:>14.6e}  {dta_loss_relative:>14.6e}"
+    )
+    print(
+        "  Gradient relative L2             "
+        f"{reference_repeat_gradients['relative_l2']:>14.6e}  {dta_gradients['relative_l2']:>14.6e}"
+    )
+    print(
+        "  Gradient cosine                  "
+        f"{reference_repeat_gradients['cosine']:>14.9f}  {dta_gradients['cosine']:>14.9f}"
+    )
+    print(
+        "  Gradient max abs diff            "
+        f"{reference_repeat_gradients['max_abs']:>14.6e}  {dta_gradients['max_abs']:>14.6e}"
+    )
+    print("Loss values:")
+    print(f"  Reference A: {reference_loss_a:.9f}")
+    print(f"  Reference B: {reference_loss_b:.9f}")
+    print(f"  DTA:         {dta_output['loss']:.9f}")
+    print(f"Gradient tensors compared: {dta_gradients['parameter_count']}")
+    print(
+        "Worst Ref/Ref gradient tensor: "
+        f"{reference_repeat_gradients['worst_name']} "
+        f"({reference_repeat_gradients['worst_relative_l2']:.6e})"
+    )
+    print(
+        "Worst DTA/Ref gradient tensor: "
+        f"{dta_gradients['worst_name']} ({dta_gradients['worst_relative_l2']:.6e})"
+    )
