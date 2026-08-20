@@ -43,6 +43,7 @@ from verl.models.mcore.dta import DTA_REQUEST_KEY, DTAForwardBackwardRequest, Se
 from verl.models.mcore.dta import attention as dta_attention_module
 from verl.models.mcore.dta import rectangular_attention as rectangular_attention_module
 from verl.models.mcore.dta.context import get_tree_attention_context
+from verl.models.mcore.dta.kv_stack import KVStack
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 
@@ -90,6 +91,7 @@ _MEASURE_RUNS = 10
 _BREAKDOWN_WARMUP_RUNS = 1
 _BREAKDOWN_MEASURE_RUNS = 3
 _RUN_BREAKDOWN = os.getenv("DTA_PROFILE_BREAKDOWN", "1") == "1"
+_RUN_MEMORY_BREAKDOWN = os.getenv("DTA_PROFILE_MEMORY_BREAKDOWN", "0") == "1"
 _MIB = 1024**2
 _GIB = 1024**3
 _RECOVERY_TOLERANCE_BYTES = 512 * _MIB
@@ -325,6 +327,109 @@ def _profile_runs(run, zero_grad):
     }
 
 
+def _tensor_bytes(value):
+    tensors = []
+
+    def visit(item):
+        if isinstance(item, torch.Tensor):
+            tensors.append(item)
+        elif isinstance(item, dict) or hasattr(item, "values"):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (tuple, list)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    unique = {id(tensor): tensor for tensor in tensors}
+    return sum(tensor.numel() * tensor.element_size() for tensor in unique.values())
+
+
+def _collect_root_pop_memory_breakdown(run, zero_grad):
+    """Run one synchronized diagnostic iteration and sample root-pop allocations."""
+
+    samples = []
+    tensor_bytes = {
+        "detached_prefix_kv": 0,
+        "kv_grad_buffer": 0,
+        "anchor": 0,
+    }
+    active_root_pop = [False]
+    original_pop = SegmentExecutor.pop
+    original_build_anchors = KVStack.build_past_anchors
+    original_forward = SegmentExecutor._forward
+    original_backward = torch.autograd.backward
+
+    def sample(stage, *, phase_peak=None):
+        torch.npu.synchronize()
+        row = {
+            "stage": stage,
+            "allocated": torch.npu.memory_allocated(),
+            "reserved": torch.npu.memory_reserved(),
+        }
+        if phase_peak is not None:
+            row["phase_peak"] = phase_peak
+        samples.append(row)
+
+    def traced_pop(executor, segment_id):
+        entry = executor.kv_stack.top()
+        tensor_bytes["detached_prefix_kv"] = _tensor_bytes(entry.kv.key_values)
+        tensor_bytes["kv_grad_buffer"] = _tensor_bytes(entry.gradients)
+        active_root_pop[0] = True
+        sample("enter_root_pop")
+        try:
+            return original_pop(executor, segment_id)
+        finally:
+            sample("root_pop_complete")
+            active_root_pop[0] = False
+
+    def traced_build_anchors(stack):
+        if active_root_pop[0]:
+            # SegmentExecutor has dropped the popped KV entry by this point;
+            # relayed dKV tensors remain live until backward finishes.
+            sample("old_prefix_kv_released")
+        anchors = original_build_anchors(stack)
+        if active_root_pop[0]:
+            tensor_bytes["anchor"] = _tensor_bytes(anchors.key_values)
+            sample("anchors_built")
+        return anchors
+
+    def traced_forward(executor, segment, *, past_key_values, no_grad):
+        result = original_forward(
+            executor,
+            segment,
+            past_key_values=past_key_values,
+            no_grad=no_grad,
+        )
+        if active_root_pop[0] and not no_grad:
+            sample("prefix_recompute_forward_complete")
+        return result
+
+    def traced_backward(*args, **kwargs):
+        if not active_root_pop[0]:
+            return original_backward(*args, **kwargs)
+        sample("before_dkv_injection")
+        torch.npu.reset_peak_memory_stats()
+        result = original_backward(*args, **kwargs)
+        torch.npu.synchronize()
+        phase_peak = torch.npu.max_memory_allocated()
+        sample("prefix_backward_complete", phase_peak=phase_peak)
+        return result
+
+    zero_grad()
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.synchronize()
+    with (
+        patch.object(SegmentExecutor, "pop", traced_pop),
+        patch.object(KVStack, "build_past_anchors", traced_build_anchors),
+        patch.object(SegmentExecutor, "_forward", traced_forward),
+        patch.object(torch.autograd, "backward", traced_backward),
+    ):
+        run()
+    return {"samples": tuple(samples), "tensor_bytes": tensor_bytes}
+
+
 def _install_module_timing_hooks(model, recorder):
     handles = []
 
@@ -555,6 +660,8 @@ def _profile_dta(monkeypatch, prefix_length, suffix_length, sibling_count, initi
     stats["parameter_count"] = parameter_count
     if _RUN_BREAKDOWN:
         stats["breakdown"] = _collect_breakdown(run, zero_grad, model, dta=True)
+    if _RUN_MEMORY_BREAKDOWN:
+        stats["memory_breakdown"] = _collect_root_pop_memory_breakdown(run, zero_grad)
     return stats
 
 
@@ -616,6 +723,25 @@ def _print_breakdown(name, breakdown, *, sibling_count):
     print(f"  wall - model graph    {approximate_remainder:>10.3f} ms (approximate)")
 
 
+def _print_memory_breakdown(breakdown):
+    print("DTA root-pop memory breakdown (one synchronized diagnostic run):")
+    previous = None
+    for sample in breakdown["samples"]:
+        delta = 0 if previous is None else sample["allocated"] - previous
+        peak = sample.get("phase_peak")
+        peak_text = "" if peak is None else f", backward phase peak={peak / _GIB:.3f} GiB"
+        print(
+            f"  {sample['stage']:<36} allocated={sample['allocated'] / _GIB:.3f} GiB "
+            f"delta={delta / _GIB:+.3f} GiB{peak_text}"
+        )
+        previous = sample["allocated"]
+    sizes = breakdown["tensor_bytes"]
+    print("  logical tensor payloads (storage overlap is not additive):")
+    print(f"    detached prefix KV: {sizes['detached_prefix_kv'] / _GIB:.3f} GiB")
+    print(f"    KV-grad buffer:     {sizes['kv_grad_buffer'] / _GIB:.3f} GiB")
+    print(f"    anchors:            {sizes['anchor'] / _GIB:.3f} GiB")
+
+
 def _print_case(prefix_length, suffix_length, sibling_count, reference, dta):
     speedup = reference["median_ms"] / dta["median_ms"]
     memory_ratio = reference["incremental_peak"] / max(dta["incremental_peak"], 1)
@@ -646,6 +772,8 @@ def _print_case(prefix_length, suffix_length, sibling_count, reference, dta):
     if _RUN_BREAKDOWN:
         _print_breakdown("Reference", reference["breakdown"], sibling_count=sibling_count)
         _print_breakdown("DTA", dta["breakdown"], sibling_count=sibling_count)
+    if _RUN_MEMORY_BREAKDOWN:
+        _print_memory_breakdown(dta["memory_breakdown"])
     print(f"Speedup (median): {speedup:.3f}x")
     print(f"Incremental-peak ratio: {memory_ratio:.3f}x")
     print(f"Incremental-peak reduction: {memory_reduction * 100.0:.2f}%")
