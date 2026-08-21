@@ -97,7 +97,13 @@ def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
             max_sequence_length=full_length,
             core_attention_module=None,
         )
-    rectangular = qwen_fixture._make_qwen_model(
+    rectangular_a = qwen_fixture._make_qwen_model(
+        device,
+        dta=False,
+        max_sequence_length=full_length,
+        core_attention_module=_ProfileFusedCausalAttention,
+    )
+    rectangular_b = qwen_fixture._make_qwen_model(
         device,
         dta=False,
         max_sequence_length=full_length,
@@ -105,22 +111,26 @@ def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
     )
     initial_state = native_a.state_dict()
     native_b.load_state_dict(initial_state, strict=True)
-    rectangular.load_state_dict(initial_state, strict=True)
+    rectangular_a.load_state_dict(initial_state, strict=True)
+    rectangular_b.load_state_dict(initial_state, strict=True)
     _assert_core_attention(native_a, DotProductAttention)
     _assert_core_attention(native_b, DotProductAttention)
-    _assert_core_attention(rectangular, _ProfileFusedCausalAttention)
+    _assert_core_attention(rectangular_a, _ProfileFusedCausalAttention)
+    _assert_core_attention(rectangular_b, _ProfileFusedCausalAttention)
     _disable_cuda_fused_softmax(native_a)
     _disable_cuda_fused_softmax(native_b)
 
-    for model in (native_a, native_b, rectangular):
+    for model in (native_a, native_b, rectangular_a, rectangular_b):
         _configure_model_runtime(model)
     engine_a = _make_engine(native_a, dta_enabled=False, monkeypatch=monkeypatch)
     engine_b = _make_engine(native_b, dta_enabled=False, monkeypatch=monkeypatch)
-    engine_rect = _make_engine(rectangular, dta_enabled=False, monkeypatch=monkeypatch)
-    observed_a, observed_b, observed_rect = [], [], []
+    engine_rect_a = _make_engine(rectangular_a, dta_enabled=False, monkeypatch=monkeypatch)
+    engine_rect_b = _make_engine(rectangular_b, dta_enabled=False, monkeypatch=monkeypatch)
+    observed_a, observed_b, observed_rect_a, observed_rect_b = [], [], [], []
     _install_reference_forward(engine_a, observed_a, monkeypatch)
     _install_reference_forward(engine_b, observed_b, monkeypatch)
-    _install_reference_forward(engine_rect, observed_rect, monkeypatch)
+    _install_reference_forward(engine_rect_a, observed_rect_a, monkeypatch)
+    _install_reference_forward(engine_rect_b, observed_rect_b, monkeypatch)
 
     prefix = metrics._tokens(114, metrics._PREFIX_LENGTH, device)
     suffixes = tuple(
@@ -128,9 +138,19 @@ def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
         for sibling in range(metrics._SIBLING_COUNT)
     )
     trajectories = tuple(torch.cat((prefix, suffix)) for suffix in suffixes)
-    logprobs = {"native_a": [], "native_b": [], "rectangular": []}
+    logprobs = {
+        "native_a": [],
+        "native_b": [],
+        "rectangular_a": [],
+        "rectangular_b": [],
+    }
     losses = {}
-    adapter_calls = {"native_a": 0, "native_b": 0, "rectangular": 0}
+    adapter_calls = {
+        "native_a": 0,
+        "native_b": 0,
+        "rectangular_a": 0,
+        "rectangular_b": 0,
+    }
     active_path = [None]
     original_adapter = rectangular_attention_module.rectangular_causal_attention
 
@@ -160,17 +180,20 @@ def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
     ):
         run_path("native_a", native_a, engine_a)
         run_path("native_b", native_b, engine_b)
-        run_path("rectangular", rectangular, engine_rect)
+        run_path("rectangular_a", rectangular_a, engine_rect_a)
+        run_path("rectangular_b", rectangular_b, engine_rect_b)
 
     assert adapter_calls == {
         "native_a": 0,
         "native_b": 0,
-        "rectangular": qwen_fixture.QWEN_NUM_LAYERS * metrics._SIBLING_COUNT,
+        "rectangular_a": qwen_fixture.QWEN_NUM_LAYERS * metrics._SIBLING_COUNT,
+        "rectangular_b": qwen_fixture.QWEN_NUM_LAYERS * metrics._SIBLING_COUNT,
     }
     expected_microbatches = [1] * metrics._SIBLING_COUNT
     assert observed_a == expected_microbatches
     assert observed_b == expected_microbatches
-    assert observed_rect == expected_microbatches
+    assert observed_rect_a == expected_microbatches
+    assert observed_rect_b == expected_microbatches
 
     native_repeat = {
         "loss": abs(losses["native_b"] - losses["native_a"])
@@ -183,18 +206,30 @@ def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
             metrics._model_gradients(native_b), metrics._model_gradients(native_a)
         ),
     }
+    rectangular_repeat = {
+        "loss": abs(losses["rectangular_b"] - losses["rectangular_a"])
+        / max(abs(losses["rectangular_a"]), 1e-12),
+        "logprob": metrics._logprob_metrics(
+            torch.cat(logprobs["rectangular_b"], dim=0),
+            torch.cat(logprobs["rectangular_a"], dim=0),
+        ),
+        "gradients": metrics._mapping_metrics(
+            metrics._model_gradients(rectangular_b),
+            metrics._model_gradients(rectangular_a),
+        ),
+    }
     rectangular_vs_native = {
-        "loss": abs(losses["rectangular"] - losses["native_a"])
+        "loss": abs(losses["rectangular_a"] - losses["native_a"])
         / max(abs(losses["native_a"]), 1e-12),
         "logprob": metrics._logprob_metrics(
-            torch.cat(logprobs["rectangular"], dim=0),
+            torch.cat(logprobs["rectangular_a"], dim=0),
             torch.cat(logprobs["native_a"], dim=0),
         ),
         "gradients": metrics._mapping_metrics(
-            metrics._model_gradients(rectangular), metrics._model_gradients(native_a)
+            metrics._model_gradients(rectangular_a), metrics._model_gradients(native_a)
         ),
     }
-    for comparison in (native_repeat, rectangular_vs_native):
+    for comparison in (native_repeat, rectangular_repeat, rectangular_vs_native):
         assert math.isfinite(comparison["loss"])
         assert math.isfinite(comparison["logprob"]["relative_l2"])
         assert math.isfinite(comparison["gradients"]["relative_l2"])
@@ -205,7 +240,8 @@ def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
     print(f"Adapter calls: {adapter_calls}")
     for name, comparison in (
         ("Native DotProduct B vs Native DotProduct A", native_repeat),
-        ("Rectangular CANN vs Native DotProduct A", rectangular_vs_native),
+        ("Rectangular CANN B vs Rectangular CANN A", rectangular_repeat),
+        ("Rectangular CANN A vs Native DotProduct A", rectangular_vs_native),
     ):
         print(f"{name}:")
         print(f"  loss relative diff:     {comparison['loss']:.6e}")
