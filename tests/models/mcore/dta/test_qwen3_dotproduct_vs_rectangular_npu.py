@@ -63,6 +63,16 @@ def _assert_core_attention(model, expected_type):
     assert all(type(module) is expected_type for module in core_modules)
 
 
+def _disable_cuda_fused_softmax(model):
+    """Force native DotProductAttention onto its portable torch-softmax path."""
+
+    model.config.masked_softmax_fusion = False
+    for layer in model.decoder.layers:
+        softmax = layer.self_attention.core_attention.scale_mask_softmax
+        softmax.scaled_masked_softmax_fusion = False
+        assert not softmax.scaled_masked_softmax_fusion
+
+
 def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
     torch.manual_seed(2026)
     device = torch.device("npu")
@@ -99,6 +109,8 @@ def test_qwen3_native_dotproduct_vs_rectangular_cann_one_step(monkeypatch):
     _assert_core_attention(native_a, DotProductAttention)
     _assert_core_attention(native_b, DotProductAttention)
     _assert_core_attention(rectangular, _ProfileFusedCausalAttention)
+    _disable_cuda_fused_softmax(native_a)
+    _disable_cuda_fused_softmax(native_b)
 
     for model in (native_a, native_b, rectangular):
         _configure_model_runtime(model)
