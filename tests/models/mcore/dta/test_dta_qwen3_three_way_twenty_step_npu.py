@@ -71,28 +71,50 @@ def test_qwen3_reference_repeat_and_tpr_for_twenty_adamw_steps(monkeypatch):
     monkeypatch.setattr(experiment.profile, "_PROFILE_VOCAB_SIZE", QWEN_VOCAB_SIZE)
     full_length = experiment._PREFIX_LENGTH + experiment._SUFFIX_LENGTH
 
-    reference_a = _make_qwen_model(device, dta=False, max_sequence_length=full_length, core_attention_module=experiment.profile._ProfileFusedCausalAttention, model_shape=experiment.profile._PROFILE_MODEL_SHAPE)
-    reference_b = _make_qwen_model(device, dta=False, max_sequence_length=full_length, core_attention_module=experiment.profile._ProfileFusedCausalAttention, model_shape=experiment.profile._PROFILE_MODEL_SHAPE)
-    tpr_model = _make_qwen_model(device, dta=True, max_sequence_length=full_length, core_attention_module=experiment.profile._ProfileFusedCausalAttention, model_shape=experiment.profile._PROFILE_MODEL_SHAPE)
+    reference_a = _make_qwen_model(
+        device,
+        dta=False,
+        max_sequence_length=full_length,
+        core_attention_module=experiment.profile._ProfileFusedCausalAttention,
+        model_shape=experiment.profile._PROFILE_MODEL_SHAPE,
+    )
+    reference_b = _make_qwen_model(
+        device,
+        dta=False,
+        max_sequence_length=full_length,
+        core_attention_module=experiment.profile._ProfileFusedCausalAttention,
+        model_shape=experiment.profile._PROFILE_MODEL_SHAPE,
+    )
+    tpr_model = _make_qwen_model(
+        device,
+        dta=True,
+        max_sequence_length=full_length,
+        core_attention_module=experiment.profile._ProfileFusedCausalAttention,
+        model_shape=experiment.profile._PROFILE_MODEL_SHAPE,
+    )
     initial_state = reference_a.state_dict()
     reference_b.load_state_dict(initial_state, strict=True)
     tpr_model.load_state_dict(initial_state, strict=True)
+
     parameter_count = experiment.profile._assert_profile_model_scale(reference_a)
     assert experiment.profile._assert_profile_model_scale(reference_b) == parameter_count
     assert experiment.profile._assert_profile_model_scale(tpr_model) == parameter_count
     for model in (reference_a, reference_b, tpr_model):
         _configure_model_runtime(model)
+
     engine_a = _make_engine(reference_a, dta_enabled=False, monkeypatch=monkeypatch)
     engine_b = _make_engine(reference_b, dta_enabled=False, monkeypatch=monkeypatch)
     tpr_engine = _make_engine(tpr_model, dta_enabled=True, monkeypatch=monkeypatch)
     observed_a, observed_b = [], []
     _install_reference_forward(engine_a, observed_a, monkeypatch)
     _install_reference_forward(engine_b, observed_b, monkeypatch)
+
     masters_a, optimizer_a = experiment._make_fp32_optimizer(reference_a)
     masters_b, optimizer_b = experiment._make_fp32_optimizer(reference_b)
     masters_tpr, optimizer_tpr = experiment._make_fp32_optimizer(tpr_model)
     assert experiment._mapping_metrics(masters_b, masters_a)["relative_l2"] == 0.0
     assert experiment._mapping_metrics(masters_tpr, masters_a)["relative_l2"] == 0.0
+
     logprobs_a, logprobs_b = [], []
     loss_function_a = _make_reference_loss_function(logprobs_a)
     loss_function_b = _make_reference_loss_function(logprobs_b)
@@ -102,9 +124,19 @@ def test_qwen3_reference_repeat_and_tpr_for_twenty_adamw_steps(monkeypatch):
     def capture_tpr_logprobs(executor, segment, logits):
         output = capture["logprobs"]
         if output is not None and segment.loss_terms:
-            query_offsets = torch.tensor([term.query_offset for term in segment.loss_terms], dtype=torch.long, device=logits.device)
-            targets = torch.tensor([term.target_token_id for term in segment.loss_terms], dtype=torch.long, device=logits.device)
-            values = experiment._target_logprobs(logits[0].index_select(0, query_offsets), targets).cpu()
+            query_offsets = torch.tensor(
+                [term.query_offset for term in segment.loss_terms],
+                dtype=torch.long,
+                device=logits.device,
+            )
+            targets = torch.tensor(
+                [term.target_token_id for term in segment.loss_terms],
+                dtype=torch.long,
+                device=logits.device,
+            )
+            values = experiment._target_logprobs(
+                logits[0].index_select(0, query_offsets), targets
+            ).cpu()
             for term, value in zip(segment.loss_terms, values, strict=True):
                 global_query = segment.position_start + term.query_offset
                 if term.sample_id is None:
@@ -115,28 +147,46 @@ def test_qwen3_reference_repeat_and_tpr_for_twenty_adamw_steps(monkeypatch):
 
     monkeypatch.setattr(SegmentExecutor, "_compute_loss", capture_tpr_logprobs)
     rows = []
+
     for step in range(1, experiment._STEPS + 1):
         for model in (reference_a, reference_b, tpr_model):
             model.zero_grad(set_to_none=True)
         logprobs_a.clear()
         logprobs_b.clear()
         prefix = experiment._tokens(17 + step * 97, experiment._PREFIX_LENGTH, device)
-        suffixes = tuple(experiment._tokens(700 + step * 193 + sibling * 1300, experiment._SUFFIX_LENGTH, device) for sibling in range(experiment._SIBLING_COUNT))
+        suffixes = tuple(
+            experiment._tokens(
+                700 + step * 193 + sibling * 1300,
+                experiment._SUFFIX_LENGTH,
+                device,
+            )
+            for sibling in range(experiment._SIBLING_COUNT)
+        )
         trajectories = tuple(torch.cat((prefix, suffix)) for suffix in suffixes)
         plan = _make_plan(prefix, *suffixes)
 
         def run_reference(engine, loss_function):
-            output = engine.forward_backward_batch(_reference_data(*trajectories), loss_function=loss_function, forward_only=False)
+            output = engine.forward_backward_batch(
+                _reference_data(*trajectories),
+                loss_function=loss_function,
+                forward_only=False,
+            )
             return sum(output["loss"])
 
-        tpr_step_logprobs = torch.full((experiment._SIBLING_COUNT, full_length - 1), float("nan"), dtype=torch.float32)
+        tpr_step_logprobs = torch.full(
+            (experiment._SIBLING_COUNT, full_length - 1),
+            float("nan"),
+            dtype=torch.float32,
+        )
 
         def run_tpr():
             capture["logprobs"] = tpr_step_logprobs
             data = TensorDict({}, batch_size=[])
             tu.assign_non_tensor(data, **{DTA_REQUEST_KEY: DTAForwardBackwardRequest(plan)})
             try:
-                return tpr_engine.forward_backward_batch(data, loss_function=None, forward_only=False)["loss"]
+                return tpr_engine.forward_backward_batch(
+                    data, loss_function=None, forward_only=False
+                )["loss"]
             finally:
                 capture["logprobs"] = None
 
@@ -147,6 +197,7 @@ def test_qwen3_reference_repeat_and_tpr_for_twenty_adamw_steps(monkeypatch):
         else:
             loss_tpr = run_tpr()
             loss_b = run_reference(engine_b, loss_function_b)
+
         assert not torch.isnan(tpr_step_logprobs).any().item()
         step_logprobs_a = torch.cat(logprobs_a, dim=0)
         step_logprobs_b = torch.cat(logprobs_b, dim=0)
@@ -154,14 +205,28 @@ def test_qwen3_reference_repeat_and_tpr_for_twenty_adamw_steps(monkeypatch):
         tpr_logprob = experiment._logprob_metrics(tpr_step_logprobs, step_logprobs_a)
         ref_loss_relative = abs(loss_b - loss_a) / max(abs(loss_a), 1e-12)
         tpr_loss_relative = abs(loss_tpr - loss_a) / max(abs(loss_a), 1e-12)
-        ref_gradients = experiment._mapping_metrics(experiment._model_gradients(reference_b), experiment._model_gradients(reference_a))
-        tpr_gradients = experiment._mapping_metrics(experiment._model_gradients(tpr_model), experiment._model_gradients(reference_a))
-        for value in (ref_loss_relative, tpr_loss_relative, ref_logprob["relative_l2"], tpr_logprob["relative_l2"], ref_gradients["relative_l2"], tpr_gradients["relative_l2"]):
+        ref_gradients = experiment._mapping_metrics(
+            experiment._model_gradients(reference_b),
+            experiment._model_gradients(reference_a),
+        )
+        tpr_gradients = experiment._mapping_metrics(
+            experiment._model_gradients(tpr_model),
+            experiment._model_gradients(reference_a),
+        )
+        for value in (
+            ref_loss_relative,
+            tpr_loss_relative,
+            ref_logprob["relative_l2"],
+            tpr_logprob["relative_l2"],
+            ref_gradients["relative_l2"],
+            tpr_gradients["relative_l2"],
+        ):
             assert math.isfinite(value)
         assert tpr_logprob["relative_l2"] <= experiment._MAX_LOGPROB_RELATIVE_L2
         assert tpr_loss_relative <= experiment._MAX_LOSS_RELATIVE_DIFF
         assert tpr_gradients["relative_l2"] <= _MAX_TPR_GRADIENT_RELATIVE_L2
         assert tpr_gradients["cosine"] >= experiment._MIN_GRADIENT_COSINE
+
         norms = {
             "a": float(torch.nn.utils.clip_grad_norm_(reference_a.parameters(), experiment._MAX_GRAD_NORM, foreach=False)),
             "b": float(torch.nn.utils.clip_grad_norm_(reference_b.parameters(), experiment._MAX_GRAD_NORM, foreach=False)),
@@ -172,15 +237,29 @@ def test_qwen3_reference_repeat_and_tpr_for_twenty_adamw_steps(monkeypatch):
         experiment._optimizer_step(tpr_model, masters_tpr, optimizer_tpr)
         ref_parameters = experiment._mapping_metrics(masters_b, masters_a)
         tpr_parameters = experiment._mapping_metrics(masters_tpr, masters_a)
-        rows.append({
-            "ref_loss": ref_loss_relative, "tpr_loss": tpr_loss_relative,
-            "ref_logprob": ref_logprob, "tpr_logprob": tpr_logprob,
-            "ref_gradients": ref_gradients, "tpr_gradients": tpr_gradients,
-            "ref_parameters": ref_parameters, "tpr_parameters": tpr_parameters,
-            "ref_clip_mismatch": (norms["a"] > experiment._MAX_GRAD_NORM) != (norms["b"] > experiment._MAX_GRAD_NORM),
-            "tpr_clip_mismatch": (norms["a"] > experiment._MAX_GRAD_NORM) != (norms["tpr"] > experiment._MAX_GRAD_NORM),
-        })
-        print(f"step={step:02d} ref/ref: loss={ref_loss_relative:.3e} logp={ref_logprob['relative_l2']:.3e} grad={ref_gradients['relative_l2']:.3e} cos={ref_gradients['cosine']:.7f} param={ref_parameters['relative_l2']:.3e} | tpr/ref: loss={tpr_loss_relative:.3e} logp={tpr_logprob['relative_l2']:.3e} grad={tpr_gradients['relative_l2']:.3e} cos={tpr_gradients['cosine']:.7f} param={tpr_parameters['relative_l2']:.3e}")
+        rows.append(
+            {
+                "ref_loss": ref_loss_relative,
+                "tpr_loss": tpr_loss_relative,
+                "ref_logprob": ref_logprob,
+                "tpr_logprob": tpr_logprob,
+                "ref_gradients": ref_gradients,
+                "tpr_gradients": tpr_gradients,
+                "ref_parameters": ref_parameters,
+                "tpr_parameters": tpr_parameters,
+                "ref_clip_mismatch": (norms["a"] > experiment._MAX_GRAD_NORM) != (norms["b"] > experiment._MAX_GRAD_NORM),
+                "tpr_clip_mismatch": (norms["a"] > experiment._MAX_GRAD_NORM) != (norms["tpr"] > experiment._MAX_GRAD_NORM),
+            }
+        )
+        print(
+            f"step={step:02d} "
+            f"ref/ref: loss={ref_loss_relative:.3e} logp={ref_logprob['relative_l2']:.3e} "
+            f"grad={ref_gradients['relative_l2']:.3e} cos={ref_gradients['cosine']:.7f} "
+            f"param={ref_parameters['relative_l2']:.3e} | "
+            f"tpr/ref: loss={tpr_loss_relative:.3e} logp={tpr_logprob['relative_l2']:.3e} "
+            f"grad={tpr_gradients['relative_l2']:.3e} cos={tpr_gradients['cosine']:.7f} "
+            f"param={tpr_parameters['relative_l2']:.3e}"
+        )
 
     expected_microbatches = [1] * (experiment._SIBLING_COUNT * experiment._STEPS)
     assert observed_a == expected_microbatches
