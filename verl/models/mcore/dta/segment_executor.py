@@ -16,14 +16,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .context import TreeAttentionContext, use_tree_attention_context
+from .context import KVPair, TreeAttentionContext, use_tree_attention_context
 from .kv_stack import KVStack
 from .rope import build_suffix_rotary_pos_emb
 from .segment_plan import SegmentId, SegmentPlan, SegmentSpec
@@ -107,14 +107,22 @@ class SegmentExecutor:
         self._ensure_healthy()
         try:
             segment = self.plan.get(segment_id)
-            context, _ = self._forward(segment, past_key_values=self.kv_stack.build_past_key_values(), no_grad=True)
+            context, logits = self._forward(
+                segment,
+                past_key_values=self.kv_stack.build_past_key_values(),
+                no_grad=True,
+            )
+            del logits
             context.assert_new_kv_layers(self.expected_layer_numbers)
-            self.kv_stack.push(segment, context.new_key_values)
+            cached_key_values = _compact_kv_cache(context.new_key_values)
+            layer_count = len(cached_key_values)
+            del context
+            self.kv_stack.push(segment, cached_key_values)
             return SegmentForwardResult(
                 segment_id=segment_id,
                 prefix_length=segment.prefix_length,
                 suffix_length=segment.length,
-                layer_count=len(context.new_key_values),
+                layer_count=layer_count,
             )
         except Exception:
             self._failed = True
@@ -310,6 +318,18 @@ class SegmentExecutor:
     def _ensure_healthy(self) -> None:
         if self._failed:
             raise RuntimeError("SegmentExecutor is failed and cannot continue")
+
+
+def _compact_kv_cache(key_values: Mapping[int, KVPair]) -> dict[int, KVPair]:
+    """Copy no-grad KV views into compact, independently owned storage."""
+
+    return {
+        layer_number: (
+            key.detach().clone(memory_format=torch.contiguous_format),
+            value.detach().clone(memory_format=torch.contiguous_format),
+        )
+        for layer_number, (key, value) in key_values.items()
+    }
 
 
 def _model_device(model: nn.Module) -> torch.device:

@@ -23,6 +23,7 @@ from verl.models.mcore.dta import (
     SegmentSpec,
     get_tree_attention_context,
 )
+from verl.models.mcore.dta.segment_executor import _compact_kv_cache
 
 
 class _FakeRotaryEmbedding:
@@ -82,6 +83,27 @@ def _plan():
         loss_terms=(SegmentLossTerm(0, 6, weight=3.0),),
     )
     return SegmentPlan([root, child], root_id=0)
+
+
+def test_compact_kv_cache_owns_exact_graph_free_storage():
+    source = torch.arange(4 * 1 * 1 * 8, dtype=torch.float32).reshape(4, 1, 1, 8)
+    source.requires_grad_(True)
+    key_view = source[..., 1:3]
+    value_view = source[..., 5:7]
+
+    compact = _compact_kv_cache({1: (key_view, value_view)})
+    key, value = compact[1]
+
+    torch.testing.assert_close(key, key_view)
+    torch.testing.assert_close(value, value_view)
+    assert key.is_contiguous() and value.is_contiguous()
+    assert not key.requires_grad and key.grad_fn is None
+    assert not value.requires_grad and value.grad_fn is None
+    assert key.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    assert value.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    assert key.untyped_storage().data_ptr() != value.untyped_storage().data_ptr()
+    assert key.untyped_storage().nbytes() == key.numel() * key.element_size()
+    assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
 
 
 def test_push_pop_relays_child_kv_gradients_and_empties_stack():
