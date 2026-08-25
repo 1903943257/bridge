@@ -19,6 +19,7 @@ import gc
 import os
 import statistics
 import time
+import types
 import weakref
 from contextlib import ExitStack
 from contextvars import ContextVar
@@ -44,7 +45,7 @@ from verl.models.mcore.dta import DTA_REQUEST_KEY, DTAForwardBackwardRequest, Se
 from verl.models.mcore.dta import attention as dta_attention_module
 from verl.models.mcore.dta import rectangular_attention as rectangular_attention_module
 from verl.models.mcore.dta.context import get_tree_attention_context
-from verl.models.mcore.dta.kv_stack import KVStack
+from verl.models.mcore.dta.kv_stack import KVStack, KVStackEntry, SegmentKV
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 
@@ -423,6 +424,58 @@ def _live_storage_audit(categories):
     }
 
 
+def _gc_object_ownership(object_id, expected_type):
+    """Find a slots object by id and summarize its immediate Python owners."""
+
+    objects = gc.get_objects()
+    target = next(
+        (
+            candidate
+            for candidate in objects
+            if id(candidate) == object_id and isinstance(candidate, expected_type)
+        ),
+        None,
+    )
+    if target is None:
+        del objects
+        return {"alive": False, "referrers": ()}
+
+    referrers = gc.get_referrers(target)
+    summaries = []
+    for referrer in referrers:
+        if referrer is objects or referrer is referrers:
+            continue
+        if isinstance(referrer, types.FrameType):
+            local_names = tuple(
+                name for name, value in referrer.f_locals.items() if value is target
+            )
+            summaries.append(
+                f"frame:{referrer.f_code.co_name}:locals={local_names or ('<eval-stack>',)}"
+            )
+        elif isinstance(referrer, dict):
+            keys = tuple(str(key) for key, value in referrer.items() if value is target)
+            summaries.append(f"dict(len={len(referrer)},keys={keys})")
+        elif isinstance(referrer, list):
+            indexes = tuple(
+                index for index, value in enumerate(referrer) if value is target
+            )
+            summaries.append(f"list(len={len(referrer)},indexes={indexes[:4]})")
+        elif isinstance(referrer, tuple):
+            indexes = tuple(
+                index for index, value in enumerate(referrer) if value is target
+            )
+            summaries.append(f"tuple(len={len(referrer)},indexes={indexes[:4]})")
+        elif isinstance(referrer, KVStackEntry):
+            summaries.append(
+                f"KVStackEntry(segment_id={referrer.segment.segment_id})"
+            )
+        else:
+            summaries.append(type(referrer).__name__)
+    result = {"alive": True, "referrers": tuple(sorted(set(summaries)))}
+    del referrers, target, objects
+    return result
+
+
 def _collect_root_pop_memory_breakdown(run, zero_grad):
     """Run one synchronized diagnostic iteration and sample root-pop allocations."""
 
@@ -438,6 +491,9 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
     detached_kv_storage_ptrs = ()
     release_audit = None
     forward_entry_release_audit = None
+    ownership_audits = []
+    popped_entry_id = None
+    popped_segment_kv_id = None
     executor_state = None
     active_root_pop = [False]
     original_pop = SegmentExecutor.pop
@@ -483,10 +539,24 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         del alive_storage_owners, alive_tensors
         return status
 
+    def sample_ownership(stage):
+        if popped_entry_id is None or popped_segment_kv_id is None:
+            return
+        ownership_audits.append(
+            {
+                "stage": stage,
+                "entry": _gc_object_ownership(popped_entry_id, KVStackEntry),
+                "segment_kv": _gc_object_ownership(popped_segment_kv_id, SegmentKV),
+            }
+        )
+
     def traced_pop(executor, segment_id):
         nonlocal storage_audit, detached_kv_weakrefs, detached_storage_owner_weakrefs
         nonlocal detached_kv_storage_ptrs, executor_state
+        nonlocal popped_entry_id, popped_segment_kv_id
         entry = executor.kv_stack.top()
+        popped_entry_id = id(entry)
+        popped_segment_kv_id = id(entry.kv)
         tensor_bytes["detached_prefix_kv"] = _tensor_bytes(entry.kv.key_values)
         tensor_bytes["kv_grad_buffer"] = _tensor_bytes(entry.gradients)
         detached_tensors = _flatten_tensors(entry.kv.key_values)
@@ -532,6 +602,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         try:
             return original_pop(executor, segment_id)
         finally:
+            sample_ownership("root_pop_complete")
             sample("root_pop_complete")
             active_root_pop[0] = False
 
@@ -543,6 +614,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
             # temporary. Sample it accurately instead of claiming it is released.
             sample("after_stack_pop_before_forward")
             release_audit = weakref_release_status("after_stack_pop_before_forward")
+            sample_ownership("after_stack_pop_before_forward")
         anchors = original_build_anchors(stack)
         if active_root_pop[0]:
             tensor_bytes["anchor"] = _tensor_bytes(anchors.key_values)
@@ -558,6 +630,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
             forward_entry_release_audit = weakref_release_status(
                 "prefix_recompute_forward_start"
             )
+            sample_ownership("prefix_recompute_forward_start")
         result = original_forward(
             executor,
             segment,
@@ -574,6 +647,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         sample("before_dkv_injection")
         result = original_backward(*args, **kwargs)
         torch.npu.synchronize()
+        sample_ownership("prefix_backward_complete")
         sample("prefix_backward_complete")
         return result
 
@@ -597,6 +671,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         "storage_audit": storage_audit,
         "release_audit": release_audit,
         "forward_entry_release_audit": forward_entry_release_audit,
+        "ownership_audits": tuple(ownership_audits),
         "executor_state": executor_state,
     }
 
@@ -949,6 +1024,15 @@ def _print_memory_breakdown(breakdown):
             f"view/base owners={release['alive_storage_owner_count']}, "
             "live data_ptr="
             + format_ptrs(release["alive_storage_ptrs"])
+        )
+    print("  popped object ownership audit (slots objects tracked by id/GC):")
+    for ownership in breakdown["ownership_audits"]:
+        entry = ownership["entry"]
+        segment_kv = ownership["segment_kv"]
+        print(
+            f"    {ownership['stage']}: "
+            f"KVStackEntry alive={entry['alive']} refs={entry['referrers']}; "
+            f"SegmentKV alive={segment_kv['alive']} refs={segment_kv['referrers']}"
         )
 
 
