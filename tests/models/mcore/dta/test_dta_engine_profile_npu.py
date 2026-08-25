@@ -44,7 +44,7 @@ from test_segment_push_pop_npu import _install_single_rank_runtime
 from verl.models.mcore.dta import DTA_REQUEST_KEY, DTAForwardBackwardRequest, SegmentExecutor
 from verl.models.mcore.dta import attention as dta_attention_module
 from verl.models.mcore.dta import rectangular_attention as rectangular_attention_module
-from verl.models.mcore.dta.context import get_tree_attention_context
+from verl.models.mcore.dta.context import TreeAttentionContext, get_tree_attention_context
 from verl.models.mcore.dta.kv_stack import KVStack, KVStackEntry, SegmentKV
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
@@ -494,6 +494,8 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
     ownership_audits = []
     popped_entry_id = None
     popped_segment_kv_id = None
+    pushed_owner_ids = {}
+    popped_owner_ids = None
     executor_state = None
     active_root_pop = [False]
     original_pop = SegmentExecutor.pop
@@ -542,21 +544,39 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
     def sample_ownership(stage):
         if popped_entry_id is None or popped_segment_kv_id is None:
             return
-        ownership_audits.append(
-            {
-                "stage": stage,
-                "entry": _gc_object_ownership(popped_entry_id, KVStackEntry),
-                "segment_kv": _gc_object_ownership(popped_segment_kv_id, SegmentKV),
-            }
-        )
+        row = {
+            "stage": stage,
+            "entry": _gc_object_ownership(popped_entry_id, KVStackEntry),
+            "segment_kv": _gc_object_ownership(popped_segment_kv_id, SegmentKV),
+        }
+        if popped_owner_ids is not None:
+            row.update(
+                {
+                    "push_context": _gc_object_ownership(
+                        popped_owner_ids["context"], TreeAttentionContext
+                    ),
+                    "new_kv_dict": _gc_object_ownership(
+                        popped_owner_ids["new_kv_dict"], dict
+                    ),
+                    "kv_pair": _gc_object_ownership(
+                        popped_owner_ids["kv_pair"], tuple
+                    ),
+                    "kv_tensor": _gc_object_ownership(
+                        popped_owner_ids["kv_tensor"], torch.Tensor
+                    ),
+                }
+            )
+        ownership_audits.append(row)
 
     def traced_pop(executor, segment_id):
         nonlocal storage_audit, detached_kv_weakrefs, detached_storage_owner_weakrefs
         nonlocal detached_kv_storage_ptrs, executor_state
         nonlocal popped_entry_id, popped_segment_kv_id
+        nonlocal popped_owner_ids
         entry = executor.kv_stack.top()
         popped_entry_id = id(entry)
         popped_segment_kv_id = id(entry.kv)
+        popped_owner_ids = pushed_owner_ids.get(segment_id)
         tensor_bytes["detached_prefix_kv"] = _tensor_bytes(entry.kv.key_values)
         tensor_bytes["kv_grad_buffer"] = _tensor_bytes(entry.gradients)
         detached_tensors = _flatten_tensors(entry.kv.key_values)
@@ -637,6 +657,16 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
             past_key_values=past_key_values,
             no_grad=no_grad,
         )
+        if no_grad:
+            context = result[0]
+            first_pair = next(iter(context._new_key_values.values()))
+            pushed_owner_ids[segment.segment_id] = {
+                "context": id(context),
+                "new_kv_dict": id(context._new_key_values),
+                "kv_pair": id(first_pair),
+                "kv_tensor": id(first_pair[0]),
+            }
+            del first_pair, context
         if active_root_pop[0] and not no_grad:
             sample("prefix_recompute_forward_complete")
         return result
@@ -1034,6 +1064,13 @@ def _print_memory_breakdown(breakdown):
             f"KVStackEntry alive={entry['alive']} refs={entry['referrers']}; "
             f"SegmentKV alive={segment_kv['alive']} refs={segment_kv['referrers']}"
         )
+        for name in ("push_context", "new_kv_dict", "kv_pair", "kv_tensor"):
+            if name not in ownership:
+                continue
+            owner = ownership[name]
+            print(
+                f"      {name}: alive={owner['alive']} refs={owner['referrers']}"
+            )
 
 
 def _print_case(prefix_length, suffix_length, sibling_count, reference, dta):
