@@ -437,6 +437,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
     detached_storage_owner_weakrefs = ()
     detached_kv_storage_ptrs = ()
     release_audit = None
+    forward_entry_release_audit = None
     executor_state = None
     active_root_pop = [False]
     original_pop = SegmentExecutor.pop
@@ -453,6 +454,34 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
             "window_peak": torch.npu.max_memory_allocated(),
         }
         samples.append(row)
+
+    def weakref_release_status(stage):
+        """Snapshot weak references without extending their lifetime afterwards."""
+
+        alive_tensors = tuple(
+            tensor
+            for reference in detached_kv_weakrefs
+            if (tensor := reference()) is not None
+        )
+        alive_storage_owners = tuple(
+            tensor
+            for reference in detached_storage_owner_weakrefs
+            if (tensor := reference()) is not None
+        )
+        status = {
+            "stage": stage,
+            "original_storage_ptrs": detached_kv_storage_ptrs,
+            "alive_tensor_count": len(alive_tensors),
+            "alive_storage_ptrs": tuple(
+                sorted({_storage_identity(tensor)[1] for tensor in alive_tensors})
+            ),
+            "alive_storage_owner_count": len(alive_storage_owners),
+            "alive_owner_storage_ptrs": tuple(
+                sorted({_storage_identity(tensor)[1] for tensor in alive_storage_owners})
+            ),
+        }
+        del alive_storage_owners, alive_tensors
+        return status
 
     def traced_pop(executor, segment_id):
         nonlocal storage_audit, detached_kv_weakrefs, detached_storage_owner_weakrefs
@@ -509,37 +538,11 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
     def traced_build_anchors(stack):
         nonlocal release_audit
         if active_root_pop[0]:
-            # SegmentExecutor has dropped the popped KV entry by this point;
-            # relayed dKV tensors remain live until backward finishes.
-            sample("old_prefix_kv_released")
-            alive_list = []
-            for reference in detached_kv_weakrefs:
-                referenced_tensor = reference()
-                if referenced_tensor is not None:
-                    alive_list.append(referenced_tensor)
-                del referenced_tensor
-            alive_tensors = tuple(alive_list)
-            del alive_list
-            alive_owner_list = []
-            for reference in detached_storage_owner_weakrefs:
-                referenced_tensor = reference()
-                if referenced_tensor is not None:
-                    alive_owner_list.append(referenced_tensor)
-                del referenced_tensor
-            alive_storage_owners = tuple(alive_owner_list)
-            del alive_owner_list
-            release_audit = {
-                "original_storage_ptrs": detached_kv_storage_ptrs,
-                "alive_tensor_count": len(alive_tensors),
-                "alive_storage_ptrs": tuple(
-                    sorted({_storage_identity(tensor)[1] for tensor in alive_tensors})
-                ),
-                "alive_storage_owner_count": len(alive_storage_owners),
-                "alive_owner_storage_ptrs": tuple(
-                    sorted({_storage_identity(tensor)[1] for tensor in alive_storage_owners})
-                ),
-            }
-            del alive_storage_owners, alive_tensors
+            # This hook runs while the caller is still completing the pop/build
+            # expression. CPython may therefore still hold the popped entry as a
+            # temporary. Sample it accurately instead of claiming it is released.
+            sample("after_stack_pop_before_forward")
+            release_audit = weakref_release_status("after_stack_pop_before_forward")
         anchors = original_build_anchors(stack)
         if active_root_pop[0]:
             tensor_bytes["anchor"] = _tensor_bytes(anchors.key_values)
@@ -547,6 +550,14 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         return anchors
 
     def traced_forward(executor, segment, *, past_key_values, no_grad):
+        nonlocal forward_entry_release_audit
+        if active_root_pop[0] and not no_grad:
+            # By function entry the caller has advanced past anchor construction,
+            # so this is the first reliable point at which the old entry can die.
+            sample("prefix_recompute_forward_start")
+            forward_entry_release_audit = weakref_release_status(
+                "prefix_recompute_forward_start"
+            )
         result = original_forward(
             executor,
             segment,
@@ -585,6 +596,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         "tensor_bytes": tensor_bytes,
         "storage_audit": storage_audit,
         "release_audit": release_audit,
+        "forward_entry_release_audit": forward_entry_release_audit,
         "executor_state": executor_state,
     }
 
@@ -883,6 +895,12 @@ def _print_breakdown(name, breakdown, *, sibling_count):
 
 
 def _print_memory_breakdown(breakdown):
+    def format_ptrs(pointers, limit=6):
+        rendered = ",".join(hex(pointer) for pointer in pointers[:limit])
+        if len(pointers) > limit:
+            rendered += f",... ({len(pointers)} total)"
+        return rendered
+
     print("DTA root-pop memory breakdown (one synchronized diagnostic run):")
     print(f"  diagnostic baseline: {breakdown['baseline_allocated'] / _GIB:.3f} GiB")
     print(f"  whole-window peak:   {breakdown['whole_iteration_peak'] / _GIB:.3f} GiB")
@@ -904,7 +922,7 @@ def _print_memory_breakdown(breakdown):
     allocated_at_entry = breakdown["samples"][0]["allocated"]
     print("  live storage audit at root-pop entry:")
     for name, row in audit["categories"].items():
-        pointers = ",".join(hex(pointer) for pointer in row["storage_ptrs"])
+        pointers = format_ptrs(row["storage_ptrs"])
         print(
             f"    {name:<20} tensors={row['tensor_count']:<4} "
             f"logical={row['logical_bytes'] / _GIB:.3f} GiB "
@@ -918,25 +936,20 @@ def _print_memory_breakdown(breakdown):
         print(
             f"    alias overlap {overlap['left']} <-> {overlap['right']}: "
             f"{overlap['bytes'] / _GIB:.3f} GiB, data_ptr="
-            + ",".join(hex(pointer) for pointer in overlap["storage_ptrs"])
+            + format_ptrs(overlap["storage_ptrs"])
         )
     print(f"    executor state:             {breakdown['executor_state']}")
-    release = breakdown["release_audit"]
     print("  detached-KV release audit:")
-    print(
-        "    original data_ptr: "
-        + ",".join(hex(pointer) for pointer in release["original_storage_ptrs"])
-    )
-    print(f"    live tensor weakrefs after pop: {release['alive_tensor_count']}")
-    print(
-        "    live data_ptr after pop: "
-        + ",".join(hex(pointer) for pointer in release["alive_storage_ptrs"])
-    )
-    print(f"    live view/base owners after pop: {release['alive_storage_owner_count']}")
-    print(
-        "    live owner data_ptr after pop: "
-        + ",".join(hex(pointer) for pointer in release["alive_owner_storage_ptrs"])
-    )
+    for release in (
+        breakdown["release_audit"],
+        breakdown["forward_entry_release_audit"],
+    ):
+        print(
+            f"    {release['stage']}: tensors={release['alive_tensor_count']}, "
+            f"view/base owners={release['alive_storage_owner_count']}, "
+            "live data_ptr="
+            + format_ptrs(release["alive_storage_ptrs"])
+        )
 
 
 def _print_case(prefix_length, suffix_length, sibling_count, reference, dta):
