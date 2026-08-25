@@ -329,39 +329,33 @@ def _profile_runs(run, zero_grad):
     }
 
 
-def _tensor_bytes(value):
-    tensors = []
+def _iter_tensors(value):
+    """Iterate nested tensors without a recursive closure retaining a collector list."""
 
-    def visit(item):
+    pending = [value]
+    while pending:
+        item = pending.pop()
         if isinstance(item, torch.Tensor):
-            tensors.append(item)
+            yield item
         elif isinstance(item, dict) or hasattr(item, "values"):
-            for child in item.values():
-                visit(child)
+            pending.extend(item.values())
         elif isinstance(item, (tuple, list)):
-            for child in item:
-                visit(child)
+            pending.extend(item)
 
-    visit(value)
-    unique = {id(tensor): tensor for tensor in tensors}
-    return sum(tensor.numel() * tensor.element_size() for tensor in unique.values())
+
+def _tensor_bytes(value):
+    seen = set()
+    total = 0
+    for tensor in _iter_tensors(value):
+        if id(tensor) in seen:
+            continue
+        seen.add(id(tensor))
+        total += tensor.numel() * tensor.element_size()
+    return total
 
 
 def _flatten_tensors(value):
-    tensors = []
-
-    def visit(item):
-        if isinstance(item, torch.Tensor):
-            tensors.append(item)
-        elif isinstance(item, dict) or hasattr(item, "values"):
-            for child in item.values():
-                visit(child)
-        elif isinstance(item, (tuple, list)):
-            for child in item:
-                visit(child)
-
-    visit(value)
-    return tuple(tensors)
+    return tuple(_iter_tensors(value))
 
 
 def _storage_identity(tensor):
@@ -516,29 +510,30 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
     def weakref_release_status(stage):
         """Snapshot weak references without extending their lifetime afterwards."""
 
-        alive_tensors = tuple(
-            tensor
-            for reference in detached_kv_weakrefs
-            if (tensor := reference()) is not None
-        )
-        alive_storage_owners = tuple(
-            tensor
-            for reference in detached_storage_owner_weakrefs
-            if (tensor := reference()) is not None
-        )
+        alive_tensor_count = 0
+        alive_storage_ptrs = set()
+        for reference in detached_kv_weakrefs:
+            referenced_tensor = reference()
+            if referenced_tensor is not None:
+                alive_tensor_count += 1
+                alive_storage_ptrs.add(_storage_identity(referenced_tensor)[1])
+            del referenced_tensor
+        alive_storage_owner_count = 0
+        alive_owner_storage_ptrs = set()
+        for reference in detached_storage_owner_weakrefs:
+            referenced_tensor = reference()
+            if referenced_tensor is not None:
+                alive_storage_owner_count += 1
+                alive_owner_storage_ptrs.add(_storage_identity(referenced_tensor)[1])
+            del referenced_tensor
         status = {
             "stage": stage,
             "original_storage_ptrs": detached_kv_storage_ptrs,
-            "alive_tensor_count": len(alive_tensors),
-            "alive_storage_ptrs": tuple(
-                sorted({_storage_identity(tensor)[1] for tensor in alive_tensors})
-            ),
-            "alive_storage_owner_count": len(alive_storage_owners),
-            "alive_owner_storage_ptrs": tuple(
-                sorted({_storage_identity(tensor)[1] for tensor in alive_storage_owners})
-            ),
+            "alive_tensor_count": alive_tensor_count,
+            "alive_storage_ptrs": tuple(sorted(alive_storage_ptrs)),
+            "alive_storage_owner_count": alive_storage_owner_count,
+            "alive_owner_storage_ptrs": tuple(sorted(alive_owner_storage_ptrs)),
         }
-        del alive_storage_owners, alive_tensors
         return status
 
     def sample_ownership(stage):
