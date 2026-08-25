@@ -19,6 +19,7 @@ import gc
 import os
 import statistics
 import time
+import weakref
 from contextlib import ExitStack
 from contextvars import ContextVar
 from unittest.mock import patch
@@ -345,6 +346,83 @@ def _tensor_bytes(value):
     return sum(tensor.numel() * tensor.element_size() for tensor in unique.values())
 
 
+def _flatten_tensors(value):
+    tensors = []
+
+    def visit(item):
+        if isinstance(item, torch.Tensor):
+            tensors.append(item)
+        elif isinstance(item, dict) or hasattr(item, "values"):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (tuple, list)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return tuple(tensors)
+
+
+def _storage_identity(tensor):
+    storage = tensor.untyped_storage()
+    return (str(tensor.device), int(storage.data_ptr()), int(storage.nbytes()))
+
+
+def _tensor_base_closure(tensors):
+    original_ids = {id(tensor) for tensor in tensors}
+    closure = {}
+    pending = list(tensors)
+    while pending:
+        tensor = pending.pop()
+        if id(tensor) in closure:
+            continue
+        closure[id(tensor)] = tensor
+        base = getattr(tensor, "_base", None)
+        if isinstance(base, torch.Tensor):
+            pending.append(base)
+    return tuple(tensor for tensor_id, tensor in closure.items() if tensor_id not in original_ids)
+
+
+def _live_storage_audit(categories):
+    category_rows = {}
+    category_storages = {}
+    all_storages = {}
+    for name, value in categories.items():
+        tensors = tuple(
+            tensor
+            for tensor in _flatten_tensors(value)
+            if str(tensor.device).startswith("npu")
+        )
+        storages = {_storage_identity(tensor) for tensor in tensors}
+        category_storages[name] = storages
+        category_rows[name] = {
+            "tensor_count": len(tensors),
+            "logical_bytes": sum(tensor.numel() * tensor.element_size() for tensor in tensors),
+            "unique_storage_bytes": sum(item[2] for item in storages),
+            "storage_ptrs": tuple(sorted(item[1] for item in storages)),
+        }
+        all_storages.update({item[:2]: item[2] for item in storages})
+    overlaps = []
+    names = tuple(category_storages)
+    for left_index, left_name in enumerate(names):
+        for right_name in names[left_index + 1 :]:
+            shared = category_storages[left_name] & category_storages[right_name]
+            if shared:
+                overlaps.append(
+                    {
+                        "left": left_name,
+                        "right": right_name,
+                        "bytes": sum(item[2] for item in shared),
+                        "storage_ptrs": tuple(sorted(item[1] for item in shared)),
+                    }
+                )
+    return {
+        "categories": category_rows,
+        "accounted_unique_storage_bytes": sum(all_storages.values()),
+        "overlaps": tuple(overlaps),
+    }
+
+
 def _collect_root_pop_memory_breakdown(run, zero_grad):
     """Run one synchronized diagnostic iteration and sample root-pop allocations."""
 
@@ -354,27 +432,72 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         "kv_grad_buffer": 0,
         "anchor": 0,
     }
+    storage_audit = None
+    detached_kv_weakrefs = ()
+    detached_storage_owner_weakrefs = ()
+    detached_kv_storage_ptrs = ()
+    release_audit = None
+    executor_state = None
     active_root_pop = [False]
     original_pop = SegmentExecutor.pop
     original_build_anchors = KVStack.build_past_anchors
     original_forward = SegmentExecutor._forward
     original_backward = torch.autograd.backward
 
-    def sample(stage, *, phase_peak=None):
+    def sample(stage):
         torch.npu.synchronize()
         row = {
             "stage": stage,
             "allocated": torch.npu.memory_allocated(),
             "reserved": torch.npu.memory_reserved(),
+            "window_peak": torch.npu.max_memory_allocated(),
         }
-        if phase_peak is not None:
-            row["phase_peak"] = phase_peak
         samples.append(row)
 
     def traced_pop(executor, segment_id):
+        nonlocal storage_audit, detached_kv_weakrefs, detached_storage_owner_weakrefs
+        nonlocal detached_kv_storage_ptrs, executor_state
         entry = executor.kv_stack.top()
         tensor_bytes["detached_prefix_kv"] = _tensor_bytes(entry.kv.key_values)
         tensor_bytes["kv_grad_buffer"] = _tensor_bytes(entry.gradients)
+        detached_tensors = _flatten_tensors(entry.kv.key_values)
+        detached_kv_weakrefs = tuple(weakref.ref(tensor) for tensor in detached_tensors)
+        detached_storage_owners = _tensor_base_closure(detached_tensors)
+        detached_storage_owner_weakrefs = tuple(
+            weakref.ref(tensor) for tensor in detached_storage_owners
+        )
+        detached_kv_storage_ptrs = tuple(
+            sorted({_storage_identity(tensor)[1] for tensor in detached_tensors})
+        )
+        parameters = tuple(executor.model.parameters())
+        parameter_grads = tuple(
+            parameter.grad for parameter in parameters if parameter.grad is not None
+        )
+        parameter_main_grads = tuple(
+            parameter.main_grad
+            for parameter in parameters
+            if getattr(parameter, "main_grad", None) is not None
+        )
+        storage_audit = _live_storage_audit(
+            {
+                "model_parameters": parameters,
+                "model_buffers": tuple(executor.model.buffers()),
+                "parameter_grad": parameter_grads,
+                "parameter_main_grad": parameter_main_grads,
+                "detached_prefix_kv": detached_tensors,
+                "kv_grad_buffer": entry.gradients,
+            }
+        )
+        executor_state = {
+            "stack_segment_ids": executor.kv_stack.segment_ids,
+            "stack_prefix_length": executor.kv_stack.prefix_length,
+            "tree_context_active": get_tree_attention_context() is not None,
+        }
+        # Do not let the diagnostic wrapper extend the KVStackEntry/KV tensor
+        # lifetime across SegmentExecutor.pop(). Only weakrefs and primitive
+        # storage metadata remain live after this point.
+        del detached_storage_owners, detached_tensors
+        del parameter_grads, parameter_main_grads, parameters, entry
         active_root_pop[0] = True
         sample("enter_root_pop")
         try:
@@ -384,10 +507,39 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
             active_root_pop[0] = False
 
     def traced_build_anchors(stack):
+        nonlocal release_audit
         if active_root_pop[0]:
             # SegmentExecutor has dropped the popped KV entry by this point;
             # relayed dKV tensors remain live until backward finishes.
             sample("old_prefix_kv_released")
+            alive_list = []
+            for reference in detached_kv_weakrefs:
+                referenced_tensor = reference()
+                if referenced_tensor is not None:
+                    alive_list.append(referenced_tensor)
+                del referenced_tensor
+            alive_tensors = tuple(alive_list)
+            del alive_list
+            alive_owner_list = []
+            for reference in detached_storage_owner_weakrefs:
+                referenced_tensor = reference()
+                if referenced_tensor is not None:
+                    alive_owner_list.append(referenced_tensor)
+                del referenced_tensor
+            alive_storage_owners = tuple(alive_owner_list)
+            del alive_owner_list
+            release_audit = {
+                "original_storage_ptrs": detached_kv_storage_ptrs,
+                "alive_tensor_count": len(alive_tensors),
+                "alive_storage_ptrs": tuple(
+                    sorted({_storage_identity(tensor)[1] for tensor in alive_tensors})
+                ),
+                "alive_storage_owner_count": len(alive_storage_owners),
+                "alive_owner_storage_ptrs": tuple(
+                    sorted({_storage_identity(tensor)[1] for tensor in alive_storage_owners})
+                ),
+            }
+            del alive_storage_owners, alive_tensors
         anchors = original_build_anchors(stack)
         if active_root_pop[0]:
             tensor_bytes["anchor"] = _tensor_bytes(anchors.key_values)
@@ -409,17 +561,15 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         if not active_root_pop[0]:
             return original_backward(*args, **kwargs)
         sample("before_dkv_injection")
-        torch.npu.reset_peak_memory_stats()
         result = original_backward(*args, **kwargs)
         torch.npu.synchronize()
-        phase_peak = torch.npu.max_memory_allocated()
-        sample("prefix_backward_complete", phase_peak=phase_peak)
+        sample("prefix_backward_complete")
         return result
 
     zero_grad()
-    gc.collect()
-    torch.npu.empty_cache()
     torch.npu.synchronize()
+    baseline_allocated = torch.npu.memory_allocated()
+    torch.npu.reset_peak_memory_stats()
     with (
         patch.object(SegmentExecutor, "pop", traced_pop),
         patch.object(KVStack, "build_past_anchors", traced_build_anchors),
@@ -427,7 +577,16 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         patch.object(torch.autograd, "backward", traced_backward),
     ):
         run()
-    return {"samples": tuple(samples), "tensor_bytes": tensor_bytes}
+    torch.npu.synchronize()
+    return {
+        "baseline_allocated": baseline_allocated,
+        "whole_iteration_peak": torch.npu.max_memory_allocated(),
+        "samples": tuple(samples),
+        "tensor_bytes": tensor_bytes,
+        "storage_audit": storage_audit,
+        "release_audit": release_audit,
+        "executor_state": executor_state,
+    }
 
 
 def _install_module_timing_hooks(model, recorder):
@@ -725,14 +884,15 @@ def _print_breakdown(name, breakdown, *, sibling_count):
 
 def _print_memory_breakdown(breakdown):
     print("DTA root-pop memory breakdown (one synchronized diagnostic run):")
+    print(f"  diagnostic baseline: {breakdown['baseline_allocated'] / _GIB:.3f} GiB")
+    print(f"  whole-window peak:   {breakdown['whole_iteration_peak'] / _GIB:.3f} GiB")
     previous = None
     for sample in breakdown["samples"]:
         delta = 0 if previous is None else sample["allocated"] - previous
-        peak = sample.get("phase_peak")
-        peak_text = "" if peak is None else f", backward phase peak={peak / _GIB:.3f} GiB"
         print(
             f"  {sample['stage']:<36} allocated={sample['allocated'] / _GIB:.3f} GiB "
-            f"delta={delta / _GIB:+.3f} GiB{peak_text}"
+            f"delta={delta / _GIB:+.3f} GiB, "
+            f"window peak={sample['window_peak'] / _GIB:.3f} GiB"
         )
         previous = sample["allocated"]
     sizes = breakdown["tensor_bytes"]
@@ -740,6 +900,43 @@ def _print_memory_breakdown(breakdown):
     print(f"    detached prefix KV: {sizes['detached_prefix_kv'] / _GIB:.3f} GiB")
     print(f"    KV-grad buffer:     {sizes['kv_grad_buffer'] / _GIB:.3f} GiB")
     print(f"    anchors:            {sizes['anchor'] / _GIB:.3f} GiB")
+    audit = breakdown["storage_audit"]
+    allocated_at_entry = breakdown["samples"][0]["allocated"]
+    print("  live storage audit at root-pop entry:")
+    for name, row in audit["categories"].items():
+        pointers = ",".join(hex(pointer) for pointer in row["storage_ptrs"])
+        print(
+            f"    {name:<20} tensors={row['tensor_count']:<4} "
+            f"logical={row['logical_bytes'] / _GIB:.3f} GiB "
+            f"unique_storage={row['unique_storage_bytes'] / _GIB:.3f} GiB "
+            f"data_ptr=[{pointers}]"
+        )
+    accounted = audit["accounted_unique_storage_bytes"]
+    print(f"    accounted unique storage: {accounted / _GIB:.3f} GiB")
+    print(f"    unclassified allocated:    {(allocated_at_entry - accounted) / _GIB:.3f} GiB")
+    for overlap in audit["overlaps"]:
+        print(
+            f"    alias overlap {overlap['left']} <-> {overlap['right']}: "
+            f"{overlap['bytes'] / _GIB:.3f} GiB, data_ptr="
+            + ",".join(hex(pointer) for pointer in overlap["storage_ptrs"])
+        )
+    print(f"    executor state:             {breakdown['executor_state']}")
+    release = breakdown["release_audit"]
+    print("  detached-KV release audit:")
+    print(
+        "    original data_ptr: "
+        + ",".join(hex(pointer) for pointer in release["original_storage_ptrs"])
+    )
+    print(f"    live tensor weakrefs after pop: {release['alive_tensor_count']}")
+    print(
+        "    live data_ptr after pop: "
+        + ",".join(hex(pointer) for pointer in release["alive_storage_ptrs"])
+    )
+    print(f"    live view/base owners after pop: {release['alive_storage_owner_count']}")
+    print(
+        "    live owner data_ptr after pop: "
+        + ",".join(hex(pointer) for pointer in release["alive_owner_storage_ptrs"])
+    )
 
 
 def _print_case(prefix_length, suffix_length, sibling_count, reference, dta):
