@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -41,6 +42,7 @@ class StatefulGDNResult:
     output_bias: Tensor | None
     state: LinearPrefixState
     causal_conv_backend: str
+    recurrent_backend: str
     consumed_state_ptrs: tuple[int, int] | None
 
 
@@ -183,6 +185,7 @@ def run_stateful_gdn_segment(
     gdn_module: ModuleType,
     *,
     initial_state: LinearPrefixState | None = None,
+    recurrent_backend: Callable[..., tuple[Tensor, Tensor | None]] | None = None,
 ) -> StatefulGDNResult:
     """Run one CP=1 GDN segment while exposing both continuation states.
 
@@ -247,7 +250,8 @@ def run_stateful_gdn_segment(
     )
     g, beta = model._compute_g_and_beta(model.A_log, model.dt_bias, alpha, beta)
     recurrent_initial_state = None if initial_state is None else initial_state.recurrent_state
-    core_attention_output, recurrent_final_state = model.gated_delta_rule(
+    selected_recurrent_backend = recurrent_backend or model.gated_delta_rule
+    core_attention_output, recurrent_final_state = selected_recurrent_backend(
         query,
         key,
         value,
@@ -276,5 +280,6 @@ def run_stateful_gdn_segment(
             prefix_length=previous_length + sequence_length,
         ),
         causal_conv_backend=causal_conv_backend,
+        recurrent_backend=selected_recurrent_backend.__module__,
         consumed_state_ptrs=consumed_state_ptrs,
     )

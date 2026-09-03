@@ -239,6 +239,28 @@ def _run_native(model: nn.Module, hidden: Tensor) -> Tensor:
     return output
 
 
+def _select_continuation_backend(model: nn.Module):
+    """Choose a backend that truly implements recurrent-state continuation."""
+
+    default_backend = model.gated_delta_rule
+    default_module = default_backend.__module__
+    if default_module == "mindspeed.core.ssm.ops.flash_gated_delta_rule":
+        return default_backend, "native fused backend supports initial_state"
+    if default_module == "mindspeed.core.ssm.chunk_gated_delta_rule":
+        # The optimized Triton training kernel rejects every non-None
+        # initial_state in chunk_gated_delta_rule_fwd_h. MindSpeed's
+        # deterministic Torch reference implements the same recurrence with
+        # explicit initial/final state and is therefore the controlled backend
+        # for this forward capability test.
+        from mindspeed.core.ssm.chunk_gated_delta_rule import torch_chunk_gated_delta_rule
+
+        return (
+            torch_chunk_gated_delta_rule,
+            "default Triton training backend rejects initial_state; using MindSpeed Torch reference",
+        )
+    raise AssertionError(f"GDN bound an unexpected recurrent backend: {default_module}")
+
+
 def _assert_state_contract(
     model: nn.Module,
     state: LinearPrefixState,
@@ -336,23 +358,24 @@ def test_gdn_prefix_state_forward_matches_full_sequence(
     model = _make_gdn(runtime)
     hidden = _make_hidden(runtime, prefix_length + suffix_length)
 
-    recurrent_backend = model.gated_delta_rule.__module__
-    supported_recurrent_backends = {
-        "mindspeed.core.ssm.ops.flash_gated_delta_rule",
-        "mindspeed.core.ssm.chunk_gated_delta_rule",
-    }
-    if recurrent_backend not in supported_recurrent_backends:
-        raise AssertionError(f"GDN bound an unexpected recurrent backend: {recurrent_backend}")
+    default_recurrent_backend = model.gated_delta_rule.__module__
+    continuation_backend, continuation_capability = _select_continuation_backend(model)
 
     with torch.no_grad():
         native_full_a = _run_native(model, hidden)
         native_full_b = _run_native(model, hidden)
-        stateful_full = run_stateful_gdn_segment(model, hidden, runtime.gdn_module)
+        stateful_full = run_stateful_gdn_segment(
+            model,
+            hidden,
+            runtime.gdn_module,
+            recurrent_backend=continuation_backend,
+        )
 
         prefix_result = run_stateful_gdn_segment(
             model,
             hidden[:prefix_length],
             runtime.gdn_module,
+            recurrent_backend=continuation_backend,
         )
         prefix_conv_before = prefix_result.state.causal_conv_state.clone()
         prefix_recurrent_before = prefix_result.state.recurrent_state.clone()
@@ -361,6 +384,7 @@ def test_gdn_prefix_state_forward_matches_full_sequence(
             hidden[prefix_length:],
             runtime.gdn_module,
             initial_state=prefix_result.state,
+            recurrent_backend=continuation_backend,
         )
         relayed_output = torch.cat((prefix_result.output, suffix_result.output), dim=0)
 
@@ -372,6 +396,11 @@ def test_gdn_prefix_state_forward_matches_full_sequence(
         raise AssertionError(
             "causal-conv backend changed between prefix and suffix: "
             f"{prefix_result.causal_conv_backend} vs {suffix_result.causal_conv_backend}"
+        )
+    if prefix_result.recurrent_backend != suffix_result.recurrent_backend:
+        raise AssertionError(
+            "recurrent backend changed between prefix and suffix: "
+            f"{prefix_result.recurrent_backend} vs {suffix_result.recurrent_backend}"
         )
 
     _assert_state_contract(
@@ -442,7 +471,9 @@ def test_gdn_prefix_state_forward_matches_full_sequence(
         "\nLinear GDN prefix-state forward continuation\n"
         f"  P/S:                          {prefix_length}/{suffix_length}\n"
         f"  GDN implementation:           {type(model).__module__}.{type(model).__name__}\n"
-        f"  recurrent backend:            {recurrent_backend}\n"
+        f"  default recurrent backend:    {default_recurrent_backend}\n"
+        f"  continuation backend:         {prefix_result.recurrent_backend}\n"
+        f"  continuation capability:      {continuation_capability}\n"
         f"  causal-conv backend:          {prefix_result.causal_conv_backend}\n"
         f"  native repeat rel/cos/max:    {native_repeat_metrics.relative_l2:.6e} / "
         f"{native_repeat_metrics.cosine:.9f} / {native_repeat_metrics.max_abs_diff:.6e}\n"
