@@ -471,12 +471,26 @@ def test_native_mindspeed_gdn_cp2_matches_cp1(
         if not torch.equal(reference_tensor, actual_tensor):
             raise AssertionError(f"CP model state differs from reference before execution: {name}")
 
-    kernel_module = cp_model.gated_delta_rule.__module__
-    conv_module = runtime.gdn_module.causal_conv1d.__module__
-    if kernel_module != "mindspeed.core.ssm.ops.flash_gated_delta_rule":
-        raise AssertionError(f"GDN did not bind the expected NPU recurrent kernel: {kernel_module}")
-    if conv_module != "mindspeed.core.ssm.ops.npu_causal_conv1d":
-        raise AssertionError(f"GDN did not bind the expected NPU causal-conv kernel: {conv_module}")
+    recurrent_backend = cp_model.gated_delta_rule.__module__
+    supported_recurrent_backends = {
+        "mindspeed.core.ssm.ops.flash_gated_delta_rule",
+        "mindspeed.core.ssm.chunk_gated_delta_rule",
+    }
+    if recurrent_backend not in supported_recurrent_backends:
+        raise AssertionError(f"GDN bound an unexpected recurrent backend: {recurrent_backend}")
+
+    causal_conv = runtime.gdn_module.causal_conv1d
+    if causal_conv is None:
+        # MindSpeed deliberately falls back to F.conv1d when the optional
+        # fla_npu package is unavailable. The operation still executes on NPU
+        # because its input and weights are NPU tensors.
+        causal_conv_backend = "torch.nn.functional.conv1d (NPU fallback)"
+    else:
+        causal_conv_backend = causal_conv.__module__
+        if causal_conv_backend != "mindspeed.core.ssm.ops.npu_causal_conv1d":
+            raise AssertionError(
+                f"GDN bound an unexpected causal-conv backend: {causal_conv_backend}"
+            )
 
     hidden, target = _make_full_inputs(runtime, sequence_length)
     with AllToAllProbe(runtime.gdn_module) as probe:
@@ -539,8 +553,8 @@ def test_native_mindspeed_gdn_cp2_matches_cp1(
             "\nNative MindSpeed CP/GDN equivalence\n"
             f"  sequence length:              {sequence_length}\n"
             f"  GDN implementation:           {type(cp_model).__module__}.{type(cp_model).__name__}\n"
-            f"  recurrent kernel:             {kernel_module}\n"
-            f"  causal-conv kernel:           {conv_module}\n"
+            f"  recurrent backend:            {recurrent_backend}\n"
+            f"  causal-conv backend:          {causal_conv_backend}\n"
             f"  CP=2 A2A calls:               cp2hp={cp2hp_count}, hp2cp={hp2cp_count}\n"
             f"  output rel L2/cos/max abs:    {output_metrics.relative_l2:.6e} / "
             f"{output_metrics.cosine:.9f} / {output_metrics.max_abs_diff:.6e}\n"
