@@ -165,7 +165,18 @@ def broadcast_module_state(module: nn.Module, *, src: int = 0) -> None:
     """Make every rank start from bitwise-identical parameters and buffers."""
 
     with torch.no_grad():
-        for tensor in module.state_dict().values():
+        for name, tensor in module.state_dict().items():
+            # Megatron parallel linear layers may expose an ``_extra_state``
+            # entry whose value is None. It carries no tensor storage and is
+            # already identical on every rank, so it must not enter a tensor
+            # collective.
+            if tensor is None:
+                continue
+            if not isinstance(tensor, Tensor):
+                raise TypeError(
+                    f"cannot broadcast non-Tensor module state {name!r}: "
+                    f"{type(tensor).__name__}"
+                )
             dist.broadcast(tensor, src=src)
 
 

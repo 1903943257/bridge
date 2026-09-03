@@ -461,8 +461,14 @@ def test_native_mindspeed_gdn_cp2_matches_cp1(
     torch.manual_seed(7400)
     cp_model = _make_gdn(runtime, cp_size=_EXPECTED_WORLD_SIZE)
     cp_model.load_state_dict(reference_model.state_dict(), strict=True)
+    cp_state = cp_model.state_dict()
     for name, reference_tensor in reference_model.state_dict().items():
-        if not torch.equal(reference_tensor, cp_model.state_dict()[name]):
+        actual_tensor = cp_state[name]
+        if reference_tensor is None or actual_tensor is None:
+            if reference_tensor is not None or actual_tensor is not None:
+                raise AssertionError(f"CP model non-Tensor state differs before execution: {name}")
+            continue
+        if not torch.equal(reference_tensor, actual_tensor):
             raise AssertionError(f"CP model state differs from reference before execution: {name}")
 
     kernel_module = cp_model.gated_delta_rule.__module__
