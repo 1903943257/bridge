@@ -27,6 +27,7 @@ global output-space objective and its complete gradients.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -110,10 +111,25 @@ def _initialize_runtime() -> _DistributedGDNRuntime:
             f"CP/GDN equivalence requires world_size=2, got {dist.get_world_size()}"
         )
 
+    # MindSpeed parses sys.argv when megatron_adaptor is first imported. Pytest
+    # short options such as ``-s`` and ``-v`` are otherwise misparsed as a
+    # dynamic TransformerConfig field named "". Pytest has already consumed
+    # its CLI by fixture setup, so isolate that import from the runner's argv.
+    pytest_argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = pytest_argv
+
+    # Be defensive when another collection-time import populated MindSpeed's
+    # global argument cache before the isolated import above.
+    from mindspeed.args_utils import get_full_args
+
+    vars(get_full_args()).pop("", None)
+
     # Repatch before importing GatedDeltaNet so its FLA symbols bind to the
     # NPU kernels and the Megatron class is replaced by MindSpeed's CP version.
-    from mindspeed.megatron_adaptor import repatch
-
     repatch(
         {
             "context_parallel_size": _EXPECTED_WORLD_SIZE,
