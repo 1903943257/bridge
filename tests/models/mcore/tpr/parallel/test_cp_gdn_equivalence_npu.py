@@ -143,6 +143,7 @@ def _initialize_runtime() -> _DistributedGDNRuntime:
     from megatron.core.models.backends import LocalSpecProvider
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.transformer_config import TransformerConfig
     import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
 
@@ -153,6 +154,11 @@ def _initialize_runtime() -> _DistributedGDNRuntime:
             context_parallel_size=_EXPECTED_WORLD_SIZE,
             expert_model_parallel_size=1,
         )
+
+    # The normal Megatron training bootstrap seeds the model-parallel RNG
+    # tracker after process-group initialization. This standalone module test
+    # must do the same before constructing ColumnParallelLinear.
+    model_parallel_cuda_manual_seed(7300)
 
     if GatedDeltaNet is not mindspeed_gdn.GatedDeltaNet:
         raise AssertionError(
