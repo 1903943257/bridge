@@ -25,11 +25,14 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
@@ -47,7 +50,13 @@ from verl.models.mcore.tpr import (
 )
 from verl.utils.device import is_torch_npu_available
 
-from ._cp_gdn_test_utils import broadcast_module_state
+from ._cp_gdn_test_utils import (
+    assert_named_tensors_finite,
+    broadcast_module_state,
+    clone_parameter_gradients,
+    named_tensor_comparison,
+    tensor_comparison,
+)
 
 
 _EXPECTED_WORLD_SIZE = 2
@@ -57,6 +66,20 @@ _SECOND_SUFFIX_LENGTH = 256
 _VOCAB_SIZE = 2048
 _LAYER_COUNT = 2
 _DTYPE = torch.bfloat16
+_EQUIVALENCE_CASES = (
+    (128, 64, 32),
+    (1024, 512, 256),
+    (2048, 128, 512),
+)
+_LOSS_RELATIVE_TOL = 5e-4
+_LOGPROB_ATOL = 5e-2
+_LOGPROB_RTOL = 5e-3
+_LOGPROB_RELATIVE_L2_TOL = 5e-3
+_LOGPROB_COSINE_MIN = 0.9999
+_GRAD_ATOL = 5e-3
+_GRAD_RTOL = 5e-2
+_GRAD_RELATIVE_L2_TOL = 3e-2
+_GRAD_COSINE_MIN = 0.999
 
 
 if not is_torch_npu_available(check_device=True):
@@ -132,7 +155,9 @@ def cp_runtime():
     dist.destroy_process_group()
 
 
-def _make_model(runtime):
+def _make_model(runtime, *, max_sequence_length=None):
+    if max_sequence_length is None:
+        max_sequence_length = _PREFIX_LENGTH + _FIRST_SUFFIX_LENGTH
     config = TransformerConfig(
         num_layers=_LAYER_COUNT,
         hidden_size=128,
@@ -171,7 +196,7 @@ def _make_model(runtime):
         config=config,
         transformer_layer_spec=spec,
         vocab_size=_VOCAB_SIZE,
-        max_sequence_length=_PREFIX_LENGTH + _FIRST_SUFFIX_LENGTH,
+        max_sequence_length=max_sequence_length,
         pre_process=True,
         post_process=True,
         parallel_output=False,
@@ -218,6 +243,261 @@ def _plan():
             SegmentSpec(2, 0, second, _PREFIX_LENGTH, _PREFIX_LENGTH, second_terms),
         ),
         root_id=0,
+    )
+
+
+@dataclass(frozen=True)
+class _EquivalenceRun:
+    normalized_loss: Tensor
+    target_logprobs: Tensor
+    parameter_gradients: dict[str, Tensor]
+    execution_trace: tuple[tuple[PhysicalExecutionKind, int], ...]
+
+
+def _sample_internal_terms(tokens, *, sample_id):
+    return tuple(
+        SegmentLossTerm(index, int(tokens[index + 1]), sample_id=sample_id)
+        for index in range(tokens.numel() - 1)
+    )
+
+
+def _equivalence_tpr_plan(prefix, first, second):
+    prefix_length = prefix.numel()
+    prefix_terms = tuple(
+        SegmentLossTerm(
+            index,
+            int(prefix[index + 1]),
+            sample_id=sample_id,
+        )
+        for sample_id in (1, 2)
+        for index in range(prefix_length - 1)
+    ) + (
+        SegmentLossTerm(prefix_length - 1, int(first[0]), sample_id=1),
+        SegmentLossTerm(prefix_length - 1, int(second[0]), sample_id=2),
+    )
+    plan = SegmentPlan(
+        (
+            SegmentSpec(0, None, prefix, 0, 0, prefix_terms),
+            SegmentSpec(
+                1,
+                0,
+                first,
+                prefix_length,
+                prefix_length,
+                _sample_internal_terms(first, sample_id=1),
+            ),
+            SegmentSpec(
+                2,
+                0,
+                second,
+                prefix_length,
+                prefix_length,
+                _sample_internal_terms(second, sample_id=2),
+            ),
+        ),
+        root_id=0,
+    )
+    expected_weight = (prefix_length + first.numel() - 1) + (
+        prefix_length + second.numel() - 1
+    )
+    if plan.total_loss_weight != expected_weight:
+        raise AssertionError(
+            f"TPR total loss weight must be {expected_weight}, got {plan.total_loss_weight}"
+        )
+    branch_terms = plan.get(0).loss_terms[-2:]
+    if tuple(term.query_offset for term in branch_terms) != (
+        prefix_length - 1,
+        prefix_length - 1,
+    ):
+        raise AssertionError("branch-point losses must be owned by the final Prefix query")
+    if tuple(term.target_token_id for term in branch_terms) != (int(first[0]), int(second[0])):
+        raise AssertionError("branch-point labels do not match the first Suffix tokens")
+    return plan
+
+
+def _independent_plan(trajectory, *, sample_id, total_loss_weight):
+    return SegmentPlan(
+        (
+            SegmentSpec(
+                sample_id,
+                None,
+                trajectory,
+                0,
+                0,
+                _sample_internal_terms(trajectory, sample_id=sample_id),
+            ),
+        ),
+        root_id=sample_id,
+        total_loss_weight=total_loss_weight,
+    )
+
+
+def _logical_logprob_indices(first_trajectory, second_trajectory):
+    indices = {}
+    cursor = 0
+    for sample_id, trajectory in ((1, first_trajectory), (2, second_trajectory)):
+        for query_position in range(trajectory.numel() - 1):
+            indices[(sample_id, query_position)] = cursor
+            cursor += 1
+    return indices, cursor
+
+
+def _execute_and_capture(
+    model,
+    plan,
+    runtime,
+    logical_indices,
+    logprob_values,
+    owner_counts,
+):
+    executor = SegmentExecutor(
+        model,
+        plan,
+        expected_layer_numbers=tuple(range(1, _LAYER_COUNT + 1)),
+        cp_group=runtime.cp_group,
+    )
+    original_compute_loss = executor._compute_loss
+
+    def capture_loss(segment, logits):
+        owned_terms = executor._owned_loss_terms(segment)
+        if owned_terms:
+            shard = executor._segment_shard(segment)
+            query_offsets = torch.tensor(
+                [term.query_offset - shard.local_start for term in owned_terms],
+                dtype=torch.long,
+                device=runtime.device,
+            )
+            targets = torch.tensor(
+                [term.target_token_id for term in owned_terms],
+                dtype=torch.long,
+                device=runtime.device,
+            )
+            selected_logits = logits[0].index_select(0, query_offsets).float()
+            selected_logprobs = F.log_softmax(selected_logits, dim=-1).gather(
+                1, targets.unsqueeze(1)
+            ).squeeze(1)
+            logical_offsets = []
+            for term in owned_terms:
+                if term.sample_id is None:
+                    raise AssertionError("equivalence loss terms must carry sample_id")
+                logical_offsets.append(
+                    logical_indices[(term.sample_id, segment.position_start + term.query_offset)]
+                )
+            logical_offsets = torch.tensor(
+                logical_offsets,
+                dtype=torch.long,
+                device=runtime.device,
+            )
+            logprob_values.index_copy_(0, logical_offsets, selected_logprobs.detach())
+            owner_counts.index_add_(
+                0,
+                logical_offsets,
+                torch.ones_like(logical_offsets, dtype=owner_counts.dtype),
+            )
+        return original_compute_loss(segment, logits)
+
+    executor._compute_loss = capture_loss
+    try:
+        return FixedTopologyScheduler(plan, executor).run()
+    finally:
+        executor._compute_loss = original_compute_loss
+
+
+def _aggregate_loss_and_logprobs(loss, logprobs, owner_counts, runtime):
+    global_loss = loss.detach().clone()
+    dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=runtime.cp_group)
+    dist.all_reduce(logprobs, op=dist.ReduceOp.SUM, group=runtime.cp_group)
+    dist.all_reduce(owner_counts, op=dist.ReduceOp.SUM, group=runtime.cp_group)
+    if not torch.all(owner_counts == 1).item():
+        bad = torch.nonzero(owner_counts != 1).flatten().cpu().tolist()
+        raise AssertionError(
+            f"every logical logprob must have exactly one CP owner; bad indexes={bad[:16]}"
+        )
+    return global_loss, logprobs
+
+
+def _finalize_cp_parameter_gradients(model, runtime):
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            raise AssertionError(f"missing parameter gradient before CP finalize: {name}")
+        dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=runtime.cp_group)
+        parameter.grad.div_(_EXPECTED_WORLD_SIZE)
+    gradients = clone_parameter_gradients(model)
+    assert_named_tensors_finite(gradients, label="finalized CP parameter gradient")
+    return gradients
+
+
+def _run_independent_cp_reference(
+    model,
+    first_trajectory,
+    second_trajectory,
+    runtime,
+    logical_indices,
+    logical_count,
+):
+    model.zero_grad(set_to_none=True)
+    logprobs = torch.zeros(logical_count, dtype=torch.float32, device=runtime.device)
+    owner_counts = torch.zeros(logical_count, dtype=torch.int64, device=runtime.device)
+    total_loss_weight = float(
+        first_trajectory.numel() + second_trajectory.numel() - 2
+    )
+    local_loss = torch.zeros((), dtype=torch.float32, device=runtime.device)
+    trace = []
+    for sample_id, trajectory in ((1, first_trajectory), (2, second_trajectory)):
+        plan = _independent_plan(
+            trajectory,
+            sample_id=sample_id,
+            total_loss_weight=total_loss_weight,
+        )
+        result = _execute_and_capture(
+            model,
+            plan,
+            runtime,
+            logical_indices,
+            logprobs,
+            owner_counts,
+        )
+        local_loss = local_loss + result.normalized_loss
+        trace.extend((execution.kind, execution.segment_id) for execution in result.execution_trace)
+    global_loss, global_logprobs = _aggregate_loss_and_logprobs(
+        local_loss, logprobs, owner_counts, runtime
+    )
+    return _EquivalenceRun(
+        normalized_loss=global_loss,
+        target_logprobs=global_logprobs,
+        parameter_gradients=_finalize_cp_parameter_gradients(model, runtime),
+        execution_trace=tuple(trace),
+    )
+
+
+def _run_tpr_cp(
+    model,
+    plan,
+    runtime,
+    logical_indices,
+    logical_count,
+):
+    model.zero_grad(set_to_none=True)
+    logprobs = torch.zeros(logical_count, dtype=torch.float32, device=runtime.device)
+    owner_counts = torch.zeros(logical_count, dtype=torch.int64, device=runtime.device)
+    result = _execute_and_capture(
+        model,
+        plan,
+        runtime,
+        logical_indices,
+        logprobs,
+        owner_counts,
+    )
+    global_loss, global_logprobs = _aggregate_loss_and_logprobs(
+        result.normalized_loss, logprobs, owner_counts, runtime
+    )
+    return _EquivalenceRun(
+        normalized_loss=global_loss,
+        target_logprobs=global_logprobs,
+        parameter_gradients=_finalize_cp_parameter_gradients(model, runtime),
+        execution_trace=tuple(
+            (execution.kind, execution.segment_id) for execution in result.execution_trace
+        ),
     )
 
 
@@ -377,6 +657,153 @@ def test_cp2_scheduler_reuses_prefix_across_unequal_siblings_and_pops(cp_runtime
             f"ReduceScatter={counts['reduce_scatter']}\n"
             f"  global loss: {global_normalized_loss.item():.9f}\n"
             f"  parameter tensors with gradients: {parameter_count}"
+        )
+
+    dist.barrier(group=runtime.cp_group)
+
+
+@pytest.mark.parametrize(
+    ("prefix_length", "first_suffix_length", "second_suffix_length"),
+    _EQUIVALENCE_CASES,
+)
+def test_cp2_tpr_matches_independent_allgather_cp(
+    cp_runtime,
+    prefix_length,
+    first_suffix_length,
+    second_suffix_length,
+):
+    runtime = cp_runtime
+    dist.barrier(group=runtime.cp_group)
+    torch.manual_seed(261000 + prefix_length + first_suffix_length + second_suffix_length)
+
+    max_sequence_length = prefix_length + max(first_suffix_length, second_suffix_length)
+    reference_model = _make_model(
+        runtime,
+        max_sequence_length=max_sequence_length,
+    )
+    tpr_model = _make_model(
+        runtime,
+        max_sequence_length=max_sequence_length,
+    )
+    tpr_model.load_state_dict(reference_model.state_dict(), strict=True)
+
+    prefix = _tokens(17, prefix_length)
+    first = _tokens(701, first_suffix_length)
+    second = _tokens(1301, second_suffix_length)
+    first_trajectory = torch.cat((prefix, first))
+    second_trajectory = torch.cat((prefix, second))
+    tpr_plan = _equivalence_tpr_plan(prefix, first, second)
+    logical_indices, logical_count = _logical_logprob_indices(
+        first_trajectory,
+        second_trajectory,
+    )
+    if tpr_plan.total_loss_weight != logical_count:
+        raise AssertionError(
+            f"logical logprob count {logical_count} does not match "
+            f"loss weight {tpr_plan.total_loss_weight}"
+        )
+
+    reference = _run_independent_cp_reference(
+        reference_model,
+        first_trajectory,
+        second_trajectory,
+        runtime,
+        logical_indices,
+        logical_count,
+    )
+    actual = _run_tpr_cp(
+        tpr_model,
+        tpr_plan,
+        runtime,
+        logical_indices,
+        logical_count,
+    )
+
+    assert reference.execution_trace == (
+        (PhysicalExecutionKind.VISIT_LEAF, 1),
+        (PhysicalExecutionKind.VISIT_LEAF, 2),
+    )
+    assert actual.execution_trace == (
+        (PhysicalExecutionKind.PUSH, 0),
+        (PhysicalExecutionKind.VISIT_LEAF, 1),
+        (PhysicalExecutionKind.VISIT_LEAF, 2),
+        (PhysicalExecutionKind.POP, 0),
+    )
+    if not torch.isfinite(reference.normalized_loss).item():
+        raise AssertionError("Independent CP reference loss is non-finite")
+    if not torch.isfinite(actual.normalized_loss).item():
+        raise AssertionError("TPR CP loss is non-finite")
+    if not torch.isfinite(reference.target_logprobs).all().item():
+        raise AssertionError("Independent CP reference logprobs are non-finite")
+    if not torch.isfinite(actual.target_logprobs).all().item():
+        raise AssertionError("TPR CP logprobs are non-finite")
+
+    reference_loss = float(reference.normalized_loss.item())
+    actual_loss = float(actual.normalized_loss.item())
+    loss_relative = abs(actual_loss - reference_loss) / max(abs(reference_loss), 1e-12)
+    if loss_relative > _LOSS_RELATIVE_TOL:
+        raise AssertionError(
+            f"loss relative difference {loss_relative:.6e} exceeds {_LOSS_RELATIVE_TOL:.6e}"
+        )
+
+    torch.testing.assert_close(
+        actual.target_logprobs,
+        reference.target_logprobs,
+        atol=_LOGPROB_ATOL,
+        rtol=_LOGPROB_RTOL,
+    )
+    logprob_metrics = tensor_comparison(
+        reference.target_logprobs,
+        actual.target_logprobs,
+    )
+    if logprob_metrics.relative_l2 > _LOGPROB_RELATIVE_L2_TOL:
+        raise AssertionError(
+            f"logprob relative L2 {logprob_metrics.relative_l2:.6e} "
+            f"exceeds {_LOGPROB_RELATIVE_L2_TOL:.6e}"
+        )
+    if logprob_metrics.cosine < _LOGPROB_COSINE_MIN:
+        raise AssertionError(
+            f"logprob cosine {logprob_metrics.cosine:.9f} is below {_LOGPROB_COSINE_MIN:.9f}"
+        )
+
+    gradient_metrics, worst_gradient = named_tensor_comparison(
+        reference.parameter_gradients,
+        actual.parameter_gradients,
+    )
+    for name in sorted(reference.parameter_gradients):
+        torch.testing.assert_close(
+            actual.parameter_gradients[name],
+            reference.parameter_gradients[name],
+            atol=_GRAD_ATOL,
+            rtol=_GRAD_RTOL,
+            msg=lambda message, name=name: f"parameter gradient mismatch for {name}: {message}",
+        )
+    if gradient_metrics.relative_l2 > _GRAD_RELATIVE_L2_TOL:
+        raise AssertionError(
+            f"parameter-gradient relative L2 {gradient_metrics.relative_l2:.6e} "
+            f"exceeds {_GRAD_RELATIVE_L2_TOL:.6e}"
+        )
+    if gradient_metrics.cosine < _GRAD_COSINE_MIN:
+        raise AssertionError(
+            f"parameter-gradient cosine {gradient_metrics.cosine:.9f} "
+            f"is below {_GRAD_COSINE_MIN:.9f}"
+        )
+
+    if runtime.rank == 0:
+        print(
+            "\nTPR CP=2 controlled equivalence passed\n"
+            f"  topology: P={prefix_length}, S1={first_suffix_length}, "
+            f"S2={second_suffix_length}\n"
+            f"  target logprobs: {logical_count}\n"
+            f"  loss reference/TPR: {reference_loss:.9f} / {actual_loss:.9f}\n"
+            f"  loss relative diff: {loss_relative:.6e}\n"
+            f"  logprob relative L2: {logprob_metrics.relative_l2:.6e}\n"
+            f"  logprob cosine: {logprob_metrics.cosine:.9f}\n"
+            f"  gradient tensors: {len(reference.parameter_gradients)}\n"
+            f"  gradient relative L2: {gradient_metrics.relative_l2:.6e}\n"
+            f"  gradient cosine: {gradient_metrics.cosine:.9f}\n"
+            f"  worst gradient: {worst_gradient[0]} "
+            f"({worst_gradient[1].relative_l2:.6e})"
         )
 
     dist.barrier(group=runtime.cp_group)
