@@ -15,7 +15,11 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import build_suffix_rotary_pos_emb
+from verl.models.mcore.tpr import (
+    RangeSequenceShard,
+    build_sharded_rotary_pos_emb,
+    build_suffix_rotary_pos_emb,
+)
 
 
 class _RecordingRotaryEmbedding:
@@ -86,6 +90,25 @@ def test_suffix_rope_can_disable_the_embedding_bound_cp_shard():
     cp_group = rotary_embedding.calls[0]["cp_group"]
     assert cp_group is not None
     assert cp_group.size() == 1
+
+
+def test_sharded_rope_follows_noncontiguous_local_token_order():
+    rotary_embedding = _RecordingRotaryEmbedding()
+    shard = RangeSequenceShard(8, ((0, 2), (6, 8)), cp_rank=0, cp_size=2)
+
+    result = build_sharded_rotary_pos_emb(
+        rotary_embedding,
+        position_start=16,
+        shard=shard,
+        disable_context_parallel_sharding=True,
+    )
+
+    assert result[:, 0, 0, 0].tolist() == [16.0, 17.0, 22.0, 23.0]
+    assert [(call["max_seq_len"], call["offset"]) for call in rotary_embedding.calls] == [
+        (2, 16),
+        (2, 22),
+    ]
+    assert all(call["cp_group"].size() == 1 for call in rotary_embedding.calls)
 
 
 @pytest.mark.parametrize(

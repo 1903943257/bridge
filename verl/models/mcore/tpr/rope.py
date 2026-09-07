@@ -18,7 +18,10 @@ from __future__ import annotations
 
 from typing import Protocol
 
+import torch
 from torch import Tensor
+
+from .shard import SequenceShard
 
 
 class _RotaryEmbedding(Protocol):
@@ -90,6 +93,36 @@ def build_suffix_rotary_pos_emb(
         )
     if rotary_pos_emb.shape[3] <= 0:
         raise ValueError("suffix rotary embedding must have a positive rotary dimension")
+    return rotary_pos_emb
+
+
+def build_sharded_rotary_pos_emb(
+    rotary_embedding: _RotaryEmbedding,
+    *,
+    position_start: int,
+    shard: SequenceShard,
+    disable_context_parallel_sharding: bool = False,
+) -> Tensor:
+    """Build RoPE in the local-token order described by ``shard``."""
+
+    _validate_length("position_start", position_start, allow_zero=True)
+    if not isinstance(shard, SequenceShard):
+        raise TypeError(f"shard must implement SequenceShard, got {type(shard).__name__}")
+    chunks = tuple(
+        build_suffix_rotary_pos_emb(
+            rotary_embedding,
+            prefix_length=position_start + start,
+            suffix_length=end - start,
+            disable_context_parallel_sharding=disable_context_parallel_sharding,
+        )
+        for start, end in shard.global_ranges
+    )
+    rotary_pos_emb = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+    if rotary_pos_emb.shape[0] != shard.local_length:
+        raise RuntimeError(
+            f"sharded rotary embedding length must be {shard.local_length}, "
+            f"got {rotary_pos_emb.shape[0]}"
+        )
     return rotary_pos_emb
 
 

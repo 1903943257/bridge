@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from ..prefix_state import PrefixShard
+from ..shard import PrefixShard
 from ..rectangular_attention import rectangular_causal_attention
 
 

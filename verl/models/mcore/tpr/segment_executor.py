@@ -26,17 +26,16 @@ from torch import Tensor, nn
 
 from .context import KVPair, TPRAttentionContext, use_tpr_attention_context
 from .kv_stack import KVStack
+from .parallel.backend import TPRCPBackend, resolve_tpr_cp_backend
 from .parallel.execution_context import (
     ShardedPastKVAnchors,
     accumulate_sharded_past_anchor_gradients,
     build_sharded_past_anchors,
-    make_anchored_allgather_cp_backend,
-    make_cached_allgather_cp_backend,
     resolve_cp_group,
 )
-from .prefix_state import PrefixShard
-from .rope import build_suffix_rotary_pos_emb
+from .rope import build_sharded_rotary_pos_emb
 from .segment_plan import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
+from .shard import PrefixShard, SequenceShard
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +80,7 @@ class SegmentExecutor:
         kv_stack: KVStack | None = None,
         loss_scale_func: Callable[[Tensor], Tensor] | None = None,
         cp_group: Any | None = None,
+        cp_backend: TPRCPBackend | str | None = None,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError(f"model must be torch.nn.Module, got {type(model).__name__}")
@@ -108,17 +108,27 @@ class SegmentExecutor:
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
         if cp_group is None:
+            if cp_backend is not None:
+                raise ValueError("cp_backend requires a cp_group")
             self.cp_size, self.cp_rank = 1, 0
+            self.cp_backend = None
         else:
             self.cp_size, self.cp_rank = resolve_cp_group(cp_group)
             if self.cp_size <= 1:
                 raise ValueError(f"cp_group must contain more than one rank, got {self.cp_size}")
+            self.cp_backend = resolve_tpr_cp_backend(
+                cp_backend,
+                cp_group=cp_group,
+                parallel_size=self.cp_size,
+                parallel_rank=self.cp_rank,
+            )
             for segment in plan.segments.values():
-                if segment.length % self.cp_size != 0:
+                try:
+                    self.cp_backend.validate_segment_length(segment.length)
+                except ValueError as exc:
                     raise ValueError(
-                        f"segment {segment.segment_id} length {segment.length} must be divisible "
-                        f"by CP size {self.cp_size}"
-                    )
+                        f"segment {segment.segment_id} {exc}"
+                    ) from exc
         self._failed = False
 
     @property
@@ -305,38 +315,27 @@ class SegmentExecutor:
     ) -> tuple[TPRAttentionContext, Tensor]:
         device = _model_device(self.model)
         shard = self._segment_shard(segment)
-        local_token_ids = segment.token_ids[shard.local_start : shard.local_end]
+        local_token_ids = shard.select(segment.token_ids)
         input_ids = local_token_ids.to(device=device).unsqueeze(0)
-        position_ids = torch.arange(
-            segment.position_start + shard.local_start,
-            segment.position_start + shard.local_end,
-            dtype=torch.long,
-            device=device,
-        ).unsqueeze(0)
+        position_ids = shard.global_indices(device=device).add(segment.position_start).unsqueeze(0)
         attention_backend = None
         if self.cp_enabled:
-            if sharded_past_anchors is None:
-                attention_backend = make_cached_allgather_cp_backend(
-                    self.kv_stack,
-                    expected_layer_numbers=self.expected_layer_numbers,
-                    current_shard=shard,
-                    cp_group=self.cp_group,
-                )
-            else:
-                attention_backend = make_anchored_allgather_cp_backend(
-                    sharded_past_anchors,
-                    expected_layer_numbers=self.expected_layer_numbers,
-                    current_shard=shard,
-                    cp_group=self.cp_group,
-                )
+            if self.cp_backend is None:
+                raise RuntimeError("CP execution is missing its backend")
+            attention_backend = self.cp_backend.make_attention_backend(
+                self.kv_stack,
+                expected_layer_numbers=self.expected_layer_numbers,
+                current_shard=shard,
+                past_anchors=sharded_past_anchors,
+            )
         context = TPRAttentionContext(
             prefix_length=segment.prefix_length,
             suffix_length=segment.length,
             past_key_values=past_key_values,
-            suffix_rotary_pos_emb=build_suffix_rotary_pos_emb(
+            suffix_rotary_pos_emb=build_sharded_rotary_pos_emb(
                 self.model.rotary_pos_emb,
-                prefix_length=segment.position_start + shard.local_start,
-                suffix_length=shard.local_length,
+                position_start=segment.position_start,
+                shard=shard,
                 disable_context_parallel_sharding=self.cp_enabled,
             ),
             attention_backend=attention_backend,
@@ -361,9 +360,12 @@ class SegmentExecutor:
         if not owned_terms:
             zero = logits.new_zeros((), dtype=torch.float32)
             return zero, zero
-        local_start = self._segment_shard(segment).local_start
+        shard = self._segment_shard(segment)
+        local_offsets = tuple(shard.global_to_local(term.query_offset) for term in owned_terms)
+        if any(offset is None for offset in local_offsets):
+            raise RuntimeError(f"segment {segment.segment_id} has a loss term outside its local shard")
         query_offsets = torch.tensor(
-            [term.query_offset - local_start for term in owned_terms],
+            local_offsets,
             dtype=torch.long,
             device=logits.device,
         )
@@ -395,7 +397,7 @@ class SegmentExecutor:
         return tuple(
             term
             for term in segment.loss_terms
-            if shard.local_start <= term.query_offset < shard.local_end
+            if shard.owns(term.query_offset)
         )
 
     def _prepare_backward_loss(
@@ -411,14 +413,12 @@ class SegmentExecutor:
             backward_loss = logits.float().sum() * 0.0
         return backward_loss if self.loss_scale_func is None else self.loss_scale_func(backward_loss)
 
-    def _segment_shard(self, segment: SegmentSpec) -> PrefixShard:
+    def _segment_shard(self, segment: SegmentSpec) -> SequenceShard:
         if not self.cp_enabled:
             return PrefixShard.full(segment.length)
-        return PrefixShard.contiguous(
-            segment.length,
-            cp_rank=self.cp_rank,
-            cp_size=self.cp_size,
-        )
+        if self.cp_backend is None:
+            raise RuntimeError("CP execution is missing its backend")
+        return self.cp_backend.make_sequence_shard(segment.length)
 
     def _accumulate_past_anchor_gradients(self, anchors) -> None:
         if self.cp_enabled:

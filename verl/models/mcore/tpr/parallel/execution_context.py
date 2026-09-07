@@ -24,7 +24,8 @@ from typing import Any
 from torch import Tensor
 
 from ..kv_stack import KVStack
-from ..prefix_state import KVPrefixAnchors, PrefixShard
+from ..prefix_state import KVPrefixAnchors
+from ..shard import PrefixShard
 from .allgather_attention import (
     LocalKVBlock,
     _group_world_size_and_rank,

@@ -24,8 +24,9 @@ import torch
 from torch import Tensor
 
 from .context import KVPair
-from .prefix_state import KVPrefixState, PrefixShard, PrefixStateEntry, PrefixStateStack
+from .prefix_state import KVPrefixState, PrefixStateEntry, PrefixStateStack
 from .segment_plan import SegmentId, SegmentSpec
+from .shard import SequenceShard
 
 
 # Compatibility name retained for existing executor and profiling imports.
@@ -99,7 +100,7 @@ class KVStack(PrefixStateStack):
         segment: SegmentSpec,
         key_values: Mapping[int, KVPair],
         *,
-        shard: PrefixShard | None = None,
+        shard: SequenceShard | None = None,
     ) -> KVStackEntry:
         kv = KVPrefixState(segment.segment_id, segment.length, key_values, shard=shard)
         if self._entries:

@@ -26,6 +26,7 @@ from torch import Tensor
 
 from .context import KVPair
 from .segment_plan import SegmentId, SegmentSpec
+from .shard import PrefixShard, SequenceShard
 
 
 def _validate_segment_id(segment_id: SegmentId) -> None:
@@ -36,81 +37,6 @@ def _validate_segment_id(segment_id: SegmentId) -> None:
 def _validate_layer_number(layer_number: int) -> None:
     if not isinstance(layer_number, int) or isinstance(layer_number, bool) or layer_number <= 0:
         raise ValueError(f"layer_number must be a positive integer, got {layer_number!r}")
-
-
-@dataclass(frozen=True, slots=True)
-class PrefixShard:
-    """One uniform contiguous shard of a segment's sequence dimension."""
-
-    global_length: int
-    local_start: int
-    local_end: int
-    cp_rank: int = 0
-    cp_size: int = 1
-
-    def __post_init__(self) -> None:
-        for name, value in (
-            ("global_length", self.global_length),
-            ("local_start", self.local_start),
-            ("local_end", self.local_end),
-            ("cp_rank", self.cp_rank),
-            ("cp_size", self.cp_size),
-        ):
-            if not isinstance(value, int) or isinstance(value, bool):
-                raise ValueError(f"{name} must be an integer, got {value!r}")
-        if self.global_length <= 0:
-            raise ValueError(f"global_length must be positive, got {self.global_length}")
-        if self.cp_size <= 0:
-            raise ValueError(f"cp_size must be positive, got {self.cp_size}")
-        if self.cp_rank < 0 or self.cp_rank >= self.cp_size:
-            raise ValueError(f"cp_rank must be in [0, {self.cp_size}), got {self.cp_rank}")
-        if self.global_length % self.cp_size != 0:
-            raise ValueError(
-                f"global_length {self.global_length} must be divisible by cp_size {self.cp_size}"
-            )
-
-        expected_local_length = self.global_length // self.cp_size
-        expected_start = self.cp_rank * expected_local_length
-        expected_end = expected_start + expected_local_length
-        if (self.local_start, self.local_end) != (expected_start, expected_end):
-            raise ValueError(
-                "contiguous shard range mismatch: "
-                f"rank {self.cp_rank}/{self.cp_size} must own [{expected_start}, {expected_end}), "
-                f"got [{self.local_start}, {self.local_end})"
-            )
-
-    @classmethod
-    def full(cls, global_length: int) -> PrefixShard:
-        return cls(global_length, 0, global_length)
-
-    @classmethod
-    def contiguous(cls, global_length: int, *, cp_rank: int, cp_size: int) -> PrefixShard:
-        if (
-            not isinstance(global_length, int)
-            or isinstance(global_length, bool)
-            or global_length <= 0
-        ):
-            raise ValueError(f"global_length must be positive, got {global_length!r}")
-        if not isinstance(cp_size, int) or isinstance(cp_size, bool) or cp_size <= 0:
-            raise ValueError(f"cp_size must be positive, got {cp_size!r}")
-        if global_length % cp_size != 0:
-            raise ValueError(f"global_length {global_length} must be divisible by cp_size {cp_size}")
-        local_length = global_length // cp_size
-        return cls(
-            global_length,
-            cp_rank * local_length,
-            (cp_rank + 1) * local_length,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-        )
-
-    @property
-    def local_length(self) -> int:
-        return self.local_end - self.local_start
-
-    @property
-    def is_full(self) -> bool:
-        return self.cp_size == 1
 
 
 @runtime_checkable
@@ -128,7 +54,7 @@ class PrefixState(Protocol):
     def state_kind(self) -> str: ...
 
     @property
-    def shard(self) -> PrefixShard: ...
+    def shard(self) -> SequenceShard: ...
 
     @property
     def global_length(self) -> int: ...
@@ -158,7 +84,7 @@ class KVPrefixAnchors:
     """Autograd leaves for one local KV prefix state."""
 
     segment_id: SegmentId
-    shard: PrefixShard
+    shard: SequenceShard
     generation: int
     key_values: Mapping[int, KVPair]
 
@@ -231,7 +157,7 @@ class KVPrefixState:
         sequence_length: int,
         key_values: Mapping[int, KVPair],
         *,
-        shard: PrefixShard | None = None,
+        shard: SequenceShard | None = None,
     ) -> None:
         _validate_segment_id(segment_id)
         if (
@@ -242,8 +168,8 @@ class KVPrefixState:
             raise ValueError(f"sequence_length must be positive, got {sequence_length!r}")
         if shard is None:
             shard = PrefixShard.full(sequence_length)
-        elif not isinstance(shard, PrefixShard):
-            raise TypeError(f"shard must be PrefixShard, got {type(shard).__name__}")
+        elif not isinstance(shard, SequenceShard):
+            raise TypeError(f"shard must implement SequenceShard, got {type(shard).__name__}")
         elif shard.global_length != sequence_length:
             raise ValueError(
                 f"sequence_length {sequence_length} must match shard global_length {shard.global_length}"
@@ -262,7 +188,7 @@ class KVPrefixState:
         return self._segment_id
 
     @property
-    def shard(self) -> PrefixShard:
+    def shard(self) -> SequenceShard:
         return self._shard
 
     @property

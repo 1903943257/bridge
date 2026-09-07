@@ -21,6 +21,7 @@ from torch import nn
 import verl.models.mcore.tpr.parallel.execution_context as cp_execution
 import verl.models.mcore.tpr.segment_executor as segment_execution
 from verl.models.mcore.tpr import (
+    RangeSequenceShard,
     SegmentExecutor,
     SegmentLossTerm,
     SegmentPlan,
@@ -68,6 +69,37 @@ class _FakeCPModel(nn.Module):
         return token_signal.view(1, -1, 1) * classes.view(1, 1, -1)
 
 
+class _RangeCPBackend:
+    backend_name = "test-range"
+    parallel_size = 2
+    parallel_rank = 0
+
+    def validate_segment_length(self, global_length):
+        if global_length != 8:
+            raise ValueError("test backend only accepts length 8")
+
+    def make_sequence_shard(self, global_length):
+        self.validate_segment_length(global_length)
+        return RangeSequenceShard(global_length, ((0, 2), (6, 8)), cp_rank=0, cp_size=2)
+
+    def make_attention_backend(
+        self,
+        kv_stack,
+        *,
+        expected_layer_numbers,
+        current_shard,
+        past_anchors,
+    ):
+        del expected_layer_numbers, past_anchors
+        return SimpleNamespace(
+            global_prefix_length=kv_stack.prefix_length,
+            global_suffix_length=current_shard.global_length,
+            local_suffix_length=current_shard.local_length,
+            parallel_size=self.parallel_size,
+            attention=lambda *args, **kwargs: None,
+        )
+
+
 def _plan(*, root_length=8, first_length=6, second_length=4):
     root = SegmentSpec(
         0,
@@ -99,6 +131,18 @@ def _plan(*, root_length=8, first_length=6, second_length=4):
         loss_terms=(SegmentLossTerm(0, 29),),
     )
     return SegmentPlan((root, first, second), root_id=0)
+
+
+def _single_segment_plan():
+    root = SegmentSpec(
+        0,
+        None,
+        torch.arange(8, dtype=torch.long),
+        position_start=0,
+        prefix_length=0,
+        loss_terms=(SegmentLossTerm(1, 7), SegmentLossTerm(6, 11)),
+    )
+    return SegmentPlan((root,), root_id=0)
 
 
 @pytest.fixture
@@ -147,6 +191,33 @@ def test_push_executes_only_the_local_contiguous_shard(
     assert state.shard.cp_rank == rank
     assert state.shard.cp_size == 2
     assert state.key_values[1][0].shape[0] == 4
+
+
+def test_executor_uses_backend_owned_noncontiguous_shard(fake_cp_runtime):
+    group = fake_cp_runtime(0)
+    model = _FakeCPModel()
+    executor = SegmentExecutor(
+        model,
+        _single_segment_plan(),
+        expected_layer_numbers=(1,),
+        cp_group=group,
+        cp_backend=_RangeCPBackend(),
+    )
+
+    executor.push(0)
+
+    call = model.calls[0]
+    assert call.input_ids.tolist() == [[0, 1, 6, 7]]
+    assert call.position_ids.tolist() == [[0, 1, 6, 7]]
+    assert [(length, offset) for length, offset, _, _ in model.rotary_pos_emb.calls] == [
+        (2, 0),
+        (2, 6),
+    ]
+    assert tuple(term.query_offset for term in executor._owned_loss_terms(executor.plan.get(0))) == (
+        1,
+        6,
+    )
+    assert isinstance(executor.kv_stack.top().kv.shard, RangeSequenceShard)
 
 
 @pytest.mark.parametrize(

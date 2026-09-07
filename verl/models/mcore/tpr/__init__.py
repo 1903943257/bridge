@@ -32,22 +32,29 @@ from .fixed_topology_scheduler import (
 from .kv_stack import KVStack, KVStackEntry, PastKVAnchors, PastKVSlice, SegmentKV
 from .module_spec import make_tpr_module_spec_provider, replace_self_attention_with_tpr
 from .parallel import (
+    ALLGATHER_CP_BACKEND,
+    HYBRID_CP_BACKEND,
+    RING_CP_BACKEND,
+    ULYSSES_CP_BACKEND,
+    AllGatherCPBackend,
     AllGatherCPAttentionBackend,
     LocalKVBlock,
     ShardedPastKVAnchors,
+    TPRCPBackend,
     all_gather_sequence,
     allgather_cp_rectangular_attention,
+    resolve_tpr_cp_backend,
 )
 from .prefix_state import (
     KVPrefixAnchors,
     KVPrefixState,
-    PrefixShard,
     PrefixState,
     PrefixStateEntry,
     PrefixStateStack,
 )
 from .rectangular_attention import rectangular_causal_attention
-from .rope import build_suffix_rotary_pos_emb
+from .rope import build_sharded_rotary_pos_emb, build_suffix_rotary_pos_emb
+from .shard import PrefixShard, RangeSequenceShard, SequenceShard
 from .segment_executor import LeafVisitResult, SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
 from .segment_plan import (
     PopSegment,
@@ -60,10 +67,15 @@ from .segment_plan import (
 )
 
 __all__ = [
+    "ALLGATHER_CP_BACKEND",
+    "HYBRID_CP_BACKEND",
+    "RING_CP_BACKEND",
+    "ULYSSES_CP_BACKEND",
     "TPRSelfAttention",
     "TPRForwardBackwardRequest",
     "TPR_REQUEST_KEY",
     "AllGatherCPAttentionBackend",
+    "AllGatherCPBackend",
     "FixedTopologyScheduler",
     "KVStack",
     "KVStackEntry",
@@ -76,14 +88,17 @@ __all__ = [
     "PhysicalExecution",
     "PhysicalExecutionKind",
     "PrefixShard",
+    "RangeSequenceShard",
     "PrefixState",
     "PrefixStateEntry",
     "PrefixStateStack",
     "SegmentKV",
     "ShardedPastKVAnchors",
+    "SequenceShard",
     "SchedulerState",
     "TPRAttentionContext",
     "TPRAttentionBackend",
+    "TPRCPBackend",
     "TreeScheduleResult",
     "PopSegment",
     "PushSegment",
@@ -97,10 +112,12 @@ __all__ = [
     "SegmentSpec",
     "all_gather_sequence",
     "allgather_cp_rectangular_attention",
+    "build_sharded_rotary_pos_emb",
     "build_suffix_rotary_pos_emb",
     "get_tpr_attention_context",
     "make_tpr_module_spec_provider",
     "rectangular_causal_attention",
+    "resolve_tpr_cp_backend",
     "replace_self_attention_with_tpr",
     "use_tpr_attention_context",
 ]

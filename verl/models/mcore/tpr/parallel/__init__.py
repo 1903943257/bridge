@@ -19,6 +19,15 @@ from .allgather_attention import (
     all_gather_sequence,
     allgather_cp_rectangular_attention,
 )
+from .backend import (
+    ALLGATHER_CP_BACKEND,
+    HYBRID_CP_BACKEND,
+    RING_CP_BACKEND,
+    ULYSSES_CP_BACKEND,
+    AllGatherCPBackend,
+    TPRCPBackend,
+    resolve_tpr_cp_backend,
+)
 from .execution_context import (
     AllGatherCPAttentionBackend,
     ShardedPastKVAnchors,
@@ -30,9 +39,15 @@ from .execution_context import (
 )
 
 __all__ = [
+    "ALLGATHER_CP_BACKEND",
+    "HYBRID_CP_BACKEND",
+    "RING_CP_BACKEND",
+    "ULYSSES_CP_BACKEND",
+    "AllGatherCPBackend",
     "AllGatherCPAttentionBackend",
     "LocalKVBlock",
     "ShardedPastKVAnchors",
+    "TPRCPBackend",
     "accumulate_sharded_past_anchor_gradients",
     "all_gather_sequence",
     "allgather_cp_rectangular_attention",
@@ -40,4 +55,5 @@ __all__ = [
     "make_anchored_allgather_cp_backend",
     "make_cached_allgather_cp_backend",
     "resolve_cp_group",
+    "resolve_tpr_cp_backend",
 ]
