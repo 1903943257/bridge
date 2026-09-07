@@ -140,6 +140,8 @@ def _make_model(runtime):
         num_attention_heads=4,
         num_query_groups=2,
         kv_channels=32,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-6,
         attention_dropout=0.0,
         hidden_dropout=0.0,
         add_bias_linear=False,
