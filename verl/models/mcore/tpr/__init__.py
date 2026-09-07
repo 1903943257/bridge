@@ -26,6 +26,7 @@ from .fixed_topology_scheduler import (
 )
 from .kv_stack import KVStack, KVStackEntry, PastKVAnchors, PastKVSlice, SegmentKV
 from .module_spec import make_tpr_module_spec_provider, replace_self_attention_with_tpr
+from .parallel import LocalKVBlock, all_gather_sequence, allgather_cp_rectangular_attention
 from .prefix_state import (
     KVPrefixAnchors,
     KVPrefixState,
@@ -56,6 +57,7 @@ __all__ = [
     "KVStackEntry",
     "KVPrefixAnchors",
     "KVPrefixState",
+    "LocalKVBlock",
     "LeafVisitResult",
     "PastKVAnchors",
     "PastKVSlice",
@@ -79,6 +81,8 @@ __all__ = [
     "SegmentLossTerm",
     "SegmentPlan",
     "SegmentSpec",
+    "all_gather_sequence",
+    "allgather_cp_rectangular_attention",
     "build_suffix_rotary_pos_emb",
     "get_tree_attention_context",
     "make_tpr_module_spec_provider",
