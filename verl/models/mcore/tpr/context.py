@@ -29,7 +29,7 @@ KVPair = tuple[Tensor, Tensor]
 RotaryPosEmb = Tensor | tuple[Tensor, Tensor]
 
 
-class TreeAttentionBackend(Protocol):
+class TPRAttentionBackend(Protocol):
     """Per-forward backend for one sharded TPR attention execution."""
 
     @property
@@ -106,7 +106,7 @@ class TreeAttentionContext:
     suffix_length: int
     past_key_values: Mapping[int, KVPair] = field(default_factory=dict)
     suffix_rotary_pos_emb: RotaryPosEmb | None = None
-    attention_backend: TreeAttentionBackend | None = None
+    attention_backend: TPRAttentionBackend | None = None
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -130,7 +130,7 @@ class TreeAttentionContext:
             ]
             if missing or not callable(getattr(self.attention_backend, "attention", None)):
                 raise TypeError(
-                    "attention_backend must implement TreeAttentionBackend; "
+                    "attention_backend must implement TPRAttentionBackend; "
                     f"missing={missing}, got {type(self.attention_backend).__name__}"
                 )
             if self.past_key_values:

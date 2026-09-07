@@ -16,7 +16,7 @@
 
 from .attention import TPRSelfAttention
 from .context import (
-    TreeAttentionBackend,
+    TPRAttentionBackend,
     TreeAttentionContext,
     get_tree_attention_context,
     use_tree_attention_context,
@@ -83,7 +83,7 @@ __all__ = [
     "ShardedPastKVAnchors",
     "SchedulerState",
     "TreeAttentionContext",
-    "TreeAttentionBackend",
+    "TPRAttentionBackend",
     "TreeScheduleResult",
     "PopSegment",
     "PushSegment",
