@@ -26,6 +26,14 @@ from .fixed_topology_scheduler import (
 )
 from .kv_stack import KVStack, KVStackEntry, PastKVAnchors, PastKVSlice, SegmentKV
 from .module_spec import make_tpr_module_spec_provider, replace_self_attention_with_tpr
+from .prefix_state import (
+    KVPrefixAnchors,
+    KVPrefixState,
+    PrefixShard,
+    PrefixState,
+    PrefixStateEntry,
+    PrefixStateStack,
+)
 from .rectangular_attention import rectangular_causal_attention
 from .rope import build_suffix_rotary_pos_emb
 from .segment_executor import LeafVisitResult, SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
@@ -46,11 +54,17 @@ __all__ = [
     "FixedTopologyScheduler",
     "KVStack",
     "KVStackEntry",
+    "KVPrefixAnchors",
+    "KVPrefixState",
     "LeafVisitResult",
     "PastKVAnchors",
     "PastKVSlice",
     "PhysicalExecution",
     "PhysicalExecutionKind",
+    "PrefixShard",
+    "PrefixState",
+    "PrefixStateEntry",
+    "PrefixStateStack",
     "SegmentKV",
     "SchedulerState",
     "TreeAttentionContext",
