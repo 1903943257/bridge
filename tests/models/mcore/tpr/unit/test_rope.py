@@ -73,6 +73,21 @@ def test_suffix_rope_calls_megatron_embedding_with_offset_contract():
     ]
 
 
+def test_suffix_rope_can_disable_the_embedding_bound_cp_shard():
+    rotary_embedding = _RecordingRotaryEmbedding()
+
+    build_suffix_rotary_pos_emb(
+        rotary_embedding,
+        prefix_length=8,
+        suffix_length=4,
+        disable_context_parallel_sharding=True,
+    )
+
+    cp_group = rotary_embedding.calls[0]["cp_group"]
+    assert cp_group is not None
+    assert cp_group.size() == 1
+
+
 @pytest.mark.parametrize(
     ("prefix_length", "suffix_length", "match"),
     [(-1, 3, "prefix_length"), (True, 3, "prefix_length"), (0, 0, "suffix_length")],

@@ -31,11 +31,23 @@ class _RotaryEmbedding(Protocol):
     ) -> Tensor: ...
 
 
+class _UnshardedContextParallelGroup:
+    """Size-one sentinel that prevents RotaryEmbedding using its bound CP group."""
+
+    @staticmethod
+    def size() -> int:
+        return 1
+
+
+_UNSHARDED_CP_GROUP = _UnshardedContextParallelGroup()
+
+
 def build_suffix_rotary_pos_emb(
     rotary_embedding: _RotaryEmbedding,
     *,
     prefix_length: int,
     suffix_length: int,
+    disable_context_parallel_sharding: bool = False,
 ) -> Tensor:
     """Build standard 1D RoPE frequencies for positions ``[P, P+b)``.
 
@@ -54,7 +66,7 @@ def build_suffix_rotary_pos_emb(
         suffix_length,
         offset=prefix_length,
         packed_seq=False,
-        cp_group=None,
+        cp_group=_UNSHARDED_CP_GROUP if disable_context_parallel_sharding else None,
     )
     if not isinstance(rotary_pos_emb, Tensor):
         raise TypeError(

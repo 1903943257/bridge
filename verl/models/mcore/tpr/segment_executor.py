@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -25,8 +26,17 @@ from torch import Tensor, nn
 
 from .context import KVPair, TreeAttentionContext, use_tree_attention_context
 from .kv_stack import KVStack
+from .parallel.execution_context import (
+    ShardedPastKVAnchors,
+    accumulate_sharded_past_anchor_gradients,
+    build_sharded_past_anchors,
+    make_anchored_allgather_cp_backend,
+    make_cached_allgather_cp_backend,
+    resolve_cp_group,
+)
+from .prefix_state import PrefixShard
 from .rope import build_suffix_rotary_pos_emb
-from .segment_plan import SegmentId, SegmentPlan, SegmentSpec
+from .segment_plan import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +80,7 @@ class SegmentExecutor:
         expected_layer_numbers: tuple[int, ...] | None = None,
         kv_stack: KVStack | None = None,
         loss_scale_func: Callable[[Tensor], Tensor] | None = None,
+        cp_group: Any | None = None,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError(f"model must be torch.nn.Module, got {type(model).__name__}")
@@ -95,11 +106,28 @@ class SegmentExecutor:
         self.expected_layer_numbers = tuple(sorted(expected_layer_numbers))
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
+        self.cp_group = cp_group
+        if cp_group is None:
+            self.cp_size, self.cp_rank = 1, 0
+        else:
+            self.cp_size, self.cp_rank = resolve_cp_group(cp_group)
+            if self.cp_size <= 1:
+                raise ValueError(f"cp_group must contain more than one rank, got {self.cp_size}")
+            for segment in plan.segments.values():
+                if segment.length % self.cp_size != 0:
+                    raise ValueError(
+                        f"segment {segment.segment_id} length {segment.length} must be divisible "
+                        f"by CP size {self.cp_size}"
+                    )
         self._failed = False
 
     @property
     def failed(self) -> bool:
         return self._failed
+
+    @property
+    def cp_enabled(self) -> bool:
+        return self.cp_group is not None
 
     def push(self, segment_id: SegmentId) -> SegmentForwardResult:
         """Run a graph-free segment forward and push its new KV cache."""
@@ -109,7 +137,7 @@ class SegmentExecutor:
             segment = self.plan.get(segment_id)
             context, logits = self._forward(
                 segment,
-                past_key_values=self.kv_stack.build_past_key_values(),
+                past_key_values={} if self.cp_enabled else self.kv_stack.build_past_key_values(),
                 no_grad=True,
             )
             del logits
@@ -117,7 +145,7 @@ class SegmentExecutor:
             cached_key_values = _compact_kv_cache(context.new_key_values)
             layer_count = len(cached_key_values)
             del context
-            self.kv_stack.push(segment, cached_key_values)
+            self.kv_stack.push(segment, cached_key_values, shard=self._segment_shard(segment))
             return SegmentForwardResult(
                 segment_id=segment_id,
                 prefix_length=segment.prefix_length,
@@ -143,18 +171,33 @@ class SegmentExecutor:
                     f"segment {segment_id} relayed KV gradient layers must be {self.expected_layer_numbers}, "
                     f"got {tuple(relayed_gradients)}"
                 )
-            segment = self.kv_stack.pop(segment_id).segment
+            popped_entry = self.kv_stack.pop(segment_id)
+            segment = popped_entry.segment
             del entry
-            anchors = self.kv_stack.build_past_anchors()
-            context, logits = self._forward(segment, past_key_values=anchors.key_values, no_grad=False)
+            if self.cp_enabled:
+                popped_entry.kv.release()
+                anchors = build_sharded_past_anchors(self.kv_stack)
+                past_key_values = {}
+            else:
+                anchors = self.kv_stack.build_past_anchors()
+                past_key_values = anchors.key_values
+            context, logits = self._forward(
+                segment,
+                past_key_values=past_key_values,
+                no_grad=False,
+                sharded_past_anchors=anchors if self.cp_enabled else None,
+            )
             context.assert_new_kv_layers(self.expected_layer_numbers)
 
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
+            owned_loss_term_count = len(self._owned_loss_terms(segment))
             roots: list[Tensor] = []
             root_gradients: list[Tensor | None] = []
-            if segment.loss_terms:
-                backward_loss = (
-                    normalized_loss if self.loss_scale_func is None else self.loss_scale_func(normalized_loss)
+            if owned_loss_term_count or self.cp_enabled:
+                backward_loss = self._prepare_backward_loss(
+                    normalized_loss,
+                    logits=logits,
+                    has_owned_loss=owned_loss_term_count > 0,
                 )
                 if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
                     raise TypeError("loss_scale_func must return a scalar tensor")
@@ -170,14 +213,13 @@ class SegmentExecutor:
 
             if roots:
                 torch.autograd.backward(roots, grad_tensors=root_gradients)
-                if anchors.key_values:
-                    self.kv_stack.accumulate_anchor_gradients(anchors)
+                self._accumulate_past_anchor_gradients(anchors)
 
             return SegmentBackwardResult(
                 segment_id=segment_id,
                 loss_sum=loss_sum.detach(),
                 normalized_loss=normalized_loss.detach(),
-                loss_term_count=len(segment.loss_terms),
+                loss_term_count=owned_loss_term_count,
                 relayed_layer_count=len(relayed_gradients),
             )
         except Exception:
@@ -205,26 +247,34 @@ class SegmentExecutor:
                     f"got {segment.prefix_length}"
                 )
 
-            anchors = self.kv_stack.build_past_anchors()
-            context, logits = self._forward(segment, past_key_values=anchors.key_values, no_grad=False)
+            if self.cp_enabled:
+                anchors = build_sharded_past_anchors(self.kv_stack)
+                past_key_values = {}
+            else:
+                anchors = self.kv_stack.build_past_anchors()
+                past_key_values = anchors.key_values
+            context, logits = self._forward(
+                segment,
+                past_key_values=past_key_values,
+                no_grad=False,
+                sharded_past_anchors=anchors if self.cp_enabled else None,
+            )
             context.assert_new_kv_layers(self.expected_layer_numbers)
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
+            owned_loss_term_count = len(self._owned_loss_terms(segment))
 
-            if segment.loss_terms:
-                backward_loss = (
-                    normalized_loss if self.loss_scale_func is None else self.loss_scale_func(normalized_loss)
-                )
-                if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
-                    raise TypeError("loss_scale_func must return a scalar tensor")
-            else:
-                # First-version leaf-direct deliberately still performs one
-                # grad-enabled FWD+BWD for an empty-loss leaf. Keep the zero
-                # connected to the graph; a no-op fast path is a later concern.
-                backward_loss = logits.float().sum() * 0.0
+            # Every CP rank must traverse the same backward graph even when
+            # this rank owns no loss term, otherwise Attention collectives hang.
+            backward_loss = self._prepare_backward_loss(
+                normalized_loss,
+                logits=logits,
+                has_owned_loss=owned_loss_term_count > 0,
+            )
+            if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
+                raise TypeError("loss_scale_func must return a scalar tensor")
 
             torch.autograd.backward(backward_loss)
-            if anchors.key_values:
-                self.kv_stack.accumulate_anchor_gradients(anchors)
+            self._accumulate_past_anchor_gradients(anchors)
 
             return LeafVisitResult(
                 forward=SegmentForwardResult(
@@ -237,7 +287,7 @@ class SegmentExecutor:
                     segment_id=segment_id,
                     loss_sum=loss_sum.detach(),
                     normalized_loss=normalized_loss.detach(),
-                    loss_term_count=len(segment.loss_terms),
+                    loss_term_count=owned_loss_term_count,
                     relayed_layer_count=0,
                 ),
             )
@@ -251,24 +301,45 @@ class SegmentExecutor:
         *,
         past_key_values,
         no_grad: bool,
+        sharded_past_anchors: ShardedPastKVAnchors | None = None,
     ) -> tuple[TreeAttentionContext, Tensor]:
         device = _model_device(self.model)
-        input_ids = segment.token_ids.to(device=device).unsqueeze(0)
+        shard = self._segment_shard(segment)
+        local_token_ids = segment.token_ids[shard.local_start : shard.local_end]
+        input_ids = local_token_ids.to(device=device).unsqueeze(0)
         position_ids = torch.arange(
-            segment.position_start,
-            segment.position_end,
+            segment.position_start + shard.local_start,
+            segment.position_start + shard.local_end,
             dtype=torch.long,
             device=device,
         ).unsqueeze(0)
+        attention_backend = None
+        if self.cp_enabled:
+            if sharded_past_anchors is None:
+                attention_backend = make_cached_allgather_cp_backend(
+                    self.kv_stack,
+                    expected_layer_numbers=self.expected_layer_numbers,
+                    current_shard=shard,
+                    cp_group=self.cp_group,
+                )
+            else:
+                attention_backend = make_anchored_allgather_cp_backend(
+                    sharded_past_anchors,
+                    expected_layer_numbers=self.expected_layer_numbers,
+                    current_shard=shard,
+                    cp_group=self.cp_group,
+                )
         context = TreeAttentionContext(
             prefix_length=segment.prefix_length,
             suffix_length=segment.length,
             past_key_values=past_key_values,
             suffix_rotary_pos_emb=build_suffix_rotary_pos_emb(
                 self.model.rotary_pos_emb,
-                prefix_length=segment.prefix_length,
-                suffix_length=segment.length,
+                prefix_length=segment.position_start + shard.local_start,
+                suffix_length=shard.local_length,
+                disable_context_parallel_sharding=self.cp_enabled,
             ),
+            attention_backend=attention_backend,
         )
         grad_context = torch.no_grad() if no_grad else torch.enable_grad()
         with grad_context:
@@ -280,33 +351,35 @@ class SegmentExecutor:
                 )
         if not isinstance(logits, Tensor) or logits.ndim != 3:
             raise ValueError(f"model must return logits [batch, sequence, vocab], got {type(logits).__name__}")
-        expected_shape = (1, segment.length)
+        expected_shape = (1, shard.local_length)
         if tuple(logits.shape[:2]) != expected_shape:
             raise ValueError(f"model logits must start with shape {expected_shape}, got {tuple(logits.shape)}")
         return context, logits
 
     def _compute_loss(self, segment: SegmentSpec, logits: Tensor) -> tuple[Tensor, Tensor]:
-        if not segment.loss_terms:
+        owned_terms = self._owned_loss_terms(segment)
+        if not owned_terms:
             zero = logits.new_zeros((), dtype=torch.float32)
             return zero, zero
+        local_start = self._segment_shard(segment).local_start
         query_offsets = torch.tensor(
-            [term.query_offset for term in segment.loss_terms],
+            [term.query_offset - local_start for term in owned_terms],
             dtype=torch.long,
             device=logits.device,
         )
         targets = torch.tensor(
-            [term.target_token_id for term in segment.loss_terms],
+            [term.target_token_id for term in owned_terms],
             dtype=torch.long,
             device=logits.device,
         )
-        max_target = max(term.target_token_id for term in segment.loss_terms)
+        max_target = max(term.target_token_id for term in owned_terms)
         if max_target >= logits.shape[-1]:
             raise ValueError(
                 f"segment {segment.segment_id} target token {max_target} "
                 f"is outside vocabulary size {logits.shape[-1]}"
             )
         weights = torch.tensor(
-            [term.weight for term in segment.loss_terms],
+            [term.weight for term in owned_terms],
             dtype=torch.float32,
             device=logits.device,
         )
@@ -314,6 +387,44 @@ class SegmentExecutor:
         per_term_loss = F.cross_entropy(selected_logits, targets, reduction="none")
         loss_sum = torch.sum(per_term_loss * weights)
         return loss_sum, loss_sum / self.plan.total_loss_weight
+
+    def _owned_loss_terms(self, segment: SegmentSpec) -> tuple[SegmentLossTerm, ...]:
+        if not self.cp_enabled:
+            return segment.loss_terms
+        shard = self._segment_shard(segment)
+        return tuple(
+            term
+            for term in segment.loss_terms
+            if shard.local_start <= term.query_offset < shard.local_end
+        )
+
+    def _prepare_backward_loss(
+        self,
+        normalized_loss: Tensor,
+        *,
+        logits: Tensor,
+        has_owned_loss: bool,
+    ) -> Tensor:
+        if has_owned_loss:
+            backward_loss = normalized_loss * self.cp_size
+        else:
+            backward_loss = logits.float().sum() * 0.0
+        return backward_loss if self.loss_scale_func is None else self.loss_scale_func(backward_loss)
+
+    def _segment_shard(self, segment: SegmentSpec) -> PrefixShard:
+        if not self.cp_enabled:
+            return PrefixShard.full(segment.length)
+        return PrefixShard.contiguous(
+            segment.length,
+            cp_rank=self.cp_rank,
+            cp_size=self.cp_size,
+        )
+
+    def _accumulate_past_anchor_gradients(self, anchors) -> None:
+        if self.cp_enabled:
+            accumulate_sharded_past_anchor_gradients(self.kv_stack, anchors)
+        elif anchors.key_values:
+            self.kv_stack.accumulate_anchor_gradients(anchors)
 
     def _ensure_healthy(self) -> None:
         if self._failed:

@@ -61,6 +61,20 @@ class _StubTPRSelfAttention(TPRSelfAttention):
         return self.query, self.key, self.value
 
 
+class _StubShardedBackend:
+    def __init__(self, *, prefix_length, global_suffix_length, local_suffix_length, parallel_size=2):
+        self.global_prefix_length = prefix_length
+        self.global_suffix_length = global_suffix_length
+        self.local_suffix_length = local_suffix_length
+        self.parallel_size = parallel_size
+        self.calls = []
+
+    def attention(self, layer_number, query, new_key, new_value, *, softmax_scale):
+        self.calls.append((layer_number, query, new_key, new_value, softmax_scale))
+        dependency = new_key.sum() + new_value.sum()
+        return query.reshape(query.shape[0], 1, -1) + dependency
+
+
 def test_no_context_delegates_to_original_self_attention(monkeypatch):
     sentinel = (object(), object())
     recorded = {}
@@ -161,6 +175,55 @@ def test_tree_forward_with_zero_prefix_uses_only_new_kv(monkeypatch):
     assert captured["key"] is new_key
     assert captured["value"] is new_value
     assert captured["key"].shape[0] == suffix_length
+    assert context.new_key_values[2][0] is new_key
+    assert context.new_key_values[2][1] is new_value
+    assert new_key.grad is not None and torch.count_nonzero(new_key.grad)
+    assert new_value.grad is not None and torch.count_nonzero(new_value.grad)
+
+
+def test_tree_forward_routes_local_qkv_through_sharded_backend(monkeypatch):
+    prefix_length, global_suffix_length, local_suffix_length = 6, 8, 4
+    query = torch.randn(local_suffix_length, 1, 4, 8, requires_grad=True)
+    new_key = torch.randn(local_suffix_length, 1, 2, 8, requires_grad=True)
+    new_value = torch.randn(local_suffix_length, 1, 2, 8, requires_grad=True)
+    rope = torch.zeros(local_suffix_length, 1, 1, 8)
+    backend = _StubShardedBackend(
+        prefix_length=prefix_length,
+        global_suffix_length=global_suffix_length,
+        local_suffix_length=local_suffix_length,
+    )
+    rope_calls = []
+
+    def fake_rope(tensor, rotary, **kwargs):
+        rope_calls.append(kwargs)
+        return tensor
+
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", fake_rope)
+    monkeypatch.setattr(
+        tpr_attention,
+        "rectangular_causal_attention",
+        lambda *args, **kwargs: pytest.fail("sharded path must bypass the single-rank adapter"),
+    )
+    attention = _StubTPRSelfAttention(query, new_key, new_value)
+    attention.config.context_parallel_size = 2
+    context = TreeAttentionContext(
+        prefix_length=prefix_length,
+        suffix_length=global_suffix_length,
+        suffix_rotary_pos_emb=rope,
+        attention_backend=backend,
+    )
+
+    with use_tree_attention_context(context):
+        output, bias = attention(torch.randn(local_suffix_length, 1, 32), attention_mask=None)
+    output.sum().backward()
+
+    assert bias is None
+    assert len(backend.calls) == 1
+    layer_number, actual_query, actual_key, actual_value, scale = backend.calls[0]
+    assert layer_number == 2
+    assert actual_query is query and actual_key is new_key and actual_value is new_value
+    assert scale == 0.25
+    assert all(call["cp_group"] is None for call in rope_calls)
     assert context.new_key_values[2][0] is new_key
     assert context.new_key_values[2][1] is new_value
     assert new_key.grad is not None and torch.count_nonzero(new_key.grad)

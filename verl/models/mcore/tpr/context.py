@@ -21,11 +21,38 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import Protocol
 
 from torch import Tensor
 
 KVPair = tuple[Tensor, Tensor]
 RotaryPosEmb = Tensor | tuple[Tensor, Tensor]
+
+
+class TreeAttentionBackend(Protocol):
+    """Per-forward backend for one sharded TPR attention execution."""
+
+    @property
+    def global_prefix_length(self) -> int: ...
+
+    @property
+    def global_suffix_length(self) -> int: ...
+
+    @property
+    def local_suffix_length(self) -> int: ...
+
+    @property
+    def parallel_size(self) -> int: ...
+
+    def attention(
+        self,
+        layer_number: int,
+        query: Tensor,
+        new_key: Tensor,
+        new_value: Tensor,
+        *,
+        softmax_scale: float | None,
+    ) -> Tensor: ...
 
 
 def _validate_layer_number(layer_number: int) -> None:
@@ -79,6 +106,7 @@ class TreeAttentionContext:
     suffix_length: int
     past_key_values: Mapping[int, KVPair] = field(default_factory=dict)
     suffix_rotary_pos_emb: RotaryPosEmb | None = None
+    attention_backend: TreeAttentionBackend | None = None
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -88,6 +116,37 @@ class TreeAttentionContext:
             raise ValueError(f"suffix_length must be a positive integer, got {self.suffix_length!r}")
         if self.prefix_length == 0 and self.past_key_values:
             raise ValueError("past_key_values must be empty when prefix_length is 0")
+        if self.attention_backend is not None:
+            missing = [
+                name
+                for name in (
+                    "global_prefix_length",
+                    "global_suffix_length",
+                    "local_suffix_length",
+                    "parallel_size",
+                    "attention",
+                )
+                if not hasattr(self.attention_backend, name)
+            ]
+            if missing or not callable(getattr(self.attention_backend, "attention", None)):
+                raise TypeError(
+                    "attention_backend must implement TreeAttentionBackend; "
+                    f"missing={missing}, got {type(self.attention_backend).__name__}"
+                )
+            if self.past_key_values:
+                raise ValueError("past_key_values must be empty when an attention_backend is active")
+            if self.attention_backend.global_prefix_length != self.prefix_length:
+                raise ValueError(
+                    "attention backend prefix length must match TreeAttentionContext: "
+                    f"backend={self.attention_backend.global_prefix_length}, context={self.prefix_length}"
+                )
+            if self.attention_backend.global_suffix_length != self.suffix_length:
+                raise ValueError(
+                    "attention backend suffix length must match TreeAttentionContext: "
+                    f"backend={self.attention_backend.global_suffix_length}, context={self.suffix_length}"
+                )
+            if self.attention_backend.local_suffix_length <= 0:
+                raise ValueError("attention backend local suffix length must be positive")
 
         normalized_past: dict[int, KVPair] = {}
         for layer_number, pair in self.past_key_values.items():
@@ -112,10 +171,20 @@ class TreeAttentionContext:
 
         return MappingProxyType(self._new_key_values)
 
+    @property
+    def local_suffix_length(self) -> int:
+        """Sequence length physically executed by this rank."""
+
+        if self.attention_backend is None:
+            return self.suffix_length
+        return self.attention_backend.local_suffix_length
+
     def get_past_kv(self, layer_number: int) -> KVPair | None:
         """Return this layer's prefix KV, or ``None`` for a zero-length prefix."""
 
         _validate_layer_number(layer_number)
+        if self.attention_backend is not None:
+            raise RuntimeError("sharded attention must obtain prefix state from its attention backend")
         if self.prefix_length == 0:
             return None
         try:
@@ -133,7 +202,7 @@ class TreeAttentionContext:
             layer_number,
             key,
             value,
-            expected_sequence_length=self.suffix_length,
+            expected_sequence_length=self.local_suffix_length,
             kind="new",
         )
         self._new_key_values[layer_number] = (key, value)

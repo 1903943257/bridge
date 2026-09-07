@@ -102,7 +102,9 @@ class TPRSelfAttention(SelfAttention):
         )
 
         q_pos_emb, k_pos_emb = _as_rotary_pair(context.suffix_rotary_pos_emb)
-        cp_group = getattr(self.pg_collection, "cp", None)
+        # A sharded backend receives rank-local RoPE that was already sliced
+        # by SegmentExecutor; passing cp_group here would shard it a second time.
+        cp_group = None if context.attention_backend is not None else getattr(self.pg_collection, "cp", None)
         rope_kwargs = {
             "config": self.config,
             "cu_seqlens": None,
@@ -112,23 +114,32 @@ class TPRSelfAttention(SelfAttention):
         query = apply_rotary_pos_emb(query, q_pos_emb, **rope_kwargs)
         new_key = apply_rotary_pos_emb(new_key, k_pos_emb, **rope_kwargs)
 
-        past_kv = context.get_past_kv(self.layer_number)
-        if past_kv is None:
-            key = new_key
-            value = new_value
+        if context.attention_backend is not None:
+            core_attn_out = context.attention_backend.attention(
+                self.layer_number,
+                query,
+                new_key,
+                new_value,
+                softmax_scale=getattr(self.core_attention, "softmax_scale", None),
+            )
         else:
-            past_key, past_value = past_kv
-            _validate_past_compatibility(self.layer_number, past_key, past_value, new_key, new_value)
-            key = _concat_sequence(past_key, new_key)
-            value = _concat_sequence(past_value, new_value)
+            past_kv = context.get_past_kv(self.layer_number)
+            if past_kv is None:
+                key = new_key
+                value = new_value
+            else:
+                past_key, past_value = past_kv
+                _validate_past_compatibility(self.layer_number, past_key, past_value, new_key, new_value)
+                key = _concat_sequence(past_key, new_key)
+                value = _concat_sequence(past_value, new_value)
 
-        core_attn_out = rectangular_causal_attention(
-            query,
-            key,
-            value,
-            softmax_scale=getattr(self.core_attention, "softmax_scale", None),
-            dropout_p=0.0,
-        )
+            core_attn_out = rectangular_causal_attention(
+                query,
+                key,
+                value,
+                softmax_scale=getattr(self.core_attention, "softmax_scale", None),
+                dropout_p=0.0,
+            )
 
         # Collect post-RoPE K and raw V without detach/clone, preserving the
         # graph both for descendants and for gradients into an external prefix.
@@ -157,14 +168,14 @@ class TPRSelfAttention(SelfAttention):
                 "TPR external-KV mode requires hidden_states [suffix, 1, hidden], "
                 f"got {hidden_states.shape}"
             )
-        if hidden_states.shape[0] != context.suffix_length:
+        if hidden_states.shape[0] != context.local_suffix_length:
             raise ValueError(
                 f"hidden suffix length ({hidden_states.shape[0]}) does not match "
-                f"TreeAttentionContext ({context.suffix_length})"
+                f"TreeAttentionContext local length ({context.local_suffix_length})"
             )
         if context.suffix_rotary_pos_emb is None:
             raise ValueError("TreeAttentionContext.suffix_rotary_pos_emb is required in TPR mode")
-        _validate_rotary_sequence_length(context.suffix_rotary_pos_emb, context.suffix_length)
+        _validate_rotary_sequence_length(context.suffix_rotary_pos_emb, context.local_suffix_length)
 
         unsupported = {
             "key_value_states": key_value_states,
@@ -199,12 +210,20 @@ class TPRSelfAttention(SelfAttention):
         for name in (
             "tensor_model_parallel_size",
             "pipeline_model_parallel_size",
-            "context_parallel_size",
             "expert_model_parallel_size",
         ):
             value = getattr(self.config, name, 1)
             if value != 1:
                 raise NotImplementedError(f"TPR external-KV MVP requires {name}=1, got {value}")
+        context_parallel_size = getattr(self.config, "context_parallel_size", 1)
+        expected_context_parallel_size = (
+            1 if context.attention_backend is None else context.attention_backend.parallel_size
+        )
+        if context_parallel_size != expected_context_parallel_size:
+            raise ValueError(
+                "TPR attention backend/config CP size mismatch: "
+                f"backend={expected_context_parallel_size}, config={context_parallel_size}"
+            )
 
 
 def _as_rotary_pair(rotary_pos_emb: Union[Tensor, Tuple[Tensor, Tensor], None]) -> tuple[Tensor, Tensor]:

@@ -24,7 +24,7 @@ import torch
 from torch import Tensor
 
 from .context import KVPair
-from .prefix_state import KVPrefixState, PrefixStateEntry, PrefixStateStack
+from .prefix_state import KVPrefixState, PrefixShard, PrefixStateEntry, PrefixStateStack
 from .segment_plan import SegmentId, SegmentSpec
 
 
@@ -94,8 +94,14 @@ class KVStack(PrefixStateStack):
             raise TypeError(f"KVStack contains {type(entry).__name__}")
         return entry
 
-    def push(self, segment: SegmentSpec, key_values: Mapping[int, KVPair]) -> KVStackEntry:
-        kv = KVPrefixState(segment.segment_id, segment.length, key_values)
+    def push(
+        self,
+        segment: SegmentSpec,
+        key_values: Mapping[int, KVPair],
+        *,
+        shard: PrefixShard | None = None,
+    ) -> KVStackEntry:
+        kv = KVPrefixState(segment.segment_id, segment.length, key_values, shard=shard)
         if self._entries:
             first = self._entries[0]
             previous = self._entries[-1]
@@ -134,6 +140,8 @@ class KVStack(PrefixStateStack):
 
         if not self._entries:
             return MappingProxyType({})
+        if any(entry.kv.shard.cp_size != 1 for entry in self._entries if isinstance(entry, KVStackEntry)):
+            raise RuntimeError("sharded KV must be consumed through a context-parallel attention backend")
         result: dict[int, KVPair] = {}
         for layer_number in self._entries[0].kv.layer_numbers:
             entries = [entry for entry in self._entries if isinstance(entry, KVStackEntry)]

@@ -15,7 +15,12 @@
 """Model-side primitives for depth-first tree attention training."""
 
 from .attention import TPRSelfAttention
-from .context import TreeAttentionContext, get_tree_attention_context, use_tree_attention_context
+from .context import (
+    TreeAttentionBackend,
+    TreeAttentionContext,
+    get_tree_attention_context,
+    use_tree_attention_context,
+)
 from .engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
 from .fixed_topology_scheduler import (
     FixedTopologyScheduler,
@@ -26,7 +31,13 @@ from .fixed_topology_scheduler import (
 )
 from .kv_stack import KVStack, KVStackEntry, PastKVAnchors, PastKVSlice, SegmentKV
 from .module_spec import make_tpr_module_spec_provider, replace_self_attention_with_tpr
-from .parallel import LocalKVBlock, all_gather_sequence, allgather_cp_rectangular_attention
+from .parallel import (
+    AllGatherCPAttentionBackend,
+    LocalKVBlock,
+    ShardedPastKVAnchors,
+    all_gather_sequence,
+    allgather_cp_rectangular_attention,
+)
 from .prefix_state import (
     KVPrefixAnchors,
     KVPrefixState,
@@ -52,6 +63,7 @@ __all__ = [
     "TPRSelfAttention",
     "TPRForwardBackwardRequest",
     "TPR_REQUEST_KEY",
+    "AllGatherCPAttentionBackend",
     "FixedTopologyScheduler",
     "KVStack",
     "KVStackEntry",
@@ -68,8 +80,10 @@ __all__ = [
     "PrefixStateEntry",
     "PrefixStateStack",
     "SegmentKV",
+    "ShardedPastKVAnchors",
     "SchedulerState",
     "TreeAttentionContext",
+    "TreeAttentionBackend",
     "TreeScheduleResult",
     "PopSegment",
     "PushSegment",
