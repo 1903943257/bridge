@@ -241,3 +241,9 @@ def test_tpr_forward_rejects_missing_suffix_rope_before_qkv():
             assert "suffix_rotary_pos_emb" in str(exc)
         else:
             raise AssertionError("missing suffix RoPE must be rejected")
+
+
+def test_softmax_scale_is_read_through_mindspeed_ulysses_wrapper():
+    wrapped = SimpleNamespace(local_attn=SimpleNamespace(softmax_scale=0.125))
+
+    assert tpr_attention._core_attention_softmax_scale(wrapped) == 0.125

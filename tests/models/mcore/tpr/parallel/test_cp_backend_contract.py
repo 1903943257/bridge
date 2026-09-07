@@ -22,6 +22,7 @@ from verl.models.mcore.tpr import (
     PrefixShard,
     RangeSequenceShard,
     TPRCPBackend,
+    UlyssesCPBackend,
 )
 from verl.models.mcore.tpr.parallel import resolve_tpr_cp_backend
 
@@ -63,7 +64,31 @@ def test_resolver_accepts_a_structural_custom_backend():
     ) is backend
 
 
-@pytest.mark.parametrize("name", ["ulysses", "ring", "hybrid"])
+def test_resolver_constructs_the_ulysses_adapter():
+    backend = resolve_tpr_cp_backend(
+        "ulysses",
+        cp_group=object(),
+        parallel_size=2,
+        parallel_rank=1,
+    )
+
+    assert isinstance(backend, UlyssesCPBackend)
+    assert backend.backend_name == "ulysses"
+    assert backend.make_sequence_shard(8) == PrefixShard.contiguous(8, cp_rank=1, cp_size=2)
+
+
+def test_resolver_accepts_the_mindspeed_ulysses_algorithm_name():
+    backend = resolve_tpr_cp_backend(
+        "ulysses_cp_algo",
+        cp_group=object(),
+        parallel_size=2,
+        parallel_rank=0,
+    )
+
+    assert isinstance(backend, UlyssesCPBackend)
+
+
+@pytest.mark.parametrize("name", ["ring", "hybrid"])
 def test_planned_backends_fail_explicitly_instead_of_falling_back(name):
     with pytest.raises(NotImplementedError, match=name):
         resolve_tpr_cp_backend(

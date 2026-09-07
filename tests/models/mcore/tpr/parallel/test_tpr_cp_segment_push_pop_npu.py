@@ -349,12 +349,15 @@ def _execute_and_capture(
     logical_indices,
     logprob_values,
     owner_counts,
+    *,
+    cp_backend=None,
 ):
     executor = SegmentExecutor(
         model,
         plan,
         expected_layer_numbers=tuple(range(1, _LAYER_COUNT + 1)),
         cp_group=runtime.cp_group,
+        cp_backend=cp_backend,
     )
     original_compute_loss = executor._compute_loss
 
@@ -362,8 +365,11 @@ def _execute_and_capture(
         owned_terms = executor._owned_loss_terms(segment)
         if owned_terms:
             shard = executor._segment_shard(segment)
+            local_offsets = tuple(shard.global_to_local(term.query_offset) for term in owned_terms)
+            if any(offset is None for offset in local_offsets):
+                raise AssertionError("owned loss term is not present in the local sequence shard")
             query_offsets = torch.tensor(
-                [term.query_offset - shard.local_start for term in owned_terms],
+                local_offsets,
                 dtype=torch.long,
                 device=runtime.device,
             )
@@ -476,6 +482,8 @@ def _run_tpr_cp(
     runtime,
     logical_indices,
     logical_count,
+    *,
+    cp_backend="allgather",
 ):
     model.zero_grad(set_to_none=True)
     logprobs = torch.zeros(logical_count, dtype=torch.float32, device=runtime.device)
@@ -487,6 +495,7 @@ def _run_tpr_cp(
         logical_indices,
         logprobs,
         owner_counts,
+        cp_backend=cp_backend,
     )
     global_loss, global_logprobs = _aggregate_loss_and_logprobs(
         result.normalized_loss, logprobs, owner_counts, runtime
@@ -666,11 +675,13 @@ def test_cp2_scheduler_reuses_prefix_across_unequal_siblings_and_pops(cp_runtime
     ("prefix_length", "first_suffix_length", "second_suffix_length"),
     _EQUIVALENCE_CASES,
 )
+@pytest.mark.parametrize("tpr_backend", ("allgather", "ulysses"))
 def test_cp2_tpr_matches_independent_allgather_cp(
     cp_runtime,
     prefix_length,
     first_suffix_length,
     second_suffix_length,
+    tpr_backend,
 ):
     runtime = cp_runtime
     dist.barrier(group=runtime.cp_group)
@@ -710,6 +721,7 @@ def test_cp2_tpr_matches_independent_allgather_cp(
         runtime,
         logical_indices,
         logical_count,
+        cp_backend=tpr_backend,
     )
     actual = _run_tpr_cp(
         tpr_model,
@@ -791,7 +803,7 @@ def test_cp2_tpr_matches_independent_allgather_cp(
 
     if runtime.rank == 0:
         print(
-            "\nTPR CP=2 controlled equivalence passed\n"
+            f"\nTPR CP=2 {tpr_backend} controlled equivalence passed\n"
             f"  topology: P={prefix_length}, S1={first_suffix_length}, "
             f"S2={second_suffix_length}\n"
             f"  target logprobs: {logical_count}\n"

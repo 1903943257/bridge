@@ -41,9 +41,12 @@ from .parallel import (
     LocalKVBlock,
     ShardedPastKVAnchors,
     TPRCPBackend,
+    UlyssesCPAttentionBackend,
+    UlyssesCPBackend,
     all_gather_sequence,
     allgather_cp_rectangular_attention,
     resolve_tpr_cp_backend,
+    ulysses_cp_rectangular_attention,
 )
 from .prefix_state import (
     KVPrefixAnchors,
@@ -99,6 +102,8 @@ __all__ = [
     "TPRAttentionContext",
     "TPRAttentionBackend",
     "TPRCPBackend",
+    "UlyssesCPAttentionBackend",
+    "UlyssesCPBackend",
     "TreeScheduleResult",
     "PopSegment",
     "PushSegment",
@@ -120,4 +125,5 @@ __all__ = [
     "resolve_tpr_cp_backend",
     "replace_self_attention_with_tpr",
     "use_tpr_attention_context",
+    "ulysses_cp_rectangular_attention",
 ]

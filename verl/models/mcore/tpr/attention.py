@@ -120,7 +120,7 @@ class TPRSelfAttention(SelfAttention):
                 query,
                 new_key,
                 new_value,
-                softmax_scale=getattr(self.core_attention, "softmax_scale", None),
+                softmax_scale=_core_attention_softmax_scale(self.core_attention),
             )
         else:
             past_kv = context.get_past_kv(self.layer_number)
@@ -137,7 +137,7 @@ class TPRSelfAttention(SelfAttention):
                 query,
                 key,
                 value,
-                softmax_scale=getattr(self.core_attention, "softmax_scale", None),
+                softmax_scale=_core_attention_softmax_scale(self.core_attention),
                 dropout_p=0.0,
             )
 
@@ -273,3 +273,13 @@ def _concat_sequence(prefix: Tensor, suffix: Tensor) -> Tensor:
     # Kept as a tiny seam so tests can assert that external KV remains part of
     # the autograd graph without introducing any storage transformation here.
     return torch.cat((prefix, suffix), dim=0)
+
+
+def _core_attention_softmax_scale(core_attention) -> float | None:
+    """Read the scale through MindSpeed's Ulysses wrapper when present."""
+
+    scale = getattr(core_attention, "softmax_scale", None)
+    if scale is not None:
+        return scale
+    local_attention = getattr(core_attention, "local_attn", None)
+    return None if local_attention is None else getattr(local_attention, "softmax_scale", None)

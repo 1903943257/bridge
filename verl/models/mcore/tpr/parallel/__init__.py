@@ -26,8 +26,10 @@ from .backend import (
     ULYSSES_CP_BACKEND,
     AllGatherCPBackend,
     TPRCPBackend,
+    UlyssesCPBackend,
     resolve_tpr_cp_backend,
 )
+from .ulysses_attention import UlyssesCPAttentionBackend, ulysses_cp_rectangular_attention
 from .execution_context import (
     AllGatherCPAttentionBackend,
     ShardedPastKVAnchors,
@@ -48,6 +50,8 @@ __all__ = [
     "LocalKVBlock",
     "ShardedPastKVAnchors",
     "TPRCPBackend",
+    "UlyssesCPAttentionBackend",
+    "UlyssesCPBackend",
     "accumulate_sharded_past_anchor_gradients",
     "all_gather_sequence",
     "allgather_cp_rectangular_attention",
@@ -56,4 +60,5 @@ __all__ = [
     "make_cached_allgather_cp_backend",
     "resolve_cp_group",
     "resolve_tpr_cp_backend",
+    "ulysses_cp_rectangular_attention",
 ]
