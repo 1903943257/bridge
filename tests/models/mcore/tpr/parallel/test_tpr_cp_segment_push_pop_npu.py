@@ -23,6 +23,7 @@ Run from the verl repository root with two visible NPUs::
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -33,7 +34,6 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
 from verl.models.mcore.tpr import (
@@ -79,6 +79,27 @@ def cp_runtime():
     torch.npu.set_device(local_rank)
     if not dist.is_initialized():
         dist.init_process_group(backend="hccl")
+
+    # Match the production NPU bootstrap before Megatron initializes its
+    # model-parallel RNG tracker. MindSpeed also redirects the legacy
+    # ``torch.cuda`` RNG calls in this Megatron revision to torch_npu.
+    pytest_argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = pytest_argv
+
+    from mindspeed.args_utils import get_full_args
+
+    vars(get_full_args()).pop("", None)
+    repatch(
+        {
+            "context_parallel_size": _EXPECTED_WORLD_SIZE,
+            "context_parallel_algo": "megatron_cp_algo",
+        }
+    )
+
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=1,
@@ -86,6 +107,9 @@ def cp_runtime():
             context_parallel_size=_EXPECTED_WORLD_SIZE,
             expert_model_parallel_size=1,
         )
+
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
     model_parallel_cuda_manual_seed(260907)
 
     cp_group = parallel_state.get_context_parallel_group()
