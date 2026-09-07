@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .context import KVPair, TreeAttentionContext, use_tree_attention_context
+from .context import KVPair, TPRAttentionContext, use_tpr_attention_context
 from .kv_stack import KVStack
 from .parallel.execution_context import (
     ShardedPastKVAnchors,
@@ -302,7 +302,7 @@ class SegmentExecutor:
         past_key_values,
         no_grad: bool,
         sharded_past_anchors: ShardedPastKVAnchors | None = None,
-    ) -> tuple[TreeAttentionContext, Tensor]:
+    ) -> tuple[TPRAttentionContext, Tensor]:
         device = _model_device(self.model)
         shard = self._segment_shard(segment)
         local_token_ids = segment.token_ids[shard.local_start : shard.local_end]
@@ -329,7 +329,7 @@ class SegmentExecutor:
                     current_shard=shard,
                     cp_group=self.cp_group,
                 )
-        context = TreeAttentionContext(
+        context = TPRAttentionContext(
             prefix_length=segment.prefix_length,
             suffix_length=segment.length,
             past_key_values=past_key_values,
@@ -343,7 +343,7 @@ class SegmentExecutor:
         )
         grad_context = torch.no_grad() if no_grad else torch.enable_grad()
         with grad_context:
-            with use_tree_attention_context(context):
+            with use_tpr_attention_context(context):
                 logits = self.model(
                     input_ids=input_ids,
                     position_ids=position_ids,

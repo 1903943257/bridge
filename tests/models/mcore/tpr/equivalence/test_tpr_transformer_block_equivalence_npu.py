@@ -26,10 +26,10 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from verl.models.mcore.tpr import (
     TPRSelfAttention,
-    TreeAttentionContext,
+    TPRAttentionContext,
     build_suffix_rotary_pos_emb,
     replace_self_attention_with_tpr,
-    use_tree_attention_context,
+    use_tpr_attention_context,
 )
 from verl.utils.device import is_torch_npu_available
 
@@ -252,12 +252,12 @@ def test_two_layer_transformer_block_full_vs_external_kv(
             prefix_length=0,
             suffix_length=prefix_length,
         )
-        prefix_context = TreeAttentionContext(
+        prefix_context = TPRAttentionContext(
             prefix_length=0,
             suffix_length=prefix_length,
             suffix_rotary_pos_emb=prefix_rope,
         )
-        with use_tree_attention_context(prefix_context):
+        with use_tpr_attention_context(prefix_context):
             block(hidden_states=prefix_hidden, attention_mask=None)
         _assert_collected_kv(prefix_context, prefix_length)
         past_key_values = prefix_context.new_key_values
@@ -272,13 +272,13 @@ def test_two_layer_transformer_block_full_vs_external_kv(
         prefix_length=prefix_length,
         suffix_length=suffix_length,
     )
-    suffix_context = TreeAttentionContext(
+    suffix_context = TPRAttentionContext(
         prefix_length=prefix_length,
         suffix_length=suffix_length,
         past_key_values=past_key_values,
         suffix_rotary_pos_emb=suffix_rope,
     )
-    with use_tree_attention_context(suffix_context):
+    with use_tpr_attention_context(suffix_context):
         tpr_suffix_output = block(hidden_states=suffix_hidden, attention_mask=None)
     _assert_collected_kv(suffix_context, suffix_length)
     # 校验：可以成功读取KV，不强制对象身份完全一致

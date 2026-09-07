@@ -18,9 +18,9 @@ import torch
 import torch.nn.functional as F
 
 from verl.models.mcore.tpr import (
-    TreeAttentionContext,
+    TPRAttentionContext,
     build_suffix_rotary_pos_emb,
-    use_tree_attention_context,
+    use_tpr_attention_context,
 )
 
 from ..equivalence.test_tpr_gpt_model_equivalence_npu import (
@@ -64,7 +64,7 @@ def test_tpr_16k_prefix_8k_suffix_forward_backward_is_finite(monkeypatch):
         torch.arange(17, 17 + full_length, dtype=torch.long, device=device) % _VOCAB_SIZE
     ).unsqueeze(0)
 
-    prefix_context = TreeAttentionContext(
+    prefix_context = TPRAttentionContext(
         prefix_length=0,
         suffix_length=_PREFIX_LENGTH,
         suffix_rotary_pos_emb=build_suffix_rotary_pos_emb(
@@ -73,7 +73,7 @@ def test_tpr_16k_prefix_8k_suffix_forward_backward_is_finite(monkeypatch):
             suffix_length=_PREFIX_LENGTH,
         ),
     )
-    with use_tree_attention_context(prefix_context):
+    with use_tpr_attention_context(prefix_context):
         prefix_logits = model(
             input_ids=input_ids[:, :_PREFIX_LENGTH],
             position_ids=_position_ids(0, _PREFIX_LENGTH, device),
@@ -90,7 +90,7 @@ def test_tpr_16k_prefix_8k_suffix_forward_backward_is_finite(monkeypatch):
         retained_past[layer_number] = (past_key, past_value)
     del prefix_logits
 
-    suffix_context = TreeAttentionContext(
+    suffix_context = TPRAttentionContext(
         prefix_length=_PREFIX_LENGTH,
         suffix_length=_SUFFIX_LENGTH,
         past_key_values=past_key_values,
@@ -100,7 +100,7 @@ def test_tpr_16k_prefix_8k_suffix_forward_backward_is_finite(monkeypatch):
             suffix_length=_SUFFIX_LENGTH,
         ),
     )
-    with use_tree_attention_context(suffix_context):
+    with use_tpr_attention_context(suffix_context):
         suffix_logits = model(
             input_ids=input_ids[:, _PREFIX_LENGTH:],
             position_ids=_position_ids(_PREFIX_LENGTH, _SUFFIX_LENGTH, device),

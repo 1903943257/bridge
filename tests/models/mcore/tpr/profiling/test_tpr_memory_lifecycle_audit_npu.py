@@ -268,7 +268,7 @@ def test_root_pop_storage_lifecycle_and_fresh_prefix_forward(monkeypatch):
     # The build-anchors hook can observe a CPython expression temporary. The
     # forward-entry sample is the meaningful lifetime boundary and is reported
     # rather than made gating, because this file is an opt-in diagnostic audit.
-    assert not audit["executor_state"]["tree_context_active"]
+    assert not audit["executor_state"]["tpr_context_active"]
 
 
 def test_reference_forward_backward_phase_memory(monkeypatch):

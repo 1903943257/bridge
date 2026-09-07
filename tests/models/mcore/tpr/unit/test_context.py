@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import TreeAttentionContext, get_tree_attention_context, use_tree_attention_context
+from verl.models.mcore.tpr import TPRAttentionContext, get_tpr_attention_context, use_tpr_attention_context
 
 
 def _kv(sequence_length: int, *, requires_grad: bool = False):
@@ -25,32 +25,32 @@ def _kv(sequence_length: int, *, requires_grad: bool = False):
 
 
 def test_context_manager_sets_and_restores_context():
-    outer = TreeAttentionContext(prefix_length=0, suffix_length=3)
-    inner = TreeAttentionContext(prefix_length=0, suffix_length=2)
+    outer = TPRAttentionContext(prefix_length=0, suffix_length=3)
+    inner = TPRAttentionContext(prefix_length=0, suffix_length=2)
 
-    assert get_tree_attention_context() is None
-    with use_tree_attention_context(outer):
-        assert get_tree_attention_context() is outer
-        with use_tree_attention_context(inner):
-            assert get_tree_attention_context() is inner
-        assert get_tree_attention_context() is outer
-    assert get_tree_attention_context() is None
+    assert get_tpr_attention_context() is None
+    with use_tpr_attention_context(outer):
+        assert get_tpr_attention_context() is outer
+        with use_tpr_attention_context(inner):
+            assert get_tpr_attention_context() is inner
+        assert get_tpr_attention_context() is outer
+    assert get_tpr_attention_context() is None
 
 
 def test_context_manager_restores_context_after_exception():
-    context = TreeAttentionContext(prefix_length=0, suffix_length=3)
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
 
     with pytest.raises(RuntimeError, match="expected failure"):
-        with use_tree_attention_context(context):
-            assert get_tree_attention_context() is context
+        with use_tpr_attention_context(context):
+            assert get_tpr_attention_context() is context
             raise RuntimeError("expected failure")
-    assert get_tree_attention_context() is None
+    assert get_tpr_attention_context() is None
 
 
 def test_past_kv_is_selected_by_layer_number_without_detaching():
     layer_1 = _kv(6, requires_grad=True)
     layer_2 = _kv(6, requires_grad=True)
-    context = TreeAttentionContext(
+    context = TPRAttentionContext(
         prefix_length=6,
         suffix_length=3,
         past_key_values={1: layer_1, 2: layer_2},
@@ -63,18 +63,18 @@ def test_past_kv_is_selected_by_layer_number_without_detaching():
 
 
 def test_zero_prefix_returns_no_past_kv():
-    context = TreeAttentionContext(prefix_length=0, suffix_length=3)
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
     assert context.get_past_kv(1) is None
 
 
 def test_missing_past_kv_fails_with_layer_number():
-    context = TreeAttentionContext(prefix_length=6, suffix_length=3, past_key_values={1: _kv(6)})
+    context = TPRAttentionContext(prefix_length=6, suffix_length=3, past_key_values={1: _kv(6)})
     with pytest.raises(KeyError, match="layer 2"):
         context.get_past_kv(2)
 
 
 def test_new_kv_collector_preserves_tensor_identity_and_checks_layers():
-    context = TreeAttentionContext(prefix_length=6, suffix_length=3, past_key_values={1: _kv(6)})
+    context = TPRAttentionContext(prefix_length=6, suffix_length=3, past_key_values={1: _kv(6)})
     new_key, new_value = _kv(3, requires_grad=True)
 
     context.set_new_kv(1, new_key, new_value)
@@ -86,7 +86,7 @@ def test_new_kv_collector_preserves_tensor_identity_and_checks_layers():
 
 
 def test_duplicate_new_kv_is_rejected():
-    context = TreeAttentionContext(prefix_length=0, suffix_length=3)
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
     new_key, new_value = _kv(3)
     context.set_new_kv(1, new_key, new_value)
 
@@ -100,20 +100,20 @@ def test_duplicate_new_kv_is_rejected():
 )
 def test_invalid_lengths_are_rejected(prefix_length, suffix_length, match):
     with pytest.raises(ValueError, match=match):
-        TreeAttentionContext(prefix_length=prefix_length, suffix_length=suffix_length)
+        TPRAttentionContext(prefix_length=prefix_length, suffix_length=suffix_length)
 
 
 def test_invalid_past_or_new_kv_length_is_rejected():
     with pytest.raises(ValueError, match="past KV sequence length"):
-        TreeAttentionContext(prefix_length=6, suffix_length=3, past_key_values={1: _kv(5)})
+        TPRAttentionContext(prefix_length=6, suffix_length=3, past_key_values={1: _kv(5)})
 
-    context = TreeAttentionContext(prefix_length=0, suffix_length=3)
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
     with pytest.raises(ValueError, match="new KV sequence length"):
         context.set_new_kv(1, *_kv(2))
 
 
 def test_collector_reports_missing_and_unexpected_layers():
-    context = TreeAttentionContext(prefix_length=0, suffix_length=3)
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
     context.set_new_kv(2, *_kv(3))
 
     with pytest.raises(RuntimeError, match=r"missing=\[1\], unexpected=\[2\]"):

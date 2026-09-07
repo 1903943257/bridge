@@ -94,7 +94,7 @@ def _validate_kv_pair(
 
 
 @dataclass(slots=True)
-class TreeAttentionContext:
+class TPRAttentionContext:
     """External KV state scoped to one prefix or suffix model forward.
 
     Tensor references are stored unchanged. In particular, this class never
@@ -137,12 +137,12 @@ class TreeAttentionContext:
                 raise ValueError("past_key_values must be empty when an attention_backend is active")
             if self.attention_backend.global_prefix_length != self.prefix_length:
                 raise ValueError(
-                    "attention backend prefix length must match TreeAttentionContext: "
+                    "attention backend prefix length must match TPRAttentionContext: "
                     f"backend={self.attention_backend.global_prefix_length}, context={self.prefix_length}"
                 )
             if self.attention_backend.global_suffix_length != self.suffix_length:
                 raise ValueError(
-                    "attention backend suffix length must match TreeAttentionContext: "
+                    "attention backend suffix length must match TPRAttentionContext: "
                     f"backend={self.attention_backend.global_suffix_length}, context={self.suffix_length}"
                 )
             if self.attention_backend.local_suffix_length <= 0:
@@ -220,26 +220,26 @@ class TreeAttentionContext:
             raise RuntimeError(f"new KV layer mismatch: missing={missing}, unexpected={unexpected}")
 
 
-_TREE_ATTENTION_CONTEXT: ContextVar[TreeAttentionContext | None] = ContextVar(
-    "tree_attention_context",
+_TPR_ATTENTION_CONTEXT: ContextVar[TPRAttentionContext | None] = ContextVar(
+    "tpr_attention_context",
     default=None,
 )
 
 
-def get_tree_attention_context() -> TreeAttentionContext | None:
+def get_tpr_attention_context() -> TPRAttentionContext | None:
     """Return the context for the current model forward, if one is active."""
 
-    return _TREE_ATTENTION_CONTEXT.get()
+    return _TPR_ATTENTION_CONTEXT.get()
 
 
 @contextmanager
-def use_tree_attention_context(context: TreeAttentionContext) -> Iterator[TreeAttentionContext]:
+def use_tpr_attention_context(context: TPRAttentionContext) -> Iterator[TPRAttentionContext]:
     """Activate ``context`` and reliably restore the previous context."""
 
-    if not isinstance(context, TreeAttentionContext):
-        raise TypeError(f"context must be a TreeAttentionContext, got {type(context).__name__}")
-    token = _TREE_ATTENTION_CONTEXT.set(context)
+    if not isinstance(context, TPRAttentionContext):
+        raise TypeError(f"context must be a TPRAttentionContext, got {type(context).__name__}")
+    token = _TPR_ATTENTION_CONTEXT.set(context)
     try:
         yield context
     finally:
-        _TREE_ATTENTION_CONTEXT.reset(token)
+        _TPR_ATTENTION_CONTEXT.reset(token)

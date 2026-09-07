@@ -21,7 +21,7 @@ from verl.models.mcore.tpr import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
-    get_tree_attention_context,
+    get_tpr_attention_context,
 )
 from verl.models.mcore.tpr.segment_executor import _compact_kv_cache
 
@@ -43,7 +43,7 @@ class _FakeTPRModel(nn.Module):
         del position_ids, attention_mask
         if self.fail:
             raise RuntimeError("injected forward failure")
-        context = get_tree_attention_context()
+        context = get_tpr_attention_context()
         assert context is not None
         token_signal = input_ids.transpose(0, 1).to(self.scale.dtype).view(-1, 1, 1, 1) * self.scale
         past_signal = self.scale.new_zeros(())

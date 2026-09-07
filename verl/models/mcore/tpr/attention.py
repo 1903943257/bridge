@@ -27,14 +27,14 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.typed_torch import apply_module
 
-from .context import TreeAttentionContext, get_tree_attention_context
+from .context import TPRAttentionContext, get_tpr_attention_context
 from .rectangular_attention import rectangular_causal_attention
 
 
 class TPRSelfAttention(SelfAttention):
     """Self-attention that consumes per-layer external KV in tree mode.
 
-    With no active :class:`TreeAttentionContext`, this class delegates the
+    With no active :class:`TPRAttentionContext`, this class delegates the
     complete call to Megatron's ``SelfAttention.forward``.  The external-KV
     branch is intentionally restricted to the first MVP configuration and
     bypasses only Megatron/MindSpeed's core-attention wrapper.
@@ -56,7 +56,7 @@ class TPRSelfAttention(SelfAttention):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor | None]:
-        context = get_tree_attention_context()
+        context = get_tpr_attention_context()
         if context is None:
             return super().forward(
                 hidden_states,
@@ -91,7 +91,7 @@ class TPRSelfAttention(SelfAttention):
     def _tree_forward(
         self,
         hidden_states: Tensor,
-        context: TreeAttentionContext,
+        context: TPRAttentionContext,
     ) -> tuple[Tensor, Tensor | None]:
         # Reuse Megatron's projection, GQA reshaping, and optional Q/K norms.
         query, new_key, new_value = self.get_query_key_value_tensors(
@@ -149,7 +149,7 @@ class TPRSelfAttention(SelfAttention):
     def _validate_tree_forward(
         self,
         *,
-        context: TreeAttentionContext,
+        context: TPRAttentionContext,
         hidden_states: Tensor,
         key_value_states: Optional[Tensor],
         inference_context: Optional[BaseInferenceContext],
@@ -171,10 +171,10 @@ class TPRSelfAttention(SelfAttention):
         if hidden_states.shape[0] != context.local_suffix_length:
             raise ValueError(
                 f"hidden suffix length ({hidden_states.shape[0]}) does not match "
-                f"TreeAttentionContext local length ({context.local_suffix_length})"
+                f"TPRAttentionContext local length ({context.local_suffix_length})"
             )
         if context.suffix_rotary_pos_emb is None:
-            raise ValueError("TreeAttentionContext.suffix_rotary_pos_emb is required in TPR mode")
+            raise ValueError("TPRAttentionContext.suffix_rotary_pos_emb is required in TPR mode")
         _validate_rotary_sequence_length(context.suffix_rotary_pos_emb, context.local_suffix_length)
 
         unsupported = {

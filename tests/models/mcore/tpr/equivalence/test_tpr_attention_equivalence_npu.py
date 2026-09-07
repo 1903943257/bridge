@@ -27,10 +27,10 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from verl.models.mcore.tpr import (
     TPRSelfAttention,
-    TreeAttentionContext,
+    TPRAttentionContext,
     build_suffix_rotary_pos_emb,
     replace_self_attention_with_tpr,
-    use_tree_attention_context,
+    use_tpr_attention_context,
 )
 from verl.utils.device import is_torch_npu_available
 
@@ -228,12 +228,12 @@ def test_real_megatron_attention_full_vs_external_kv(prefix_length, suffix_lengt
             prefix_length=0,
             suffix_length=prefix_length,
         )
-        prefix_context = TreeAttentionContext(
+        prefix_context = TPRAttentionContext(
             prefix_length=0,
             suffix_length=prefix_length,
             suffix_rotary_pos_emb=prefix_rope,
         )
-        with use_tree_attention_context(prefix_context):
+        with use_tpr_attention_context(prefix_context):
             attention(prefix_hidden, attention_mask=None)
         prefix_context.assert_new_kv_layers([1])
         past_key_values = prefix_context.new_key_values
@@ -248,13 +248,13 @@ def test_real_megatron_attention_full_vs_external_kv(prefix_length, suffix_lengt
         prefix_length=prefix_length,
         suffix_length=suffix_length,
     )
-    suffix_context = TreeAttentionContext(
+    suffix_context = TPRAttentionContext(
         prefix_length=prefix_length,
         suffix_length=suffix_length,
         past_key_values=past_key_values,
         suffix_rotary_pos_emb=suffix_rope,
     )
-    with use_tree_attention_context(suffix_context):
+    with use_tpr_attention_context(suffix_context):
         tpr_suffix_output, tpr_bias = attention(suffix_hidden, attention_mask=None)
     assert tpr_bias is None
     suffix_context.assert_new_kv_layers([1])

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import torch
 
 from megatron.core.transformer.attention import SelfAttention
-from verl.models.mcore.tpr import TPRSelfAttention, TreeAttentionContext, use_tree_attention_context
+from verl.models.mcore.tpr import TPRSelfAttention, TPRAttentionContext, use_tpr_attention_context
 from verl.models.mcore.tpr import attention as tpr_attention
 
 
@@ -96,7 +96,7 @@ def test_no_context_delegates_to_original_self_attention(monkeypatch):
     assert recorded["packed_seq_params"] is None
 
 
-def test_tree_forward_selects_layer_kv_collects_new_kv_and_preserves_prefix_grad(monkeypatch):
+def test_tpr_forward_selects_layer_kv_collects_new_kv_and_preserves_prefix_grad(monkeypatch):
     prefix_length, suffix_length = 6, 3
     query = torch.randn(suffix_length, 1, 4, 8, requires_grad=True)
     new_key = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
@@ -119,14 +119,14 @@ def test_tree_forward_selects_layer_kv_collects_new_kv_and_preserves_prefix_grad
 
     monkeypatch.setattr(tpr_attention, "rectangular_causal_attention", fake_rectangular)
     attention = _StubTPRSelfAttention(query, new_key, new_value)
-    context = TreeAttentionContext(
+    context = TPRAttentionContext(
         prefix_length=prefix_length,
         suffix_length=suffix_length,
         past_key_values={1: other_layer_kv, 2: (past_key, past_value)},
         suffix_rotary_pos_emb=rope,
     )
 
-    with use_tree_attention_context(context):
+    with use_tpr_attention_context(context):
         output, bias = attention(torch.randn(suffix_length, 1, 32), attention_mask=None)
     output.sum().backward()
 
@@ -143,7 +143,7 @@ def test_tree_forward_selects_layer_kv_collects_new_kv_and_preserves_prefix_grad
     assert other_layer_kv[1].grad is None
 
 
-def test_tree_forward_with_zero_prefix_uses_only_new_kv(monkeypatch):
+def test_tpr_forward_with_zero_prefix_uses_only_new_kv(monkeypatch):
     suffix_length = 6
     query = torch.randn(suffix_length, 1, 4, 8, requires_grad=True)
     new_key = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
@@ -160,13 +160,13 @@ def test_tree_forward_with_zero_prefix_uses_only_new_kv(monkeypatch):
 
     monkeypatch.setattr(tpr_attention, "rectangular_causal_attention", fake_rectangular)
     attention = _StubTPRSelfAttention(query, new_key, new_value)
-    context = TreeAttentionContext(
+    context = TPRAttentionContext(
         prefix_length=0,
         suffix_length=suffix_length,
         suffix_rotary_pos_emb=rope,
     )
 
-    with use_tree_attention_context(context):
+    with use_tpr_attention_context(context):
         output, bias = attention(torch.randn(suffix_length, 1, 32), attention_mask=None)
     output.sum().backward()
 
@@ -181,7 +181,7 @@ def test_tree_forward_with_zero_prefix_uses_only_new_kv(monkeypatch):
     assert new_value.grad is not None and torch.count_nonzero(new_value.grad)
 
 
-def test_tree_forward_routes_local_qkv_through_sharded_backend(monkeypatch):
+def test_tpr_forward_routes_local_qkv_through_sharded_backend(monkeypatch):
     prefix_length, global_suffix_length, local_suffix_length = 6, 8, 4
     query = torch.randn(local_suffix_length, 1, 4, 8, requires_grad=True)
     new_key = torch.randn(local_suffix_length, 1, 2, 8, requires_grad=True)
@@ -206,14 +206,14 @@ def test_tree_forward_routes_local_qkv_through_sharded_backend(monkeypatch):
     )
     attention = _StubTPRSelfAttention(query, new_key, new_value)
     attention.config.context_parallel_size = 2
-    context = TreeAttentionContext(
+    context = TPRAttentionContext(
         prefix_length=prefix_length,
         suffix_length=global_suffix_length,
         suffix_rotary_pos_emb=rope,
         attention_backend=backend,
     )
 
-    with use_tree_attention_context(context):
+    with use_tpr_attention_context(context):
         output, bias = attention(torch.randn(local_suffix_length, 1, 32), attention_mask=None)
     output.sum().backward()
 
@@ -230,11 +230,11 @@ def test_tree_forward_routes_local_qkv_through_sharded_backend(monkeypatch):
     assert new_value.grad is not None and torch.count_nonzero(new_value.grad)
 
 
-def test_tree_forward_rejects_missing_suffix_rope_before_qkv():
+def test_tpr_forward_rejects_missing_suffix_rope_before_qkv():
     attention = _StubTPRSelfAttention(None, None, None)
-    context = TreeAttentionContext(prefix_length=0, suffix_length=3)
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
 
-    with use_tree_attention_context(context), torch.no_grad():
+    with use_tpr_attention_context(context), torch.no_grad():
         try:
             attention(torch.randn(3, 1, 16), attention_mask=None)
         except ValueError as exc:

@@ -407,7 +407,7 @@ def test_qwen3_real_checkpoint_matches_reference_and_tpr(monkeypatch):
     suffixes = (_tokens(700, _SUFFIX_LENGTH, device), _tokens(1300, _SUFFIX_LENGTH, device))
 
     # TPRSelfAttention must remain a transparent replacement without an active
-    # TreeAttentionContext.
+    # TPRAttentionContext.
     full_tokens = torch.cat((prefix, suffixes[0])).unsqueeze(0)
     positions = torch.arange(full_length, device=device).unsqueeze(0)
     causal_mask = torch.triu(

@@ -25,8 +25,8 @@ from verl.models.mcore.tpr import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
-    TreeAttentionContext,
-    get_tree_attention_context,
+    TPRAttentionContext,
+    get_tpr_attention_context,
 )
 
 
@@ -53,7 +53,7 @@ class _FakeCPModel(nn.Module):
 
     def forward(self, *, input_ids, position_ids, attention_mask):
         del attention_mask
-        context = get_tree_attention_context()
+        context = get_tpr_attention_context()
         assert context is not None
         self.calls.append(
             SimpleNamespace(
@@ -227,7 +227,7 @@ def test_non_divisible_segment_is_rejected_before_execution(fake_cp_runtime):
         )
 
 
-def test_tree_context_rejects_mismatched_sharded_backend_lengths():
+def test_tpr_context_rejects_mismatched_sharded_backend_lengths():
     backend = SimpleNamespace(
         global_prefix_length=4,
         global_suffix_length=8,
@@ -236,7 +236,7 @@ def test_tree_context_rejects_mismatched_sharded_backend_lengths():
         attention=lambda *args, **kwargs: None,
     )
     with pytest.raises(ValueError, match="prefix length"):
-        TreeAttentionContext(
+        TPRAttentionContext(
             prefix_length=6,
             suffix_length=8,
             suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 2),

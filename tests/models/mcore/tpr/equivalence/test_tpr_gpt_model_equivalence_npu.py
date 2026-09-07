@@ -27,10 +27,10 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from verl.models.mcore.tpr import (
     TPRSelfAttention,
-    TreeAttentionContext,
+    TPRAttentionContext,
     build_suffix_rotary_pos_emb,
     replace_self_attention_with_tpr,
-    use_tree_attention_context,
+    use_tpr_attention_context,
 )
 from verl.utils.device import is_torch_npu_available
 
@@ -351,7 +351,7 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
     past_key_values = {}
     retained_past = {}
     if prefix_length:
-        prefix_context = TreeAttentionContext(
+        prefix_context = TPRAttentionContext(
             prefix_length=0,
             suffix_length=prefix_length,
             suffix_rotary_pos_emb=build_suffix_rotary_pos_emb(
@@ -361,7 +361,7 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
             ),
         )
         with _finite_forward_hooks(model, "TPR prefix forward"):
-            with use_tree_attention_context(prefix_context):
+            with use_tpr_attention_context(prefix_context):
                 prefix_logits = model(
                     input_ids=full_input_ids[:, :prefix_length],
                     position_ids=_position_ids(0, prefix_length, device),
@@ -377,7 +377,7 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
             past_value.retain_grad()
             retained_past[layer_number] = (past_key, past_value)
 
-    suffix_context = TreeAttentionContext(
+    suffix_context = TPRAttentionContext(
         prefix_length=prefix_length,
         suffix_length=suffix_length,
         past_key_values=past_key_values,
@@ -388,7 +388,7 @@ def test_tiny_gpt_model_full_vs_external_kv(prefix_length, suffix_length, monkey
         ),
     )
     with _finite_forward_hooks(model, "TPR suffix forward"):
-        with use_tree_attention_context(suffix_context):
+        with use_tpr_attention_context(suffix_context):
             tpr_suffix_logits = model(
                 input_ids=full_input_ids[:, prefix_length:],
                 position_ids=_position_ids(prefix_length, suffix_length, device),

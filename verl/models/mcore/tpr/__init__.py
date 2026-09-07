@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-side primitives for depth-first tree attention training."""
+"""Model-side primitives for depth-first tree-prefix-reuse training."""
 
 from .attention import TPRSelfAttention
 from .context import (
     TPRAttentionBackend,
-    TreeAttentionContext,
-    get_tree_attention_context,
-    use_tree_attention_context,
+    TPRAttentionContext,
+    get_tpr_attention_context,
+    use_tpr_attention_context,
 )
 from .engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
 from .fixed_topology_scheduler import (
@@ -82,7 +82,7 @@ __all__ = [
     "SegmentKV",
     "ShardedPastKVAnchors",
     "SchedulerState",
-    "TreeAttentionContext",
+    "TPRAttentionContext",
     "TPRAttentionBackend",
     "TreeScheduleResult",
     "PopSegment",
@@ -98,9 +98,9 @@ __all__ = [
     "all_gather_sequence",
     "allgather_cp_rectangular_attention",
     "build_suffix_rotary_pos_emb",
-    "get_tree_attention_context",
+    "get_tpr_attention_context",
     "make_tpr_module_spec_provider",
     "rectangular_causal_attention",
     "replace_self_attention_with_tpr",
-    "use_tree_attention_context",
+    "use_tpr_attention_context",
 ]

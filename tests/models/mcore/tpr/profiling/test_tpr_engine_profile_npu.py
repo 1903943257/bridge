@@ -44,7 +44,7 @@ from ..equivalence.test_segment_push_pop_npu import _install_single_rank_runtime
 from verl.models.mcore.tpr import TPR_REQUEST_KEY, TPRForwardBackwardRequest, SegmentExecutor
 from verl.models.mcore.tpr import attention as tpr_attention_module
 from verl.models.mcore.tpr import rectangular_attention as rectangular_attention_module
-from verl.models.mcore.tpr.context import TreeAttentionContext, get_tree_attention_context
+from verl.models.mcore.tpr.context import TPRAttentionContext, get_tpr_attention_context
 from verl.models.mcore.tpr.kv_stack import KVStack, KVStackEntry, SegmentKV
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
@@ -211,7 +211,7 @@ def _verify_fused_adapter_path(run, zero_grad, *, expected_path):
     original_tree_forward = tpr_attention_module.TPRSelfAttention._tree_forward
 
     def counted_attention(*args, **kwargs):
-        path_name = "tpr" if get_tree_attention_context() is not None else "reference"
+        path_name = "tpr" if get_tpr_attention_context() is not None else "reference"
         adapter_calls[path_name] += 1
         if path_name == "tpr":
             segment_scope = _TRACE_SEGMENT_SCOPE.get()
@@ -235,7 +235,7 @@ def _verify_fused_adapter_path(run, zero_grad, *, expected_path):
         return original_adapter(*args, **kwargs)
 
     def counted_fusion_attention(*args, **kwargs):
-        path_name = "tpr" if get_tree_attention_context() is not None else "reference"
+        path_name = "tpr" if get_tpr_attention_context() is not None else "reference"
         fusion_calls[path_name] += 1
         return original_fusion(*args, **kwargs)
 
@@ -548,7 +548,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
             row.update(
                 {
                     "push_context": _gc_object_ownership(
-                        popped_owner_ids["context"], TreeAttentionContext
+                        popped_owner_ids["context"], TPRAttentionContext
                     ),
                     "new_kv_dict": _gc_object_ownership(
                         popped_owner_ids["new_kv_dict"], dict
@@ -605,7 +605,7 @@ def _collect_root_pop_memory_breakdown(run, zero_grad):
         executor_state = {
             "stack_segment_ids": executor.kv_stack.segment_ids,
             "stack_prefix_length": executor.kv_stack.prefix_length,
-            "tree_context_active": get_tree_attention_context() is not None,
+            "tpr_context_active": get_tpr_attention_context() is not None,
         }
         # Do not let the diagnostic wrapper extend the KVStackEntry/KV tensor
         # lifetime across SegmentExecutor.pop(). Only weakrefs and primitive

@@ -10,9 +10,9 @@ import pytest
 import torch
 
 from verl.models.mcore.tpr import (
-    TreeAttentionContext,
+    TPRAttentionContext,
     build_suffix_rotary_pos_emb,
-    use_tree_attention_context,
+    use_tpr_attention_context,
 )
 
 from .test_tpr_gpt_model_equivalence_npu import (
@@ -78,14 +78,14 @@ def _full_step(model, optimizer, input_ids, prefix_length, suffix_length, upstre
 def _external_kv_step(model, optimizer, input_ids, prefix_length, suffix_length, upstream_gradient):
     past_key_values = {}
     if prefix_length:
-        prefix_context = TreeAttentionContext(
+        prefix_context = TPRAttentionContext(
             prefix_length=0,
             suffix_length=prefix_length,
             suffix_rotary_pos_emb=build_suffix_rotary_pos_emb(
                 model.rotary_pos_emb, prefix_length=0, suffix_length=prefix_length
             ),
         )
-        with use_tree_attention_context(prefix_context):
+        with use_tpr_attention_context(prefix_context):
             prefix_logits = model(
                 input_ids=input_ids[:, :prefix_length],
                 position_ids=_position_ids(0, prefix_length, input_ids.device),
@@ -99,7 +99,7 @@ def _external_kv_step(model, optimizer, input_ids, prefix_length, suffix_length,
         past_key_values = prefix_context.new_key_values
         del prefix_logits
 
-    suffix_context = TreeAttentionContext(
+    suffix_context = TPRAttentionContext(
         prefix_length=prefix_length,
         suffix_length=suffix_length,
         past_key_values=past_key_values,
@@ -109,7 +109,7 @@ def _external_kv_step(model, optimizer, input_ids, prefix_length, suffix_length,
             suffix_length=suffix_length,
         ),
     )
-    with use_tree_attention_context(suffix_context):
+    with use_tpr_attention_context(suffix_context):
         suffix_logits = model(
             input_ids=input_ids[:, prefix_length:],
             position_ids=_position_ids(prefix_length, suffix_length, input_ids.device),
