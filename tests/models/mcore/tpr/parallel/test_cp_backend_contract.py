@@ -16,9 +16,12 @@ from types import SimpleNamespace
 
 import pytest
 
+import verl.models.mcore.tpr.parallel.backend as backend_module
 from verl.models.mcore.tpr import (
     ALLGATHER_CP_BACKEND,
     AllGatherCPBackend,
+    HybridCPBackend,
+    HybridCPTopology,
     PrefixShard,
     RangeSequenceShard,
     RingCPBackend,
@@ -110,15 +113,41 @@ def test_resolver_constructs_the_ring_adapter(name):
         backend.validate_segment_length(10)
 
 
-@pytest.mark.parametrize("name", ["hybrid"])
-def test_planned_backends_fail_explicitly_instead_of_falling_back(name):
-    with pytest.raises(NotImplementedError, match=name):
-        resolve_tpr_cp_backend(
-            name,
-            cp_group=object(),
-            parallel_size=2,
-            parallel_rank=0,
-        )
+@pytest.mark.parametrize("name", ["hybrid", "hybrid_cp_algo"])
+def test_resolver_constructs_the_hybrid_adapter(monkeypatch, name):
+    cp_group = object()
+    topology = HybridCPTopology(
+        cp_group=cp_group,
+        ulysses_group=object(),
+        ring_group=object(),
+        cp_size=4,
+        cp_rank=0,
+        ulysses_size=2,
+        ulysses_rank=0,
+        ring_size=2,
+        ring_rank=0,
+    )
+    monkeypatch.setattr(
+        backend_module,
+        "resolve_mindspeed_hybrid_topology",
+        lambda group, **kwargs: topology,
+    )
+
+    backend = resolve_tpr_cp_backend(
+        name,
+        cp_group=cp_group,
+        parallel_size=4,
+        parallel_rank=0,
+    )
+
+    assert isinstance(backend, HybridCPBackend)
+    assert backend.backend_name == "hybrid"
+    assert backend.make_sequence_shard(16) == RangeSequenceShard(
+        16,
+        ((0, 4),),
+        cp_rank=0,
+        cp_size=4,
+    )
 
 
 def test_unknown_backend_name_is_rejected():

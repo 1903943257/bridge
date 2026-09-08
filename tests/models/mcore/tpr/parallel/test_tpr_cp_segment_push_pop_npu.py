@@ -12,11 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CP=2 penetration test for TPR Push/Visit/Pop execution.
+"""CP penetration tests for TPR Push/Visit/Pop execution.
 
 Run from the verl repository root with two visible NPUs::
 
     torchrun --standalone --nproc_per_node=2 -m pytest -s -v \
+        tests/models/mcore/tpr/parallel/test_tpr_cp_segment_push_pop_npu.py
+
+Run the Hybrid-only CP=4 cases with::
+
+    torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29508 \
+        -m pytest -s -v -k cp4_hybrid \
         tests/models/mcore/tpr/parallel/test_tpr_cp_segment_push_pop_npu.py
 """
 
@@ -24,7 +30,7 @@ from __future__ import annotations
 
 import os
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -39,6 +45,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
 import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
+import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
+import verl.models.mcore.tpr.parallel.ulysses_attention as ulysses_attention
 from verl.models.mcore.tpr import (
     FixedTopologyScheduler,
     PhysicalExecutionKind,
@@ -60,6 +68,8 @@ from ._cp_gdn_test_utils import (
 
 
 _EXPECTED_WORLD_SIZE = 2
+_HYBRID_WORLD_SIZE = 4
+_HYBRID_ULYSSES_SIZE = 2
 _PREFIX_LENGTH = 1024
 _FIRST_SUFFIX_LENGTH = 512
 _SECOND_SUFFIX_LENGTH = 256
@@ -70,6 +80,10 @@ _EQUIVALENCE_CASES = (
     (128, 64, 32),
     (1024, 512, 256),
     (2048, 128, 512),
+)
+_HYBRID_EQUIVALENCE_CASES = (
+    (128, 64, 32),
+    (1024, 512, 256),
 )
 _LOSS_RELATIVE_TOL = 5e-4
 _LOGPROB_ATOL = 5e-2
@@ -85,17 +99,11 @@ _GRAD_COSINE_MIN = 0.999
 if not is_torch_npu_available(check_device=True):
     pytest.skip("Requires an Ascend NPU", allow_module_level=True)
 
-pytestmark = pytest.mark.skipif(
-    int(os.getenv("WORLD_SIZE", "1")) != _EXPECTED_WORLD_SIZE,
-    reason=(
-        "Run with: torchrun --standalone --nproc_per_node=2 -m pytest -s -v "
-        "tests/models/mcore/tpr/parallel/test_tpr_cp_segment_push_pop_npu.py"
-    ),
-)
-
 
 @pytest.fixture(scope="module")
 def cp_runtime():
+    if int(os.getenv("WORLD_SIZE", "1")) != _EXPECTED_WORLD_SIZE:
+        pytest.skip("CP=2 cases require torchrun --nproc_per_node=2")
     import torch_npu  # noqa: F401
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -144,10 +152,88 @@ def cp_runtime():
         )
     yield SimpleNamespace(
         rank=dist.get_rank(cp_group),
+        cp_size=cp_group.size(),
         device=torch.device("npu", local_rank),
         cp_group=cp_group,
         tp_group=tp_group,
         pp_group=pp_group,
+    )
+
+    dist.barrier(group=cp_group)
+    parallel_state.destroy_model_parallel()
+    dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def hybrid_cp_runtime():
+    if int(os.getenv("WORLD_SIZE", "1")) != _HYBRID_WORLD_SIZE:
+        pytest.skip("Hybrid CP cases require torchrun --nproc_per_node=4")
+    import torch_npu  # noqa: F401
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="hccl")
+
+    pytest_argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = pytest_argv
+
+    from mindspeed.args_utils import get_full_args
+
+    vars(get_full_args()).pop("", None)
+    repatch(
+        {
+            "context_parallel_size": _HYBRID_WORLD_SIZE,
+            "context_parallel_algo": "hybrid_cp_algo",
+            "ulysses_degree_in_cp": _HYBRID_ULYSSES_SIZE,
+        }
+    )
+
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=_HYBRID_WORLD_SIZE,
+            expert_model_parallel_size=1,
+        )
+
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from mindspeed.core.context_parallel.model_parallel_utils import (
+        get_context_parallel_group_for_hybrid_ring,
+        get_context_parallel_group_for_hybrid_ulysses,
+    )
+
+    model_parallel_cuda_manual_seed(260908)
+    cp_group = parallel_state.get_context_parallel_group()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+    ulysses_group = get_context_parallel_group_for_hybrid_ulysses()
+    ring_group = get_context_parallel_group_for_hybrid_ring()
+    if (
+        cp_group.size() != _HYBRID_WORLD_SIZE
+        or ulysses_group.size() != _HYBRID_ULYSSES_SIZE
+        or ring_group.size() != _HYBRID_WORLD_SIZE // _HYBRID_ULYSSES_SIZE
+        or tp_group.size() != 1
+        or pp_group.size() != 1
+    ):
+        raise AssertionError(
+            "unexpected Hybrid topology: "
+            f"TP={tp_group.size()}, PP={pp_group.size()}, CP={cp_group.size()}, "
+            f"U={ulysses_group.size()}, R={ring_group.size()}"
+        )
+    yield SimpleNamespace(
+        rank=dist.get_rank(cp_group),
+        cp_size=cp_group.size(),
+        device=torch.device("npu", local_rank),
+        cp_group=cp_group,
+        tp_group=tp_group,
+        pp_group=pp_group,
+        ulysses_group=ulysses_group,
+        ring_group=ring_group,
     )
 
     dist.barrier(group=cp_group)
@@ -177,7 +263,7 @@ def _make_model(runtime, *, max_sequence_length=None):
         bf16=True,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
-        context_parallel_size=_EXPECTED_WORLD_SIZE,
+        context_parallel_size=runtime.cp_size,
         expert_model_parallel_size=1,
         sequence_parallel=False,
         apply_rope_fusion=False,
@@ -427,7 +513,7 @@ def _finalize_cp_parameter_gradients(model, runtime):
         if parameter.grad is None:
             raise AssertionError(f"missing parameter gradient before CP finalize: {name}")
         dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=runtime.cp_group)
-        parameter.grad.div_(_EXPECTED_WORLD_SIZE)
+        parameter.grad.div_(runtime.cp_size)
     gradients = clone_parameter_gradients(model)
     assert_named_tensors_finite(gradients, label="finalized CP parameter gradient")
     return gradients
@@ -531,6 +617,36 @@ def _collective_probe():
     finally:
         cp_attention._all_gather_into_tensor = original_all_gather
         cp_attention._reduce_scatter_tensor = original_reduce_scatter
+
+
+@contextmanager
+def _hybrid_communication_probe():
+    original_all_to_all = ulysses_attention._mindspeed_all_to_all
+    original_ring_forward = ring_attention._block_attention_forward
+    original_ring_backward = ring_attention._block_attention_backward
+    counts = {"all_to_all": 0, "ring_forward": 0, "ring_backward": 0}
+
+    def all_to_all(*args, **kwargs):
+        counts["all_to_all"] += 1
+        return original_all_to_all(*args, **kwargs)
+
+    def ring_forward(*args, **kwargs):
+        counts["ring_forward"] += 1
+        return original_ring_forward(*args, **kwargs)
+
+    def ring_backward(*args, **kwargs):
+        counts["ring_backward"] += 1
+        return original_ring_backward(*args, **kwargs)
+
+    ulysses_attention._mindspeed_all_to_all = all_to_all
+    ring_attention._block_attention_forward = ring_forward
+    ring_attention._block_attention_backward = ring_backward
+    try:
+        yield counts
+    finally:
+        ulysses_attention._mindspeed_all_to_all = original_all_to_all
+        ring_attention._block_attention_forward = original_ring_forward
+        ring_attention._block_attention_backward = original_ring_backward
 
 
 def _clone_prefix_gradients(executor):
@@ -671,19 +787,13 @@ def test_cp2_scheduler_reuses_prefix_across_unequal_siblings_and_pops(cp_runtime
     dist.barrier(group=runtime.cp_group)
 
 
-@pytest.mark.parametrize(
-    ("prefix_length", "first_suffix_length", "second_suffix_length"),
-    _EQUIVALENCE_CASES,
-)
-@pytest.mark.parametrize("tpr_backend", ("allgather", "ulysses", "ring"))
-def test_cp2_tpr_matches_independent_allgather_cp(
-    cp_runtime,
+def _run_controlled_equivalence(
+    runtime,
     prefix_length,
     first_suffix_length,
     second_suffix_length,
     tpr_backend,
 ):
-    runtime = cp_runtime
     dist.barrier(group=runtime.cp_group)
     torch.manual_seed(261000 + prefix_length + first_suffix_length + second_suffix_length)
 
@@ -722,14 +832,29 @@ def test_cp2_tpr_matches_independent_allgather_cp(
         logical_indices,
         logical_count,
     )
-    actual = _run_tpr_cp(
-        tpr_model,
-        tpr_plan,
-        runtime,
-        logical_indices,
-        logical_count,
-        cp_backend=tpr_backend,
-    )
+    probe = _hybrid_communication_probe() if tpr_backend == "hybrid" else nullcontext(None)
+    with probe as hybrid_counts:
+        actual = _run_tpr_cp(
+            tpr_model,
+            tpr_plan,
+            runtime,
+            logical_indices,
+            logical_count,
+            cp_backend=tpr_backend,
+        )
+
+    if hybrid_counts is not None:
+        local_counts = torch.tensor(
+            tuple(hybrid_counts.values()),
+            dtype=torch.int64,
+            device=runtime.device,
+        )
+        rank_counts = [torch.empty_like(local_counts) for _ in range(runtime.cp_size)]
+        dist.all_gather(rank_counts, local_counts, group=runtime.cp_group)
+        if any(not torch.equal(counts, rank_counts[0]) for counts in rank_counts[1:]):
+            raise AssertionError(f"Hybrid collective counts differ across CP ranks: {rank_counts}")
+        if torch.any(local_counts <= 0).item():
+            raise AssertionError(f"Hybrid path did not execute every communication phase: {hybrid_counts}")
 
     assert reference.execution_trace == (
         (PhysicalExecutionKind.VISIT_LEAF, 1),
@@ -803,7 +928,7 @@ def test_cp2_tpr_matches_independent_allgather_cp(
 
     if runtime.rank == 0:
         print(
-            f"\nTPR CP=2 {tpr_backend} controlled equivalence passed\n"
+            f"\nTPR CP={runtime.cp_size} {tpr_backend} controlled equivalence passed\n"
             f"  topology: P={prefix_length}, S1={first_suffix_length}, "
             f"S2={second_suffix_length}\n"
             f"  target logprobs: {logical_count}\n"
@@ -819,3 +944,43 @@ def test_cp2_tpr_matches_independent_allgather_cp(
         )
 
     dist.barrier(group=runtime.cp_group)
+
+
+@pytest.mark.parametrize(
+    ("prefix_length", "first_suffix_length", "second_suffix_length"),
+    _EQUIVALENCE_CASES,
+)
+@pytest.mark.parametrize("tpr_backend", ("allgather", "ulysses", "ring"))
+def test_cp2_tpr_matches_independent_allgather_cp(
+    cp_runtime,
+    prefix_length,
+    first_suffix_length,
+    second_suffix_length,
+    tpr_backend,
+):
+    _run_controlled_equivalence(
+        cp_runtime,
+        prefix_length,
+        first_suffix_length,
+        second_suffix_length,
+        tpr_backend,
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix_length", "first_suffix_length", "second_suffix_length"),
+    _HYBRID_EQUIVALENCE_CASES,
+)
+def test_cp4_hybrid_tpr_matches_independent_allgather_cp(
+    hybrid_cp_runtime,
+    prefix_length,
+    first_suffix_length,
+    second_suffix_length,
+):
+    _run_controlled_equivalence(
+        hybrid_cp_runtime,
+        prefix_length,
+        first_suffix_length,
+        second_suffix_length,
+        "hybrid",
+    )
