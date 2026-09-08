@@ -17,7 +17,7 @@
 MindSpeed's native causal Ring Attention assumes that Q/K/V are equal-length
 shards of one sequence. TPR instead supplies Current Q and an ordered sequence
 of external Prefix KV blocks plus Current KV. This module keeps MindSpeed's
-RingP2P transport and online-softmax math, but owns the TPR-specific block
+RingP2P transport and online-softmax semantics, but owns the TPR-specific block
 schedule and gradient routing.
 """
 
@@ -362,13 +362,81 @@ def _merge_attention(
 ) -> tuple[Tensor, Tensor, Tensor]:
     if previous is None:
         return current
-    _, forward_update_without_fused = _load_mindspeed_ring_primitives()
-    return forward_update_without_fused(
-        *previous,
-        *current,
-        actual_seq_qlen=[query_length],
-        layout=_TND_LAYOUT,
+    previous_output, previous_max, previous_sum = previous
+    current_output, current_max, current_sum = current
+    actual_seq_qlen = (query_length,)
+
+    # MindSpeed 376e9cc's TND unflatten_softmax uses view() immediately
+    # after transpose(), which fails on current PyTorch because that tensor is
+    # non-contiguous. Keep its exact layout semantics locally and use reshape
+    # at the non-contiguous boundary instead of patching MindSpeed globally.
+    previous_max = _flatten_tnd_softmax(previous_max, actual_seq_qlen)
+    previous_sum = _flatten_tnd_softmax(previous_sum, actual_seq_qlen)
+    current_max = _flatten_tnd_softmax(current_max, actual_seq_qlen)
+    current_sum = _flatten_tnd_softmax(current_sum, actual_seq_qlen)
+
+    merged_max = torch.maximum(previous_max, current_max)
+    previous_scale = torch.exp(previous_max - merged_max)
+    current_scale = torch.exp(current_max - merged_max)
+    previous_sum = previous_sum * previous_scale
+    current_sum = current_sum * current_scale
+    merged_sum = previous_sum + current_sum
+
+    head_dim = previous_output.shape[-1]
+    previous_output_scale = (previous_sum / merged_sum)[..., 0].unsqueeze(2)
+    current_output_scale = (current_sum / merged_sum)[..., 0].unsqueeze(2)
+    previous_output_scale = previous_output_scale.expand(-1, -1, head_dim)
+    current_output_scale = current_output_scale.expand(-1, -1, head_dim)
+    merged_output = previous_output * previous_output_scale
+    merged_output.add_(current_output * current_output_scale)
+    merged_output = merged_output.to(previous_output.dtype)
+    return (
+        merged_output,
+        _unflatten_tnd_softmax(merged_max, actual_seq_qlen),
+        _unflatten_tnd_softmax(merged_sum, actual_seq_qlen),
     )
+
+
+def _flatten_tnd_softmax(
+    tensor: Tensor,
+    actual_seq_qlen: Sequence[int],
+) -> Tensor:
+    original_shape = tensor.shape
+    section_lengths = tuple(length * original_shape[1] for length in actual_seq_qlen)
+    flattened = tensor.reshape(-1, original_shape[-1])
+    if sum(section_lengths) != flattened.shape[0]:
+        raise ValueError(
+            "softmax statistics do not match actual_seq_qlen: "
+            f"shape={tuple(original_shape)}, lengths={tuple(actual_seq_qlen)}"
+        )
+    sections = flattened.split(section_lengths, dim=0)
+    reordered = tuple(
+        section.reshape(original_shape[1], -1, original_shape[-1]).transpose(0, 1)
+        for section in sections
+    )
+    return torch.cat(reordered, dim=0)
+
+
+def _unflatten_tnd_softmax(
+    tensor: Tensor,
+    actual_seq_qlen: Sequence[int],
+) -> Tensor:
+    original_shape = tensor.shape
+    section_lengths = tuple(length * original_shape[1] for length in actual_seq_qlen)
+    flattened = tensor.reshape(-1, original_shape[-1])
+    if sum(section_lengths) != flattened.shape[0]:
+        raise ValueError(
+            "softmax statistics do not match actual_seq_qlen: "
+            f"shape={tuple(original_shape)}, lengths={tuple(actual_seq_qlen)}"
+        )
+    sections = flattened.split(section_lengths, dim=0)
+    reordered = tuple(
+        section.reshape(-1, original_shape[1], original_shape[-1])
+        .transpose(0, 1)
+        .reshape(-1, original_shape[-1])
+        for section in sections
+    )
+    return torch.cat(reordered, dim=0).reshape(original_shape)
 
 
 def _block_attention_backward(

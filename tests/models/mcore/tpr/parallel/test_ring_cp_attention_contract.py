@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+import verl.models.mcore.tpr.parallel.ring_attention as ring
 from verl.models.mcore.tpr import (
     RingBlockKind,
     classify_ring_block,
@@ -49,6 +50,34 @@ def test_ring_block_visibility(query_range, kv_range, is_prefix, expected):
 def test_ring_block_visibility_rejects_partial_overlap():
     with pytest.raises(ValueError, match="partially overlapping"):
         classify_ring_block((4, 8), (6, 10), is_prefix=False)
+
+
+def test_tnd_online_softmax_merge_handles_noncontiguous_layout_conversion():
+    query_length, heads, head_dim = 4, 2, 8
+    output_shape = (query_length, heads, head_dim)
+    statistics_shape = (1, heads, query_length, 8)
+    previous = (
+        torch.zeros(output_shape),
+        torch.zeros(statistics_shape),
+        torch.ones(statistics_shape),
+    )
+    current = (
+        torch.ones(output_shape),
+        torch.zeros(statistics_shape),
+        torch.ones(statistics_shape),
+    )
+
+    output, softmax_max, softmax_sum = ring._merge_attention(
+        previous,
+        current,
+        query_length=query_length,
+    )
+
+    torch.testing.assert_close(output, torch.full(output_shape, 0.5))
+    flattened_max = ring._flatten_tnd_softmax(softmax_max, (query_length,))
+    flattened_sum = ring._flatten_tnd_softmax(softmax_sum, (query_length,))
+    torch.testing.assert_close(flattened_max, torch.zeros_like(flattened_max))
+    torch.testing.assert_close(flattened_sum, torch.full_like(flattened_sum, 2.0))
 
 
 @pytest.mark.parametrize(
