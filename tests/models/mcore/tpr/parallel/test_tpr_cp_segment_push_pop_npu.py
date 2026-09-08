@@ -721,7 +721,6 @@ def test_cp2_tpr_matches_independent_allgather_cp(
         runtime,
         logical_indices,
         logical_count,
-        cp_backend=tpr_backend,
     )
     actual = _run_tpr_cp(
         tpr_model,
@@ -729,6 +728,7 @@ def test_cp2_tpr_matches_independent_allgather_cp(
         runtime,
         logical_indices,
         logical_count,
+        cp_backend=tpr_backend,
     )
 
     assert reference.execution_trace == (
