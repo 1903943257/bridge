@@ -20,12 +20,17 @@ from typing import Any, Protocol, runtime_checkable
 
 from ..context import TPRAttentionBackend
 from ..kv_stack import KVStack
-from ..shard import PrefixShard, SequenceShard
+from ..shard import PrefixShard, RangeSequenceShard, SequenceShard
 from .execution_context import (
     ShardedPastKVAnchors,
     make_anchored_allgather_cp_backend,
     make_cached_allgather_cp_backend,
     resolve_cp_group,
+)
+from .ring_attention import (
+    make_anchored_ring_cp_backend,
+    make_cached_ring_cp_backend,
+    make_ring_sequence_shard,
 )
 from .ulysses_attention import (
     make_anchored_ulysses_cp_backend,
@@ -36,8 +41,9 @@ ALLGATHER_CP_BACKEND = "allgather"
 ULYSSES_CP_BACKEND = "ulysses"
 MINDSPEED_ULYSSES_CP_ALGO = "ulysses_cp_algo"
 RING_CP_BACKEND = "ring"
+MINDSPEED_RING_CP_ALGO = "megatron_cp_algo"
 HYBRID_CP_BACKEND = "hybrid"
-_PLANNED_BACKENDS = (RING_CP_BACKEND, HYBRID_CP_BACKEND)
+_PLANNED_BACKENDS = (HYBRID_CP_BACKEND,)
 
 
 @runtime_checkable
@@ -180,6 +186,53 @@ class UlyssesCPBackend(AllGatherCPBackend):
         )
 
 
+class RingCPBackend(AllGatherCPBackend):
+    """TPR policy using MindSpeed's symmetric causal Ring layout and P2P."""
+
+    backend_name = RING_CP_BACKEND
+
+    def validate_segment_length(self, global_length: int) -> None:
+        make_ring_sequence_shard(
+            global_length,
+            cp_rank=self.parallel_rank,
+            cp_size=self.parallel_size,
+        )
+
+    def make_sequence_shard(self, global_length: int) -> RangeSequenceShard:
+        return make_ring_sequence_shard(
+            global_length,
+            cp_rank=self.parallel_rank,
+            cp_size=self.parallel_size,
+        )
+
+    def make_attention_backend(
+        self,
+        kv_stack: KVStack,
+        *,
+        expected_layer_numbers: tuple[int, ...],
+        current_shard: SequenceShard,
+        past_anchors: ShardedPastKVAnchors | None,
+    ) -> TPRAttentionBackend:
+        if not isinstance(current_shard, RangeSequenceShard):
+            raise TypeError(
+                "Ring CP requires a RangeSequenceShard, "
+                f"got {type(current_shard).__name__}"
+            )
+        if past_anchors is None:
+            return make_cached_ring_cp_backend(
+                kv_stack,
+                expected_layer_numbers=expected_layer_numbers,
+                current_shard=current_shard,
+                cp_group=self._cp_group,
+            )
+        return make_anchored_ring_cp_backend(
+            past_anchors,
+            expected_layer_numbers=expected_layer_numbers,
+            current_shard=current_shard,
+            cp_group=self._cp_group,
+        )
+
+
 def resolve_tpr_cp_backend(
     backend: TPRCPBackend | str | None,
     *,
@@ -201,12 +254,18 @@ def resolve_tpr_cp_backend(
             parallel_size=parallel_size,
             parallel_rank=parallel_rank,
         )
+    if backend in (RING_CP_BACKEND, MINDSPEED_RING_CP_ALGO):
+        return RingCPBackend(
+            cp_group,
+            parallel_size=parallel_size,
+            parallel_rank=parallel_rank,
+        )
     if isinstance(backend, str):
         if backend in _PLANNED_BACKENDS:
             raise NotImplementedError(f"TPR CP backend {backend!r} is planned but not implemented")
         raise ValueError(
             f"unknown TPR CP backend {backend!r}; expected one of "
-            f"{(ALLGATHER_CP_BACKEND, ULYSSES_CP_BACKEND, *_PLANNED_BACKENDS)}"
+            f"{(ALLGATHER_CP_BACKEND, ULYSSES_CP_BACKEND, RING_CP_BACKEND, *_PLANNED_BACKENDS)}"
         )
     if not isinstance(backend, TPRCPBackend):
         raise TypeError(f"cp_backend must implement TPRCPBackend, got {type(backend).__name__}")

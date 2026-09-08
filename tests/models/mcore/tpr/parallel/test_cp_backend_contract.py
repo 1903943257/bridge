@@ -21,6 +21,7 @@ from verl.models.mcore.tpr import (
     AllGatherCPBackend,
     PrefixShard,
     RangeSequenceShard,
+    RingCPBackend,
     TPRCPBackend,
     UlyssesCPBackend,
 )
@@ -88,7 +89,28 @@ def test_resolver_accepts_the_mindspeed_ulysses_algorithm_name():
     assert isinstance(backend, UlyssesCPBackend)
 
 
-@pytest.mark.parametrize("name", ["ring", "hybrid"])
+@pytest.mark.parametrize("name", ["ring", "megatron_cp_algo"])
+def test_resolver_constructs_the_ring_adapter(name):
+    backend = resolve_tpr_cp_backend(
+        name,
+        cp_group=object(),
+        parallel_size=2,
+        parallel_rank=0,
+    )
+
+    assert isinstance(backend, RingCPBackend)
+    assert backend.backend_name == "ring"
+    assert backend.make_sequence_shard(16) == RangeSequenceShard(
+        16,
+        ((0, 4), (12, 16)),
+        cp_rank=0,
+        cp_size=2,
+    )
+    with pytest.raises(ValueError, match=r"2 \* CP size"):
+        backend.validate_segment_length(10)
+
+
+@pytest.mark.parametrize("name", ["hybrid"])
 def test_planned_backends_fail_explicitly_instead_of_falling_back(name):
     with pytest.raises(NotImplementedError, match=name):
         resolve_tpr_cp_backend(

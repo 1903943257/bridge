@@ -25,9 +25,18 @@ from .backend import (
     RING_CP_BACKEND,
     ULYSSES_CP_BACKEND,
     AllGatherCPBackend,
+    RingCPBackend,
     TPRCPBackend,
     UlyssesCPBackend,
     resolve_tpr_cp_backend,
+)
+from .ring_attention import (
+    RingBlockKind,
+    RingCPAttentionBackend,
+    RingLocalKVBlock,
+    classify_ring_block,
+    make_ring_sequence_shard,
+    ring_cp_attention,
 )
 from .ulysses_attention import UlyssesCPAttentionBackend, ulysses_cp_rectangular_attention
 from .execution_context import (
@@ -48,6 +57,10 @@ __all__ = [
     "AllGatherCPBackend",
     "AllGatherCPAttentionBackend",
     "LocalKVBlock",
+    "RingBlockKind",
+    "RingCPAttentionBackend",
+    "RingCPBackend",
+    "RingLocalKVBlock",
     "ShardedPastKVAnchors",
     "TPRCPBackend",
     "UlyssesCPAttentionBackend",
@@ -56,9 +69,12 @@ __all__ = [
     "all_gather_sequence",
     "allgather_cp_rectangular_attention",
     "build_sharded_past_anchors",
+    "classify_ring_block",
+    "make_ring_sequence_shard",
     "make_anchored_allgather_cp_backend",
     "make_cached_allgather_cp_backend",
     "resolve_cp_group",
     "resolve_tpr_cp_backend",
+    "ring_cp_attention",
     "ulysses_cp_rectangular_attention",
 ]

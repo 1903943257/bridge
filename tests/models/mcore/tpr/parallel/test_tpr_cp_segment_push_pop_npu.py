@@ -675,7 +675,7 @@ def test_cp2_scheduler_reuses_prefix_across_unequal_siblings_and_pops(cp_runtime
     ("prefix_length", "first_suffix_length", "second_suffix_length"),
     _EQUIVALENCE_CASES,
 )
-@pytest.mark.parametrize("tpr_backend", ("allgather", "ulysses"))
+@pytest.mark.parametrize("tpr_backend", ("allgather", "ulysses", "ring"))
 def test_cp2_tpr_matches_independent_allgather_cp(
     cp_runtime,
     prefix_length,
