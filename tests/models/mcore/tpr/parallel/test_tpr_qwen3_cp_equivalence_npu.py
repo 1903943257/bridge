@@ -275,6 +275,7 @@ def real_qwen_cp_case(request, cp_runtime):
         runtime,
         logical_indices,
         logical_count,
+        expected_layer_numbers=tuple(range(1, hf_config.num_hidden_layers + 1)),
     )
     reference = _move_reference_to_cpu(reference_result)
     del reference_result

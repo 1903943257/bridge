@@ -424,11 +424,12 @@ def _execute_and_capture(
     owner_counts,
     *,
     cp_backend=None,
+    expected_layer_numbers=None,
 ):
     executor = SegmentExecutor(
         model,
         plan,
-        expected_layer_numbers=tuple(range(1, _LAYER_COUNT + 1)),
+        expected_layer_numbers=expected_layer_numbers,
         cp_group=runtime.cp_group,
         cp_backend=cp_backend,
     )
@@ -513,6 +514,8 @@ def _run_independent_cp_reference(
     runtime,
     logical_indices,
     logical_count,
+    *,
+    expected_layer_numbers=None,
 ):
     model.zero_grad(set_to_none=True)
     logprobs = torch.zeros(logical_count, dtype=torch.float32, device=runtime.device)
@@ -535,6 +538,7 @@ def _run_independent_cp_reference(
             logical_indices,
             logprobs,
             owner_counts,
+            expected_layer_numbers=expected_layer_numbers,
         )
         local_loss = local_loss + result.normalized_loss
         trace.extend((execution.kind, execution.segment_id) for execution in result.execution_trace)
@@ -557,6 +561,7 @@ def _run_tpr_cp(
     logical_count,
     *,
     cp_backend="allgather",
+    expected_layer_numbers=None,
 ):
     model.zero_grad(set_to_none=True)
     logprobs = torch.zeros(logical_count, dtype=torch.float32, device=runtime.device)
@@ -569,6 +574,7 @@ def _run_tpr_cp(
         logprobs,
         owner_counts,
         cp_backend=cp_backend,
+        expected_layer_numbers=expected_layer_numbers,
     )
     global_loss, global_logprobs = _aggregate_loss_and_logprobs(
         result.normalized_loss, logprobs, owner_counts, runtime
