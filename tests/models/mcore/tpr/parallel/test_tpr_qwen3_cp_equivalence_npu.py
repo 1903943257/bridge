@@ -438,7 +438,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     )
     pointwise_outliers = int(torch.count_nonzero(absolute_difference > diagnostic_limit).item())
     max_abs_difference = float(absolute_difference.max().item())
-    model_name = case.model_case.name
+    model_name = case.spec.name
     relative_l2_tolerance = _LOGPROB_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][
         backend
     ]
