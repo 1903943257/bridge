@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Protocol
 
 import torch
@@ -43,6 +44,28 @@ class _UnshardedContextParallelGroup:
 
 
 _UNSHARDED_CP_GROUP = _UnshardedContextParallelGroup()
+
+
+@contextmanager
+def disable_bound_context_parallel_sharding(rotary_embedding: _RotaryEmbedding):
+    """Temporarily stop implicit CP slicing by a bound RotaryEmbedding group.
+
+    GPTModel builds a rotary embedding in ``_preprocess`` even though TPR
+    attention consumes the rank-local embedding stored in its execution
+    context.  For padded, non-divisible sequence lengths that unused build can
+    fail in MindSpeed before TPR attention is reached.  Override the embedding's
+    bound group only for the model forward and restore it on every exit path.
+    """
+
+    if not hasattr(rotary_embedding, "cp_group"):
+        yield
+        return
+    cp_group = rotary_embedding.cp_group
+    rotary_embedding.cp_group = _UNSHARDED_CP_GROUP
+    try:
+        yield
+    finally:
+        rotary_embedding.cp_group = cp_group
 
 
 def build_suffix_rotary_pos_emb(

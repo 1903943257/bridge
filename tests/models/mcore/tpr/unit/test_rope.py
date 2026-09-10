@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+from verl.models.mcore.tpr.rope import disable_bound_context_parallel_sharding
 from verl.models.mcore.tpr import (
     AllGatherCPBackend,
     RangeSequenceShard,
@@ -91,6 +92,19 @@ def test_suffix_rope_can_disable_the_embedding_bound_cp_shard():
     cp_group = rotary_embedding.calls[0]["cp_group"]
     assert cp_group is not None
     assert cp_group.size() == 1
+
+
+def test_bound_cp_shard_is_disabled_temporarily_and_restored_after_failure():
+    rotary_embedding = _RecordingRotaryEmbedding()
+    original_group = object()
+    rotary_embedding.cp_group = original_group
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with disable_bound_context_parallel_sharding(rotary_embedding):
+            assert rotary_embedding.cp_group.size() == 1
+            raise RuntimeError("forward failed")
+
+    assert rotary_embedding.cp_group is original_group
 
 
 def test_sharded_rope_follows_noncontiguous_local_token_order():

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,7 +34,10 @@ from .parallel.execution_context import (
     build_sharded_past_anchors,
     resolve_cp_group,
 )
-from .rope import build_sharded_rotary_pos_emb
+from .rope import (
+    build_sharded_rotary_pos_emb,
+    disable_bound_context_parallel_sharding,
+)
 from .segment_plan import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
 from .shard import PrefixShard, SequenceShard
 
@@ -342,7 +346,12 @@ class SegmentExecutor:
         )
         grad_context = torch.no_grad() if no_grad else torch.enable_grad()
         with grad_context:
-            with use_tpr_attention_context(context):
+            rope_context = (
+                disable_bound_context_parallel_sharding(self.model.rotary_pos_emb)
+                if self.cp_enabled
+                else nullcontext()
+            )
+            with rope_context, use_tpr_attention_context(context):
                 logits = self.model(
                     input_ids=input_ids,
                     position_ids=position_ids,
