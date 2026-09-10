@@ -81,8 +81,8 @@ _FIRST_SUFFIX_LENGTH = 63
 _SECOND_SUFFIX_LENGTH = 31
 _LOSS_ATOL = 2e-2
 _LOSS_RTOL = 2e-2
-_LOGPROB_ATOL = 5e-2
-_LOGPROB_RTOL = 5e-3
+_LOGPROB_DIAGNOSTIC_ATOL = 5e-2
+_LOGPROB_DIAGNOSTIC_RTOL = 5e-3
 _LOGPROB_RELATIVE_L2_TOL = 5e-3
 _LOGPROB_COSINE_MIN = 0.9999
 _CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL = 7e-2
@@ -400,18 +400,8 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         atol=_LOSS_ATOL,
         rtol=_LOSS_RTOL,
     )
-    _assert_real_qwen_gradients_close(
-        actual_gradients,
-        reference.parameter_gradients,
-        per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
-    )
-    torch.testing.assert_close(
-        actual_logprobs,
-        reference.target_logprobs,
-        atol=_LOGPROB_ATOL,
-        rtol=_LOGPROB_RTOL,
-    )
     difference = actual_logprobs - reference.target_logprobs
+    absolute_difference = difference.abs()
     relative_l2 = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(
         reference.target_logprobs
     ).clamp_min(torch.finfo(torch.float32).tiny)
@@ -420,8 +410,43 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         reference.target_logprobs,
         dim=0,
     )
-    assert relative_l2.item() <= _LOGPROB_RELATIVE_L2_TOL
-    assert cosine.item() >= _LOGPROB_COSINE_MIN
+    diagnostic_limit = _LOGPROB_DIAGNOSTIC_ATOL + (
+        _LOGPROB_DIAGNOSTIC_RTOL * reference.target_logprobs.abs()
+    )
+    pointwise_outliers = int(torch.count_nonzero(absolute_difference > diagnostic_limit).item())
+    max_abs_difference = float(absolute_difference.max().item())
+    if runtime.rank == 0:
+        print(
+            "Qwen logprob comparison: "
+            f"relative_l2={relative_l2.item():.6e}, "
+            f"cosine={cosine.item():.9f}, "
+            f"max_abs={max_abs_difference:.6e}, "
+            f"pointwise_outliers={pointwise_outliers}/{case.logical_count}"
+        )
+        reverse_indices = {index: key for key, index in case.logical_indices.items()}
+        worst_count = min(10, case.logical_count)
+        _, worst_indices = torch.topk(absolute_difference, worst_count)
+        for index in worst_indices.tolist():
+            sample_id, query_position = reverse_indices[index]
+            region = "prefix" if query_position < _PREFIX_LENGTH else "suffix"
+            print(
+                f"  sample={sample_id} query_position={query_position} region={region} "
+                f"reference={reference.target_logprobs[index].item():.7f} "
+                f"actual={actual_logprobs[index].item():.7f} "
+                f"abs_diff={absolute_difference[index].item():.7f}"
+            )
+    assert relative_l2.item() <= _LOGPROB_RELATIVE_L2_TOL, (
+        f"Qwen logprob relative L2 {relative_l2.item():.6e} exceeds "
+        f"{_LOGPROB_RELATIVE_L2_TOL:.6e}"
+    )
+    assert cosine.item() >= _LOGPROB_COSINE_MIN, (
+        f"Qwen logprob cosine {cosine.item():.9f} is below {_LOGPROB_COSINE_MIN:.9f}"
+    )
+    _assert_real_qwen_gradients_close(
+        actual_gradients,
+        reference.parameter_gradients,
+        per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
+    )
     assert output["metrics"]["tpr_cp_size"] == 2
     assert output["metrics"]["tpr_cp_backend"] == backend
     assert output["metrics"]["tpr_peak_path_tokens"] == (
@@ -440,6 +465,8 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             f"{output['loss']:.9f}\n"
             f"  logprob relative L2: {relative_l2.item():.6e}\n"
             f"  logprob cosine: {cosine.item():.9f}\n"
+            f"  logprob max abs diff: {max_abs_difference:.6e}\n"
+            f"  pointwise diagnostic outliers: {pointwise_outliers}/{case.logical_count}\n"
             f"  gradient tensors: {len(actual_gradients)}"
         )
     del actual_gradients, actual_logprobs
