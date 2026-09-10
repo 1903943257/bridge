@@ -345,7 +345,16 @@ def _assert_real_qwen_gradients_close(
         actual_square_sum += actual_square
         dot_sum += dot
         relative_l2 = (difference_square / max(expected_square, 1e-24)) ** 0.5
-        per_parameter.append((relative_l2, name))
+        per_parameter.append(
+            (
+                relative_l2,
+                name,
+                difference_square**0.5,
+                expected_square**0.5,
+                actual_square**0.5,
+                actual_gradient.numel(),
+            )
+        )
 
     global_relative_l2 = (
         difference_square_sum / max(expected_square_sum, 1e-24)
@@ -354,15 +363,35 @@ def _assert_real_qwen_gradients_close(
         (actual_square_sum * expected_square_sum) ** 0.5,
         1e-24,
     )
-    worst_parameters = sorted(per_parameter, reverse=True)[:10]
-    print(
-        "Qwen gradient comparison: "
-        f"global_relative_l2={global_relative_l2:.6g}, "
-        f"global_relative_l2_tolerance={global_relative_l2_tol:.6g}, "
-        f"global_cosine={global_cosine:.8f}"
+    worst_parameters = sorted(
+        per_parameter,
+        key=lambda item: item[0],
+        reverse=True,
+    )[:10]
+    should_print = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
-    for relative_l2, name in worst_parameters:
-        print(f"  gradient relative_l2={relative_l2:.6g}: {name}")
+    if should_print:
+        print(
+            "Qwen gradient comparison: "
+            f"global_relative_l2={global_relative_l2:.6g}, "
+            f"global_relative_l2_tolerance={global_relative_l2_tol:.6g}, "
+            f"global_cosine={global_cosine:.8f}"
+        )
+        for (
+            relative_l2,
+            name,
+            difference_l2,
+            expected_l2,
+            actual_l2,
+            numel,
+        ) in worst_parameters:
+            print(
+                f"  gradient relative_l2={relative_l2:.6g}, "
+                f"difference_l2={difference_l2:.6g}, "
+                f"expected_l2={expected_l2:.6g}, actual_l2={actual_l2:.6g}, "
+                f"numel={numel}: {name}"
+            )
 
     assert global_relative_l2 <= global_relative_l2_tol, (
         f"Qwen gradient global relative L2 {global_relative_l2:.6g} exceeds "
@@ -370,8 +399,8 @@ def _assert_real_qwen_gradients_close(
     )
     assert global_cosine >= _GLOBAL_GRAD_COSINE_MIN
     excessive = [
-        (name, relative_l2)
-        for relative_l2, name in per_parameter
+        (name, relative_l2, difference_l2, expected_l2)
+        for relative_l2, name, difference_l2, expected_l2, _, _ in per_parameter
         if relative_l2 > per_parameter_relative_l2_tol
     ]
     assert not excessive, (

@@ -24,7 +24,8 @@ Run from the verl repository root with two visible NPUs::
 The independent reference executes each complete trajectory separately through
 AllGather CP.  The actual path enters MegatronEngine once, caches the shared
 prefix, and executes the two suffixes with the selected TPR CP backend.  The
-non-divisible lengths deliberately exercise physical padding and loss ownership.
+default non-divisible lengths deliberately exercise physical padding and loss
+ownership.  Set ``TPR_QWEN_CP_TOPOLOGY=divisible`` for the shape-control case.
 """
 
 from __future__ import annotations
@@ -76,9 +77,18 @@ pytestmark = pytest.mark.skipif(
     reason="Set TPR_RUN_QWEN_CP=1 for real Qwen3 CP correctness",
 )
 
-_PREFIX_LENGTH = 127
-_FIRST_SUFFIX_LENGTH = 63
-_SECOND_SUFFIX_LENGTH = 31
+_TOPOLOGIES = {
+    "non_divisible": (127, 63, 31),
+    "divisible": (128, 64, 32),
+}
+_TOPOLOGY_NAME = os.getenv("TPR_QWEN_CP_TOPOLOGY", "non_divisible")
+if _TOPOLOGY_NAME not in _TOPOLOGIES:
+    raise ValueError(
+        f"TPR_QWEN_CP_TOPOLOGY must be one of {tuple(_TOPOLOGIES)}, got {_TOPOLOGY_NAME!r}"
+    )
+_PREFIX_LENGTH, _FIRST_SUFFIX_LENGTH, _SECOND_SUFFIX_LENGTH = _TOPOLOGIES[
+    _TOPOLOGY_NAME
+]
 _LOSS_ATOL = 2e-2
 _LOSS_RTOL = 2e-2
 _LOGPROB_DIAGNOSTIC_ATOL = 5e-2
@@ -445,7 +455,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     if runtime.rank == 0:
         print(
             "Qwen logprob comparison: "
-            f"model={model_name}, backend={backend}, "
+            f"model={model_name}, backend={backend}, topology={_TOPOLOGY_NAME}, "
             f"relative_l2={relative_l2.item():.6e}, "
             f"relative_l2_tolerance={relative_l2_tolerance:.6e}, "
             f"cosine={cosine.item():.9f}, "
@@ -491,7 +501,8 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             f"\n{case.spec.name} real-checkpoint TPR CP correctness passed\n"
             f"  checkpoint: {case.spec.path}\n"
             f"  backend: {backend}\n"
-            f"  topology: P={_PREFIX_LENGTH}, S1={_FIRST_SUFFIX_LENGTH}, "
+            f"  topology: {_TOPOLOGY_NAME}, P={_PREFIX_LENGTH}, "
+            f"S1={_FIRST_SUFFIX_LENGTH}, "
             f"S2={_SECOND_SUFFIX_LENGTH}\n"
             f"  loss reference/TPR: {reference.normalized_loss.item():.9f} / "
             f"{output['loss']:.9f}\n"
