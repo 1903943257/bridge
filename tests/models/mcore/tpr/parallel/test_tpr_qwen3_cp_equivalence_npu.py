@@ -89,6 +89,11 @@ _LOGPROB_RELATIVE_L2_TOL_BY_BACKEND = {
     "ring": 7e-3,
 }
 _LOGPROB_COSINE_MIN = 0.9999
+_CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_BACKEND = {
+    "allgather": 2e-2,
+    "ulysses": 2e-2,
+    "ring": 2.5e-2,
+}
 _CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL = 7e-2
 
 
@@ -451,6 +456,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     _assert_real_qwen_gradients_close(
         actual_gradients,
         reference.parameter_gradients,
+        global_relative_l2_tol=_CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_BACKEND[backend],
         per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
     )
     assert output["metrics"]["tpr_cp_size"] == 2

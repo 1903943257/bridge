@@ -323,6 +323,7 @@ def _assert_real_qwen_gradients_close(
     actual,
     expected,
     *,
+    global_relative_l2_tol=_GLOBAL_GRAD_RELATIVE_L2_TOL,
     per_parameter_relative_l2_tol=_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
 ):
     assert actual.keys() == expected.keys()
@@ -357,12 +358,16 @@ def _assert_real_qwen_gradients_close(
     print(
         "Qwen gradient comparison: "
         f"global_relative_l2={global_relative_l2:.6g}, "
+        f"global_relative_l2_tolerance={global_relative_l2_tol:.6g}, "
         f"global_cosine={global_cosine:.8f}"
     )
     for relative_l2, name in worst_parameters:
         print(f"  gradient relative_l2={relative_l2:.6g}: {name}")
 
-    assert global_relative_l2 <= _GLOBAL_GRAD_RELATIVE_L2_TOL
+    assert global_relative_l2 <= global_relative_l2_tol, (
+        f"Qwen gradient global relative L2 {global_relative_l2:.6g} exceeds "
+        f"{global_relative_l2_tol:.6g}"
+    )
     assert global_cosine >= _GLOBAL_GRAD_COSINE_MIN
     excessive = [
         (name, relative_l2)
