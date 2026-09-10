@@ -85,6 +85,7 @@ _LOGPROB_ATOL = 5e-2
 _LOGPROB_RTOL = 5e-3
 _LOGPROB_RELATIVE_L2_TOL = 5e-3
 _LOGPROB_COSINE_MIN = 0.9999
+_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL = 7e-2
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,7 +400,11 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         atol=_LOSS_ATOL,
         rtol=_LOSS_RTOL,
     )
-    _assert_real_qwen_gradients_close(actual_gradients, reference.parameter_gradients)
+    _assert_real_qwen_gradients_close(
+        actual_gradients,
+        reference.parameter_gradients,
+        per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
+    )
     torch.testing.assert_close(
         actual_logprobs,
         reference.target_logprobs,

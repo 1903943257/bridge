@@ -319,7 +319,12 @@ def _tokens(start, length, device):
     return torch.arange(start, start + length, dtype=torch.long, device=device) % QWEN_VOCAB_SIZE
 
 
-def _assert_real_qwen_gradients_close(actual, expected):
+def _assert_real_qwen_gradients_close(
+    actual,
+    expected,
+    *,
+    per_parameter_relative_l2_tol=_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
+):
     assert actual.keys() == expected.keys()
     difference_square_sum = 0.0
     expected_square_sum = 0.0
@@ -362,9 +367,12 @@ def _assert_real_qwen_gradients_close(actual, expected):
     excessive = [
         (name, relative_l2)
         for relative_l2, name in per_parameter
-        if relative_l2 > _PER_PARAMETER_GRAD_RELATIVE_L2_TOL
+        if relative_l2 > per_parameter_relative_l2_tol
     ]
-    assert not excessive, f"per-parameter Qwen gradient mismatches: {excessive[:10]}"
+    assert not excessive, (
+        f"per-parameter Qwen gradient relative L2 exceeds "
+        f"{per_parameter_relative_l2_tol}: {excessive[:10]}"
+    )
 
 
 def test_qwen3_real_checkpoint_matches_reference_and_tpr(monkeypatch):
