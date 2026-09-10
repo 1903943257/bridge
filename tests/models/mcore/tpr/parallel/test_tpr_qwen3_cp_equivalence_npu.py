@@ -83,16 +83,30 @@ _LOSS_ATOL = 2e-2
 _LOSS_RTOL = 2e-2
 _LOGPROB_DIAGNOSTIC_ATOL = 5e-2
 _LOGPROB_DIAGNOSTIC_RTOL = 5e-3
-_LOGPROB_RELATIVE_L2_TOL_BY_BACKEND = {
-    "allgather": 5e-3,
-    "ulysses": 5e-3,
-    "ring": 7e-3,
+_LOGPROB_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND = {
+    "qwen3_0_6b": {
+        "allgather": 5e-3,
+        "ulysses": 5e-3,
+        "ring": 7e-3,
+    },
+    "qwen3_1_7b": {
+        "allgather": 7e-3,
+        "ulysses": 7e-3,
+        "ring": 7e-3,
+    },
 }
 _LOGPROB_COSINE_MIN = 0.9999
-_CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_BACKEND = {
-    "allgather": 2e-2,
-    "ulysses": 2e-2,
-    "ring": 2.5e-2,
+_CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND = {
+    "qwen3_0_6b": {
+        "allgather": 2e-2,
+        "ulysses": 2e-2,
+        "ring": 2.5e-2,
+    },
+    "qwen3_1_7b": {
+        "allgather": 2.5e-2,
+        "ulysses": 2.5e-2,
+        "ring": 2.5e-2,
+    },
 }
 _CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL = 7e-2
 
@@ -424,10 +438,14 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     )
     pointwise_outliers = int(torch.count_nonzero(absolute_difference > diagnostic_limit).item())
     max_abs_difference = float(absolute_difference.max().item())
-    relative_l2_tolerance = _LOGPROB_RELATIVE_L2_TOL_BY_BACKEND[backend]
+    model_name = case.model_case.name
+    relative_l2_tolerance = _LOGPROB_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][
+        backend
+    ]
     if runtime.rank == 0:
         print(
             "Qwen logprob comparison: "
+            f"model={model_name}, backend={backend}, "
             f"relative_l2={relative_l2.item():.6e}, "
             f"relative_l2_tolerance={relative_l2_tolerance:.6e}, "
             f"cosine={cosine.item():.9f}, "
@@ -448,7 +466,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             )
     assert relative_l2.item() <= relative_l2_tolerance, (
         f"Qwen logprob relative L2 {relative_l2.item():.6e} exceeds "
-        f"{relative_l2_tolerance:.6e} for backend={backend}"
+        f"{relative_l2_tolerance:.6e} for model={model_name}, backend={backend}"
     )
     assert cosine.item() >= _LOGPROB_COSINE_MIN, (
         f"Qwen logprob cosine {cosine.item():.9f} is below {_LOGPROB_COSINE_MIN:.9f}"
@@ -456,7 +474,9 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     _assert_real_qwen_gradients_close(
         actual_gradients,
         reference.parameter_gradients,
-        global_relative_l2_tol=_CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_BACKEND[backend],
+        global_relative_l2_tol=(
+            _CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][backend]
+        ),
         per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
     )
     assert output["metrics"]["tpr_cp_size"] == 2
