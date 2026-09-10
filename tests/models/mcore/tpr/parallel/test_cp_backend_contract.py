@@ -57,6 +57,17 @@ def test_allgather_backend_owns_contiguous_shard_policy():
     assert (padded.global_length, padded.padded_length, padded.valid_local_length) == (7, 8, 3)
 
 
+def test_resolver_accepts_the_mindspeed_allgather_algorithm_name():
+    backend = resolve_tpr_cp_backend(
+        "kvallgather_cp_algo",
+        cp_group=object(),
+        parallel_size=2,
+        parallel_rank=0,
+    )
+
+    assert isinstance(backend, AllGatherCPBackend)
+
+
 def test_resolver_accepts_a_structural_custom_backend():
     backend = _CustomBackend()
 

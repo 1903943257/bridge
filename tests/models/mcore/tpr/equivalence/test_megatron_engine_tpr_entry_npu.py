@@ -95,6 +95,8 @@ def test_megatron_engine_tpr_thin_entry_runs_hooks_once(monkeypatch):
 
     assert calls == {"no_sync_enter": 1, "no_sync_exit": 1, "loss_scale": 3, "finalize": 1}
     assert output["loss"] == output["metrics"]["tpr_loss"]
+    assert output["metrics"]["tpr_cp_size"] == 1
+    assert output["metrics"]["tpr_cp_backend"] == "none"
     assert output["metrics"]["tpr_peak_path_tokens"] == _PREFIX_LENGTH + _SUFFIX_1_LENGTH
     assert output["metrics"]["tpr_segment_count"] == 3
     assert output["metrics"]["tpr_direct_leaf_count"] == 2

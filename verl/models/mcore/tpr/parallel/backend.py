@@ -52,6 +52,7 @@ from .ulysses_attention import (
 )
 
 ALLGATHER_CP_BACKEND = "allgather"
+MINDSPEED_ALLGATHER_CP_ALGO = "kvallgather_cp_algo"
 ULYSSES_CP_BACKEND = "ulysses"
 MINDSPEED_ULYSSES_CP_ALGO = "ulysses_cp_algo"
 RING_CP_BACKEND = "ring"
@@ -335,7 +336,7 @@ def resolve_tpr_cp_backend(
 ) -> TPRCPBackend:
     """Resolve one CP policy without silently falling back between algorithms."""
 
-    if backend is None or backend == ALLGATHER_CP_BACKEND:
+    if backend is None or backend in (ALLGATHER_CP_BACKEND, MINDSPEED_ALLGATHER_CP_ALGO):
         return AllGatherCPBackend(
             cp_group,
             parallel_size=parallel_size,

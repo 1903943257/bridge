@@ -27,6 +27,7 @@ from .attention import TPRSelfAttention
 from .engine_adapter import TPRForwardBackwardRequest
 from .fixed_topology_scheduler import FixedTopologyScheduler
 from .module_spec import make_tpr_module_spec_provider
+from .parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
 from .segment_executor import SegmentExecutor
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ def run_tpr_forward_backward(
     *,
     forward_only: bool,
 ) -> dict[str, Any]:
-    """Run the single-rank TPR MVP instead of Megatron's linear schedule."""
+    """Run TPR instead of Megatron's linear schedule on the initialized CP topology."""
 
     if not isinstance(request, TPRForwardBackwardRequest):
         raise TypeError(
@@ -64,13 +65,15 @@ def run_tpr_forward_backward(
     parallel_sizes = {
         "TP": engine.engine_config.tensor_model_parallel_size,
         "PP": engine.engine_config.pipeline_model_parallel_size,
-        "CP": engine.engine_config.context_parallel_size,
         "EP": engine.engine_config.expert_model_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
     unsupported_sizes = {name: size for name, size in parallel_sizes.items() if size != 1}
     if unsupported_sizes:
-        raise NotImplementedError(f"TPR MVP requires all parallel sizes to be 1, got {unsupported_sizes}")
+        raise NotImplementedError(
+            "TPR formal CP entry currently requires TP/PP/EP/DP=1, "
+            f"got {unsupported_sizes}"
+        )
     if engine.engine_config.virtual_pipeline_model_parallel_size is not None:
         raise NotImplementedError("TPR MVP does not support virtual pipeline parallelism")
     if engine.model_config.mtp.enable:
@@ -99,11 +102,14 @@ def run_tpr_forward_backward(
     if not tpr_attentions:
         raise TypeError("TPR thin entry requires a model built with TPRSelfAttention")
     layer_numbers = tuple(sorted(attention.layer_number for attention in tpr_attentions))
+    cp_runtime = resolve_engine_cp_runtime(engine, config)
     executor = SegmentExecutor(
         model,
         request.plan,
         expected_layer_numbers=layer_numbers,
         loss_scale_func=getattr(config, "grad_scale_func", None),
+        cp_group=cp_runtime.group,
+        cp_backend=cp_runtime.backend,
     )
     scheduler = FixedTopologyScheduler(request.plan, executor, events=request.events)
 
@@ -119,13 +125,20 @@ def run_tpr_forward_backward(
         raise RuntimeError("TPR training requires config.finalize_model_grads_func")
     finalize_model_grads_func(engine.module, None, force_all_reduce=True)
 
-    loss = result.normalized_loss.item()
+    global_loss_sum, global_normalized_loss = aggregate_cp_loss(
+        result.loss_sum,
+        result.normalized_loss,
+        cp_runtime,
+    )
+    loss = global_normalized_loss.item()
     return {
         "model_output": {},
         "loss": loss,
         "metrics": {
             "tpr_loss": loss,
-            "tpr_loss_sum": result.loss_sum.item(),
+            "tpr_loss_sum": global_loss_sum.item(),
+            "tpr_cp_size": cp_runtime.size,
+            "tpr_cp_backend": cp_runtime.backend_name,
             "tpr_peak_path_tokens": result.peak_path_tokens,
             "tpr_segment_count": result.executed_segment_count,
             "tpr_direct_leaf_count": result.direct_leaf_count,

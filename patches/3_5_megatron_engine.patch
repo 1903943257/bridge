@@ -2,11 +2,12 @@ diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
 index 059bf392..6c604a5b 100644
 --- a/verl/workers/config/engine.py
 +++ b/verl/workers/config/engine.py
-@@ -207,6 +207,7 @@ class McoreEngineConfig(EngineConfig):
+@@ -207,6 +207,8 @@ class McoreEngineConfig(EngineConfig):
      use_mbridge: bool = True
      vanilla_mbridge: bool = False
      use_megatron_fsdp: bool = False
 +    tpr_enabled: bool = False
++    tpr_cp_backend: Optional[str] = None
      strategy: str = "megatron"
      qat: QATEngineConfig = field(default_factory=QATEngineConfig)
  
@@ -26,7 +27,7 @@ index 207f4458..0c3b8bda 100644
          module, updated_tf_config = make_megatron_module(
              wrap_config=wrap_config,
              tf_config=self.tf_config,
-@@ -691,6 +696,12 @@ class MegatronEngine(BaseEngine):
+@@ -691,5 +696,11 @@ class MegatronEngine(BaseEngine):
          return torch.tensor(input_ids.numel(), device=input_ids.device)
  
      def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
