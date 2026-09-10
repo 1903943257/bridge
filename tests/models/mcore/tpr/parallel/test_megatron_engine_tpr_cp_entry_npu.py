@@ -120,6 +120,7 @@ def _run_engine_tpr(model, plan, runtime, *, expected_backend):
 
     data = TensorDict({}, batch_size=[])
     tu.assign_non_tensor(data, **{TPR_REQUEST_KEY: TPRForwardBackwardRequest(plan)})
+    assert list(data.keys()) == [TPR_REQUEST_KEY]
     output = engine.forward_backward_batch(data, loss_function=None, forward_only=False)
 
     assert calls == {"no_sync_enter": 1, "no_sync_exit": 1, "finalize": 1}

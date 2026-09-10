@@ -27,10 +27,12 @@ index 207f4458..0c3b8bda 100644
          module, updated_tf_config = make_megatron_module(
              wrap_config=wrap_config,
              tf_config=self.tf_config,
-@@ -691,5 +696,11 @@ class MegatronEngine(BaseEngine):
+@@ -691,5 +696,13 @@ class MegatronEngine(BaseEngine):
          return torch.tensor(input_ids.numel(), device=input_ids.device)
  
      def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
++        # A TPR request owns its complete execution plan and does not carry the
++        # native Megatron batch fields. Route it before mutating or reading data.
 +        tpr_request = tu.get_non_tensor_data(data, key="tpr_forward_backward_request", default=None)
 +        if tpr_request is not None:
 +            from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward
