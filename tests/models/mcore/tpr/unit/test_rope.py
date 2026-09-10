@@ -141,6 +141,28 @@ def test_sharded_rope_repeats_the_last_logical_position_for_padding():
     assert [(call["max_seq_len"], call["offset"]) for call in rotary_embedding.calls] == [(3, 20)]
 
 
+def test_padded_prefix_does_not_shift_the_first_suffix_rope_position():
+    rotary_embedding = _RecordingRotaryEmbedding()
+    suffix_shard = AllGatherCPBackend(
+        object(),
+        parallel_size=2,
+        parallel_rank=0,
+    ).make_sequence_shard(63)
+
+    result = build_sharded_rotary_pos_emb(
+        rotary_embedding,
+        position_start=127,
+        shard=suffix_shard,
+        disable_context_parallel_sharding=True,
+    )
+
+    assert (suffix_shard.global_length, suffix_shard.padded_length) == (63, 64)
+    assert result[0, 0, 0, 0].item() == 127
+    assert [(call["max_seq_len"], call["offset"]) for call in rotary_embedding.calls] == [
+        (32, 127)
+    ]
+
+
 @pytest.mark.parametrize(
     ("prefix_length", "suffix_length", "match"),
     [(-1, 3, "prefix_length"), (True, 3, "prefix_length"), (0, 0, "suffix_length")],

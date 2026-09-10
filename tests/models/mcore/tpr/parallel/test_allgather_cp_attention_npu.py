@@ -151,10 +151,10 @@ def _assert_padding_gradient_zero(tensor, shard):
 @pytest.mark.parametrize(
     ("prefix_lengths", "current_length", "query_heads", "kv_heads"),
     [
-        ((), 128, 2, 2),
-        ((1024,), 512, 4, 2),
-        ((512, 512), 256, 4, 2),
-        ((127,), 63, 4, 2),
+        pytest.param((), 128, 2, 2, id="no_prefix_divisible"),
+        pytest.param((1024,), 512, 4, 2, id="single_prefix_divisible"),
+        pytest.param((512, 512), 256, 4, 2, id="multiple_prefix_divisible"),
+        pytest.param((127,), 63, 4, 2, id="prefix_127_current_63_non_divisible"),
     ],
 )
 def test_allgather_cp_attention_matches_full_causal_forward_backward(

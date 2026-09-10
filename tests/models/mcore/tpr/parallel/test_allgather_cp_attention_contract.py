@@ -23,6 +23,16 @@ def _tensor(length, *, heads=2, head_dim=4):
     return torch.randn(length, 1, heads, head_dim)
 
 
+def _padded_contiguous_shard(logical_length, *, rank):
+    padded_length = ((logical_length + 1) // 2) * 2
+    physical_shard = PrefixShard.contiguous(
+        padded_length,
+        cp_rank=rank,
+        cp_size=2,
+    )
+    return PaddedSequenceShard(logical_length, physical_shard)
+
+
 @pytest.mark.parametrize(("rank", "expected_kv_length"), [(0, 12), (1, 16)])
 def test_each_rank_truncates_current_kv_at_its_local_end(monkeypatch, rank, expected_kv_length):
     monkeypatch.setattr(cp_attention, "_group_world_size_and_rank", lambda group: (2, rank))
@@ -104,6 +114,109 @@ def test_padding_reaches_attention_and_is_masked_from_valid_queries(monkeypatch)
     assert tuple((~attention_mask).sum(dim=1).tolist()) == (12, 13, 14, 14)
     torch.testing.assert_close(output[:3], torch.ones_like(output[:3]))
     torch.testing.assert_close(output[3], torch.zeros_like(output[3]))
+
+
+def test_multiple_padded_prefixes_keep_middle_holes_masked():
+    rank = 1
+    first_shard = _padded_contiguous_shard(3, rank=rank)
+    second_shard = _padded_contiguous_shard(5, rank=rank)
+    current_shard = _padded_contiguous_shard(3, rank=rank)
+    blocks = (
+        LocalKVBlock(0, first_shard, _tensor(2), _tensor(2)),
+        LocalKVBlock(1, second_shard, _tensor(3), _tensor(3)),
+    )
+
+    attention_mask, valid_query = cp_attention._physical_causal_padding_mask(
+        current_shard,
+        blocks,
+        device=torch.device("cpu"),
+    )
+
+    assert attention_mask.shape == (2, 14)
+    assert valid_query.tolist() == [True, False]
+    assert torch.all(attention_mask[:, (3, 9, 13)])
+    assert not attention_mask[0, 4]
+    assert not attention_mask[0, 8]
+    assert not attention_mask[0, 12]
+    assert int((~attention_mask[0]).sum()) == 11
+    assert torch.equal(attention_mask[0], attention_mask[1])
+
+
+def test_prefix_padding_does_not_shift_the_first_suffix_logical_position():
+    rank = 0
+    prefix_shard = _padded_contiguous_shard(127, rank=rank)
+    current_shard = _padded_contiguous_shard(63, rank=rank)
+    prefix = LocalKVBlock(0, prefix_shard, _tensor(64), _tensor(64))
+
+    query_positions, valid_query = cp_attention._local_physical_positions(
+        current_shard,
+        logical_offset=prefix_shard.global_length,
+        device=torch.device("cpu"),
+    )
+    attention_mask, _ = cp_attention._physical_causal_padding_mask(
+        current_shard,
+        (prefix,),
+        device=torch.device("cpu"),
+    )
+
+    assert query_positions[0].item() == 127
+    assert valid_query[0].item()
+    assert attention_mask[0, 127]
+    assert not attention_mask[0, 128]
+    assert attention_mask[0, 129]
+
+
+def test_padded_attention_has_zero_output_and_qkv_gradients_for_padding(monkeypatch):
+    monkeypatch.setattr(cp_attention, "_group_world_size_and_rank", lambda group: (2, 1))
+
+    def fake_all_gather(tensor, group):
+        return torch.cat((torch.zeros_like(tensor), tensor), dim=0)
+
+    def cpu_attention(query, key, value, **kwargs):
+        query_t = query.squeeze(1)
+        key_t = key.squeeze(1)
+        value_t = value.squeeze(1)
+        scale = kwargs["softmax_scale"]
+        scores = torch.einsum("qhd,khd->hqk", query_t, key_t) * scale
+        scores = scores.masked_fill(kwargs["attention_mask"].unsqueeze(0), float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1)
+        output = torch.einsum("hqk,khd->qhd", probabilities, value_t)
+        return output.reshape(query.shape[0], 1, -1)
+
+    monkeypatch.setattr(cp_attention, "all_gather_sequence", fake_all_gather)
+    monkeypatch.setattr(cp_attention, "rectangular_causal_attention", cpu_attention)
+    shard = _padded_contiguous_shard(7, rank=1)
+    generator = torch.Generator().manual_seed(2026)
+
+    def leaf():
+        return torch.randn(4, 1, 1, 2, generator=generator, dtype=torch.float64).requires_grad_(True)
+
+    query = leaf()
+    current_key = leaf()
+    current_value = leaf()
+    prefix_key = leaf()
+    prefix_value = leaf()
+    prefix = LocalKVBlock(0, shard, prefix_key, prefix_value)
+
+    output = cp_attention.allgather_cp_rectangular_attention(
+        query,
+        current_key,
+        current_value,
+        prefix_blocks=(prefix,),
+        current_shard=shard,
+        cp_group=object(),
+        softmax_scale=2**-0.5,
+    )
+    output.sum().backward()
+
+    padding = shard.physical_global_indices() >= shard.global_length
+    valid = ~padding
+    torch.testing.assert_close(output[padding], torch.zeros_like(output[padding]))
+    for tensor in (query, current_key, current_value, prefix_key, prefix_value):
+        torch.testing.assert_close(tensor.grad[padding], torch.zeros_like(tensor.grad[padding]))
+    assert torch.count_nonzero(query.grad[valid]).item() > 0
+    assert torch.count_nonzero(prefix_key.grad[valid]).item() > 0
+    assert torch.count_nonzero(prefix_value.grad[valid]).item() > 0
 
 
 def test_multiple_prefix_blocks_are_gathered_in_path_order(monkeypatch):
