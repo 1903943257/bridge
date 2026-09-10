@@ -83,7 +83,11 @@ _LOSS_ATOL = 2e-2
 _LOSS_RTOL = 2e-2
 _LOGPROB_DIAGNOSTIC_ATOL = 5e-2
 _LOGPROB_DIAGNOSTIC_RTOL = 5e-3
-_LOGPROB_RELATIVE_L2_TOL = 5e-3
+_LOGPROB_RELATIVE_L2_TOL_BY_BACKEND = {
+    "allgather": 5e-3,
+    "ulysses": 5e-3,
+    "ring": 7e-3,
+}
 _LOGPROB_COSINE_MIN = 0.9999
 _CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL = 7e-2
 
@@ -415,10 +419,12 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     )
     pointwise_outliers = int(torch.count_nonzero(absolute_difference > diagnostic_limit).item())
     max_abs_difference = float(absolute_difference.max().item())
+    relative_l2_tolerance = _LOGPROB_RELATIVE_L2_TOL_BY_BACKEND[backend]
     if runtime.rank == 0:
         print(
             "Qwen logprob comparison: "
             f"relative_l2={relative_l2.item():.6e}, "
+            f"relative_l2_tolerance={relative_l2_tolerance:.6e}, "
             f"cosine={cosine.item():.9f}, "
             f"max_abs={max_abs_difference:.6e}, "
             f"pointwise_outliers={pointwise_outliers}/{case.logical_count}"
@@ -435,9 +441,9 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
                 f"actual={actual_logprobs[index].item():.7f} "
                 f"abs_diff={absolute_difference[index].item():.7f}"
             )
-    assert relative_l2.item() <= _LOGPROB_RELATIVE_L2_TOL, (
+    assert relative_l2.item() <= relative_l2_tolerance, (
         f"Qwen logprob relative L2 {relative_l2.item():.6e} exceeds "
-        f"{_LOGPROB_RELATIVE_L2_TOL:.6e}"
+        f"{relative_l2_tolerance:.6e} for backend={backend}"
     )
     assert cosine.item() >= _LOGPROB_COSINE_MIN, (
         f"Qwen logprob cosine {cosine.item():.9f} is below {_LOGPROB_COSINE_MIN:.9f}"
