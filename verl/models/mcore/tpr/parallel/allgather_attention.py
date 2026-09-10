@@ -190,6 +190,80 @@ def _normalize_prefix_blocks(
     return normalized
 
 
+def _has_padding(shard: SequenceShard) -> bool:
+    return shard.padded_length != shard.global_length
+
+
+def _full_physical_positions(
+    shard: SequenceShard,
+    *,
+    logical_offset: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    physical_indices = torch.arange(shard.padded_length, device=device)
+    valid = physical_indices < shard.global_length
+    logical_positions = physical_indices.clamp_max(shard.global_length - 1).add(
+        logical_offset
+    )
+    return logical_positions, valid
+
+
+def _local_physical_positions(
+    shard: SequenceShard,
+    *,
+    logical_offset: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    physical_indices = shard.physical_global_indices(device=device)
+    valid = physical_indices < shard.global_length
+    logical_positions = physical_indices.clamp_max(shard.global_length - 1).add(
+        logical_offset
+    )
+    return logical_positions, valid
+
+
+def _physical_causal_padding_mask(
+    current_shard: SequenceShard,
+    prefix_blocks: Sequence[LocalKVBlock],
+    *,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Build the standard bool mask for physical padded AllGather attention."""
+
+    key_positions = []
+    key_validity = []
+    logical_offset = 0
+    for block in prefix_blocks:
+        positions, valid = _full_physical_positions(
+            block.shard,
+            logical_offset=logical_offset,
+            device=device,
+        )
+        key_positions.append(positions)
+        key_validity.append(valid)
+        logical_offset += block.shard.global_length
+
+    current_positions, current_validity = _full_physical_positions(
+        current_shard,
+        logical_offset=logical_offset,
+        device=device,
+    )
+    key_positions.append(current_positions)
+    key_validity.append(current_validity)
+    query_positions, query_validity = _local_physical_positions(
+        current_shard,
+        logical_offset=logical_offset,
+        device=device,
+    )
+    all_key_positions = torch.cat(key_positions)
+    all_key_validity = torch.cat(key_validity)
+    attention_mask = torch.logical_or(
+        torch.logical_not(all_key_validity).unsqueeze(0),
+        all_key_positions.unsqueeze(0) > query_positions.unsqueeze(1),
+    )
+    return attention_mask, query_validity
+
+
 def allgather_cp_rectangular_attention(
     query: Tensor,
     current_key: Tensor,
@@ -203,8 +277,10 @@ def allgather_cp_rectangular_attention(
     """Run local-query causal attention over gathered prefix/current KV.
 
     Every prefix segment is gathered independently so a multi-level path stays
-    in segment order. Current KV is truncated at this rank's local shard end;
-    sparse mode 3 then right-aligns local Q to its correct global positions.
+    in segment order. The unpadded fast path truncates current KV at this
+    rank's local shard end and uses sparse mode 3. If any segment is padded,
+    physical Q/K/V remain intact and a standard bool mask supplies both causal
+    visibility and logical padding isolation.
     """
 
     cp_size, cp_rank = _group_world_size_and_rank(cp_group)
@@ -243,14 +319,44 @@ def allgather_cp_rectangular_attention(
         cp_rank=cp_rank,
         current_key=current_key,
     )
-    full_prefix_keys: list[Tensor] = []
-    full_prefix_values: list[Tensor] = []
+    physical_prefix_keys: list[Tensor] = []
+    physical_prefix_values: list[Tensor] = []
     for block in blocks:
-        full_prefix_keys.append(all_gather_sequence(block.key, cp_group)[: block.shard.global_length])
-        full_prefix_values.append(all_gather_sequence(block.value, cp_group)[: block.shard.global_length])
+        physical_prefix_keys.append(all_gather_sequence(block.key, cp_group))
+        physical_prefix_values.append(all_gather_sequence(block.value, cp_group))
 
-    full_current_key = all_gather_sequence(current_key, cp_group)[: current_shard.global_length]
-    full_current_value = all_gather_sequence(current_value, cp_group)[: current_shard.global_length]
+    physical_current_key = all_gather_sequence(current_key, cp_group)
+    physical_current_value = all_gather_sequence(current_value, cp_group)
+    if _has_padding(current_shard) or any(_has_padding(block.shard) for block in blocks):
+        # torch_npu fusion attention does not currently support padding_mask.
+        # Keep physical tensors intact and express validity through its standard
+        # bool atten_mask input instead.
+        physical_key = torch.cat((*physical_prefix_keys, physical_current_key), dim=0)
+        physical_value = torch.cat((*physical_prefix_values, physical_current_value), dim=0)
+        attention_mask, valid_query = _physical_causal_padding_mask(
+            current_shard,
+            blocks,
+            device=query.device,
+        )
+        physical_output = rectangular_causal_attention(
+            query,
+            physical_key,
+            physical_value,
+            softmax_scale=softmax_scale,
+            attention_mask=attention_mask,
+        )
+        return physical_output * valid_query[:, None, None].to(physical_output.dtype)
+
+    full_prefix_keys = [
+        key[: block.shard.global_length]
+        for key, block in zip(physical_prefix_keys, blocks, strict=True)
+    ]
+    full_prefix_values = [
+        value[: block.shard.global_length]
+        for value, block in zip(physical_prefix_values, blocks, strict=True)
+    ]
+    full_current_key = physical_current_key[: current_shard.global_length]
+    full_current_value = physical_current_value[: current_shard.global_length]
     output = query.reshape(query.shape[0], 1, -1) * 0.0
     valid_slices = iter_valid_sequence_slices(current_shard)
     if not valid_slices:

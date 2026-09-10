@@ -141,6 +141,13 @@ def _assert_close(actual, expected, *, gradient=False):
     )
 
 
+def _assert_padding_gradient_zero(tensor, shard):
+    physical_indices = shard.physical_global_indices(device=tensor.device)
+    padding = physical_indices >= shard.global_length
+    if torch.any(padding).item():
+        assert torch.count_nonzero(tensor.grad[padding]).item() == 0
+
+
 @pytest.mark.parametrize(
     ("prefix_lengths", "current_length", "query_heads", "kv_heads"),
     [
@@ -231,16 +238,19 @@ def test_allgather_cp_attention_matches_full_causal_forward_backward(
 
     _assert_close(actual, current_shard.select(expected))
     _assert_close(local_query.grad, current_shard.select(reference_query.grad), gradient=True)
+    _assert_padding_gradient_zero(local_query, current_shard)
     _assert_close(
         local_current_key.grad,
         current_shard.select(reference_current_key.grad),
         gradient=True,
     )
+    _assert_padding_gradient_zero(local_current_key, current_shard)
     _assert_close(
         local_current_value.grad,
         current_shard.select(reference_current_value.grad),
         gradient=True,
     )
+    _assert_padding_gradient_zero(local_current_value, current_shard)
     for index, length in enumerate(prefix_lengths):
         shard = shard_policy.make_sequence_shard(length)
         _assert_close(
@@ -253,6 +263,8 @@ def test_allgather_cp_attention_matches_full_causal_forward_backward(
             shard.select(reference_prefix_values[index].grad),
             gradient=True,
         )
+        _assert_padding_gradient_zero(local_prefix_keys[index], shard)
+        _assert_padding_gradient_zero(local_prefix_values[index], shard)
         assert torch.count_nonzero(local_prefix_keys[index].grad).item() > 0
         assert torch.count_nonzero(local_prefix_values[index].grad).item() > 0
 

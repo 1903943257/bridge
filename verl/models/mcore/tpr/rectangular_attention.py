@@ -28,6 +28,7 @@ import torch
 from torch import Tensor
 
 _RIGHT_DOWN_CAUSAL_MODE = 3
+_CUSTOM_MASK_MODE = 0
 _TND_LAYOUT = "TND"
 _DEFAULT_PRE_TOKENS = 2**31 - 1
 _COMPRESSED_CAUSAL_MASK_SIZE = 2048
@@ -82,6 +83,32 @@ def _validate_inputs(query: Tensor, key: Tensor, value: Tensor, dropout_p: float
     return query_length, kv_length, query_heads, head_dim
 
 
+def _validate_attention_mask(
+    attention_mask: Tensor | None,
+    *,
+    query_length: int,
+    kv_length: int,
+    device: torch.device,
+) -> None:
+    if attention_mask is None:
+        return
+    if not isinstance(attention_mask, Tensor):
+        raise TypeError(
+            f"attention_mask must be a torch.Tensor or None, got {type(attention_mask).__name__}"
+        )
+    if attention_mask.dtype != torch.bool:
+        raise ValueError(f"attention_mask must use torch.bool, got {attention_mask.dtype}")
+    if attention_mask.device != device:
+        raise ValueError(
+            f"attention_mask must be on {device}, got {attention_mask.device}"
+        )
+    expected_shape = (query_length, kv_length)
+    if tuple(attention_mask.shape) != expected_shape:
+        raise ValueError(
+            f"attention_mask must have shape {expected_shape}, got {tuple(attention_mask.shape)}"
+        )
+
+
 def rectangular_causal_attention(
     query: Tensor,
     key: Tensor,
@@ -91,6 +118,7 @@ def rectangular_causal_attention(
     dropout_p: float = 0.0,
     pre_tokens: int = _DEFAULT_PRE_TOKENS,
     inner_precise: int = 0,
+    attention_mask: Tensor | None = None,
 ) -> Tensor:
     """Run differentiable rectangular causal attention on one NPU sequence.
 
@@ -105,12 +133,21 @@ def rectangular_causal_attention(
         pre_tokens: CANN's preceding-token window. It defaults to an effectively
             unbounded value so sparse mode 3 supplies the causal boundary.
         inner_precise: Forwarded unchanged to ``npu_fusion_attention``.
+        attention_mask: Optional physical ``[Sq, Skv]`` bool mask. ``True``
+            entries are excluded. Supplying it selects CANN's standard custom
+            mask mode instead of the compressed right-down causal mask.
 
     Returns:
         Attention context in Megatron layout ``[Sq, 1, Hq * D]``.
     """
 
     query_length, kv_length, query_heads, head_dim = _validate_inputs(query, key, value, dropout_p)
+    _validate_attention_mask(
+        attention_mask,
+        query_length=query_length,
+        kv_length=kv_length,
+        device=query.device,
+    )
 
     if query.device.type != "npu":
         raise RuntimeError(f"rectangular_causal_attention requires an NPU tensor, got device {query.device}")
@@ -129,7 +166,12 @@ def rectangular_causal_attention(
     query_tnd = query.squeeze(1).contiguous()
     key_tnd = key.squeeze(1).contiguous()
     value_tnd = value.squeeze(1).contiguous()
-    attention_mask = _compressed_causal_mask(query.device)
+    if attention_mask is None:
+        attention_mask = _compressed_causal_mask(query.device)
+        sparse_mode = _RIGHT_DOWN_CAUSAL_MODE
+    else:
+        attention_mask = attention_mask.contiguous()
+        sparse_mode = _CUSTOM_MASK_MODE
 
     output = torch_npu.npu_fusion_attention(
         query_tnd,
@@ -145,7 +187,7 @@ def rectangular_causal_attention(
         next_tockens=0,
         keep_prob=1.0,
         inner_precise=inner_precise,
-        sparse_mode=_RIGHT_DOWN_CAUSAL_MODE,
+        sparse_mode=sparse_mode,
         actual_seq_qlen=[query_length],
         actual_seq_kvlen=[kv_length],
     )[0]

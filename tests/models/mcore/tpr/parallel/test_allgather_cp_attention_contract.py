@@ -16,7 +16,7 @@ import pytest
 import torch
 
 import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
-from verl.models.mcore.tpr import LocalKVBlock, PrefixShard
+from verl.models.mcore.tpr import LocalKVBlock, PaddedSequenceShard, PrefixShard
 
 
 def _tensor(length, *, heads=2, head_dim=4):
@@ -36,6 +36,7 @@ def test_each_rank_truncates_current_kv_at_its_local_end(monkeypatch, rank, expe
     def fake_attention(query, key, value, **kwargs):
         captured["key"] = key
         captured["value"] = value
+        captured["kwargs"] = kwargs
         return query.reshape(query.shape[0], 1, -1)
 
     monkeypatch.setattr(cp_attention, "rectangular_causal_attention", fake_attention)
@@ -58,6 +59,51 @@ def test_each_rank_truncates_current_kv_at_its_local_end(monkeypatch, rank, expe
     assert output.shape == (4, 1, 8)
     assert captured["key"].shape[0] == expected_kv_length
     assert captured["value"].shape[0] == expected_kv_length
+    assert "attention_mask" not in captured["kwargs"]
+
+
+def test_padding_reaches_attention_and_is_masked_from_valid_queries(monkeypatch):
+    monkeypatch.setattr(cp_attention, "_group_world_size_and_rank", lambda group: (2, 1))
+    monkeypatch.setattr(
+        cp_attention,
+        "all_gather_sequence",
+        lambda tensor, group: torch.cat((tensor, tensor), dim=0),
+    )
+    captured = {}
+
+    def fake_attention(query, key, value, **kwargs):
+        captured["query"] = query
+        captured["key"] = key
+        captured["value"] = value
+        captured["attention_mask"] = kwargs["attention_mask"]
+        return torch.ones(query.shape[0], 1, query.shape[2] * query.shape[3])
+
+    monkeypatch.setattr(cp_attention, "rectangular_causal_attention", fake_attention)
+    physical_shard = PrefixShard.contiguous(8, cp_rank=1, cp_size=2)
+    shard = PaddedSequenceShard(7, physical_shard)
+    prefix = LocalKVBlock(0, shard, _tensor(4), _tensor(4))
+
+    output = cp_attention.allgather_cp_rectangular_attention(
+        _tensor(4),
+        _tensor(4),
+        _tensor(4),
+        prefix_blocks=(prefix,),
+        current_shard=shard,
+        cp_group=object(),
+    )
+
+    assert captured["query"].shape[0] == 4
+    assert captured["key"].shape[0] == 16
+    assert captured["value"].shape[0] == 16
+    attention_mask = captured["attention_mask"]
+    assert attention_mask.dtype == torch.bool
+    assert attention_mask.shape == (4, 16)
+    assert torch.all(attention_mask[:, 7])
+    assert torch.all(attention_mask[:, 15])
+    assert not torch.any(torch.all(attention_mask, dim=1))
+    assert tuple((~attention_mask).sum(dim=1).tolist()) == (12, 13, 14, 14)
+    torch.testing.assert_close(output[:3], torch.ones_like(output[:3]))
+    torch.testing.assert_close(output[3], torch.zeros_like(output[3]))
 
 
 def test_multiple_prefix_blocks_are_gathered_in_path_order(monkeypatch):

@@ -15,7 +15,11 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr.rectangular_attention import _validate_inputs, rectangular_causal_attention
+from verl.models.mcore.tpr.rectangular_attention import (
+    _validate_attention_mask,
+    _validate_inputs,
+    rectangular_causal_attention,
+)
 
 
 def _qkv(query_length=3, kv_length=9, query_heads=4, kv_heads=2, head_dim=8):
@@ -48,6 +52,33 @@ def test_contract_rejects_incompatible_inputs(mutation, match):
 def test_contract_rejects_attention_dropout():
     with pytest.raises(ValueError, match="dropout_p=0"):
         _validate_inputs(*_qkv(), dropout_p=0.1)
+
+
+def test_contract_accepts_physical_bool_attention_mask():
+    query, key, _ = _qkv()
+    _validate_attention_mask(
+        torch.zeros(query.shape[0], key.shape[0], dtype=torch.bool),
+        query_length=query.shape[0],
+        kv_length=key.shape[0],
+        device=query.device,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mask", "match"),
+    [
+        (torch.zeros(3, 9), "torch.bool"),
+        (torch.zeros(3, 8, dtype=torch.bool), "shape"),
+    ],
+)
+def test_contract_rejects_invalid_physical_attention_mask(mask, match):
+    with pytest.raises(ValueError, match=match):
+        _validate_attention_mask(
+            mask,
+            query_length=3,
+            kv_length=9,
+            device=torch.device("cpu"),
+        )
 
 
 def test_public_adapter_fails_clearly_off_npu():
