@@ -71,7 +71,15 @@ from .prefix_state import (
 )
 from .rectangular_attention import rectangular_causal_attention
 from .rope import build_sharded_rotary_pos_emb, build_suffix_rotary_pos_emb
-from .shard import PrefixShard, RangeSequenceShard, SequenceShard
+from .shard import (
+    PaddedSequenceShard,
+    PrefixShard,
+    RangeSequenceShard,
+    SequenceShard,
+    iter_valid_sequence_slices,
+    physical_sequence_shard,
+    round_up_sequence_length,
+)
 from .segment_executor import LeafVisitResult, SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
 from .segment_plan import (
     PopSegment,
@@ -108,6 +116,7 @@ __all__ = [
     "PastKVSlice",
     "PhysicalExecution",
     "PhysicalExecutionKind",
+    "PaddedSequenceShard",
     "PrefixShard",
     "RangeSequenceShard",
     "RingBlockKind",
@@ -143,13 +152,16 @@ __all__ = [
     "build_suffix_rotary_pos_emb",
     "classify_ring_block",
     "hybrid_cp_rectangular_attention",
+    "iter_valid_sequence_slices",
     "get_tpr_attention_context",
     "make_tpr_module_spec_provider",
     "make_hybrid_sequence_shard",
     "make_ring_sequence_shard",
+    "physical_sequence_shard",
     "rectangular_causal_attention",
     "resolve_tpr_cp_backend",
     "resolve_mindspeed_hybrid_topology",
+    "round_up_sequence_length",
     "ring_cp_attention",
     "replace_self_attention_with_tpr",
     "use_tpr_attention_context",

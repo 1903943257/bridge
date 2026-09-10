@@ -108,15 +108,29 @@ def build_sharded_rotary_pos_emb(
     _validate_length("position_start", position_start, allow_zero=True)
     if not isinstance(shard, SequenceShard):
         raise TypeError(f"shard must implement SequenceShard, got {type(shard).__name__}")
-    chunks = tuple(
-        build_suffix_rotary_pos_emb(
-            rotary_embedding,
-            prefix_length=position_start + start,
-            suffix_length=end - start,
-            disable_context_parallel_sharding=disable_context_parallel_sharding,
-        )
-        for start, end in shard.global_ranges
-    )
+    chunks = []
+    for physical_start, physical_end in shard.physical_global_ranges:
+        valid_end = min(physical_end, shard.global_length)
+        valid_length = max(0, valid_end - physical_start)
+        physical_length = physical_end - physical_start
+        if valid_length:
+            chunk = build_suffix_rotary_pos_emb(
+                rotary_embedding,
+                prefix_length=position_start + physical_start,
+                suffix_length=valid_length,
+                disable_context_parallel_sharding=disable_context_parallel_sharding,
+            )
+        else:
+            chunk = build_suffix_rotary_pos_emb(
+                rotary_embedding,
+                prefix_length=position_start + shard.global_length - 1,
+                suffix_length=1,
+                disable_context_parallel_sharding=disable_context_parallel_sharding,
+            )
+        if valid_length < physical_length:
+            padding = chunk[-1:].expand(physical_length - valid_length, *chunk.shape[1:])
+            chunk = torch.cat((chunk if valid_length else chunk[:0], padding), dim=0)
+        chunks.append(chunk)
     rotary_pos_emb = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
     if rotary_pos_emb.shape[0] != shard.local_length:
         raise RuntimeError(

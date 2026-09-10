@@ -32,7 +32,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 import verl.models.mcore.tpr.parallel.ulysses_attention as ulysses
-from verl.models.mcore.tpr import LocalKVBlock, PrefixShard
+from verl.models.mcore.tpr import AllGatherCPBackend, LocalKVBlock, SequenceShard
 from verl.utils.device import is_torch_npu_available
 
 
@@ -75,7 +75,7 @@ def _randn(shape, *, seed, device):
     return torch.randn(shape, generator=generator).to(device=device, dtype=_DTYPE)
 
 
-def _local_leaf(tensor: Tensor, shard: PrefixShard) -> Tensor:
+def _local_leaf(tensor: Tensor, shard: SequenceShard) -> Tensor:
     return shard.select(tensor).detach().clone().requires_grad_(True)
 
 
@@ -135,6 +135,7 @@ def _a2a_probe():
         ((), 128, 4, 2),
         ((1024,), 512, 4, 2),
         ((512, 512), 256, 4, 2),
+        ((127,), 63, 4, 2),
     ],
 )
 def test_ulysses_cp_attention_matches_full_causal_forward_backward(
@@ -148,7 +149,12 @@ def test_ulysses_cp_attention_matches_full_causal_forward_backward(
     rank = dist.get_rank(cp_group)
     head_dim = 64
     scale = head_dim**-0.5
-    current_shard = PrefixShard.contiguous(current_length, cp_rank=rank, cp_size=2)
+    shard_policy = AllGatherCPBackend(
+        cp_group,
+        parallel_size=_EXPECTED_WORLD_SIZE,
+        parallel_rank=rank,
+    )
+    current_shard = shard_policy.make_sequence_shard(current_length)
     global_query = _randn((current_length, 1, query_heads, head_dim), seed=100, device=device)
     global_current_key = _randn((current_length, 1, kv_heads, head_dim), seed=101, device=device)
     global_current_value = _randn((current_length, 1, kv_heads, head_dim), seed=102, device=device)
@@ -169,7 +175,7 @@ def test_ulysses_cp_attention_matches_full_causal_forward_backward(
     for index, (length, key, value) in enumerate(
         zip(prefix_lengths, global_prefix_keys, global_prefix_values, strict=True)
     ):
-        shard = PrefixShard.contiguous(length, cp_rank=rank, cp_size=2)
+        shard = shard_policy.make_sequence_shard(length)
         local_key = _local_leaf(key, shard)
         local_value = _local_leaf(value, shard)
         local_prefix_keys.append(local_key)
@@ -221,7 +227,7 @@ def test_ulysses_cp_attention_matches_full_causal_forward_backward(
         gradient=True,
     )
     for index, length in enumerate(prefix_lengths):
-        shard = PrefixShard.contiguous(length, cp_rank=rank, cp_size=2)
+        shard = shard_policy.make_sequence_shard(length)
         _assert_close(
             local_prefix_keys[index].grad,
             shard.select(reference_prefix_keys[index].grad),

@@ -53,8 +53,8 @@ def test_allgather_backend_owns_contiguous_shard_policy():
     assert isinstance(backend, TPRCPBackend)
     assert backend.backend_name == ALLGATHER_CP_BACKEND
     assert backend.make_sequence_shard(8) == PrefixShard.contiguous(8, cp_rank=1, cp_size=2)
-    with pytest.raises(ValueError, match="divisible"):
-        backend.validate_segment_length(7)
+    padded = backend.make_sequence_shard(7)
+    assert (padded.global_length, padded.padded_length, padded.valid_local_length) == (7, 8, 3)
 
 
 def test_resolver_accepts_a_structural_custom_backend():
@@ -109,8 +109,8 @@ def test_resolver_constructs_the_ring_adapter(name):
         cp_rank=0,
         cp_size=2,
     )
-    with pytest.raises(ValueError, match=r"2 \* CP size"):
-        backend.validate_segment_length(10)
+    padded = backend.make_sequence_shard(10)
+    assert (padded.global_length, padded.padded_length) == (10, 12)
 
 
 @pytest.mark.parametrize("name", ["hybrid", "hybrid_cp_algo"])

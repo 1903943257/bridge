@@ -25,7 +25,7 @@ from torch import Tensor
 
 from ..kv_stack import KVStack
 from ..prefix_state import KVPrefixAnchors
-from ..shard import PrefixShard
+from ..shard import PrefixShard, SequenceShard, physical_sequence_shard
 from .allgather_attention import (
     LocalKVBlock,
     _group_world_size_and_rank,
@@ -58,7 +58,7 @@ class AllGatherCPAttentionBackend:
         self,
         *,
         global_prefix_length: int,
-        current_shard: PrefixShard,
+        current_shard: SequenceShard,
         prefix_blocks_by_layer: Mapping[int, Sequence[LocalKVBlock]],
         cp_group: Any,
     ) -> None:
@@ -66,8 +66,10 @@ class AllGatherCPAttentionBackend:
             raise ValueError(f"global_prefix_length must be an integer, got {global_prefix_length!r}")
         if global_prefix_length < 0:
             raise ValueError(f"global_prefix_length must be non-negative, got {global_prefix_length}")
-        if not isinstance(current_shard, PrefixShard):
-            raise TypeError(f"current_shard must be PrefixShard, got {type(current_shard).__name__}")
+        if not isinstance(current_shard, SequenceShard):
+            raise TypeError(f"current_shard must implement SequenceShard, got {type(current_shard).__name__}")
+        if not isinstance(physical_sequence_shard(current_shard), PrefixShard):
+            raise TypeError("AllGather CP requires contiguous physical sequence placement")
 
         cp_size, cp_rank = _group_world_size_and_rank(cp_group)
         if (current_shard.cp_size, current_shard.cp_rank) != (cp_size, cp_rank):
@@ -123,7 +125,7 @@ class AllGatherCPAttentionBackend:
         return self._parallel_size
 
     @property
-    def current_shard(self) -> PrefixShard:
+    def current_shard(self) -> SequenceShard:
         return self._current_shard
 
     @property
@@ -182,7 +184,7 @@ def make_cached_allgather_cp_backend(
     kv_stack: KVStack,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: PrefixShard,
+    current_shard: SequenceShard,
     cp_group: Any,
 ) -> AllGatherCPAttentionBackend:
     """Build a no-grad backend over graph-free Prefix states."""
@@ -210,7 +212,7 @@ def make_anchored_allgather_cp_backend(
     anchors: ShardedPastKVAnchors,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: PrefixShard,
+    current_shard: SequenceShard,
     cp_group: Any,
 ) -> AllGatherCPAttentionBackend:
     """Build a grad-enabled backend over local Prefix anchor leaves."""

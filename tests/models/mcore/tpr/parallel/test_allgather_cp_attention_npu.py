@@ -31,7 +31,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
-from verl.models.mcore.tpr import LocalKVBlock, PrefixShard
+from verl.models.mcore.tpr import AllGatherCPBackend, LocalKVBlock, PrefixShard, SequenceShard
 from verl.utils.device import is_torch_npu_available
 
 
@@ -108,8 +108,8 @@ def _randn(shape, *, seed, device, requires_grad=False):
     return tensor.requires_grad_(requires_grad)
 
 
-def _local_leaf(tensor: Tensor, shard: PrefixShard) -> Tensor:
-    return tensor[shard.local_start : shard.local_end].detach().clone().requires_grad_(True)
+def _local_leaf(tensor: Tensor, shard: SequenceShard) -> Tensor:
+    return shard.select(tensor).detach().clone().requires_grad_(True)
 
 
 def _reference(query, prefix_keys, prefix_values, current_key, current_value, scale):
@@ -147,6 +147,7 @@ def _assert_close(actual, expected, *, gradient=False):
         ((), 128, 2, 2),
         ((1024,), 512, 4, 2),
         ((512, 512), 256, 4, 2),
+        ((127,), 63, 4, 2),
     ],
 )
 def test_allgather_cp_attention_matches_full_causal_forward_backward(
@@ -160,7 +161,12 @@ def test_allgather_cp_attention_matches_full_causal_forward_backward(
     rank = dist.get_rank(cp_group)
     head_dim = 64
     scale = head_dim**-0.5
-    current_shard = PrefixShard.contiguous(current_length, cp_rank=rank, cp_size=_EXPECTED_WORLD_SIZE)
+    shard_policy = AllGatherCPBackend(
+        cp_group,
+        parallel_size=_EXPECTED_WORLD_SIZE,
+        parallel_rank=rank,
+    )
+    current_shard = shard_policy.make_sequence_shard(current_length)
 
     global_query = _randn((current_length, 1, query_heads, head_dim), seed=100, device=device)
     global_current_key = _randn((current_length, 1, kv_heads, head_dim), seed=101, device=device)
@@ -183,7 +189,7 @@ def test_allgather_cp_attention_matches_full_causal_forward_backward(
     for index, (length, global_key, global_value) in enumerate(
         zip(prefix_lengths, global_prefix_keys, global_prefix_values, strict=True)
     ):
-        shard = PrefixShard.contiguous(length, cp_rank=rank, cp_size=_EXPECTED_WORLD_SIZE)
+        shard = shard_policy.make_sequence_shard(length)
         local_key = _local_leaf(global_key, shard)
         local_value = _local_leaf(global_value, shard)
         local_prefix_keys.append(local_key)
@@ -195,7 +201,7 @@ def test_allgather_cp_attention_matches_full_causal_forward_backward(
         seed=999,
         device=device,
     )
-    local_gradient = global_gradient[current_shard.local_start : current_shard.local_end]
+    local_gradient = current_shard.select(global_gradient)
     with _CollectiveProbe() as counts:
         actual = cp_attention.allgather_cp_rectangular_attention(
             local_query,
@@ -223,16 +229,30 @@ def test_allgather_cp_attention_matches_full_causal_forward_backward(
     )
     expected.backward(global_gradient.float())
 
-    local_slice = slice(current_shard.local_start, current_shard.local_end)
-    _assert_close(actual, expected[local_slice])
-    _assert_close(local_query.grad, reference_query.grad[local_slice], gradient=True)
-    _assert_close(local_current_key.grad, reference_current_key.grad[local_slice], gradient=True)
-    _assert_close(local_current_value.grad, reference_current_value.grad[local_slice], gradient=True)
+    _assert_close(actual, current_shard.select(expected))
+    _assert_close(local_query.grad, current_shard.select(reference_query.grad), gradient=True)
+    _assert_close(
+        local_current_key.grad,
+        current_shard.select(reference_current_key.grad),
+        gradient=True,
+    )
+    _assert_close(
+        local_current_value.grad,
+        current_shard.select(reference_current_value.grad),
+        gradient=True,
+    )
     for index, length in enumerate(prefix_lengths):
-        shard = PrefixShard.contiguous(length, cp_rank=rank, cp_size=_EXPECTED_WORLD_SIZE)
-        prefix_slice = slice(shard.local_start, shard.local_end)
-        _assert_close(local_prefix_keys[index].grad, reference_prefix_keys[index].grad[prefix_slice], gradient=True)
-        _assert_close(local_prefix_values[index].grad, reference_prefix_values[index].grad[prefix_slice], gradient=True)
+        shard = shard_policy.make_sequence_shard(length)
+        _assert_close(
+            local_prefix_keys[index].grad,
+            shard.select(reference_prefix_keys[index].grad),
+            gradient=True,
+        )
+        _assert_close(
+            local_prefix_values[index].grad,
+            shard.select(reference_prefix_values[index].grad),
+            gradient=True,
+        )
         assert torch.count_nonzero(local_prefix_keys[index].grad).item() > 0
         assert torch.count_nonzero(local_prefix_values[index].grad).item() > 0
 

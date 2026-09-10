@@ -66,7 +66,13 @@ class SequenceShard(Protocol):
     def global_length(self) -> int: ...
 
     @property
+    def padded_length(self) -> int: ...
+
+    @property
     def local_length(self) -> int: ...
+
+    @property
+    def valid_local_length(self) -> int: ...
 
     @property
     def cp_rank(self) -> int: ...
@@ -78,11 +84,16 @@ class SequenceShard(Protocol):
     def global_ranges(self) -> tuple[SequenceRange, ...]: ...
 
     @property
+    def physical_global_ranges(self) -> tuple[SequenceRange, ...]: ...
+
+    @property
     def is_full(self) -> bool: ...
 
     def select(self, tensor: Tensor, *, dim: int = 0) -> Tensor: ...
 
     def global_indices(self, *, device: torch.device | str | None = None) -> Tensor: ...
+
+    def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor: ...
 
     def owns(self, global_offset: int) -> bool: ...
 
@@ -145,8 +156,20 @@ class PrefixShard:
         return self.local_end - self.local_start
 
     @property
+    def padded_length(self) -> int:
+        return self.global_length
+
+    @property
+    def valid_local_length(self) -> int:
+        return self.local_length
+
+    @property
     def global_ranges(self) -> tuple[SequenceRange, ...]:
         return ((self.local_start, self.local_end),)
+
+    @property
+    def physical_global_ranges(self) -> tuple[SequenceRange, ...]:
+        return self.global_ranges
 
     @property
     def is_full(self) -> bool:
@@ -162,6 +185,9 @@ class PrefixShard:
 
     def global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
         return torch.arange(self.local_start, self.local_end, dtype=torch.long, device=device)
+
+    def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
+        return self.global_indices(device=device)
 
     def owns(self, global_offset: int) -> bool:
         _validate_global_offset(global_offset, self.global_length)
@@ -221,6 +247,18 @@ class RangeSequenceShard:
         return sum(end - start for start, end in self.ranges)
 
     @property
+    def padded_length(self) -> int:
+        return self.global_length
+
+    @property
+    def valid_local_length(self) -> int:
+        return self.local_length
+
+    @property
+    def physical_global_ranges(self) -> tuple[SequenceRange, ...]:
+        return self.global_ranges
+
+    @property
     def is_full(self) -> bool:
         return self.ranges == ((0, self.global_length),)
 
@@ -238,6 +276,9 @@ class RangeSequenceShard:
             torch.arange(start, end, dtype=torch.long, device=device) for start, end in self.ranges
         )
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+    def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
+        return self.global_indices(device=device)
 
     def owns(self, global_offset: int) -> bool:
         _validate_global_offset(global_offset, self.global_length)
@@ -263,3 +304,146 @@ class RangeSequenceShard:
                 return start + remaining
             remaining -= length
         raise AssertionError("validated local offset was not mapped")
+
+
+@dataclass(frozen=True, slots=True)
+class PaddedSequenceShard:
+    """Logical Segment ownership backed by an equally sized physical CP shard.
+
+    Padding is appended to the Segment-local global sequence.  The wrapped
+    physical shard owns positions in ``[0, padded_length)`` while all public
+    topology and loss operations remain restricted to ``[0, logical_length)``.
+    """
+
+    logical_length: int
+    physical_shard: PrefixShard | RangeSequenceShard
+
+    def __post_init__(self) -> None:
+        _validate_integer("logical_length", self.logical_length, minimum=1)
+        if not isinstance(self.physical_shard, (PrefixShard, RangeSequenceShard)):
+            raise TypeError(
+                "physical_shard must be PrefixShard or RangeSequenceShard, "
+                f"got {type(self.physical_shard).__name__}"
+            )
+        if self.logical_length >= self.physical_shard.global_length:
+            raise ValueError(
+                "PaddedSequenceShard requires logical_length smaller than the "
+                f"physical length, got {self.logical_length} and {self.physical_shard.global_length}"
+            )
+
+    @property
+    def global_length(self) -> int:
+        return self.logical_length
+
+    @property
+    def padded_length(self) -> int:
+        return self.physical_shard.global_length
+
+    @property
+    def local_length(self) -> int:
+        return self.physical_shard.local_length
+
+    @property
+    def valid_local_length(self) -> int:
+        return sum(end - start for start, end in self.global_ranges)
+
+    @property
+    def cp_rank(self) -> int:
+        return self.physical_shard.cp_rank
+
+    @property
+    def cp_size(self) -> int:
+        return self.physical_shard.cp_size
+
+    @property
+    def physical_global_ranges(self) -> tuple[SequenceRange, ...]:
+        return self.physical_shard.global_ranges
+
+    @property
+    def global_ranges(self) -> tuple[SequenceRange, ...]:
+        return tuple(
+            (start, min(end, self.logical_length))
+            for start, end in self.physical_global_ranges
+            if start < self.logical_length
+        )
+
+    @property
+    def is_full(self) -> bool:
+        return self.cp_size == 1 and self.valid_local_length == self.logical_length
+
+    def select(self, tensor: Tensor, *, dim: int = 0) -> Tensor:
+        dim = _normalize_dimension(tensor, dim)
+        if tensor.shape[dim] != self.logical_length:
+            raise ValueError(
+                f"tensor sequence dimension must be {self.logical_length}, got {tensor.shape[dim]}"
+            )
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = self.padded_length - self.logical_length
+        padding = tensor.new_zeros(pad_shape)
+        padded = torch.cat((tensor, padding), dim=dim)
+        return self.physical_shard.select(padded, dim=dim)
+
+    def global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
+        physical = self.physical_global_indices(device=device)
+        return physical.clamp_max(self.logical_length - 1)
+
+    def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
+        return self.physical_shard.global_indices(device=device)
+
+    def owns(self, global_offset: int) -> bool:
+        _validate_global_offset(global_offset, self.logical_length)
+        return self.physical_shard.owns(global_offset)
+
+    def global_to_local(self, global_offset: int) -> int | None:
+        _validate_global_offset(global_offset, self.logical_length)
+        return self.physical_shard.global_to_local(global_offset)
+
+    def local_to_global(self, local_offset: int) -> int:
+        global_offset = self.physical_shard.local_to_global(local_offset)
+        if global_offset >= self.logical_length:
+            raise ValueError(f"local offset {local_offset} refers to a padding token")
+        return global_offset
+
+
+def round_up_sequence_length(logical_length: int, alignment: int) -> int:
+    """Return the smallest positive multiple of ``alignment`` covering a Segment."""
+
+    _validate_integer("logical_length", logical_length, minimum=1)
+    _validate_integer("alignment", alignment, minimum=1)
+    return ((logical_length + alignment - 1) // alignment) * alignment
+
+
+def maybe_pad_sequence_shard(
+    logical_length: int,
+    physical_shard: PrefixShard | RangeSequenceShard,
+) -> SequenceShard:
+    """Attach logical validity metadata when a physical CP shard contains padding."""
+
+    if logical_length == physical_shard.global_length:
+        return physical_shard
+    return PaddedSequenceShard(logical_length, physical_shard)
+
+
+def physical_sequence_shard(shard: SequenceShard) -> PrefixShard | RangeSequenceShard:
+    """Return the fixed-shape shard used by CP collectives."""
+
+    return shard.physical_shard if isinstance(shard, PaddedSequenceShard) else shard
+
+
+def iter_valid_sequence_slices(
+    shard: SequenceShard,
+) -> tuple[tuple[SequenceRange, slice], ...]:
+    """Map each non-empty logical range to its slice in the local physical tensor."""
+
+    result: list[tuple[SequenceRange, slice]] = []
+    local_start = 0
+    for physical_start, physical_end in shard.physical_global_ranges:
+        physical_length = physical_end - physical_start
+        valid_end = min(physical_end, shard.global_length)
+        if physical_start < valid_end:
+            valid_length = valid_end - physical_start
+            result.append(((physical_start, valid_end), slice(local_start, local_start + valid_length)))
+        local_start += physical_length
+    if sum(item[0][1] - item[0][0] for item in result) != shard.valid_local_length:
+        raise RuntimeError("valid sequence slices do not match shard validity metadata")
+    return tuple(result)

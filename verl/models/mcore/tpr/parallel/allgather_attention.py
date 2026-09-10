@@ -25,7 +25,12 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from ..shard import PrefixShard
+from ..shard import (
+    PrefixShard,
+    SequenceShard,
+    iter_valid_sequence_slices,
+    physical_sequence_shard,
+)
 from ..rectangular_attention import rectangular_causal_attention
 
 
@@ -34,7 +39,7 @@ class LocalKVBlock:
     """One segment's local post-RoPE KV shard for a single layer."""
 
     segment_id: int
-    shard: PrefixShard
+    shard: SequenceShard
     key: Tensor
     value: Tensor
 
@@ -137,9 +142,11 @@ def _validate_kv_tensor_pair(
         raise ValueError(f"{name} key/value must be floating point, got {key.dtype}")
 
 
-def _validate_shard(shard: PrefixShard, *, cp_size: int, cp_rank: int, name: str) -> None:
-    if not isinstance(shard, PrefixShard):
-        raise TypeError(f"{name} shard must be PrefixShard, got {type(shard).__name__}")
+def _validate_shard(shard: SequenceShard, *, cp_size: int, cp_rank: int, name: str) -> None:
+    if not isinstance(shard, SequenceShard):
+        raise TypeError(f"{name} shard must implement SequenceShard, got {type(shard).__name__}")
+    if not isinstance(physical_sequence_shard(shard), PrefixShard):
+        raise TypeError(f"{name} shard must use contiguous physical placement")
     if shard.cp_size != cp_size or shard.cp_rank != cp_rank:
         raise ValueError(
             f"{name} shard CP metadata must match the process group: "
@@ -189,7 +196,7 @@ def allgather_cp_rectangular_attention(
     current_value: Tensor,
     *,
     prefix_blocks: Sequence[LocalKVBlock] = (),
-    current_shard: PrefixShard,
+    current_shard: SequenceShard,
     cp_group: Any,
     softmax_scale: float | None = None,
 ) -> Tensor:
@@ -239,18 +246,27 @@ def allgather_cp_rectangular_attention(
     full_prefix_keys: list[Tensor] = []
     full_prefix_values: list[Tensor] = []
     for block in blocks:
-        full_prefix_keys.append(all_gather_sequence(block.key, cp_group))
-        full_prefix_values.append(all_gather_sequence(block.value, cp_group))
+        full_prefix_keys.append(all_gather_sequence(block.key, cp_group)[: block.shard.global_length])
+        full_prefix_values.append(all_gather_sequence(block.value, cp_group)[: block.shard.global_length])
 
-    full_current_key = all_gather_sequence(current_key, cp_group)
-    full_current_value = all_gather_sequence(current_value, cp_group)
-    visible_current_key = full_current_key[: current_shard.local_end]
-    visible_current_value = full_current_value[: current_shard.local_end]
-    gathered_key = torch.cat((*full_prefix_keys, visible_current_key), dim=0)
-    gathered_value = torch.cat((*full_prefix_values, visible_current_value), dim=0)
-    return rectangular_causal_attention(
-        query,
-        gathered_key,
-        gathered_value,
-        softmax_scale=softmax_scale,
-    )
+    full_current_key = all_gather_sequence(current_key, cp_group)[: current_shard.global_length]
+    full_current_value = all_gather_sequence(current_value, cp_group)[: current_shard.global_length]
+    output = query.reshape(query.shape[0], 1, -1) * 0.0
+    valid_slices = iter_valid_sequence_slices(current_shard)
+    if not valid_slices:
+        dependency = full_current_key.sum() + full_current_value.sum()
+        dependency = dependency + sum(item.sum() for item in (*full_prefix_keys, *full_prefix_values))
+        return output + dependency * 0.0
+
+    for query_range, local_slice in valid_slices:
+        visible_current_key = full_current_key[: query_range[1]]
+        visible_current_value = full_current_value[: query_range[1]]
+        gathered_key = torch.cat((*full_prefix_keys, visible_current_key), dim=0)
+        gathered_value = torch.cat((*full_prefix_values, visible_current_value), dim=0)
+        output[local_slice] = rectangular_causal_attention(
+            query[local_slice],
+            gathered_key,
+            gathered_value,
+            softmax_scale=softmax_scale,
+        )
+    return output

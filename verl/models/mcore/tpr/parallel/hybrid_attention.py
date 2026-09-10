@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -25,7 +26,13 @@ import torch.distributed as dist
 from torch import Tensor
 
 from ..kv_stack import KVStack
-from ..shard import RangeSequenceShard
+from ..shard import (
+    RangeSequenceShard,
+    SequenceShard,
+    maybe_pad_sequence_shard,
+    physical_sequence_shard,
+    round_up_sequence_length,
+)
 from .allgather_attention import _group_world_size_and_rank
 from .execution_context import ShardedPastKVAnchors
 from .ring_attention import RingLocalKVBlock, make_ring_sequence_shard, ring_cp_attention
@@ -84,7 +91,7 @@ class HybridLocalKVBlock:
     """One Prefix segment's local Hybrid CP KV shard for a single layer."""
 
     segment_id: int
-    shard: RangeSequenceShard
+    shard: SequenceShard
     key: Tensor
     value: Tensor
 
@@ -202,7 +209,7 @@ def make_hybrid_sequence_shard(
     cp_rank: int,
     cp_size: int,
     ulysses_degree: int,
-) -> RangeSequenceShard:
+) -> SequenceShard:
     """Select one rank's pre-A2A shard using MindSpeed's Hybrid layout."""
 
     if (
@@ -217,15 +224,15 @@ def make_hybrid_sequence_shard(
         )
     if not isinstance(cp_rank, int) or isinstance(cp_rank, bool) or not 0 <= cp_rank < cp_size:
         raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank!r}")
-    if global_length % cp_size != 0:
-        raise ValueError(f"length {global_length} must be divisible by CP size {cp_size}")
-
     ring_size = cp_size // ulysses_degree
+    alignment = math.lcm(cp_size, 2 * ring_size)
+    padded_length = round_up_sequence_length(global_length, alignment)
     ring_rank, ulysses_rank = divmod(cp_rank, ulysses_degree)
     ring_shard = make_ring_sequence_shard(
         global_length,
         cp_rank=ring_rank,
         cp_size=ring_size,
+        padded_length=padded_length,
     )
     if ring_shard.local_length % ulysses_degree != 0:
         raise ValueError(
@@ -235,26 +242,29 @@ def make_hybrid_sequence_shard(
     local_length = ring_shard.local_length // ulysses_degree
     local_start = ulysses_rank * local_length
     ranges = _slice_ordered_ranges(
-        ring_shard.global_ranges,
+        ring_shard.physical_global_ranges,
         local_start=local_start,
         local_end=local_start + local_length,
     )
-    return RangeSequenceShard(
-        global_length,
+    physical_shard = RangeSequenceShard(
+        padded_length,
         ranges,
         cp_rank=cp_rank,
         cp_size=cp_size,
     )
+    return maybe_pad_sequence_shard(global_length, physical_shard)
 
 
 def _validate_hybrid_shard(
-    shard: RangeSequenceShard,
+    shard: SequenceShard,
     *,
     topology: HybridCPTopology,
     name: str,
 ) -> None:
-    if not isinstance(shard, RangeSequenceShard):
-        raise TypeError(f"{name} shard must be RangeSequenceShard, got {type(shard).__name__}")
+    if not isinstance(shard, SequenceShard):
+        raise TypeError(f"{name} shard must implement SequenceShard, got {type(shard).__name__}")
+    if not isinstance(physical_sequence_shard(shard), RangeSequenceShard):
+        raise TypeError(f"{name} shard must use Hybrid range placement")
     expected = make_hybrid_sequence_shard(
         shard.global_length,
         cp_rank=topology.cp_rank,
@@ -269,7 +279,7 @@ def _validate_local_kv(
     key: Tensor,
     value: Tensor,
     *,
-    shard: RangeSequenceShard,
+    shard: SequenceShard,
     name: str,
 ) -> None:
     if not isinstance(key, Tensor) or not isinstance(value, Tensor):
@@ -290,7 +300,7 @@ def hybrid_cp_rectangular_attention(
     current_value: Tensor,
     *,
     prefix_blocks: Sequence[HybridLocalKVBlock] = (),
-    current_shard: RangeSequenceShard,
+    current_shard: SequenceShard,
     topology: HybridCPTopology,
     softmax_scale: float | None = None,
 ) -> Tensor:
@@ -344,6 +354,7 @@ def hybrid_cp_rectangular_attention(
         current_shard.global_length,
         cp_rank=topology.ring_rank,
         cp_size=topology.ring_size,
+        padded_length=current_shard.padded_length,
     )
     head_query = _sequence_to_head(
         query,
@@ -367,6 +378,7 @@ def hybrid_cp_rectangular_attention(
             block.shard.global_length,
             cp_rank=topology.ring_rank,
             cp_size=topology.ring_size,
+            padded_length=block.shard.padded_length,
         )
         ring_prefix_blocks.append(
             RingLocalKVBlock(
@@ -410,7 +422,7 @@ class HybridCPAttentionBackend:
         self,
         *,
         global_prefix_length: int,
-        current_shard: RangeSequenceShard,
+        current_shard: SequenceShard,
         prefix_blocks_by_layer: Mapping[int, Sequence[HybridLocalKVBlock]],
         topology: HybridCPTopology,
     ) -> None:
@@ -487,7 +499,7 @@ def _cached_blocks(kv_stack: KVStack, layer_number: int) -> tuple[HybridLocalKVB
     blocks = []
     for segment_id in kv_stack.segment_ids:
         state = kv_stack.get(segment_id).kv
-        if not isinstance(state.shard, RangeSequenceShard):
+        if not isinstance(physical_sequence_shard(state.shard), RangeSequenceShard):
             raise TypeError("Hybrid CP requires RangeSequenceShard Prefix states")
         blocks.append(
             HybridLocalKVBlock(
@@ -503,7 +515,7 @@ def make_cached_hybrid_cp_backend(
     kv_stack: KVStack,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: RangeSequenceShard,
+    current_shard: SequenceShard,
     topology: HybridCPTopology,
 ) -> HybridCPAttentionBackend:
     return HybridCPAttentionBackend(
@@ -520,11 +532,11 @@ def make_anchored_hybrid_cp_backend(
     anchors: ShardedPastKVAnchors,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: RangeSequenceShard,
+    current_shard: SequenceShard,
     topology: HybridCPTopology,
 ) -> HybridCPAttentionBackend:
     for entry in anchors.entries:
-        if not isinstance(entry.shard, RangeSequenceShard):
+        if not isinstance(physical_sequence_shard(entry.shard), RangeSequenceShard):
             raise TypeError("Hybrid CP requires RangeSequenceShard Prefix anchors")
     return HybridCPAttentionBackend(
         global_prefix_length=anchors.global_prefix_length,

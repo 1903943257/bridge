@@ -186,6 +186,7 @@ def _communication_probe():
         ((), 128),
         ((1024,), 512),
         ((512, 512), 256),
+        ((127,), 63),
     ],
 )
 def test_hybrid_cp_attention_matches_full_causal_forward_backward(

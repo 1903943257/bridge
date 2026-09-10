@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from verl.models.mcore.tpr import (
+    AllGatherCPBackend,
     RangeSequenceShard,
     build_sharded_rotary_pos_emb,
     build_suffix_rotary_pos_emb,
@@ -109,6 +110,21 @@ def test_sharded_rope_follows_noncontiguous_local_token_order():
         (2, 22),
     ]
     assert all(call["cp_group"].size() == 1 for call in rotary_embedding.calls)
+
+
+def test_sharded_rope_repeats_the_last_logical_position_for_padding():
+    rotary_embedding = _RecordingRotaryEmbedding()
+    shard = AllGatherCPBackend(object(), parallel_size=2, parallel_rank=1).make_sequence_shard(7)
+
+    result = build_sharded_rotary_pos_emb(
+        rotary_embedding,
+        position_start=16,
+        shard=shard,
+        disable_context_parallel_sharding=True,
+    )
+
+    assert result[:, 0, 0, 0].tolist() == [20.0, 21.0, 22.0, 22.0]
+    assert [(call["max_seq_len"], call["offset"]) for call in rotary_embedding.calls] == [(3, 20)]
 
 
 @pytest.mark.parametrize(

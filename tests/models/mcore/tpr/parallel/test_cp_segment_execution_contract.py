@@ -288,14 +288,22 @@ def test_rank_without_a_loss_term_keeps_a_graph_connected_zero(fake_cp_runtime):
     assert torch.count_nonzero(logits.grad).item() == 0
 
 
-def test_non_divisible_segment_is_rejected_before_execution(fake_cp_runtime):
-    with pytest.raises(ValueError, match="segment 1 length 5 must be divisible"):
-        SegmentExecutor(
-            _FakeCPModel(),
-            _plan(first_length=5),
-            expected_layer_numbers=(1,),
-            cp_group=fake_cp_runtime(0),
-        )
+def test_non_divisible_segment_uses_physical_padding(fake_cp_runtime):
+    plan = _plan(first_length=5)
+    executor = SegmentExecutor(
+        _FakeCPModel(),
+        plan,
+        expected_layer_numbers=(1,),
+        cp_group=fake_cp_runtime(1),
+    )
+
+    shard = executor._segment_shard(plan.get(1))
+
+    assert (shard.global_length, shard.padded_length) == (5, 6)
+    assert (shard.local_length, shard.valid_local_length) == (3, 2)
+    assert shard.select(plan.get(1).token_ids).tolist() == [103, 104, 0]
+    assert shard.global_indices().tolist() == [3, 4, 4]
+    assert tuple(term.query_offset for term in executor._owned_loss_terms(plan.get(1))) == (4,)
 
 
 def test_tpr_context_rejects_mismatched_sharded_backend_lengths():

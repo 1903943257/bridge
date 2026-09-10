@@ -36,7 +36,15 @@ from torch import Tensor
 
 from ..kv_stack import KVStack
 from ..rectangular_attention import _compressed_causal_mask
-from ..shard import RangeSequenceShard, SequenceRange
+from ..shard import (
+    RangeSequenceShard,
+    SequenceRange,
+    SequenceShard,
+    iter_valid_sequence_slices,
+    maybe_pad_sequence_shard,
+    physical_sequence_shard,
+    round_up_sequence_length,
+)
 from .allgather_attention import _group_world_size_and_rank
 from .execution_context import ShardedPastKVAnchors
 
@@ -59,7 +67,7 @@ class RingLocalKVBlock:
     """One Prefix segment's local zigzag KV shard for a single layer."""
 
     segment_id: int
-    shard: RangeSequenceShard
+    shard: SequenceShard
     key: Tensor
     value: Tensor
 
@@ -81,7 +89,8 @@ class _RingAttentionConfig:
     cp_size: int
     cp_rank: int
     segment_lengths: tuple[int, ...]
-    current_shard: RangeSequenceShard
+    segment_padded_lengths: tuple[int, ...]
+    current_shard: SequenceShard
     query_heads: int
     head_dim: int
     softmax_scale: float
@@ -92,7 +101,8 @@ def make_ring_sequence_shard(
     *,
     cp_rank: int,
     cp_size: int,
-) -> RangeSequenceShard:
+    padded_length: int | None = None,
+) -> SequenceShard:
     """Return MindSpeed's symmetric two-range causal Ring shard."""
 
     if not isinstance(global_length, int) or isinstance(global_length, bool) or global_length <= 0:
@@ -102,15 +112,18 @@ def make_ring_sequence_shard(
     if not isinstance(cp_rank, int) or isinstance(cp_rank, bool) or not 0 <= cp_rank < cp_size:
         raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank!r}")
     chunk_count = 2 * cp_size
-    if global_length % chunk_count != 0:
+    if padded_length is None:
+        padded_length = round_up_sequence_length(global_length, chunk_count)
+    if padded_length < global_length or padded_length % chunk_count != 0:
         raise ValueError(
-            f"length {global_length} must be divisible by 2 * CP size ({chunk_count})"
+            f"padded_length must cover {global_length} and be divisible by {chunk_count}, "
+            f"got {padded_length}"
         )
-    chunk_length = global_length // chunk_count
+    chunk_length = padded_length // chunk_count
     first_start = cp_rank * chunk_length
     second_start = (chunk_count - cp_rank - 1) * chunk_length
-    return RangeSequenceShard(
-        global_length,
+    physical_shard = RangeSequenceShard(
+        padded_length,
         (
             (first_start, first_start + chunk_length),
             (second_start, second_start + chunk_length),
@@ -118,6 +131,7 @@ def make_ring_sequence_shard(
         cp_rank=cp_rank,
         cp_size=cp_size,
     )
+    return maybe_pad_sequence_shard(global_length, physical_shard)
 
 
 def classify_ring_block(
@@ -170,18 +184,21 @@ def _process_group_global_ranks(process_group: Any) -> tuple[int, ...]:
 
 
 def _validate_ring_shard(
-    shard: RangeSequenceShard,
+    shard: SequenceShard,
     *,
     cp_size: int,
     cp_rank: int,
     name: str,
 ) -> None:
-    if not isinstance(shard, RangeSequenceShard):
-        raise TypeError(f"{name} shard must be RangeSequenceShard, got {type(shard).__name__}")
+    if not isinstance(shard, SequenceShard):
+        raise TypeError(f"{name} shard must implement SequenceShard, got {type(shard).__name__}")
+    if not isinstance(physical_sequence_shard(shard), RangeSequenceShard):
+        raise TypeError(f"{name} shard must use Ring range placement")
     expected = make_ring_sequence_shard(
         shard.global_length,
         cp_rank=cp_rank,
         cp_size=cp_size,
+        padded_length=shard.padded_length,
     )
     if shard != expected:
         raise ValueError(f"{name} shard must use the MindSpeed causal Ring layout")
@@ -191,7 +208,7 @@ def _validate_kv_pair(
     key: Tensor,
     value: Tensor,
     *,
-    shard: RangeSequenceShard,
+    shard: SequenceShard,
     name: str,
 ) -> None:
     if not isinstance(key, Tensor) or not isinstance(value, Tensor):
@@ -216,7 +233,7 @@ def _normalize_inputs(
     current_value: Tensor,
     *,
     prefix_blocks: Sequence[RingLocalKVBlock],
-    current_shard: RangeSequenceShard,
+    current_shard: SequenceShard,
     cp_group: Any,
     softmax_scale: float | None,
 ) -> tuple[tuple[RingLocalKVBlock, ...], _RingAttentionConfig]:
@@ -271,6 +288,8 @@ def _normalize_inputs(
         cp_rank=cp_rank,
         segment_lengths=tuple(block.shard.global_length for block in blocks)
         + (current_shard.global_length,),
+        segment_padded_lengths=tuple(block.shard.padded_length for block in blocks)
+        + (current_shard.padded_length,),
         current_shard=current_shard,
         query_heads=query.shape[2],
         head_dim=query.shape[-1],
@@ -307,16 +326,12 @@ def _circulate_kv(
 
 def _iter_range_slices(
     tensor: Tensor,
-    shard: RangeSequenceShard,
+    shard: SequenceShard,
 ) -> tuple[tuple[SequenceRange, slice, Tensor], ...]:
-    result = []
-    local_start = 0
-    for global_range in shard.global_ranges:
-        length = global_range[1] - global_range[0]
-        local_slice = slice(local_start, local_start + length)
-        result.append((global_range, local_slice, tensor[local_slice]))
-        local_start += length
-    return tuple(result)
+    return tuple(
+        (global_range, local_slice, tensor[local_slice])
+        for global_range, local_slice in iter_valid_sequence_slices(shard)
+    )
 
 
 def _block_attention_forward(
@@ -528,11 +543,13 @@ class _RingTPRAttention(torch.autograd.Function):
             for segment_index, source_blocks in enumerate(segment_blocks):
                 is_prefix = segment_index + 1 < len(segment_blocks)
                 global_length = config.segment_lengths[segment_index]
+                padded_length = config.segment_padded_lengths[segment_index]
                 for source_rank, (source_key, source_value) in enumerate(source_blocks):
                     source_shard = make_ring_sequence_shard(
                         global_length,
                         cp_rank=source_rank,
                         cp_size=config.cp_size,
+                        padded_length=padded_length,
                     )
                     key_slices = _iter_range_slices(source_key.squeeze(1), source_shard)
                     value_slices = _iter_range_slices(source_value.squeeze(1), source_shard)
@@ -573,7 +590,9 @@ class _RingTPRAttention(torch.autograd.Function):
         ctx.save_for_backward(query, *saved_blocks, *saved_results)
         ctx.config = config
         ctx.block_tensor_count = len(saved_blocks)
-        output = torch.cat(tuple(result[0] for result in query_results), dim=0)
+        output = query.new_zeros((query.shape[0], config.query_heads, config.head_dim))
+        for (_, local_slice, _), result in zip(query_slices, query_results, strict=True):
+            output[local_slice] = result[0]
         return output.reshape(query.shape[0], 1, config.query_heads * config.head_dim)
 
     @staticmethod
@@ -627,11 +646,13 @@ class _RingTPRAttention(torch.autograd.Function):
             for segment_index, source_blocks in enumerate(segment_blocks):
                 is_prefix = segment_index + 1 < len(segment_blocks)
                 global_length = config.segment_lengths[segment_index]
+                padded_length = config.segment_padded_lengths[segment_index]
                 for source_rank, (source_key, source_value) in enumerate(source_blocks):
                     source_shard = make_ring_sequence_shard(
                         global_length,
                         cp_rank=source_rank,
                         cp_size=config.cp_size,
+                        padded_length=padded_length,
                     )
                     key_slices = _iter_range_slices(source_key.squeeze(1), source_shard)
                     value_slices = _iter_range_slices(source_value.squeeze(1), source_shard)
@@ -678,7 +699,7 @@ def ring_cp_attention(
     current_value: Tensor,
     *,
     prefix_blocks: Sequence[RingLocalKVBlock] = (),
-    current_shard: RangeSequenceShard,
+    current_shard: SequenceShard,
     cp_group: Any,
     softmax_scale: float | None = None,
 ) -> Tensor:
@@ -707,7 +728,7 @@ class RingCPAttentionBackend:
         self,
         *,
         global_prefix_length: int,
-        current_shard: RangeSequenceShard,
+        current_shard: SequenceShard,
         prefix_blocks_by_layer: Mapping[int, Sequence[RingLocalKVBlock]],
         cp_group: Any,
     ) -> None:
@@ -786,7 +807,7 @@ def _cached_blocks(kv_stack: KVStack, layer_number: int) -> tuple[RingLocalKVBlo
     blocks = []
     for segment_id in kv_stack.segment_ids:
         state = kv_stack.get(segment_id).kv
-        if not isinstance(state.shard, RangeSequenceShard):
+        if not isinstance(physical_sequence_shard(state.shard), RangeSequenceShard):
             raise TypeError("Ring CP requires RangeSequenceShard Prefix states")
         blocks.append(
             RingLocalKVBlock(
@@ -802,7 +823,7 @@ def make_cached_ring_cp_backend(
     kv_stack: KVStack,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: RangeSequenceShard,
+    current_shard: SequenceShard,
     cp_group: Any,
 ) -> RingCPAttentionBackend:
     return RingCPAttentionBackend(
@@ -819,11 +840,11 @@ def make_anchored_ring_cp_backend(
     anchors: ShardedPastKVAnchors,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: RangeSequenceShard,
+    current_shard: SequenceShard,
     cp_group: Any,
 ) -> RingCPAttentionBackend:
     for entry in anchors.entries:
-        if not isinstance(entry.shard, RangeSequenceShard):
+        if not isinstance(physical_sequence_shard(entry.shard), RangeSequenceShard):
             raise TypeError("Ring CP requires RangeSequenceShard Prefix anchors")
     return RingCPAttentionBackend(
         global_prefix_length=anchors.global_prefix_length,

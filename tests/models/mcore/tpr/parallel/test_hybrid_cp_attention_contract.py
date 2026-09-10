@@ -72,12 +72,6 @@ def test_hybrid_topology_uses_mindspeed_linear_cp_coordinates():
     "factory",
     [
         lambda: make_hybrid_sequence_shard(
-            30,
-            cp_rank=0,
-            cp_size=4,
-            ulysses_degree=2,
-        ),
-        lambda: make_hybrid_sequence_shard(
             32,
             cp_rank=0,
             cp_size=4,

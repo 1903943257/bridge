@@ -20,7 +20,14 @@ from typing import Any, Protocol, runtime_checkable
 
 from ..context import TPRAttentionBackend
 from ..kv_stack import KVStack
-from ..shard import PrefixShard, RangeSequenceShard, SequenceShard
+from ..shard import (
+    PrefixShard,
+    RangeSequenceShard,
+    SequenceShard,
+    maybe_pad_sequence_shard,
+    physical_sequence_shard,
+    round_up_sequence_length,
+)
 from .execution_context import (
     ShardedPastKVAnchors,
     make_anchored_allgather_cp_backend,
@@ -119,18 +126,16 @@ class AllGatherCPBackend:
     def validate_segment_length(self, global_length: int) -> None:
         if not isinstance(global_length, int) or isinstance(global_length, bool) or global_length <= 0:
             raise ValueError(f"length must be a positive integer, got {global_length!r}")
-        if global_length % self.parallel_size != 0:
-            raise ValueError(
-                f"length {global_length} must be divisible by CP size {self.parallel_size}"
-            )
 
-    def make_sequence_shard(self, global_length: int) -> PrefixShard:
+    def make_sequence_shard(self, global_length: int) -> SequenceShard:
         self.validate_segment_length(global_length)
-        return PrefixShard.contiguous(
-            global_length,
+        padded_length = round_up_sequence_length(global_length, self.parallel_size)
+        physical_shard = PrefixShard.contiguous(
+            padded_length,
             cp_rank=self.parallel_rank,
             cp_size=self.parallel_size,
         )
+        return maybe_pad_sequence_shard(global_length, physical_shard)
 
     def make_attention_backend(
         self,
@@ -140,7 +145,7 @@ class AllGatherCPBackend:
         current_shard: SequenceShard,
         past_anchors: ShardedPastKVAnchors | None,
     ) -> TPRAttentionBackend:
-        if not isinstance(current_shard, PrefixShard):
+        if not isinstance(physical_sequence_shard(current_shard), PrefixShard):
             raise TypeError(
                 "AllGather CP requires a contiguous PrefixShard, "
                 f"got {type(current_shard).__name__}"
@@ -173,7 +178,7 @@ class UlyssesCPBackend(AllGatherCPBackend):
         current_shard: SequenceShard,
         past_anchors: ShardedPastKVAnchors | None,
     ) -> TPRAttentionBackend:
-        if not isinstance(current_shard, PrefixShard):
+        if not isinstance(physical_sequence_shard(current_shard), PrefixShard):
             raise TypeError(
                 "Ulysses CP requires a contiguous PrefixShard, "
                 f"got {type(current_shard).__name__}"
@@ -205,7 +210,7 @@ class RingCPBackend(AllGatherCPBackend):
             cp_size=self.parallel_size,
         )
 
-    def make_sequence_shard(self, global_length: int) -> RangeSequenceShard:
+    def make_sequence_shard(self, global_length: int) -> SequenceShard:
         return make_ring_sequence_shard(
             global_length,
             cp_rank=self.parallel_rank,
@@ -220,7 +225,7 @@ class RingCPBackend(AllGatherCPBackend):
         current_shard: SequenceShard,
         past_anchors: ShardedPastKVAnchors | None,
     ) -> TPRAttentionBackend:
-        if not isinstance(current_shard, RangeSequenceShard):
+        if not isinstance(physical_sequence_shard(current_shard), RangeSequenceShard):
             raise TypeError(
                 "Ring CP requires a RangeSequenceShard, "
                 f"got {type(current_shard).__name__}"
@@ -285,7 +290,7 @@ class HybridCPBackend(AllGatherCPBackend):
             ulysses_degree=self.topology.ulysses_size,
         )
 
-    def make_sequence_shard(self, global_length: int) -> RangeSequenceShard:
+    def make_sequence_shard(self, global_length: int) -> SequenceShard:
         return make_hybrid_sequence_shard(
             global_length,
             cp_rank=self.parallel_rank,
@@ -301,7 +306,7 @@ class HybridCPBackend(AllGatherCPBackend):
         current_shard: SequenceShard,
         past_anchors: ShardedPastKVAnchors | None,
     ) -> TPRAttentionBackend:
-        if not isinstance(current_shard, RangeSequenceShard):
+        if not isinstance(physical_sequence_shard(current_shard), RangeSequenceShard):
             raise TypeError(
                 "Hybrid CP requires a RangeSequenceShard, "
                 f"got {type(current_shard).__name__}"

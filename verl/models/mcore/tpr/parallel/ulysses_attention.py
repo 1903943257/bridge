@@ -25,7 +25,7 @@ from torch import Tensor
 
 from ..kv_stack import KVStack
 from ..rectangular_attention import rectangular_causal_attention
-from ..shard import PrefixShard
+from ..shard import PrefixShard, SequenceShard, physical_sequence_shard
 from .allgather_attention import LocalKVBlock, _group_world_size_and_rank
 from .execution_context import ShardedPastKVAnchors
 
@@ -57,9 +57,11 @@ def _mindspeed_all_to_all(
     )
 
 
-def _validate_shard(shard: PrefixShard, *, cp_size: int, cp_rank: int, name: str) -> None:
-    if not isinstance(shard, PrefixShard):
-        raise TypeError(f"{name} shard must be a contiguous PrefixShard, got {type(shard).__name__}")
+def _validate_shard(shard: SequenceShard, *, cp_size: int, cp_rank: int, name: str) -> None:
+    if not isinstance(shard, SequenceShard):
+        raise TypeError(f"{name} shard must implement SequenceShard, got {type(shard).__name__}")
+    if not isinstance(physical_sequence_shard(shard), PrefixShard):
+        raise TypeError(f"{name} shard must use contiguous physical placement")
     if (shard.cp_size, shard.cp_rank) != (cp_size, cp_rank):
         raise ValueError(
             f"{name} shard must match CP rank {cp_rank}/{cp_size}, "
@@ -72,7 +74,7 @@ def _validate_qkv(
     current_key: Tensor,
     current_value: Tensor,
     *,
-    current_shard: PrefixShard,
+    current_shard: SequenceShard,
     cp_size: int,
 ) -> tuple[int, int]:
     for name, tensor in (
@@ -190,7 +192,7 @@ def ulysses_cp_rectangular_attention(
     current_value: Tensor,
     *,
     prefix_blocks: Sequence[LocalKVBlock] = (),
-    current_shard: PrefixShard,
+    current_shard: SequenceShard,
     cp_group: Any,
     softmax_scale: float | None = None,
 ) -> Tensor:
@@ -214,27 +216,31 @@ def ulysses_cp_rectangular_attention(
 
     head_query = _sequence_to_head(
         query,
-        global_length=current_shard.global_length,
+        global_length=current_shard.padded_length,
         cp_group=cp_group,
-    )
+    )[: current_shard.global_length]
     prefix_keys = [
-        _sequence_to_head(block.key, global_length=block.shard.global_length, cp_group=cp_group)
+        _sequence_to_head(block.key, global_length=block.shard.padded_length, cp_group=cp_group)[
+            : block.shard.global_length
+        ]
         for block in blocks
     ]
     prefix_values = [
-        _sequence_to_head(block.value, global_length=block.shard.global_length, cp_group=cp_group)
+        _sequence_to_head(block.value, global_length=block.shard.padded_length, cp_group=cp_group)[
+            : block.shard.global_length
+        ]
         for block in blocks
     ]
     head_current_key = _sequence_to_head(
         current_key,
-        global_length=current_shard.global_length,
+        global_length=current_shard.padded_length,
         cp_group=cp_group,
-    )
+    )[: current_shard.global_length]
     head_current_value = _sequence_to_head(
         current_value,
-        global_length=current_shard.global_length,
+        global_length=current_shard.padded_length,
         cp_group=cp_group,
-    )
+    )[: current_shard.global_length]
     head_key = torch.cat((*prefix_keys, head_current_key), dim=0)
     head_value = torch.cat((*prefix_values, head_current_value), dim=0)
     head_output = rectangular_causal_attention(
@@ -243,6 +249,10 @@ def ulysses_cp_rectangular_attention(
         head_value,
         softmax_scale=softmax_scale,
     )
+    if current_shard.padded_length != current_shard.global_length:
+        pad_shape = list(head_output.shape)
+        pad_shape[0] = current_shard.padded_length - current_shard.global_length
+        head_output = torch.cat((head_output, head_output.new_zeros(pad_shape)), dim=0)
     return _head_to_sequence(
         head_output,
         local_length=current_shard.local_length,
@@ -259,7 +269,7 @@ class UlyssesCPAttentionBackend:
         self,
         *,
         global_prefix_length: int,
-        current_shard: PrefixShard,
+        current_shard: SequenceShard,
         prefix_blocks_by_layer: Mapping[int, Sequence[LocalKVBlock]],
         cp_group: Any,
     ) -> None:
@@ -331,7 +341,7 @@ def _cached_blocks(kv_stack: KVStack, layer_number: int) -> tuple[LocalKVBlock, 
     blocks = []
     for segment_id in kv_stack.segment_ids:
         state = kv_stack.get(segment_id).kv
-        if not isinstance(state.shard, PrefixShard):
+        if not isinstance(physical_sequence_shard(state.shard), PrefixShard):
             raise TypeError("Ulysses CP requires contiguous Prefix shards")
         blocks.append(LocalKVBlock(segment_id, state.shard, *state.key_values[layer_number]))
     return tuple(blocks)
@@ -341,7 +351,7 @@ def make_cached_ulysses_cp_backend(
     kv_stack: KVStack,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: PrefixShard,
+    current_shard: SequenceShard,
     cp_group: Any,
 ) -> UlyssesCPAttentionBackend:
     return UlyssesCPAttentionBackend(
@@ -358,11 +368,11 @@ def make_anchored_ulysses_cp_backend(
     anchors: ShardedPastKVAnchors,
     *,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: PrefixShard,
+    current_shard: SequenceShard,
     cp_group: Any,
 ) -> UlyssesCPAttentionBackend:
     for entry in anchors.entries:
-        if not isinstance(entry.shard, PrefixShard):
+        if not isinstance(physical_sequence_shard(entry.shard), PrefixShard):
             raise TypeError("Ulysses CP requires contiguous Prefix anchor shards")
     return UlyssesCPAttentionBackend(
         global_prefix_length=anchors.global_prefix_length,

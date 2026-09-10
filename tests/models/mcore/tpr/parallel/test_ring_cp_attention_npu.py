@@ -135,6 +135,7 @@ def _kernel_probe():
         ((), 128, 4, 2),
         ((1024,), 512, 4, 2),
         ((512, 512), 256, 4, 2),
+        ((127,), 63, 4, 2),
     ],
 )
 def test_ring_cp_attention_matches_full_causal_forward_backward(

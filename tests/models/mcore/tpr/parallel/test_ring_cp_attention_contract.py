@@ -83,9 +83,9 @@ def test_tnd_online_softmax_merge_handles_noncontiguous_layout_conversion():
 @pytest.mark.parametrize(
     "factory",
     [
-        lambda: make_ring_sequence_shard(14, cp_rank=0, cp_size=2),
         lambda: make_ring_sequence_shard(16, cp_rank=2, cp_size=2),
         lambda: make_ring_sequence_shard(16, cp_rank=0, cp_size=1),
+        lambda: make_ring_sequence_shard(16, cp_rank=0, cp_size=2, padded_length=14),
     ],
 )
 def test_invalid_ring_shard_requests_are_rejected(factory):
