@@ -516,7 +516,17 @@ def _run_independent_cp_reference(
     logical_count,
     *,
     expected_layer_numbers=None,
+    force_explicit_attention_mask=False,
 ):
+    """Run two complete trajectories through independent AllGather CP.
+
+    ``force_explicit_attention_mask`` keeps the independent execution and its
+    full-trajectory topology unchanged, but selects the same standard CANN
+    custom-mask path required by physically padded TPR segments.  This avoids
+    treating sparse-mode 0 versus sparse-mode 3 kernel drift as a padding
+    correctness error when the complete trajectories happen to be divisible.
+    """
+
     model.zero_grad(set_to_none=True)
     logprobs = torch.zeros(logical_count, dtype=torch.float32, device=runtime.device)
     owner_counts = torch.zeros(logical_count, dtype=torch.int64, device=runtime.device)
@@ -525,23 +535,29 @@ def _run_independent_cp_reference(
     )
     local_loss = torch.zeros((), dtype=torch.float32, device=runtime.device)
     trace = []
-    for sample_id, trajectory in ((1, first_trajectory), (2, second_trajectory)):
-        plan = _independent_plan(
-            trajectory,
-            sample_id=sample_id,
-            total_loss_weight=total_loss_weight,
-        )
-        result = _execute_and_capture(
-            model,
-            plan,
-            runtime,
-            logical_indices,
-            logprobs,
-            owner_counts,
-            expected_layer_numbers=expected_layer_numbers,
-        )
-        local_loss = local_loss + result.normalized_loss
-        trace.extend((execution.kind, execution.segment_id) for execution in result.execution_trace)
+    explicit_mask_context = (
+        _force_explicit_allgather_attention_mask()
+        if force_explicit_attention_mask
+        else nullcontext()
+    )
+    with explicit_mask_context:
+        for sample_id, trajectory in ((1, first_trajectory), (2, second_trajectory)):
+            plan = _independent_plan(
+                trajectory,
+                sample_id=sample_id,
+                total_loss_weight=total_loss_weight,
+            )
+            result = _execute_and_capture(
+                model,
+                plan,
+                runtime,
+                logical_indices,
+                logprobs,
+                owner_counts,
+                expected_layer_numbers=expected_layer_numbers,
+            )
+            local_loss = local_loss + result.normalized_loss
+            trace.extend((execution.kind, execution.segment_id) for execution in result.execution_trace)
     global_loss, global_logprobs = _aggregate_loss_and_logprobs(
         local_loss, logprobs, owner_counts, runtime
     )
@@ -551,6 +567,36 @@ def _run_independent_cp_reference(
         parameter_gradients=_finalize_cp_parameter_gradients(model, runtime),
         execution_trace=tuple(trace),
     )
+
+
+@contextmanager
+def _force_explicit_allgather_attention_mask():
+    """Select and verify AllGather's explicit-mask path for a reference run."""
+
+    original_has_padding = cp_attention._has_padding
+    original_attention = cp_attention.rectangular_causal_attention
+    call_count = 0
+
+    def explicit_mask_required(shard):
+        del shard
+        return True
+
+    def checked_attention(*args, **kwargs):
+        nonlocal call_count
+        if kwargs.get("attention_mask") is None:
+            raise AssertionError("explicit-mask AllGather reference reached sparse mode 3")
+        call_count += 1
+        return original_attention(*args, **kwargs)
+
+    cp_attention._has_padding = explicit_mask_required
+    cp_attention.rectangular_causal_attention = checked_attention
+    try:
+        yield
+        if call_count == 0:
+            raise AssertionError("explicit-mask AllGather reference executed no attention calls")
+    finally:
+        cp_attention._has_padding = original_has_padding
+        cp_attention.rectangular_causal_attention = original_attention
 
 
 def _run_tpr_cp(

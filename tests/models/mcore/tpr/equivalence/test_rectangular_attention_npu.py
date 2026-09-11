@@ -35,6 +35,20 @@ def _reference(query, key, value, prefix_length, scale):
     return output.reshape(query.shape[0], 1, -1)
 
 
+def _right_down_mask(query_length, kv_length, device):
+    prefix_length = kv_length - query_length
+    query_positions = torch.arange(query_length, device=device) + prefix_length
+    key_positions = torch.arange(kv_length, device=device)
+    return key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+
+
+def _relative_l2(actual, expected):
+    return (
+        torch.linalg.vector_norm(actual.float() - expected.float())
+        / torch.linalg.vector_norm(expected.float()).clamp_min(torch.finfo(torch.float32).tiny)
+    )
+
+
 @pytest.mark.parametrize(("prefix_length", "suffix_length"), [(0, 3), (6, 3), (32, 1)])
 def test_rectangular_attention_matches_reference_forward_and_backward(prefix_length, suffix_length):
     torch.manual_seed(1234)
@@ -66,3 +80,59 @@ def test_rectangular_attention_matches_reference_forward_and_backward(prefix_len
     if prefix_length:
         assert key.grad[:prefix_length].float().norm() > 0
         assert value.grad[:prefix_length].float().norm() > 0
+
+
+def test_explicit_causal_mask_matches_sparse_mode_3_forward_and_backward():
+    """Quantify CANN mode-0/mode-3 drift for identical causal semantics."""
+
+    torch.manual_seed(2026)
+    device = torch.device("npu")
+    dtype = torch.bfloat16
+    query_length, kv_length = 63, 127
+    heads, head_dim = 4, 64
+    scale = head_dim**-0.5
+
+    sparse_inputs = (
+        torch.randn(query_length, 1, heads, head_dim, device=device, dtype=dtype, requires_grad=True),
+        torch.randn(kv_length, 1, heads, head_dim, device=device, dtype=dtype, requires_grad=True),
+        torch.randn(kv_length, 1, heads, head_dim, device=device, dtype=dtype, requires_grad=True),
+    )
+    masked_inputs = tuple(tensor.detach().clone().requires_grad_(True) for tensor in sparse_inputs)
+    reference_inputs = tuple(tensor.detach().clone().requires_grad_(True) for tensor in sparse_inputs)
+    grad_output = torch.randn(query_length, 1, heads * head_dim, device=device, dtype=dtype)
+
+    sparse_output = rectangular_causal_attention(*sparse_inputs, softmax_scale=scale)
+    masked_output = rectangular_causal_attention(
+        *masked_inputs,
+        softmax_scale=scale,
+        attention_mask=_right_down_mask(query_length, kv_length, device),
+    )
+    reference_output = _reference(
+        *reference_inputs,
+        prefix_length=kv_length - query_length,
+        scale=scale,
+    )
+    sparse_output.backward(grad_output)
+    masked_output.backward(grad_output)
+    reference_output.backward(grad_output.float())
+
+    output_relative_l2 = _relative_l2(masked_output, sparse_output)
+    gradient_relative_l2 = tuple(
+        _relative_l2(masked.grad, sparse.grad)
+        for masked, sparse in zip(masked_inputs, sparse_inputs, strict=True)
+    )
+    print(
+        "\nCANN explicit-mask mode 0 vs sparse mode 3: "
+        f"output_relative_l2={output_relative_l2.item():.6e}, "
+        "gradient_relative_l2="
+        f"{tuple(value.item() for value in gradient_relative_l2)}"
+    )
+
+    # Both kernels must implement the same mathematical attention.  Their
+    # direct BF16 difference is diagnostic only: it is precisely the quantity
+    # that a deep model can accumulate even when both match the FP32 oracle.
+    for output in (sparse_output, masked_output):
+        torch.testing.assert_close(output.float(), reference_output, atol=6e-3, rtol=1e-2)
+    for inputs in (sparse_inputs, masked_inputs):
+        for actual, expected in zip(inputs, reference_inputs, strict=True):
+            torch.testing.assert_close(actual.grad.float(), expected.grad, atol=6e-3, rtol=2e-2)
