@@ -23,9 +23,9 @@ Run from the verl repository root with two visible NPUs::
 
 The full-trajectory reference executes each complete trajectory separately
 through AllGather CP and remains an end-to-end BF16 numerical baseline.  The
-Qwen3-1.7B non-divisible AllGather, Ulysses, and Ring cases additionally run
-P -> S1 and P -> S2 as independent segmented trees.  The backend-matched segmented
-reference is the semantic oracle for Prefix KV reuse.  Set
+Qwen3-1.7B non-divisible AllGather, Ulysses, and Ring cases, plus the divisible
+Ring control, additionally run P -> S1 and P -> S2 as independent segmented
+trees.  The backend-matched segmented reference is the semantic oracle for Prefix KV reuse.  Set
 ``TPR_QWEN_CP_TOPOLOGY=divisible`` for the shape-control case.
 """
 
@@ -318,8 +318,15 @@ def _tokens(start: int, length: int, vocab_size: int) -> torch.Tensor:
     return torch.arange(start, start + length, dtype=torch.long) % vocab_size
 
 
-def _needs_segmented_reference(model_case: _QwenModelCase) -> bool:
-    return model_case.name == "qwen3_1_7b" and _TOPOLOGY_NAME == "non_divisible"
+def _segmented_reference_backends(model_case: _QwenModelCase) -> tuple[str, ...]:
+    if model_case.name != "qwen3_1_7b":
+        return ()
+    if _TOPOLOGY_NAME == "non_divisible":
+        return ("allgather", "ulysses", "ring")
+    # Ring changes both the attention decomposition and reduction order even
+    # without padding.  Its divisible control therefore needs the same
+    # backend-matched oracle; Full-Trajectory remains the numerical baseline.
+    return ("ring",)
 
 
 def _compare_logprobs(
@@ -469,25 +476,24 @@ def real_qwen_cp_case(request, cp_runtime):
     del full_reference_result
 
     segmented_references = {}
-    if _needs_segmented_reference(model_case):
-        for segmented_backend in ("allgather", "ulysses", "ring"):
-            segmented_result = _run_independent_segmented_cp_reference(
-                reference_model,
-                prefix,
-                first,
-                second,
-                runtime,
-                logical_indices,
-                logical_count,
-                cp_backend=segmented_backend,
-                expected_layer_numbers=tuple(
-                    range(1, hf_config.num_hidden_layers + 1)
-                ),
-            )
-            segmented_references[segmented_backend] = _move_reference_to_cpu(
-                segmented_result
-            )
-            del segmented_result
+    for segmented_backend in _segmented_reference_backends(model_case):
+        segmented_result = _run_independent_segmented_cp_reference(
+            reference_model,
+            prefix,
+            first,
+            second,
+            runtime,
+            logical_indices,
+            logical_count,
+            cp_backend=segmented_backend,
+            expected_layer_numbers=tuple(
+                range(1, hf_config.num_hidden_layers + 1)
+            ),
+        )
+        segmented_references[segmented_backend] = _move_reference_to_cpu(
+            segmented_result
+        )
+        del segmented_result
     _clear_model_gradients(reference_model)
     del reference_model
     gc.collect()
