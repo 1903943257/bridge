@@ -23,10 +23,10 @@ Run from the verl repository root with two visible NPUs::
 
 The full-trajectory reference executes each complete trajectory separately
 through AllGather CP and remains an end-to-end BF16 numerical baseline.  The
-Qwen3-1.7B non-divisible AllGather case additionally runs P -> S1 and P -> S2
-as independent segmented trees.  That shape-matched reference is the semantic
-oracle for Prefix KV reuse.  Set ``TPR_QWEN_CP_TOPOLOGY=divisible`` for the
-shape-control case.
+Qwen3-1.7B non-divisible AllGather and Ulysses cases additionally run P -> S1
+and P -> S2 as independent segmented trees.  The backend-matched segmented
+reference is the semantic oracle for Prefix KV reuse.  Set
+``TPR_QWEN_CP_TOPOLOGY=divisible`` for the shape-control case.
 """
 
 from __future__ import annotations
@@ -150,7 +150,7 @@ class _LoadedQwenCPCase:
     logical_indices: dict[tuple[int, int], int]
     logical_count: int
     full_trajectory_reference: _QwenCPReference
-    segmented_reference: _QwenCPReference | None
+    segmented_references: dict[str, _QwenCPReference]
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,21 +468,26 @@ def real_qwen_cp_case(request, cp_runtime):
     full_trajectory_reference = _move_reference_to_cpu(full_reference_result)
     del full_reference_result
 
-    segmented_reference = None
+    segmented_references = {}
     if _needs_segmented_reference(model_case):
-        segmented_result = _run_independent_segmented_cp_reference(
-            reference_model,
-            prefix,
-            first,
-            second,
-            runtime,
-            logical_indices,
-            logical_count,
-            cp_backend="allgather",
-            expected_layer_numbers=tuple(range(1, hf_config.num_hidden_layers + 1)),
-        )
-        segmented_reference = _move_reference_to_cpu(segmented_result)
-        del segmented_result
+        for segmented_backend in ("allgather", "ulysses"):
+            segmented_result = _run_independent_segmented_cp_reference(
+                reference_model,
+                prefix,
+                first,
+                second,
+                runtime,
+                logical_indices,
+                logical_count,
+                cp_backend=segmented_backend,
+                expected_layer_numbers=tuple(
+                    range(1, hf_config.num_hidden_layers + 1)
+                ),
+            )
+            segmented_references[segmented_backend] = _move_reference_to_cpu(
+                segmented_result
+            )
+            del segmented_result
     _clear_model_gradients(reference_model)
     del reference_model
     gc.collect()
@@ -498,7 +503,7 @@ def real_qwen_cp_case(request, cp_runtime):
         logical_indices=logical_indices,
         logical_count=logical_count,
         full_trajectory_reference=full_trajectory_reference,
-        segmented_reference=segmented_reference,
+        segmented_references=segmented_references,
     )
     try:
         yield loaded
@@ -533,7 +538,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     original_pop = SegmentExecutor.pop
     actual_execution_trace = []
     actual_prefix_gradients = {}
-    use_segmented_oracle = case.segmented_reference is not None and backend == "allgather"
+    use_segmented_oracle = backend in case.segmented_references
 
     def capture_loss(executor, segment, logits):
         if executor.model is case.model:
@@ -645,8 +650,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     )
 
     if use_segmented_oracle:
-        reference = case.segmented_reference
-        assert reference is not None
+        reference = case.segmented_references[backend]
         assert reference.execution_trace == (
             (PhysicalExecutionKind.PUSH, 0),
             (PhysicalExecutionKind.VISIT_LEAF, 1),

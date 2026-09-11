@@ -227,8 +227,9 @@ def _physical_causal_padding_mask(
     prefix_blocks: Sequence[LocalKVBlock],
     *,
     device: torch.device,
+    global_query: bool = False,
 ) -> tuple[Tensor, Tensor]:
-    """Build the standard bool mask for physical padded AllGather attention."""
+    """Build the shared bool mask for physical padded contiguous CP attention."""
 
     key_positions = []
     key_validity = []
@@ -250,11 +251,14 @@ def _physical_causal_padding_mask(
     )
     key_positions.append(current_positions)
     key_validity.append(current_validity)
-    query_positions, query_validity = _local_physical_positions(
-        current_shard,
-        logical_offset=logical_offset,
-        device=device,
-    )
+    if global_query:
+        query_positions, query_validity = current_positions, current_validity
+    else:
+        query_positions, query_validity = _local_physical_positions(
+            current_shard,
+            logical_offset=logical_offset,
+            device=device,
+        )
     all_key_positions = torch.cat(key_positions)
     all_key_validity = torch.cat(key_validity)
     attention_mask = torch.logical_or(

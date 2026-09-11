@@ -107,6 +107,13 @@ def _assert_close(actual, expected, *, gradient=False):
     )
 
 
+def _assert_padding_gradient_zero(tensor, shard):
+    physical_indices = shard.physical_global_indices(device=tensor.device)
+    padding = physical_indices >= shard.global_length
+    if torch.any(padding).item():
+        assert torch.count_nonzero(tensor.grad[padding]).item() == 0
+
+
 @contextmanager
 def _a2a_probe():
     original = ulysses._mindspeed_all_to_all
@@ -132,10 +139,11 @@ def _a2a_probe():
 @pytest.mark.parametrize(
     ("prefix_lengths", "current_length", "query_heads", "kv_heads"),
     [
-        ((), 128, 4, 2),
-        ((1024,), 512, 4, 2),
-        ((512, 512), 256, 4, 2),
-        ((127,), 63, 4, 2),
+        pytest.param((), 128, 4, 2, id="no_prefix_divisible"),
+        pytest.param((), 127, 4, 2, id="no_prefix_127_non_divisible"),
+        pytest.param((1024,), 512, 4, 2, id="single_prefix_divisible"),
+        pytest.param((512, 512), 256, 4, 2, id="multiple_prefix_divisible"),
+        pytest.param((127,), 63, 4, 2, id="prefix_127_current_63_non_divisible"),
     ],
 )
 def test_ulysses_cp_attention_matches_full_causal_forward_backward(
@@ -216,16 +224,19 @@ def test_ulysses_cp_attention_matches_full_causal_forward_backward(
 
     _assert_close(actual, current_shard.select(expected))
     _assert_close(local_query.grad, current_shard.select(reference_query.grad), gradient=True)
+    _assert_padding_gradient_zero(local_query, current_shard)
     _assert_close(
         local_current_key.grad,
         current_shard.select(reference_current_key.grad),
         gradient=True,
     )
+    _assert_padding_gradient_zero(local_current_key, current_shard)
     _assert_close(
         local_current_value.grad,
         current_shard.select(reference_current_value.grad),
         gradient=True,
     )
+    _assert_padding_gradient_zero(local_current_value, current_shard)
     for index, length in enumerate(prefix_lengths):
         shard = shard_policy.make_sequence_shard(length)
         _assert_close(
@@ -238,6 +249,8 @@ def test_ulysses_cp_attention_matches_full_causal_forward_backward(
             shard.select(reference_prefix_values[index].grad),
             gradient=True,
         )
+        _assert_padding_gradient_zero(local_prefix_keys[index], shard)
+        _assert_padding_gradient_zero(local_prefix_values[index], shard)
         assert torch.count_nonzero(local_prefix_keys[index].grad).item() > 0
         assert torch.count_nonzero(local_prefix_values[index].grad).item() > 0
 

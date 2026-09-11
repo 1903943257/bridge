@@ -26,7 +26,11 @@ from torch import Tensor
 from ..kv_stack import KVStack
 from ..rectangular_attention import rectangular_causal_attention
 from ..shard import PrefixShard, SequenceShard, physical_sequence_shard
-from .allgather_attention import LocalKVBlock, _group_world_size_and_rank
+from .allgather_attention import (
+    LocalKVBlock,
+    _group_world_size_and_rank,
+    _physical_causal_padding_mask,
+)
 from .execution_context import ShardedPastKVAnchors
 
 
@@ -196,7 +200,7 @@ def ulysses_cp_rectangular_attention(
     cp_group: Any,
     softmax_scale: float | None = None,
 ) -> Tensor:
-    """Run TPR attention through MindSpeed's Ulysses All-to-All primitive."""
+    """Run physical padded TPR attention through MindSpeed Ulysses A2A."""
 
     cp_size, cp_rank = _group_world_size_and_rank(cp_group)
     _validate_shard(current_shard, cp_size=cp_size, cp_rank=cp_rank, name="current")
@@ -214,45 +218,68 @@ def ulysses_cp_rectangular_attention(
         current_key=current_key,
     )
 
-    head_query = _sequence_to_head(
+    physical_head_query = _sequence_to_head(
         query,
         global_length=current_shard.padded_length,
         cp_group=cp_group,
-    )[: current_shard.global_length]
-    prefix_keys = [
-        _sequence_to_head(block.key, global_length=block.shard.padded_length, cp_group=cp_group)[
-            : block.shard.global_length
-        ]
+    )
+    physical_prefix_keys = [
+        _sequence_to_head(
+            block.key,
+            global_length=block.shard.padded_length,
+            cp_group=cp_group,
+        )
         for block in blocks
     ]
-    prefix_values = [
-        _sequence_to_head(block.value, global_length=block.shard.padded_length, cp_group=cp_group)[
-            : block.shard.global_length
-        ]
+    physical_prefix_values = [
+        _sequence_to_head(
+            block.value,
+            global_length=block.shard.padded_length,
+            cp_group=cp_group,
+        )
         for block in blocks
     ]
-    head_current_key = _sequence_to_head(
+    physical_head_current_key = _sequence_to_head(
         current_key,
         global_length=current_shard.padded_length,
         cp_group=cp_group,
-    )[: current_shard.global_length]
-    head_current_value = _sequence_to_head(
+    )
+    physical_head_current_value = _sequence_to_head(
         current_value,
         global_length=current_shard.padded_length,
         cp_group=cp_group,
-    )[: current_shard.global_length]
-    head_key = torch.cat((*prefix_keys, head_current_key), dim=0)
-    head_value = torch.cat((*prefix_values, head_current_value), dim=0)
-    head_output = rectangular_causal_attention(
-        head_query,
-        head_key,
-        head_value,
-        softmax_scale=softmax_scale,
     )
-    if current_shard.padded_length != current_shard.global_length:
-        pad_shape = list(head_output.shape)
-        pad_shape[0] = current_shard.padded_length - current_shard.global_length
-        head_output = torch.cat((head_output, head_output.new_zeros(pad_shape)), dim=0)
+    head_key = torch.cat((*physical_prefix_keys, physical_head_current_key), dim=0)
+    head_value = torch.cat((*physical_prefix_values, physical_head_current_value), dim=0)
+    has_padding = current_shard.padded_length != current_shard.global_length or any(
+        block.shard.padded_length != block.shard.global_length for block in blocks
+    )
+    attention_mask = None
+    valid_query = None
+    if has_padding:
+        attention_mask, valid_query = _physical_causal_padding_mask(
+            current_shard,
+            blocks,
+            device=query.device,
+            global_query=True,
+        )
+    if attention_mask is None:
+        head_output = rectangular_causal_attention(
+            physical_head_query,
+            head_key,
+            head_value,
+            softmax_scale=softmax_scale,
+        )
+    else:
+        head_output = rectangular_causal_attention(
+            physical_head_query,
+            head_key,
+            head_value,
+            softmax_scale=softmax_scale,
+            attention_mask=attention_mask,
+        )
+    if valid_query is not None:
+        head_output = head_output * valid_query[:, None, None].to(head_output.dtype)
     return _head_to_sequence(
         head_output,
         local_length=current_shard.local_length,
