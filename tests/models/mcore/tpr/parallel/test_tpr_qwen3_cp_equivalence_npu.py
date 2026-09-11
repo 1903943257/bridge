@@ -162,6 +162,12 @@ class _LogprobComparison:
 
 
 @dataclass(frozen=True, slots=True)
+class _LossComparison:
+    absolute_difference: float
+    relative_difference: float
+
+
+@dataclass(frozen=True, slots=True)
 class _GradientComparison:
     relative_l2: float
     cosine: float
@@ -322,7 +328,7 @@ def _compare_logprobs(
     *,
     case,
     backend,
-    reference_kind,
+    comparison,
     rank,
 ) -> _LogprobComparison:
     difference = actual - expected
@@ -341,7 +347,7 @@ def _compare_logprobs(
     if rank == 0:
         print(
             "Qwen logprob comparison: "
-            f"reference={reference_kind}, model={case.spec.name}, backend={backend}, "
+            f"comparison={comparison}, model={case.spec.name}, backend={backend}, "
             f"topology={_TOPOLOGY_NAME}, relative_l2={relative_l2.item():.6e}, "
             f"cosine={cosine.item():.9f}, max_abs={max_abs_difference:.6e}, "
             f"pointwise_outliers={pointwise_outliers}/{case.logical_count}"
@@ -354,8 +360,8 @@ def _compare_logprobs(
             region = "prefix" if query_position < _PREFIX_LENGTH else "suffix"
             print(
                 f"  sample={sample_id} query_position={query_position} region={region} "
-                f"reference={expected[index].item():.7f} "
-                f"actual={actual[index].item():.7f} "
+                f"left={expected[index].item():.7f} "
+                f"right={actual[index].item():.7f} "
                 f"abs_diff={absolute_difference[index].item():.7f}"
             )
     return _LogprobComparison(
@@ -366,7 +372,27 @@ def _compare_logprobs(
     )
 
 
-def _gradient_diagnostics(actual, expected, *, reference_kind, rank):
+def _compare_losses(actual, expected, *, comparison, rank) -> _LossComparison:
+    actual_value = float(actual.item()) if isinstance(actual, torch.Tensor) else float(actual)
+    expected_value = (
+        float(expected.item()) if isinstance(expected, torch.Tensor) else float(expected)
+    )
+    absolute_difference = abs(actual_value - expected_value)
+    relative_difference = absolute_difference / max(abs(expected_value), 1e-24)
+    if rank == 0:
+        print(
+            "Qwen loss comparison: "
+            f"comparison={comparison}, left={expected_value:.9f}, "
+            f"right={actual_value:.9f}, absolute_difference={absolute_difference:.6e}, "
+            f"relative_difference={relative_difference:.6e}"
+        )
+    return _LossComparison(
+        absolute_difference=absolute_difference,
+        relative_difference=relative_difference,
+    )
+
+
+def _gradient_diagnostics(actual, expected, *, comparison, rank):
     if actual.keys() != expected.keys():
         raise AssertionError("Qwen gradient tensor names differ")
     difference_square_sum = 0.0
@@ -395,8 +421,8 @@ def _gradient_diagnostics(actual, expected, *, reference_kind, rank):
     cosine = dot_sum / max((actual_square_sum * expected_square_sum) ** 0.5, 1e-24)
     if rank == 0:
         print(
-            "Qwen gradient numerical baseline: "
-            f"reference={reference_kind}, global_relative_l2={relative_l2:.7g}, "
+            "Qwen gradient comparison: "
+            f"comparison={comparison}, global_relative_l2={relative_l2:.7g}, "
             f"global_cosine={cosine:.9f}"
         )
         for parameter_relative_l2, name in sorted(per_parameter, reverse=True)[:10]:
@@ -629,31 +655,41 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             (PhysicalExecutionKind.VISIT_LEAF, 2),
             (PhysicalExecutionKind.POP, 0),
         )
-        full_logprob_comparison = _compare_logprobs(
-            actual_logprobs,
+        if runtime.rank == 0:
+            print(
+                "Qwen three-way comparison: "
+                "A=Full-Trajectory, B=Independent Segmented, C=TPR"
+            )
+        _compare_losses(
+            reference.normalized_loss,
+            full_reference.normalized_loss,
+            comparison="A_vs_B",
+            rank=runtime.rank,
+        )
+        _compare_logprobs(
+            reference.target_logprobs,
             full_reference.target_logprobs,
             case=case,
             backend=backend,
-            reference_kind="full_trajectory",
+            comparison="A_vs_B",
             rank=runtime.rank,
         )
-        full_gradient_comparison = _gradient_diagnostics(
-            actual_gradients,
+        _gradient_diagnostics(
+            reference.parameter_gradients,
             full_reference.parameter_gradients,
-            reference_kind="full_trajectory",
+            comparison="A_vs_B",
             rank=runtime.rank,
         )
-        if runtime.rank == 0:
-            print(
-                "Qwen loss numerical baseline: "
-                f"reference=full_trajectory, expected={full_reference.normalized_loss.item():.9f}, "
-                f"actual={output['loss']:.9f}"
-            )
     else:
         reference = full_reference
-        full_logprob_comparison = None
-        full_gradient_comparison = None
 
+    semantic_comparison = "B_vs_C" if use_segmented_oracle else "A_vs_C"
+    _compare_losses(
+        output["loss"],
+        reference.normalized_loss,
+        comparison=semantic_comparison,
+        rank=runtime.rank,
+    )
     torch.testing.assert_close(
         torch.tensor(output["loss"]),
         reference.normalized_loss,
@@ -665,7 +701,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         reference.target_logprobs,
         case=case,
         backend=backend,
-        reference_kind="independent_segmented" if use_segmented_oracle else "full_trajectory",
+        comparison=semantic_comparison,
         rank=runtime.rank,
     )
     if use_segmented_oracle:
@@ -689,7 +725,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         f"{_LOGPROB_COSINE_MIN:.9f}"
     )
     if use_segmented_oracle and runtime.rank == 0:
-        print("Qwen parameter-gradient semantic comparison: reference=independent_segmented")
+        print("Qwen parameter-gradient semantic comparison: comparison=B_vs_C")
     _assert_real_qwen_gradients_close(
         actual_gradients,
         reference.parameter_gradients,
@@ -721,6 +757,29 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             ),
             per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
         )
+        _compare_losses(
+            output["loss"],
+            full_reference.normalized_loss,
+            comparison="A_vs_C",
+            rank=runtime.rank,
+        )
+        full_logprob_comparison = _compare_logprobs(
+            actual_logprobs,
+            full_reference.target_logprobs,
+            case=case,
+            backend=backend,
+            comparison="A_vs_C",
+            rank=runtime.rank,
+        )
+        full_gradient_comparison = _gradient_diagnostics(
+            actual_gradients,
+            full_reference.parameter_gradients,
+            comparison="A_vs_C",
+            rank=runtime.rank,
+        )
+    else:
+        full_logprob_comparison = logprob_comparison
+        full_gradient_comparison = None
     assert output["metrics"]["tpr_cp_size"] == 2
     assert output["metrics"]["tpr_cp_backend"] == backend
     assert output["metrics"]["tpr_peak_path_tokens"] == (
