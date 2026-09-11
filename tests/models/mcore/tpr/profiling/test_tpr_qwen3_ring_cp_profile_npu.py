@@ -29,7 +29,10 @@ Run all cases from the verl repository root with two visible NPUs::
         tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py
 
 Set ``TPR_QWEN_RING_CP_PROFILE_CASES`` to a comma-separated list of case IDs
-to split a long run, for example ``p4096_s512_n2``.
+to split a long run, for example ``p4096_s512_n2``.  The main comparison keeps
+three warmups and ten uninstrumented samples.  A separate one-warmup,
+three-sample NPU-event pass collects the latency breakdown; set
+``TPR_QWEN_RING_CP_PROFILE_BREAKDOWN=0`` to disable that diagnostic pass.
 """
 
 from __future__ import annotations
@@ -38,13 +41,17 @@ import gc
 import math
 import os
 import statistics
+import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
 
+import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
 from verl.models.mcore.tpr import (
     FixedTopologyScheduler,
     PhysicalExecutionKind,
@@ -75,6 +82,9 @@ pytestmark = pytest.mark.skipif(
 _EXPECTED_WORLD_SIZE = 2
 _WARMUP_RUNS = 3
 _MEASURE_RUNS = 10
+_BREAKDOWN_WARMUP_RUNS = 1
+_BREAKDOWN_MEASURE_RUNS = 3
+_RUN_BREAKDOWN = os.getenv("TPR_QWEN_RING_CP_PROFILE_BREAKDOWN", "1") == "1"
 _GIB = 1024**3
 
 
@@ -124,10 +134,41 @@ class _ProfileStats:
 
 
 @dataclass(frozen=True, slots=True)
+class _BreakdownStats:
+    wall_median_ms: float
+    categories: dict[str, float]
+    calls: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _PathBreakdown:
+    prefix_attention_forward_ms: float
+    prefix_attention_backward_ms: float
+    prefix_non_attention_forward_ms: float
+    prefix_non_attention_backward_ms: float
+    branch_attention_forward_ms: float
+    branch_attention_backward_ms: float
+    branch_non_attention_forward_ms: float
+    branch_non_attention_backward_ms: float
+    ring_communication_forward_ms: float
+    ring_communication_backward_ms: float
+    ring_fa_forward_ms: float
+    ring_fa_backward_ms: float
+    ring_merge_forward_ms: float
+    ring_merge_backward_ms: float
+    tpr_overhead_forward_ms: float
+    tpr_overhead_backward_ms: float
+    other_ms: float
+    total_ms: float
+
+
+@dataclass(frozen=True, slots=True)
 class _ProfileResult:
     case: _ProfileCase
     reference: _ProfileStats
     tpr: _ProfileStats
+    reference_breakdown: _BreakdownStats | None = None
+    tpr_breakdown: _BreakdownStats | None = None
 
     @property
     def median_speedup(self) -> float:
@@ -143,6 +184,45 @@ _PROFILE_CASES = (
     _ProfileCase(4096, 512, 8),
     _ProfileCase(8192, 1024, 8),
 )
+
+
+class _NPUEventRecorder:
+    """Aggregate asynchronous NPU intervals without synchronizing inner scopes."""
+
+    def __init__(self) -> None:
+        self._stacks: dict[str, list] = {}
+        self._pairs: dict[str, list[tuple]] = {}
+
+    def begin(self, category: str) -> None:
+        event = torch.npu.Event(enable_timing=True)
+        event.record()
+        self._stacks.setdefault(category, []).append(event)
+
+    def end(self, category: str) -> None:
+        stack = self._stacks.get(category)
+        if not stack:
+            raise RuntimeError(f"unmatched NPU timing event for {category}")
+        start = stack.pop()
+        end = torch.npu.Event(enable_timing=True)
+        end.record()
+        self._pairs.setdefault(category, []).append((start, end))
+
+    def call(self, category: str, function, *args, **kwargs):
+        self.begin(category)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self.end(category)
+
+    def summarize(self) -> tuple[dict[str, float], dict[str, int]]:
+        if any(self._stacks.values()):
+            raise RuntimeError("unclosed NPU timing event")
+        totals = {
+            category: sum(start.elapsed_time(end) for start, end in pairs)
+            for category, pairs in self._pairs.items()
+        }
+        calls = {category: len(pairs) for category, pairs in self._pairs.items()}
+        return totals, calls
 
 
 def _selected_profile_cases() -> tuple[_ProfileCase, ...]:
@@ -401,8 +481,668 @@ def _profile_runner(
     )
 
 
+_BREAKDOWN_SUFFIXES = (
+    "operation",
+    "model_forward",
+    "backward",
+    "loss_forward",
+    "kv_backward",
+    "ring_forward",
+    "ring_backward",
+    "comm_forward",
+    "comm_backward",
+    "fa_forward",
+    "fa_backward",
+    "merge_forward",
+)
+
+
+def _breakdown_phases(path: str) -> tuple[str, ...]:
+    if path == "reference":
+        return ("full",)
+    if path == "tpr":
+        return ("prefix_push", "branch_visit", "prefix_pop")
+    raise ValueError(f"unknown breakdown path {path!r}")
+
+
+def _collect_breakdown(
+    run,
+    model,
+    runtime,
+    *,
+    path: str,
+    expected_trace: tuple[tuple[PhysicalExecutionKind, int], ...],
+) -> _BreakdownStats:
+    """Collect a low-sample NPU-event breakdown without inner synchronization."""
+
+    for warmup_index in range(_BREAKDOWN_WARMUP_RUNS):
+        model.zero_grad(set_to_none=True)
+        dist.barrier(group=runtime.cp_group)
+        torch.npu.synchronize()
+        observation = run()
+        torch.npu.synchronize()
+        if warmup_index == 0:
+            _validate_observation(observation, expected_trace=expected_trace)
+        del observation
+
+    phases = _breakdown_phases(path)
+    expected_categories = tuple(
+        f"{phase}.{suffix}"
+        for phase in phases
+        for suffix in _BREAKDOWN_SUFFIXES
+    ) + ("gradient_finalize",)
+    wall_samples = []
+    category_samples = []
+    call_samples = []
+
+    for _ in range(_BREAKDOWN_MEASURE_RUNS):
+        recorder = _NPUEventRecorder()
+        active_phase = [None]
+        original_push = SegmentExecutor.push
+        original_visit_leaf = SegmentExecutor.visit_leaf
+        original_pop = SegmentExecutor.pop
+        original_compute_loss = SegmentExecutor._compute_loss
+        original_accumulate = SegmentExecutor._accumulate_past_anchor_gradients
+        original_autograd_backward = torch.autograd.backward
+        original_finalize = _finalize_cp_parameter_gradients
+        original_ring_forward = ring_attention._RingTPRAttention.forward
+        original_ring_backward = ring_attention._RingTPRAttention.backward
+        original_circulate = ring_attention._circulate_kv
+        original_reduce = ring_attention._reduce_ring_gradients_to_owner
+        original_fa_forward = ring_attention._block_attention_forward
+        original_fa_backward = ring_attention._block_attention_backward
+        original_merge = ring_attention._merge_attention
+
+        def phase_for(method_name: str) -> str:
+            if path == "reference":
+                return "full"
+            return {
+                "push": "prefix_push",
+                "visit_leaf": "branch_visit",
+                "pop": "prefix_pop",
+            }[method_name]
+
+        def in_phase(category_suffix: str, function, *args, **kwargs):
+            phase = active_phase[0]
+            if phase is None:
+                return function(*args, **kwargs)
+            return recorder.call(f"{phase}.{category_suffix}", function, *args, **kwargs)
+
+        def call_operation(method_name: str, function, executor, segment_id):
+            if executor.model is not model:
+                return function(executor, segment_id)
+            previous_phase = active_phase[0]
+            active_phase[0] = phase_for(method_name)
+            try:
+                return in_phase("operation", function, executor, segment_id)
+            finally:
+                active_phase[0] = previous_phase
+
+        def timed_push(executor, segment_id):
+            return call_operation("push", original_push, executor, segment_id)
+
+        def timed_visit_leaf(executor, segment_id):
+            return call_operation(
+                "visit_leaf",
+                original_visit_leaf,
+                executor,
+                segment_id,
+            )
+
+        def timed_pop(executor, segment_id):
+            return call_operation("pop", original_pop, executor, segment_id)
+
+        def timed_compute_loss(executor, *args, **kwargs):
+            if executor.model is not model:
+                return original_compute_loss(executor, *args, **kwargs)
+            return in_phase(
+                "loss_forward",
+                original_compute_loss,
+                executor,
+                *args,
+                **kwargs,
+            )
+
+        def timed_accumulate(executor, *args, **kwargs):
+            if executor.model is not model:
+                return original_accumulate(executor, *args, **kwargs)
+            return in_phase(
+                "kv_backward",
+                original_accumulate,
+                executor,
+                *args,
+                **kwargs,
+            )
+
+        def timed_autograd_backward(*args, **kwargs):
+            return in_phase("backward", original_autograd_backward, *args, **kwargs)
+
+        def timed_finalize(model_arg, runtime_arg):
+            if model_arg is not model:
+                return original_finalize(model_arg, runtime_arg)
+            return recorder.call(
+                "gradient_finalize",
+                original_finalize,
+                model_arg,
+                runtime_arg,
+            )
+
+        def timed_ring_forward(ctx, *args):
+            return in_phase("ring_forward", original_ring_forward, ctx, *args)
+
+        def timed_ring_backward(ctx, *args):
+            return in_phase("ring_backward", original_ring_backward, ctx, *args)
+
+        def timed_circulate(*args, **kwargs):
+            return in_phase("comm_forward", original_circulate, *args, **kwargs)
+
+        def timed_reduce(*args, **kwargs):
+            return in_phase("comm_backward", original_reduce, *args, **kwargs)
+
+        def timed_fa_forward(*args, **kwargs):
+            return in_phase("fa_forward", original_fa_forward, *args, **kwargs)
+
+        def timed_fa_backward(*args, **kwargs):
+            return in_phase("fa_backward", original_fa_backward, *args, **kwargs)
+
+        def timed_merge(*args, **kwargs):
+            return in_phase("merge_forward", original_merge, *args, **kwargs)
+
+        def model_forward_start(*_args):
+            phase = active_phase[0]
+            if phase is None:
+                raise RuntimeError("profile model forward occurred outside an execution phase")
+            recorder.begin(f"{phase}.model_forward")
+
+        def model_forward_end(*_args):
+            phase = active_phase[0]
+            if phase is None:
+                raise RuntimeError("profile model forward ended outside an execution phase")
+            recorder.end(f"{phase}.model_forward")
+
+        handles = (
+            model.register_forward_pre_hook(model_forward_start),
+            model.register_forward_hook(model_forward_end),
+        )
+        module = sys.modules[__name__]
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(SegmentExecutor, "push", timed_push))
+                stack.enter_context(
+                    patch.object(SegmentExecutor, "visit_leaf", timed_visit_leaf)
+                )
+                stack.enter_context(patch.object(SegmentExecutor, "pop", timed_pop))
+                stack.enter_context(
+                    patch.object(SegmentExecutor, "_compute_loss", timed_compute_loss)
+                )
+                stack.enter_context(
+                    patch.object(
+                        SegmentExecutor,
+                        "_accumulate_past_anchor_gradients",
+                        timed_accumulate,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(torch.autograd, "backward", timed_autograd_backward)
+                )
+                stack.enter_context(
+                    patch.object(module, "_finalize_cp_parameter_gradients", timed_finalize)
+                )
+                stack.enter_context(
+                    patch.object(
+                        ring_attention._RingTPRAttention,
+                        "forward",
+                        staticmethod(timed_ring_forward),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        ring_attention._RingTPRAttention,
+                        "backward",
+                        staticmethod(timed_ring_backward),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(ring_attention, "_circulate_kv", timed_circulate)
+                )
+                stack.enter_context(
+                    patch.object(
+                        ring_attention,
+                        "_reduce_ring_gradients_to_owner",
+                        timed_reduce,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        ring_attention,
+                        "_block_attention_forward",
+                        timed_fa_forward,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        ring_attention,
+                        "_block_attention_backward",
+                        timed_fa_backward,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(ring_attention, "_merge_attention", timed_merge)
+                )
+
+                model.zero_grad(set_to_none=True)
+                dist.barrier(group=runtime.cp_group)
+                torch.npu.synchronize()
+                started = time.perf_counter()
+                observation = run()
+                torch.npu.synchronize()
+                wall_ms = (time.perf_counter() - started) * 1000.0
+                del observation
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        local_totals, local_calls = recorder.summarize()
+        wall_samples.append(_global_max_float(wall_ms, runtime))
+        category_samples.append(
+            {
+                category: _global_max_float(local_totals.get(category, 0.0), runtime)
+                for category in expected_categories
+            }
+        )
+        call_samples.append(
+            {category: local_calls.get(category, 0) for category in expected_categories}
+        )
+
+    for category in expected_categories:
+        observed_calls = {sample[category] for sample in call_samples}
+        if len(observed_calls) != 1:
+            raise AssertionError(
+                f"unstable breakdown call count for {category}: {sorted(observed_calls)}"
+            )
+    return _BreakdownStats(
+        wall_median_ms=statistics.median(wall_samples),
+        categories={
+            category: statistics.median(sample[category] for sample in category_samples)
+            for category in expected_categories
+        },
+        calls={category: call_samples[0][category] for category in expected_categories},
+    )
+
+
 def _format_gib(value: int) -> str:
     return f"{value / _GIB:.3f} GiB"
+
+
+def _category(stats: _BreakdownStats, phase: str, suffix: str) -> float:
+    return stats.categories.get(f"{phase}.{suffix}", 0.0)
+
+
+def _phase_breakdown(stats: _BreakdownStats, phase: str) -> dict[str, float]:
+    attention_forward = _category(stats, phase, "ring_forward")
+    attention_backward = _category(stats, phase, "ring_backward")
+    communication_forward = _category(stats, phase, "comm_forward")
+    communication_backward = _category(stats, phase, "comm_backward")
+    fa_forward = _category(stats, phase, "fa_forward")
+    fa_backward = _category(stats, phase, "fa_backward")
+    return {
+        "attention_forward": attention_forward,
+        "attention_backward": attention_backward,
+        "non_attention_forward": max(
+            0.0,
+            _category(stats, phase, "model_forward") - attention_forward,
+        ),
+        "non_attention_backward": max(
+            0.0,
+            _category(stats, phase, "backward") - attention_backward,
+        ),
+        "communication_forward": communication_forward,
+        "communication_backward": communication_backward,
+        "fa_forward": fa_forward,
+        "fa_backward": fa_backward,
+        # Backward merge/accumulation is implemented inside the custom Ring
+        # backward rather than through _merge_attention.  The Ring-total
+        # remainder therefore gives the least intrusive common definition.
+        "merge_forward": max(
+            0.0,
+            attention_forward - communication_forward - fa_forward,
+        ),
+        "merge_backward": max(
+            0.0,
+            attention_backward - communication_backward - fa_backward,
+        ),
+    }
+
+
+def _sum_phase_values(
+    phase_values: dict[str, dict[str, float]],
+    phases: tuple[str, ...],
+    key: str,
+) -> float:
+    return sum(phase_values[phase][key] for phase in phases)
+
+
+def _derive_path_breakdown(
+    case: _ProfileCase,
+    profile: _ProfileStats,
+    breakdown: _BreakdownStats,
+    *,
+    path: str,
+) -> _PathBreakdown:
+    phases = _breakdown_phases(path)
+    values = {phase: _phase_breakdown(breakdown, phase) for phase in phases}
+    if path == "reference":
+        full = values["full"]
+        prefix_fraction = case.prefix_length / (
+            case.prefix_length + case.suffix_length
+        )
+        branch_fraction = 1.0 - prefix_fraction
+        prefix_attention_forward = full["attention_forward"] * prefix_fraction
+        prefix_attention_backward = full["attention_backward"] * prefix_fraction
+        prefix_non_attention_forward = (
+            full["non_attention_forward"] * prefix_fraction
+        )
+        prefix_non_attention_backward = (
+            full["non_attention_backward"] * prefix_fraction
+        )
+        branch_attention_forward = full["attention_forward"] * branch_fraction
+        branch_attention_backward = full["attention_backward"] * branch_fraction
+        branch_non_attention_forward = (
+            full["non_attention_forward"] * branch_fraction
+        )
+        branch_non_attention_backward = (
+            full["non_attention_backward"] * branch_fraction
+        )
+        overhead_forward = 0.0
+        overhead_backward = 0.0
+    else:
+        prefix_phases = ("prefix_push", "prefix_pop")
+        branch_phases = ("branch_visit",)
+        prefix_attention_forward = _sum_phase_values(
+            values, prefix_phases, "attention_forward"
+        )
+        prefix_attention_backward = _sum_phase_values(
+            values, prefix_phases, "attention_backward"
+        )
+        prefix_non_attention_forward = _sum_phase_values(
+            values, prefix_phases, "non_attention_forward"
+        )
+        prefix_non_attention_backward = _sum_phase_values(
+            values, prefix_phases, "non_attention_backward"
+        )
+        branch_attention_forward = _sum_phase_values(
+            values, branch_phases, "attention_forward"
+        )
+        branch_attention_backward = _sum_phase_values(
+            values, branch_phases, "attention_backward"
+        )
+        branch_non_attention_forward = _sum_phase_values(
+            values, branch_phases, "non_attention_forward"
+        )
+        branch_non_attention_backward = _sum_phase_values(
+            values, branch_phases, "non_attention_backward"
+        )
+        overhead_forward = 0.0
+        overhead_backward = 0.0
+        for phase in phases:
+            residual = max(
+                0.0,
+                _category(breakdown, phase, "operation")
+                - _category(breakdown, phase, "model_forward")
+                - _category(breakdown, phase, "backward")
+                - _category(breakdown, phase, "loss_forward"),
+            )
+            kv_backward = min(
+                residual,
+                _category(breakdown, phase, "kv_backward"),
+            )
+            overhead_forward += residual - kv_backward
+            overhead_backward += kv_backward
+
+    communication_forward = _sum_phase_values(
+        values, phases, "communication_forward"
+    )
+    communication_backward = _sum_phase_values(
+        values, phases, "communication_backward"
+    )
+    fa_forward = _sum_phase_values(values, phases, "fa_forward")
+    fa_backward = _sum_phase_values(values, phases, "fa_backward")
+    merge_forward = _sum_phase_values(values, phases, "merge_forward")
+    merge_backward = _sum_phase_values(values, phases, "merge_backward")
+    covered_top_level = sum(
+        (
+            prefix_attention_forward,
+            prefix_attention_backward,
+            prefix_non_attention_forward,
+            prefix_non_attention_backward,
+            branch_attention_forward,
+            branch_attention_backward,
+            branch_non_attention_forward,
+            branch_non_attention_backward,
+            overhead_forward,
+            overhead_backward,
+        )
+    )
+    return _PathBreakdown(
+        prefix_attention_forward,
+        prefix_attention_backward,
+        prefix_non_attention_forward,
+        prefix_non_attention_backward,
+        branch_attention_forward,
+        branch_attention_backward,
+        branch_non_attention_forward,
+        branch_non_attention_backward,
+        communication_forward,
+        communication_backward,
+        fa_forward,
+        fa_backward,
+        merge_forward,
+        merge_backward,
+        overhead_forward,
+        overhead_backward,
+        profile.median_ms - covered_top_level,
+        profile.median_ms,
+    )
+
+
+def _format_forward_backward(forward_ms: float, backward_ms: float) -> str:
+    return f"{forward_ms:.1f}/{backward_ms:.1f}"
+
+
+def _print_breakdown_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
+    if rank != 0 or not results or results[0].reference_breakdown is None:
+        return
+    print("\nRing CP latency breakdown (all paired cells are forward/backward ms)")
+    print(
+        "Reference Prefix/Branch is a token-weighted estimate because each P+S "
+        "trajectory is one fused execution. TPR phase attribution is measured."
+    )
+    print(
+        "Ring Comm/FA are measured drill-downs of Attention and are not additive "
+        "with Prefix or Branch Attn. Total is the uninstrumented 10-run median."
+    )
+    print(
+        "Other is the residual containing loss work, final parameter-gradient "
+        "synchronization, scheduler/host gaps, and any uncovered device work."
+    )
+    print(
+        "Case | Path | Prefix | Branch Attn | Branch Non-Attn | Ring Comm | "
+        "Ring FA | TPR Overhead | Other | Total"
+    )
+    print("-" * 150)
+    for result in results:
+        assert result.reference_breakdown is not None
+        assert result.tpr_breakdown is not None
+        paths = (
+            (
+                "Reference",
+                _derive_path_breakdown(
+                    result.case,
+                    result.reference,
+                    result.reference_breakdown,
+                    path="reference",
+                ),
+            ),
+            (
+                "TPR",
+                _derive_path_breakdown(
+                    result.case,
+                    result.tpr,
+                    result.tpr_breakdown,
+                    path="tpr",
+                ),
+            ),
+        )
+        for path_name, item in paths:
+            raw_breakdown = (
+                result.reference_breakdown
+                if path_name == "Reference"
+                else result.tpr_breakdown
+            )
+            instrumented_wall = raw_breakdown.wall_median_ms
+            prefix_forward = (
+                item.prefix_attention_forward_ms
+                + item.prefix_non_attention_forward_ms
+            )
+            prefix_backward = (
+                item.prefix_attention_backward_ms
+                + item.prefix_non_attention_backward_ms
+            )
+            branch_attention = _format_forward_backward(
+                item.branch_attention_forward_ms,
+                item.branch_attention_backward_ms,
+            )
+            branch_non_attention = _format_forward_backward(
+                item.branch_non_attention_forward_ms,
+                item.branch_non_attention_backward_ms,
+            )
+            ring_communication = _format_forward_backward(
+                item.ring_communication_forward_ms,
+                item.ring_communication_backward_ms,
+            )
+            prefix_attention = _format_forward_backward(
+                item.prefix_attention_forward_ms,
+                item.prefix_attention_backward_ms,
+            )
+            prefix_non_attention = _format_forward_backward(
+                item.prefix_non_attention_forward_ms,
+                item.prefix_non_attention_backward_ms,
+            )
+            print(
+                f"{result.case.case_id} | {path_name} | "
+                f"{_format_forward_backward(prefix_forward, prefix_backward)} | "
+                f"{branch_attention} | {branch_non_attention} | "
+                f"{ring_communication} | "
+                f"{_format_forward_backward(item.ring_fa_forward_ms, item.ring_fa_backward_ms)} | "
+                f"{_format_forward_backward(item.tpr_overhead_forward_ms, item.tpr_overhead_backward_ms)} | "
+                f"{item.other_ms:.1f} | {item.total_ms:.1f}"
+            )
+            print(
+                f"  detail: Prefix Attn={prefix_attention}, "
+                f"Prefix Non-Attn={prefix_non_attention}, "
+                "Ring Merge/framework="
+                f"{_format_forward_backward(item.ring_merge_forward_ms, item.ring_merge_backward_ms)}, "
+                f"gradient finalize={raw_breakdown.categories['gradient_finalize']:.1f} ms, "
+                f"instrumented wall={instrumented_wall:.1f} ms"
+            )
+        _print_attribution(result, paths[0][1], paths[1][1])
+
+
+def _print_attribution(
+    result: _ProfileResult,
+    reference: _PathBreakdown,
+    tpr: _PathBreakdown,
+) -> None:
+    assert result.reference_breakdown is not None
+    assert result.tpr_breakdown is not None
+    case = result.case
+    tpr_raw = result.tpr_breakdown
+    push_forward = _category(tpr_raw, "prefix_push", "model_forward")
+    pop_forward = _category(tpr_raw, "prefix_pop", "model_forward")
+    pop_backward = _category(tpr_raw, "prefix_pop", "backward")
+    shape_aligned_reference_prefix = case.trajectory_count * (
+        pop_forward + pop_backward
+    )
+    actual_tpr_prefix = push_forward + pop_forward + pop_backward
+    estimated_prefix_saved = shape_aligned_reference_prefix - actual_tpr_prefix
+
+    reference_branch_fraction = case.suffix_length / (
+        case.prefix_length + case.suffix_length
+    )
+    reference_branch_compute = (
+        reference.branch_non_attention_forward_ms
+        + reference.branch_non_attention_backward_ms
+        + (
+            reference.ring_fa_forward_ms
+            + reference.ring_fa_backward_ms
+            + reference.ring_merge_forward_ms
+            + reference.ring_merge_backward_ms
+        )
+        * reference_branch_fraction
+    )
+    tpr_branch_compute = (
+        tpr.branch_non_attention_forward_ms
+        + tpr.branch_non_attention_backward_ms
+        + _category(tpr_raw, "branch_visit", "fa_forward")
+        + _category(tpr_raw, "branch_visit", "fa_backward")
+        + _phase_breakdown(tpr_raw, "branch_visit")["merge_forward"]
+        + _phase_breakdown(tpr_raw, "branch_visit")["merge_backward"]
+    )
+    penalties = {
+        "repeated Ring communication": max(
+            0.0,
+            tpr.ring_communication_forward_ms
+            + tpr.ring_communication_backward_ms
+            - reference.ring_communication_forward_ms
+            - reference.ring_communication_backward_ms,
+        ),
+        "small-shape FA/GEMM": max(
+            0.0,
+            tpr_branch_compute - reference_branch_compute,
+        ),
+        "Prefix recompute/backward": pop_forward + pop_backward,
+        "scheduler/KV/uncovered": (
+            tpr.tpr_overhead_forward_ms
+            + tpr.tpr_overhead_backward_ms
+            + max(0.0, tpr.other_ms - reference.other_ms)
+        ),
+    }
+    dominant_name, dominant_ms = max(penalties.items(), key=lambda item: item[1])
+    reference_communication_calls = sum(
+        result.reference_breakdown.calls.get(f"full.{suffix}", 0)
+        for suffix in ("comm_forward", "comm_backward")
+    )
+    tpr_communication_calls = sum(
+        result.tpr_breakdown.calls.get(f"{phase}.{suffix}", 0)
+        for phase in _breakdown_phases("tpr")
+        for suffix in ("comm_forward", "comm_backward")
+    )
+    print(
+        "  Prefix traversal count: Reference="
+        f"{case.trajectory_count} forward + {case.trajectory_count} backward; "
+        "TPR=2 forward (Push + Pop recompute) + 1 backward."
+    )
+    print(
+        "  Prefix compute saved (shape-aligned estimate): "
+        f"{estimated_prefix_saved:.1f} ms; counterfactual Reference="
+        f"{shape_aligned_reference_prefix:.1f} ms, TPR-measured={actual_tpr_prefix:.1f} ms."
+    )
+    print(
+        "  Ring transport calls on rank 0 (forward + backward wrappers): "
+        f"Reference={reference_communication_calls}, TPR={tpr_communication_calls}."
+    )
+    print(
+        "  TPR physical phases: "
+        f"Push={_category(tpr_raw, 'prefix_push', 'operation'):.1f} ms, "
+        f"Visit={_category(tpr_raw, 'branch_visit', 'operation'):.1f} ms, "
+        f"Pop={_category(tpr_raw, 'prefix_pop', 'operation'):.1f} ms "
+        f"(Pop backward={pop_backward:.1f} ms)."
+    )
+    print(
+        "  Benefit consumers (diagnostic, non-additive): "
+        + ", ".join(f"{name}={value:.1f} ms" for name, value in penalties.items())
+    )
+    print(f"  Dominant measured consumer: {dominant_name} ({dominant_ms:.1f} ms)")
 
 
 def _print_case_result(result: _ProfileResult, *, rank: int) -> None:
@@ -516,8 +1256,36 @@ def test_qwen3_1_7b_reference_cp_vs_tpr_ring_cp_profile(cp_runtime):
         )
         _release_iteration_state(model, runtime)
 
-        result = _ProfileResult(case, reference_stats, tpr_stats)
+        reference_breakdown = None
+        tpr_breakdown = None
+        if _RUN_BREAKDOWN:
+            reference_breakdown = _collect_breakdown(
+                reference_runner,
+                model,
+                runtime,
+                path="reference",
+                expected_trace=reference_trace,
+            )
+            _release_iteration_state(model, runtime)
+            tpr_breakdown = _collect_breakdown(
+                tpr_runner,
+                model,
+                runtime,
+                path="tpr",
+                expected_trace=tpr_trace,
+            )
+            _release_iteration_state(model, runtime)
+
+        result = _ProfileResult(
+            case,
+            reference_stats,
+            tpr_stats,
+            reference_breakdown,
+            tpr_breakdown,
+        )
         results.append(result)
         _print_case_result(result, rank=runtime.rank)
 
-    _print_summary(tuple(results), rank=runtime.rank)
+    final_results = tuple(results)
+    _print_summary(final_results, rank=runtime.rank)
+    _print_breakdown_summary(final_results, rank=runtime.rank)
