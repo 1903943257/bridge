@@ -21,11 +21,12 @@ Run from the verl repository root with two visible NPUs::
         -m pytest -s -v \
         tests/models/mcore/tpr/parallel/test_tpr_qwen3_cp_equivalence_npu.py
 
-The independent reference executes each complete trajectory separately through
-AllGather CP.  The actual path enters MegatronEngine once, caches the shared
-prefix, and executes the two suffixes with the selected TPR CP backend.  The
-default non-divisible lengths deliberately exercise physical padding and loss
-ownership.  Set ``TPR_QWEN_CP_TOPOLOGY=divisible`` for the shape-control case.
+The full-trajectory reference executes each complete trajectory separately
+through AllGather CP and remains an end-to-end BF16 numerical baseline.  The
+Qwen3-1.7B non-divisible AllGather case additionally runs P -> S1 and P -> S2
+as independent segmented trees.  That shape-matched reference is the semantic
+oracle for Prefix KV reuse.  Set ``TPR_QWEN_CP_TOPOLOGY=divisible`` for the
+shape-control case.
 """
 
 from __future__ import annotations
@@ -61,9 +62,11 @@ from ..correctness.test_tpr_qwen3_compatibility_npu import (
     _validate_checkpoint_files,
 )
 from ._tpr_cp_test_utils import (
+    _clone_prefix_gradients,
     _equivalence_tpr_plan,
     _logical_logprob_indices,
     _run_independent_cp_reference,
+    _run_independent_segmented_cp_reference,
     cp_runtime,
 )
 from .test_megatron_engine_tpr_cp_entry_npu import _run_engine_tpr
@@ -135,6 +138,7 @@ class _QwenCPReference:
     target_logprobs: torch.Tensor
     parameter_gradients: dict[str, torch.Tensor]
     execution_trace: tuple[tuple[PhysicalExecutionKind, int], ...]
+    prefix_gradients: dict[int, tuple[torch.Tensor, torch.Tensor]] | None
 
 
 @dataclass(slots=True)
@@ -145,7 +149,22 @@ class _LoadedQwenCPCase:
     plan: SegmentPlan
     logical_indices: dict[tuple[int, int], int]
     logical_count: int
-    reference: _QwenCPReference
+    full_trajectory_reference: _QwenCPReference
+    segmented_reference: _QwenCPReference | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LogprobComparison:
+    relative_l2: float
+    cosine: float
+    max_abs_difference: float
+    pointwise_outliers: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GradientComparison:
+    relative_l2: float
+    cosine: float
 
 
 _QWEN_MODEL_CASES = (
@@ -270,11 +289,18 @@ def _move_reference_to_cpu(result) -> _QwenCPReference:
     gradients = result.parameter_gradients
     for name in tuple(gradients):
         gradients[name] = gradients[name].cpu()
+    prefix_gradients = result.prefix_gradients
+    if prefix_gradients is not None:
+        prefix_gradients = {
+            layer_number: (key.cpu(), value.cpu())
+            for layer_number, (key, value) in prefix_gradients.items()
+        }
     return _QwenCPReference(
         normalized_loss=result.normalized_loss.cpu(),
         target_logprobs=result.target_logprobs.cpu(),
         parameter_gradients=gradients,
         execution_trace=result.execution_trace,
+        prefix_gradients=prefix_gradients,
     )
 
 
@@ -284,6 +310,108 @@ def _clear_model_gradients(model):
 
 def _tokens(start: int, length: int, vocab_size: int) -> torch.Tensor:
     return torch.arange(start, start + length, dtype=torch.long) % vocab_size
+
+
+def _needs_segmented_reference(model_case: _QwenModelCase) -> bool:
+    return model_case.name == "qwen3_1_7b" and _TOPOLOGY_NAME == "non_divisible"
+
+
+def _compare_logprobs(
+    actual,
+    expected,
+    *,
+    case,
+    backend,
+    reference_kind,
+    rank,
+) -> _LogprobComparison:
+    difference = actual - expected
+    absolute_difference = difference.abs()
+    relative_l2 = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(
+        expected
+    ).clamp_min(torch.finfo(torch.float32).tiny)
+    cosine = F.cosine_similarity(actual, expected, dim=0)
+    diagnostic_limit = _LOGPROB_DIAGNOSTIC_ATOL + (
+        _LOGPROB_DIAGNOSTIC_RTOL * expected.abs()
+    )
+    pointwise_outliers = int(
+        torch.count_nonzero(absolute_difference > diagnostic_limit).item()
+    )
+    max_abs_difference = float(absolute_difference.max().item())
+    if rank == 0:
+        print(
+            "Qwen logprob comparison: "
+            f"reference={reference_kind}, model={case.spec.name}, backend={backend}, "
+            f"topology={_TOPOLOGY_NAME}, relative_l2={relative_l2.item():.6e}, "
+            f"cosine={cosine.item():.9f}, max_abs={max_abs_difference:.6e}, "
+            f"pointwise_outliers={pointwise_outliers}/{case.logical_count}"
+        )
+        reverse_indices = {index: key for key, index in case.logical_indices.items()}
+        worst_count = min(10, case.logical_count)
+        _, worst_indices = torch.topk(absolute_difference, worst_count)
+        for index in worst_indices.tolist():
+            sample_id, query_position = reverse_indices[index]
+            region = "prefix" if query_position < _PREFIX_LENGTH else "suffix"
+            print(
+                f"  sample={sample_id} query_position={query_position} region={region} "
+                f"reference={expected[index].item():.7f} "
+                f"actual={actual[index].item():.7f} "
+                f"abs_diff={absolute_difference[index].item():.7f}"
+            )
+    return _LogprobComparison(
+        relative_l2=float(relative_l2.item()),
+        cosine=float(cosine.item()),
+        max_abs_difference=max_abs_difference,
+        pointwise_outliers=pointwise_outliers,
+    )
+
+
+def _gradient_diagnostics(actual, expected, *, reference_kind, rank):
+    if actual.keys() != expected.keys():
+        raise AssertionError("Qwen gradient tensor names differ")
+    difference_square_sum = 0.0
+    expected_square_sum = 0.0
+    actual_square_sum = 0.0
+    dot_sum = 0.0
+    per_parameter = []
+    for name in actual:
+        actual_gradient = actual[name].float()
+        expected_gradient = expected[name].float()
+        difference = actual_gradient - expected_gradient
+        difference_square = torch.sum(difference * difference).item()
+        expected_square = torch.sum(expected_gradient * expected_gradient).item()
+        actual_square = torch.sum(actual_gradient * actual_gradient).item()
+        difference_square_sum += difference_square
+        expected_square_sum += expected_square
+        actual_square_sum += actual_square
+        dot_sum += torch.sum(actual_gradient * expected_gradient).item()
+        per_parameter.append(
+            (
+                (difference_square / max(expected_square, 1e-24)) ** 0.5,
+                name,
+            )
+        )
+    relative_l2 = (difference_square_sum / max(expected_square_sum, 1e-24)) ** 0.5
+    cosine = dot_sum / max((actual_square_sum * expected_square_sum) ** 0.5, 1e-24)
+    if rank == 0:
+        print(
+            "Qwen gradient numerical baseline: "
+            f"reference={reference_kind}, global_relative_l2={relative_l2:.7g}, "
+            f"global_cosine={cosine:.9f}"
+        )
+        for parameter_relative_l2, name in sorted(per_parameter, reverse=True)[:10]:
+            print(
+                f"  gradient relative_l2={parameter_relative_l2:.7g}: {name}"
+            )
+    return _GradientComparison(relative_l2=relative_l2, cosine=cosine)
+
+
+def _flatten_prefix_gradients(prefix_gradients):
+    return {
+        f"decoder.layers.{layer_number - 1}.prefix_{kind}_gradient": gradient.float()
+        for layer_number, (key, value) in prefix_gradients.items()
+        for kind, gradient in (("key", key), ("value", value))
+    }
 
 
 @pytest.fixture(scope="module", params=_QWEN_MODEL_CASES, ids=lambda case: case.name)
@@ -302,7 +430,7 @@ def real_qwen_cp_case(request, cp_runtime):
 
     reference_model = _make_qwen_cp_model(runtime, model_case, hf_config)
     _assert_qwen_cp_architecture(reference_model, runtime, model_case, hf_config)
-    reference_result = _run_independent_cp_reference(
+    full_reference_result = _run_independent_cp_reference(
         reference_model,
         first_trajectory,
         second_trajectory,
@@ -311,8 +439,24 @@ def real_qwen_cp_case(request, cp_runtime):
         logical_count,
         expected_layer_numbers=tuple(range(1, hf_config.num_hidden_layers + 1)),
     )
-    reference = _move_reference_to_cpu(reference_result)
-    del reference_result
+    full_trajectory_reference = _move_reference_to_cpu(full_reference_result)
+    del full_reference_result
+
+    segmented_reference = None
+    if _needs_segmented_reference(model_case):
+        segmented_result = _run_independent_segmented_cp_reference(
+            reference_model,
+            prefix,
+            first,
+            second,
+            runtime,
+            logical_indices,
+            logical_count,
+            cp_backend="allgather",
+            expected_layer_numbers=tuple(range(1, hf_config.num_hidden_layers + 1)),
+        )
+        segmented_reference = _move_reference_to_cpu(segmented_result)
+        del segmented_result
     _clear_model_gradients(reference_model)
     del reference_model
     gc.collect()
@@ -321,13 +465,14 @@ def real_qwen_cp_case(request, cp_runtime):
     actual_model = _make_qwen_cp_model(runtime, model_case, hf_config)
     _assert_qwen_cp_architecture(actual_model, runtime, model_case, hf_config)
     loaded = _LoadedQwenCPCase(
-        model_case,
-        hf_config,
-        actual_model,
-        plan,
-        logical_indices,
-        logical_count,
-        reference,
+        spec=model_case,
+        hf_config=hf_config,
+        model=actual_model,
+        plan=plan,
+        logical_indices=logical_indices,
+        logical_count=logical_count,
+        full_trajectory_reference=full_trajectory_reference,
+        segmented_reference=segmented_reference,
     )
     try:
         yield loaded
@@ -357,6 +502,12 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         device=runtime.device,
     )
     original_compute_loss = SegmentExecutor._compute_loss
+    original_push = SegmentExecutor.push
+    original_visit_leaf = SegmentExecutor.visit_leaf
+    original_pop = SegmentExecutor.pop
+    actual_execution_trace = []
+    actual_prefix_gradients = {}
+    use_segmented_oracle = case.segmented_reference is not None and backend == "allgather"
 
     def capture_loss(executor, segment, logits):
         if executor.model is case.model:
@@ -403,7 +554,38 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
                 )
         return original_compute_loss(executor, segment, logits)
 
+    def capture_push(executor, segment_id):
+        result = original_push(executor, segment_id)
+        if executor.model is case.model:
+            actual_execution_trace.append((PhysicalExecutionKind.PUSH, segment_id))
+        return result
+
+    def capture_visit_leaf(executor, segment_id):
+        result = original_visit_leaf(executor, segment_id)
+        if executor.model is case.model:
+            actual_execution_trace.append((PhysicalExecutionKind.VISIT_LEAF, segment_id))
+        return result
+
+    def capture_pop(executor, segment_id):
+        if (
+            executor.model is case.model
+            and use_segmented_oracle
+            and segment_id == case.plan.root_id
+        ):
+            if actual_prefix_gradients:
+                raise AssertionError("TPR root Prefix gradients were captured more than once")
+            actual_prefix_gradients.update(
+                _clone_prefix_gradients(executor, segment_id=segment_id)
+            )
+        result = original_pop(executor, segment_id)
+        if executor.model is case.model:
+            actual_execution_trace.append((PhysicalExecutionKind.POP, segment_id))
+        return result
+
     monkeypatch.setattr(SegmentExecutor, "_compute_loss", capture_loss)
+    monkeypatch.setattr(SegmentExecutor, "push", capture_push)
+    monkeypatch.setattr(SegmentExecutor, "visit_leaf", capture_visit_leaf)
+    monkeypatch.setattr(SegmentExecutor, "pop", capture_pop)
     dist.barrier(group=runtime.cp_group)
     output, actual_gradients = _run_engine_tpr(
         case.model,
@@ -421,66 +603,93 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     actual_logprobs = actual_logprobs.cpu()
     for name in tuple(actual_gradients):
         actual_gradients[name] = actual_gradients[name].cpu()
+    for layer_number, (key, value) in tuple(actual_prefix_gradients.items()):
+        actual_prefix_gradients[layer_number] = (key.cpu(), value.cpu())
 
-    reference = case.reference
-    assert reference.execution_trace == (
+    full_reference = case.full_trajectory_reference
+    assert full_reference.execution_trace == (
         (PhysicalExecutionKind.VISIT_LEAF, 1),
         (PhysicalExecutionKind.VISIT_LEAF, 2),
     )
+    assert tuple(actual_execution_trace) == (
+        (PhysicalExecutionKind.PUSH, 0),
+        (PhysicalExecutionKind.VISIT_LEAF, 1),
+        (PhysicalExecutionKind.VISIT_LEAF, 2),
+        (PhysicalExecutionKind.POP, 0),
+    )
+
+    if use_segmented_oracle:
+        reference = case.segmented_reference
+        assert reference is not None
+        assert reference.execution_trace == (
+            (PhysicalExecutionKind.PUSH, 0),
+            (PhysicalExecutionKind.VISIT_LEAF, 1),
+            (PhysicalExecutionKind.POP, 0),
+            (PhysicalExecutionKind.PUSH, 0),
+            (PhysicalExecutionKind.VISIT_LEAF, 2),
+            (PhysicalExecutionKind.POP, 0),
+        )
+        full_logprob_comparison = _compare_logprobs(
+            actual_logprobs,
+            full_reference.target_logprobs,
+            case=case,
+            backend=backend,
+            reference_kind="full_trajectory",
+            rank=runtime.rank,
+        )
+        full_gradient_comparison = _gradient_diagnostics(
+            actual_gradients,
+            full_reference.parameter_gradients,
+            reference_kind="full_trajectory",
+            rank=runtime.rank,
+        )
+        if runtime.rank == 0:
+            print(
+                "Qwen loss numerical baseline: "
+                f"reference=full_trajectory, expected={full_reference.normalized_loss.item():.9f}, "
+                f"actual={output['loss']:.9f}"
+            )
+    else:
+        reference = full_reference
+        full_logprob_comparison = None
+        full_gradient_comparison = None
+
     torch.testing.assert_close(
         torch.tensor(output["loss"]),
         reference.normalized_loss,
         atol=_LOSS_ATOL,
         rtol=_LOSS_RTOL,
     )
-    difference = actual_logprobs - reference.target_logprobs
-    absolute_difference = difference.abs()
-    relative_l2 = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(
-        reference.target_logprobs
-    ).clamp_min(torch.finfo(torch.float32).tiny)
-    cosine = F.cosine_similarity(
+    logprob_comparison = _compare_logprobs(
         actual_logprobs,
         reference.target_logprobs,
-        dim=0,
+        case=case,
+        backend=backend,
+        reference_kind="independent_segmented" if use_segmented_oracle else "full_trajectory",
+        rank=runtime.rank,
     )
-    diagnostic_limit = _LOGPROB_DIAGNOSTIC_ATOL + (
-        _LOGPROB_DIAGNOSTIC_RTOL * reference.target_logprobs.abs()
-    )
-    pointwise_outliers = int(torch.count_nonzero(absolute_difference > diagnostic_limit).item())
-    max_abs_difference = float(absolute_difference.max().item())
+    if use_segmented_oracle:
+        torch.testing.assert_close(
+            actual_logprobs,
+            reference.target_logprobs,
+            atol=_LOGPROB_DIAGNOSTIC_ATOL,
+            rtol=_LOGPROB_DIAGNOSTIC_RTOL,
+            msg="shape-matched independent segmented logprobs differ from TPR",
+        )
     model_name = case.spec.name
     relative_l2_tolerance = _LOGPROB_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][
         backend
     ]
-    if runtime.rank == 0:
-        print(
-            "Qwen logprob comparison: "
-            f"model={model_name}, backend={backend}, topology={_TOPOLOGY_NAME}, "
-            f"relative_l2={relative_l2.item():.6e}, "
-            f"relative_l2_tolerance={relative_l2_tolerance:.6e}, "
-            f"cosine={cosine.item():.9f}, "
-            f"max_abs={max_abs_difference:.6e}, "
-            f"pointwise_outliers={pointwise_outliers}/{case.logical_count}"
-        )
-        reverse_indices = {index: key for key, index in case.logical_indices.items()}
-        worst_count = min(10, case.logical_count)
-        _, worst_indices = torch.topk(absolute_difference, worst_count)
-        for index in worst_indices.tolist():
-            sample_id, query_position = reverse_indices[index]
-            region = "prefix" if query_position < _PREFIX_LENGTH else "suffix"
-            print(
-                f"  sample={sample_id} query_position={query_position} region={region} "
-                f"reference={reference.target_logprobs[index].item():.7f} "
-                f"actual={actual_logprobs[index].item():.7f} "
-                f"abs_diff={absolute_difference[index].item():.7f}"
-            )
-    assert relative_l2.item() <= relative_l2_tolerance, (
-        f"Qwen logprob relative L2 {relative_l2.item():.6e} exceeds "
+    assert logprob_comparison.relative_l2 <= relative_l2_tolerance, (
+        f"Qwen logprob relative L2 {logprob_comparison.relative_l2:.6e} exceeds "
         f"{relative_l2_tolerance:.6e} for model={model_name}, backend={backend}"
     )
-    assert cosine.item() >= _LOGPROB_COSINE_MIN, (
-        f"Qwen logprob cosine {cosine.item():.9f} is below {_LOGPROB_COSINE_MIN:.9f}"
+    assert logprob_comparison.cosine >= _LOGPROB_COSINE_MIN, (
+        f"Qwen logprob cosine {logprob_comparison.cosine:.9f} is below "
+        f"{_LOGPROB_COSINE_MIN:.9f}"
     )
+    if use_segmented_oracle and runtime.rank == 0:
+        print("Qwen parameter-gradient semantic comparison: reference=independent_segmented")
     _assert_real_qwen_gradients_close(
         actual_gradients,
         reference.parameter_gradients,
@@ -489,6 +698,29 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         ),
         per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
     )
+    if use_segmented_oracle:
+        if reference.prefix_gradients is None:
+            raise AssertionError("segmented reference did not capture Prefix gradients")
+        if not actual_prefix_gradients:
+            raise AssertionError("TPR execution did not capture Prefix gradients")
+        expected_layers = tuple(range(1, case.hf_config.num_hidden_layers + 1))
+        assert tuple(reference.prefix_gradients) == expected_layers
+        assert tuple(actual_prefix_gradients) == expected_layers
+        assert any(
+            torch.count_nonzero(gradient).item() > 0
+            for pair in reference.prefix_gradients.values()
+            for gradient in pair
+        )
+        if runtime.rank == 0:
+            print("Qwen Prefix-KV gradient semantic comparison:")
+        _assert_real_qwen_gradients_close(
+            _flatten_prefix_gradients(actual_prefix_gradients),
+            _flatten_prefix_gradients(reference.prefix_gradients),
+            global_relative_l2_tol=(
+                _CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][backend]
+            ),
+            per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
+        )
     assert output["metrics"]["tpr_cp_size"] == 2
     assert output["metrics"]["tpr_cp_backend"] == backend
     assert output["metrics"]["tpr_peak_path_tokens"] == (
@@ -504,14 +736,27 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             f"  topology: {_TOPOLOGY_NAME}, P={_PREFIX_LENGTH}, "
             f"S1={_FIRST_SUFFIX_LENGTH}, "
             f"S2={_SECOND_SUFFIX_LENGTH}\n"
+            f"  correctness oracle: "
+            f"{'independent_segmented' if use_segmented_oracle else 'full_trajectory'}\n"
             f"  loss reference/TPR: {reference.normalized_loss.item():.9f} / "
             f"{output['loss']:.9f}\n"
-            f"  logprob relative L2: {relative_l2.item():.6e}\n"
-            f"  logprob cosine: {cosine.item():.9f}\n"
-            f"  logprob max abs diff: {max_abs_difference:.6e}\n"
-            f"  pointwise diagnostic outliers: {pointwise_outliers}/{case.logical_count}\n"
+            f"  logprob relative L2: {logprob_comparison.relative_l2:.6e}\n"
+            f"  logprob cosine: {logprob_comparison.cosine:.9f}\n"
+            f"  logprob max abs diff: {logprob_comparison.max_abs_difference:.6e}\n"
+            f"  pointwise diagnostic outliers: "
+            f"{logprob_comparison.pointwise_outliers}/{case.logical_count}\n"
             f"  gradient tensors: {len(actual_gradients)}"
         )
+        if full_logprob_comparison is not None and full_gradient_comparison is not None:
+            print(
+                "  full-trajectory numerical baseline:\n"
+                f"    loss reference/TPR: {full_reference.normalized_loss.item():.9f} / "
+                f"{output['loss']:.9f}\n"
+                f"    logprob relative L2: {full_logprob_comparison.relative_l2:.6e}\n"
+                f"    logprob cosine: {full_logprob_comparison.cosine:.9f}\n"
+                f"    gradient relative L2: {full_gradient_comparison.relative_l2:.6e}\n"
+                f"    gradient cosine: {full_gradient_comparison.cosine:.9f}"
+            )
     del actual_gradients, actual_logprobs
     case.model.zero_grad(set_to_none=True)
     gc.collect()

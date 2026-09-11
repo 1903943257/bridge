@@ -325,6 +325,7 @@ class _EquivalenceRun:
     target_logprobs: Tensor
     parameter_gradients: dict[str, Tensor]
     execution_trace: tuple[tuple[PhysicalExecutionKind, int], ...]
+    prefix_gradients: dict[int, tuple[Tensor, Tensor]] | None = None
 
 
 def _sample_internal_terms(tokens, *, sample_id):
@@ -405,6 +406,40 @@ def _independent_plan(trajectory, *, sample_id, total_loss_weight):
     )
 
 
+def _independent_segmented_plan(
+    prefix,
+    suffix,
+    *,
+    sample_id,
+    total_loss_weight,
+):
+    """Build one independent P -> S tree with the shared dataset loss scale."""
+
+    prefix_length = prefix.numel()
+    prefix_terms = _sample_internal_terms(prefix, sample_id=sample_id) + (
+        SegmentLossTerm(
+            prefix_length - 1,
+            int(suffix[0]),
+            sample_id=sample_id,
+        ),
+    )
+    return SegmentPlan(
+        (
+            SegmentSpec(0, None, prefix, 0, 0, prefix_terms),
+            SegmentSpec(
+                sample_id,
+                0,
+                suffix,
+                prefix_length,
+                prefix_length,
+                _sample_internal_terms(suffix, sample_id=sample_id),
+            ),
+        ),
+        root_id=0,
+        total_loss_weight=total_loss_weight,
+    )
+
+
 def _logical_logprob_indices(first_trajectory, second_trajectory):
     indices = {}
     cursor = 0
@@ -425,6 +460,7 @@ def _execute_and_capture(
     *,
     cp_backend=None,
     expected_layer_numbers=None,
+    root_prefix_gradient_output=None,
 ):
     executor = SegmentExecutor(
         model,
@@ -434,6 +470,7 @@ def _execute_and_capture(
         cp_backend=cp_backend,
     )
     original_compute_loss = executor._compute_loss
+    original_pop = executor.pop
 
     def capture_loss(segment, logits):
         owned_terms = executor._owned_loss_terms(segment)
@@ -477,10 +514,23 @@ def _execute_and_capture(
         return original_compute_loss(segment, logits)
 
     executor._compute_loss = capture_loss
+
+    def capture_root_prefix_gradients(segment_id):
+        if segment_id == plan.root_id:
+            if root_prefix_gradient_output:
+                raise AssertionError("root Prefix gradients were captured more than once")
+            root_prefix_gradient_output.update(
+                _clone_prefix_gradients(executor, segment_id=segment_id)
+            )
+        return original_pop(segment_id)
+
+    if root_prefix_gradient_output is not None:
+        executor.pop = capture_root_prefix_gradients
     try:
         return FixedTopologyScheduler(plan, executor).run()
     finally:
         executor._compute_loss = original_compute_loss
+        executor.pop = original_pop
 
 
 def _aggregate_loss_and_logprobs(loss, logprobs, owner_counts, runtime):
@@ -550,6 +600,93 @@ def _run_independent_cp_reference(
         target_logprobs=global_logprobs,
         parameter_gradients=_finalize_cp_parameter_gradients(model, runtime),
         execution_trace=tuple(trace),
+    )
+
+
+def _run_independent_segmented_cp_reference(
+    model,
+    prefix,
+    first_suffix,
+    second_suffix,
+    runtime,
+    logical_indices,
+    logical_count,
+    *,
+    cp_backend="allgather",
+    expected_layer_numbers=None,
+):
+    """Run P -> S1 and P -> S2 as independent, shape-matched CP trees.
+
+    Each trajectory gets a new SegmentPlan, SegmentExecutor, and KVStack, so
+    Prefix KV and its autograd graph are never shared across trajectories.
+    The two runs retain the dataset-wide normalization used by the TPR tree.
+    """
+
+    model.zero_grad(set_to_none=True)
+    logprobs = torch.zeros(logical_count, dtype=torch.float32, device=runtime.device)
+    owner_counts = torch.zeros(logical_count, dtype=torch.int64, device=runtime.device)
+    total_loss_weight = float(
+        2 * prefix.numel() + first_suffix.numel() + second_suffix.numel() - 2
+    )
+    if total_loss_weight != logical_count:
+        raise AssertionError(
+            f"segmented loss weight {total_loss_weight} does not match "
+            f"logical logprob count {logical_count}"
+        )
+
+    local_loss = torch.zeros((), dtype=torch.float32, device=runtime.device)
+    trace = []
+    combined_prefix_gradients = {}
+    for sample_id, suffix in ((1, first_suffix), (2, second_suffix)):
+        plan = _independent_segmented_plan(
+            prefix,
+            suffix,
+            sample_id=sample_id,
+            total_loss_weight=total_loss_weight,
+        )
+        trajectory_prefix_gradients = {}
+        result = _execute_and_capture(
+            model,
+            plan,
+            runtime,
+            logical_indices,
+            logprobs,
+            owner_counts,
+            cp_backend=cp_backend,
+            expected_layer_numbers=expected_layer_numbers,
+            root_prefix_gradient_output=trajectory_prefix_gradients,
+        )
+        if not trajectory_prefix_gradients:
+            raise AssertionError(
+                f"independent segmented trajectory {sample_id} did not produce Prefix gradients"
+            )
+        if not combined_prefix_gradients:
+            combined_prefix_gradients = {
+                layer_number: (key.clone(), value.clone())
+                for layer_number, (key, value) in trajectory_prefix_gradients.items()
+            }
+        else:
+            if combined_prefix_gradients.keys() != trajectory_prefix_gradients.keys():
+                raise AssertionError("independent segmented Prefix gradient layers differ")
+            for layer_number, (key, value) in trajectory_prefix_gradients.items():
+                accumulated_key, accumulated_value = combined_prefix_gradients[layer_number]
+                accumulated_key.add_(key)
+                accumulated_value.add_(value)
+        local_loss = local_loss + result.normalized_loss
+        trace.extend(
+            (execution.kind, execution.segment_id)
+            for execution in result.execution_trace
+        )
+
+    global_loss, global_logprobs = _aggregate_loss_and_logprobs(
+        local_loss, logprobs, owner_counts, runtime
+    )
+    return _EquivalenceRun(
+        normalized_loss=global_loss,
+        target_logprobs=global_logprobs,
+        parameter_gradients=_finalize_cp_parameter_gradients(model, runtime),
+        execution_trace=tuple(trace),
+        prefix_gradients=combined_prefix_gradients,
     )
 
 
@@ -642,10 +779,12 @@ def _hybrid_communication_probe():
         ring_attention._block_attention_backward = original_ring_backward
 
 
-def _clone_prefix_gradients(executor):
+def _clone_prefix_gradients(executor, *, segment_id=0):
     return {
         layer_number: (key.clone(), value.clone())
-        for layer_number, (key, value) in executor.kv_stack.get_new_kv_gradients(0).items()
+        for layer_number, (key, value) in executor.kv_stack.get_new_kv_gradients(
+            segment_id
+        ).items()
     }
 
 
