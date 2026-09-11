@@ -23,8 +23,8 @@ Run from the verl repository root with two visible NPUs::
 
 The full-trajectory reference executes each complete trajectory separately
 through AllGather CP and remains an end-to-end BF16 numerical baseline.  The
-Qwen3-1.7B non-divisible AllGather and Ulysses cases additionally run P -> S1
-and P -> S2 as independent segmented trees.  The backend-matched segmented
+Qwen3-1.7B non-divisible AllGather, Ulysses, and Ring cases additionally run
+P -> S1 and P -> S2 as independent segmented trees.  The backend-matched segmented
 reference is the semantic oracle for Prefix KV reuse.  Set
 ``TPR_QWEN_CP_TOPOLOGY=divisible`` for the shape-control case.
 """
@@ -470,7 +470,7 @@ def real_qwen_cp_case(request, cp_runtime):
 
     segmented_references = {}
     if _needs_segmented_reference(model_case):
-        for segmented_backend in ("allgather", "ulysses"):
+        for segmented_backend in ("allgather", "ulysses", "ring"):
             segmented_result = _run_independent_segmented_cp_reference(
                 reference_model,
                 prefix,

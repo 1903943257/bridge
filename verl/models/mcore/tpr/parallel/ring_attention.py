@@ -40,7 +40,6 @@ from ..shard import (
     RangeSequenceShard,
     SequenceRange,
     SequenceShard,
-    iter_valid_sequence_slices,
     maybe_pad_sequence_shard,
     physical_sequence_shard,
     round_up_sequence_length,
@@ -94,6 +93,24 @@ class _RingAttentionConfig:
     query_heads: int
     head_dim: int
     softmax_scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RingRangeSlice:
+    """One physical Ring chunk plus its clipped logical validity range."""
+
+    logical_range: SequenceRange
+    physical_range: SequenceRange
+    local_slice: slice
+    tensor: Tensor
+
+    @property
+    def physical_length(self) -> int:
+        return self.physical_range[1] - self.physical_range[0]
+
+    @property
+    def valid_length(self) -> int:
+        return self.logical_range[1] - self.logical_range[0]
 
 
 def make_ring_sequence_shard(
@@ -327,10 +344,97 @@ def _circulate_kv(
 def _iter_range_slices(
     tensor: Tensor,
     shard: SequenceShard,
-) -> tuple[tuple[SequenceRange, slice, Tensor], ...]:
-    return tuple(
-        (global_range, local_slice, tensor[local_slice])
-        for global_range, local_slice in iter_valid_sequence_slices(shard)
+) -> tuple[_RingRangeSlice, ...]:
+    """Keep partially padded Ring chunks physical while exposing logical ranges."""
+
+    if tensor.shape[0] != shard.local_length:
+        raise ValueError(
+            f"Ring tensor length must be {shard.local_length}, got {tensor.shape[0]}"
+        )
+    result = []
+    local_start = 0
+    for physical_start, physical_end in shard.physical_global_ranges:
+        physical_length = physical_end - physical_start
+        local_slice = slice(local_start, local_start + physical_length)
+        logical_end = min(physical_end, shard.global_length)
+        if physical_start < logical_end:
+            result.append(
+                _RingRangeSlice(
+                    logical_range=(physical_start, logical_end),
+                    physical_range=(physical_start, physical_end),
+                    local_slice=local_slice,
+                    tensor=tensor[local_slice],
+                )
+            )
+        local_start += physical_length
+    if local_start != shard.local_length:
+        raise RuntimeError("Ring physical ranges do not cover the local tensor")
+    return tuple(result)
+
+
+def _range_validity(item: _RingRangeSlice, *, device: torch.device) -> Tensor:
+    return torch.arange(item.physical_length, device=device) < item.valid_length
+
+
+def _physical_block_attention_mask(
+    query_item: _RingRangeSlice,
+    kv_item: _RingRangeSlice,
+    *,
+    block_kind: RingBlockKind,
+) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+    """Return a physical block mask plus optional query/KV validity vectors."""
+
+    if block_kind is RingBlockKind.SKIP:
+        raise ValueError("SKIP blocks must not enter fused attention")
+    query_has_padding = query_item.valid_length != query_item.physical_length
+    kv_has_padding = kv_item.valid_length != kv_item.physical_length
+    query_validity = (
+        _range_validity(query_item, device=query_item.tensor.device)
+        if query_has_padding
+        else None
+    )
+    kv_validity = (
+        _range_validity(kv_item, device=kv_item.tensor.device)
+        if kv_has_padding
+        else None
+    )
+    if block_kind is RingBlockKind.FULL:
+        if kv_validity is None:
+            return None, query_validity, None
+        attention_mask = torch.logical_not(kv_validity).unsqueeze(0).expand(
+            query_item.physical_length,
+            -1,
+        )
+        return attention_mask.contiguous(), query_validity, kv_validity
+
+    if not query_has_padding and not kv_has_padding:
+        return None, None, None
+    query_start, query_end = query_item.logical_range
+    query_physical_end = query_item.physical_range[1]
+    kv_start, kv_end = kv_item.logical_range
+    kv_physical_end = kv_item.physical_range[1]
+    query_positions = torch.arange(
+        query_start,
+        query_physical_end,
+        device=query_item.tensor.device,
+    ).clamp_max(query_end - 1)
+    kv_positions = torch.arange(
+        kv_start,
+        kv_physical_end,
+        device=kv_item.tensor.device,
+    ).clamp_max(kv_end - 1)
+    if kv_validity is None:
+        kv_validity = torch.ones(
+            kv_item.physical_length,
+            dtype=torch.bool,
+            device=kv_item.tensor.device,
+        )
+    attention_mask = torch.logical_or(
+        torch.logical_not(kv_validity).unsqueeze(0),
+        kv_positions.unsqueeze(0) > query_positions.unsqueeze(1),
+    )
+    return attention_mask.contiguous(), query_validity, (
+        kv_validity if kv_has_padding else None
     )
 
 
@@ -342,12 +446,22 @@ def _block_attention_forward(
     query_heads: int,
     softmax_scale: float,
     block_kind: RingBlockKind,
+    attention_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     try:
         import torch_npu
     except ImportError as exc:  # pragma: no cover - requires the server NPU runtime
         raise RuntimeError("torch_npu is required for Ring CP attention") from exc
-    causal = block_kind is RingBlockKind.CAUSAL
+    causal_fast_path = block_kind is RingBlockKind.CAUSAL and attention_mask is None
+    if attention_mask is not None:
+        if attention_mask.dtype != torch.bool:
+            raise ValueError("Ring physical attention mask must use torch.bool")
+        if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
+            raise ValueError(
+                "Ring physical attention mask shape must match Q/KV, got "
+                f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
+            )
+        attention_mask = attention_mask.contiguous()
     result = torch_npu.npu_fusion_attention(
         query,
         key,
@@ -356,13 +470,21 @@ def _block_attention_forward(
         _TND_LAYOUT,
         pse=None,
         padding_mask=None,
-        atten_mask=_compressed_causal_mask(query.device) if causal else None,
+        atten_mask=(
+            _compressed_causal_mask(query.device)
+            if causal_fast_path
+            else attention_mask
+        ),
         scale=softmax_scale,
         pre_tockens=_MAX_TOKENS,
-        next_tockens=0 if causal else _MAX_TOKENS,
+        next_tockens=0 if causal_fast_path else _MAX_TOKENS,
         keep_prob=1.0,
         inner_precise=0,
-        sparse_mode=_RIGHT_DOWN_CAUSAL_MODE if causal else _FULL_ATTENTION_MODE,
+        sparse_mode=(
+            _RIGHT_DOWN_CAUSAL_MODE
+            if causal_fast_path
+            else _FULL_ATTENTION_MODE
+        ),
         actual_seq_qlen=[query.shape[0]],
         actual_seq_kvlen=[key.shape[0]],
     )
@@ -466,12 +588,22 @@ def _block_attention_backward(
     query_heads: int,
     softmax_scale: float,
     block_kind: RingBlockKind,
+    attention_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     try:
         import torch_npu
     except ImportError as exc:  # pragma: no cover - requires the server NPU runtime
         raise RuntimeError("torch_npu is required for Ring CP attention backward") from exc
-    causal = block_kind is RingBlockKind.CAUSAL
+    causal_fast_path = block_kind is RingBlockKind.CAUSAL and attention_mask is None
+    if attention_mask is not None:
+        if attention_mask.dtype != torch.bool:
+            raise ValueError("Ring physical attention mask must use torch.bool")
+        if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
+            raise ValueError(
+                "Ring physical attention mask shape must match Q/KV, got "
+                f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
+            )
+        attention_mask = attention_mask.contiguous()
     result = torch_npu.npu_fusion_attention_grad(
         query,
         key,
@@ -481,15 +613,23 @@ def _block_attention_backward(
         _TND_LAYOUT,
         pse=None,
         padding_mask=None,
-        atten_mask=_compressed_causal_mask(query.device) if causal else None,
+        atten_mask=(
+            _compressed_causal_mask(query.device)
+            if causal_fast_path
+            else attention_mask
+        ),
         softmax_max=softmax_max,
         softmax_sum=softmax_sum,
         attention_in=attention_output,
         scale_value=softmax_scale,
         pre_tockens=_MAX_TOKENS,
-        next_tockens=0 if causal else _MAX_TOKENS,
+        next_tockens=0 if causal_fast_path else _MAX_TOKENS,
         keep_prob=1.0,
-        sparse_mode=_RIGHT_DOWN_CAUSAL_MODE if causal else _FULL_ATTENTION_MODE,
+        sparse_mode=(
+            _RIGHT_DOWN_CAUSAL_MODE
+            if causal_fast_path
+            else _FULL_ATTENTION_MODE
+        ),
         actual_seq_qlen=[query.shape[0]],
         actual_seq_kvlen=[key.shape[0]],
     )
@@ -538,7 +678,9 @@ class _RingTPRAttention(torch.autograd.Function):
         query_tnd = query.squeeze(1).contiguous()
         query_results = []
         query_slices = _iter_range_slices(query_tnd, config.current_shard)
-        for query_range, _, query_part in query_slices:
+        for query_item in query_slices:
+            query_range = query_item.logical_range
+            query_part = query_item.tensor
             merged = None
             for segment_index, source_blocks in enumerate(segment_blocks):
                 is_prefix = segment_index + 1 < len(segment_blocks)
@@ -554,8 +696,13 @@ class _RingTPRAttention(torch.autograd.Function):
                     key_slices = _iter_range_slices(source_key.squeeze(1), source_shard)
                     value_slices = _iter_range_slices(source_value.squeeze(1), source_shard)
                     for key_item, value_item in zip(key_slices, value_slices, strict=True):
-                        kv_range, _, key_part = key_item
-                        _, _, value_part = value_item
+                        if (
+                            key_item.logical_range != value_item.logical_range
+                            or key_item.physical_range != value_item.physical_range
+                            or key_item.local_slice != value_item.local_slice
+                        ):
+                            raise RuntimeError("Ring K/V physical slices differ")
+                        kv_range = key_item.logical_range
                         block_kind = classify_ring_block(
                             query_range,
                             kv_range,
@@ -563,13 +710,19 @@ class _RingTPRAttention(torch.autograd.Function):
                         )
                         if block_kind is RingBlockKind.SKIP:
                             continue
+                        attention_mask, _, _ = _physical_block_attention_mask(
+                            query_item,
+                            key_item,
+                            block_kind=block_kind,
+                        )
                         current = _block_attention_forward(
                             query_part,
-                            key_part,
-                            value_part,
+                            key_item.tensor,
+                            value_item.tensor,
                             query_heads=config.query_heads,
                             softmax_scale=config.softmax_scale,
                             block_kind=block_kind,
+                            attention_mask=attention_mask,
                         )
                         merged = _merge_attention(
                             merged,
@@ -591,8 +744,14 @@ class _RingTPRAttention(torch.autograd.Function):
         ctx.config = config
         ctx.block_tensor_count = len(saved_blocks)
         output = query.new_zeros((query.shape[0], config.query_heads, config.head_dim))
-        for (_, local_slice, _), result in zip(query_slices, query_results, strict=True):
-            output[local_slice] = result[0]
+        for query_item, result in zip(query_slices, query_results, strict=True):
+            result_output = result[0]
+            if query_item.valid_length != query_item.physical_length:
+                valid_query = _range_validity(query_item, device=query.device)
+                result_output = result_output * valid_query[:, None, None].to(
+                    result_output.dtype
+                )
+            output[query_item.local_slice] = result_output
         return output.reshape(query.shape[0], 1, config.query_heads * config.head_dim)
 
     @staticmethod
@@ -640,8 +799,19 @@ class _RingTPRAttention(torch.autograd.Function):
             query_results,
             strict=True,
         ):
-            query_range, query_local_slice, query_part = query_item
-            _, _, grad_part = grad_item
+            if (
+                query_item.logical_range != grad_item.logical_range
+                or query_item.physical_range != grad_item.physical_range
+                or query_item.local_slice != grad_item.local_slice
+            ):
+                raise RuntimeError("Ring query/gradient physical slices differ")
+            query_range = query_item.logical_range
+            query_part = query_item.tensor
+            grad_part = grad_item.tensor
+            valid_query = None
+            if query_item.valid_length != query_item.physical_length:
+                valid_query = _range_validity(query_item, device=query.device)
+                grad_part = grad_part * valid_query[:, None, None].to(grad_part.dtype)
             final_output, final_max, final_sum = final_result
             for segment_index, source_blocks in enumerate(segment_blocks):
                 is_prefix = segment_index + 1 < len(segment_blocks)
@@ -657,8 +827,13 @@ class _RingTPRAttention(torch.autograd.Function):
                     key_slices = _iter_range_slices(source_key.squeeze(1), source_shard)
                     value_slices = _iter_range_slices(source_value.squeeze(1), source_shard)
                     for key_item, value_item in zip(key_slices, value_slices, strict=True):
-                        kv_range, kv_local_slice, key_part = key_item
-                        _, _, value_part = value_item
+                        if (
+                            key_item.logical_range != value_item.logical_range
+                            or key_item.physical_range != value_item.physical_range
+                            or key_item.local_slice != value_item.local_slice
+                        ):
+                            raise RuntimeError("Ring K/V physical slices differ")
+                        kv_range = key_item.logical_range
                         block_kind = classify_ring_block(
                             query_range,
                             kv_range,
@@ -666,10 +841,15 @@ class _RingTPRAttention(torch.autograd.Function):
                         )
                         if block_kind is RingBlockKind.SKIP:
                             continue
+                        attention_mask, _, valid_kv = _physical_block_attention_mask(
+                            query_item,
+                            key_item,
+                            block_kind=block_kind,
+                        )
                         query_grad, key_grad, value_grad = _block_attention_backward(
                             query_part,
-                            key_part,
-                            value_part,
+                            key_item.tensor,
+                            value_item.tensor,
                             grad_part,
                             attention_output=final_output,
                             softmax_max=final_max,
@@ -677,11 +857,23 @@ class _RingTPRAttention(torch.autograd.Function):
                             query_heads=config.query_heads,
                             softmax_scale=config.softmax_scale,
                             block_kind=block_kind,
+                            attention_mask=attention_mask,
                         )
-                        query_gradient[query_local_slice].add_(query_grad)
+                        if valid_query is not None:
+                            query_grad = query_grad * valid_query[:, None, None].to(
+                                query_grad.dtype
+                            )
+                        if valid_kv is not None:
+                            key_grad = key_grad * valid_kv[:, None, None].to(
+                                key_grad.dtype
+                            )
+                            value_grad = value_grad * valid_kv[:, None, None].to(
+                                value_grad.dtype
+                            )
+                        query_gradient[query_item.local_slice].add_(query_grad)
                         key_buffer, value_buffer = segment_contributions[segment_index][source_rank]
-                        key_buffer[kv_local_slice].add_(key_grad.unsqueeze(1))
-                        value_buffer[kv_local_slice].add_(value_grad.unsqueeze(1))
+                        key_buffer[key_item.local_slice].add_(key_grad.unsqueeze(1))
+                        value_buffer[key_item.local_slice].add_(value_grad.unsqueeze(1))
 
         local_gradients = []
         for contributions in segment_contributions:

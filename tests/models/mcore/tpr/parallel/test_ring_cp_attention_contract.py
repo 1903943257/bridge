@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -32,6 +35,136 @@ def test_mindspeed_causal_ring_shard_uses_symmetric_ranges():
     assert rank_one.global_ranges == ((4, 8), (8, 12))
     assert rank_zero.select(source).tolist() == [0, 1, 2, 3, 12, 13, 14, 15]
     assert rank_one.select(source).tolist() == [4, 5, 6, 7, 8, 9, 10, 11]
+
+
+def test_non_divisible_ring_slice_keeps_the_physical_tail_block():
+    shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    local = shard.select(torch.arange(63))
+
+    slices = ring._iter_range_slices(local, shard)
+
+    assert [item.logical_range for item in slices] == [(0, 16), (48, 63)]
+    assert [item.physical_range for item in slices] == [(0, 16), (48, 64)]
+    assert [item.tensor.shape[0] for item in slices] == [16, 16]
+    assert slices[1].tensor[-1].item() == 0
+
+
+def test_non_divisible_causal_block_masks_physical_padding():
+    shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    local = shard.select(torch.arange(63))
+    tail = ring._iter_range_slices(local, shard)[1]
+
+    attention_mask, valid_query, valid_kv = ring._physical_block_attention_mask(
+        tail,
+        tail,
+        block_kind=RingBlockKind.CAUSAL,
+    )
+
+    assert attention_mask.shape == (16, 16)
+    assert valid_query.tolist() == [True] * 15 + [False]
+    assert valid_kv.tolist() == [True] * 15 + [False]
+    assert torch.all(attention_mask[:, -1]).item()
+    torch.testing.assert_close(
+        attention_mask[:15, :15],
+        torch.triu(torch.ones(15, 15, dtype=torch.bool), diagonal=1),
+    )
+
+
+def test_prefix_padding_mask_does_not_hide_later_current_kv():
+    query_shard = make_ring_sequence_shard(63, cp_rank=1, cp_size=2)
+    prefix_shard = make_ring_sequence_shard(127, cp_rank=0, cp_size=2)
+    query = ring._iter_range_slices(query_shard.select(torch.arange(63)), query_shard)[0]
+    prefix_tail = ring._iter_range_slices(
+        prefix_shard.select(torch.arange(127)),
+        prefix_shard,
+    )[1]
+    current = ring._iter_range_slices(query_shard.select(torch.arange(63)), query_shard)[0]
+
+    prefix_mask, _, prefix_validity = ring._physical_block_attention_mask(
+        query,
+        prefix_tail,
+        block_kind=RingBlockKind.FULL,
+    )
+    current_mask, _, current_validity = ring._physical_block_attention_mask(
+        query,
+        current,
+        block_kind=RingBlockKind.CAUSAL,
+    )
+
+    assert prefix_mask.shape == (16, 32)
+    assert torch.all(prefix_mask[:, -1]).item()
+    assert not torch.any(prefix_mask[:, :-1]).item()
+    assert prefix_validity.tolist() == [True] * 31 + [False]
+    assert current_mask is None
+    assert current_validity is None
+
+
+def test_divisible_ring_blocks_keep_the_sparse_fast_paths():
+    shard = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
+    local = shard.select(torch.arange(64))
+    first, second = ring._iter_range_slices(local, shard)
+
+    full_mask, full_query_validity, full_kv_validity = (
+        ring._physical_block_attention_mask(
+            second,
+            first,
+            block_kind=RingBlockKind.FULL,
+        )
+    )
+    causal_mask, causal_query_validity, causal_kv_validity = (
+        ring._physical_block_attention_mask(
+            second,
+            second,
+            block_kind=RingBlockKind.CAUSAL,
+        )
+    )
+
+    assert (full_mask, full_query_validity, full_kv_validity) == (None, None, None)
+    assert (causal_mask, causal_query_validity, causal_kv_validity) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_physical_padding_reaches_fused_attention_with_custom_mask(monkeypatch):
+    calls = []
+
+    def npu_fusion_attention(query, key, value, head_num, input_layout, **kwargs):
+        calls.append((query, key, value, head_num, input_layout, kwargs))
+        statistics = query.new_zeros((1, head_num, query.shape[0], 8))
+        return query.clone(), statistics, statistics
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu_fusion_attention=npu_fusion_attention),
+    )
+    query = torch.zeros(16, 4, 8)
+    key = torch.zeros(16, 2, 8)
+    value = torch.zeros_like(key)
+    attention_mask = torch.zeros(16, 16, dtype=torch.bool)
+    attention_mask[:, -1] = True
+
+    ring._block_attention_forward(
+        query,
+        key,
+        value,
+        query_heads=4,
+        softmax_scale=8**-0.5,
+        block_kind=RingBlockKind.CAUSAL,
+        attention_mask=attention_mask,
+    )
+
+    assert len(calls) == 1
+    called_query, called_key, _, _, layout, kwargs = calls[0]
+    assert called_query.shape[0] == 16
+    assert called_key.shape[0] == 16
+    assert layout == "TND"
+    assert torch.equal(kwargs["atten_mask"], attention_mask)
+    assert kwargs["sparse_mode"] == 0
+    assert kwargs["actual_seq_qlen"] == [16]
+    assert kwargs["actual_seq_kvlen"] == [16]
 
 
 @pytest.mark.parametrize(

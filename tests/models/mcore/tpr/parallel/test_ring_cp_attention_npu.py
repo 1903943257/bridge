@@ -106,6 +106,16 @@ def _assert_close(actual, expected, *, gradient=False):
     )
 
 
+def _padding_mask(shard, *, device):
+    return shard.physical_global_indices(device=device) >= shard.global_length
+
+
+def _assert_padding_zero(tensor, shard):
+    padding = _padding_mask(shard, device=tensor.device)
+    if torch.any(padding).item():
+        assert torch.count_nonzero(tensor[padding]).item() == 0
+
+
 @contextmanager
 def _kernel_probe():
     original_forward = ring._block_attention_forward
@@ -113,11 +123,25 @@ def _kernel_probe():
     calls = {"forward": [], "backward": []}
 
     def traced_forward(*args, **kwargs):
-        calls["forward"].append(kwargs["block_kind"])
+        calls["forward"].append(
+            {
+                "block_kind": kwargs["block_kind"],
+                "query_length": args[0].shape[0],
+                "kv_length": args[1].shape[0],
+                "has_mask": kwargs["attention_mask"] is not None,
+            }
+        )
         return original_forward(*args, **kwargs)
 
     def traced_backward(*args, **kwargs):
-        calls["backward"].append(kwargs["block_kind"])
+        calls["backward"].append(
+            {
+                "block_kind": kwargs["block_kind"],
+                "query_length": args[0].shape[0],
+                "kv_length": args[1].shape[0],
+                "has_mask": kwargs["attention_mask"] is not None,
+            }
+        )
         return original_backward(*args, **kwargs)
 
     ring._block_attention_forward = traced_forward
@@ -132,10 +156,18 @@ def _kernel_probe():
 @pytest.mark.parametrize(
     ("prefix_lengths", "current_length", "query_heads", "kv_heads"),
     [
-        ((), 128, 4, 2),
-        ((1024,), 512, 4, 2),
-        ((512, 512), 256, 4, 2),
-        ((127,), 63, 4, 2),
+        pytest.param((), 128, 4, 2, id="no_prefix_divisible"),
+        pytest.param((), 127, 4, 2, id="no_prefix_127_non_divisible"),
+        pytest.param((1024,), 512, 4, 2, id="single_prefix_divisible"),
+        pytest.param((512, 512), 256, 4, 2, id="multiple_prefix_divisible"),
+        pytest.param((127,), 63, 4, 2, id="prefix_127_current_63_non_divisible"),
+        pytest.param(
+            (63, 31),
+            15,
+            4,
+            2,
+            id="multiple_prefix_63_31_current_15_non_divisible",
+        ),
     ],
 )
 def test_ring_cp_attention_matches_full_causal_forward_backward(
@@ -191,6 +223,13 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
         seed=999,
         device=device,
     )
+    local_gradient = current_shard.select(global_gradient)
+    current_padding = _padding_mask(current_shard, device=device)
+    if torch.any(current_padding).item():
+        # A physical padded output is disconnected from Q/K/V even if a later
+        # operation supplies a non-zero upstream gradient at that storage row.
+        local_gradient = local_gradient.clone()
+        local_gradient[current_padding] = 1
     with _kernel_probe() as calls:
         actual = ring.ring_cp_attention(
             local_query,
@@ -201,7 +240,8 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
             cp_group=cp_group,
             softmax_scale=scale,
         )
-        actual.backward(current_shard.select(global_gradient))
+        _assert_padding_zero(actual, current_shard)
+        actual.backward(local_gradient)
 
     reference_query = global_query.detach().clone().requires_grad_(True)
     reference_current_key = global_current_key.detach().clone().requires_grad_(True)
@@ -220,16 +260,19 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
 
     _assert_close(actual, current_shard.select(expected))
     _assert_close(local_query.grad, current_shard.select(reference_query.grad), gradient=True)
+    _assert_padding_zero(local_query.grad, current_shard)
     _assert_close(
         local_current_key.grad,
         current_shard.select(reference_current_key.grad),
         gradient=True,
     )
+    _assert_padding_zero(local_current_key.grad, current_shard)
     _assert_close(
         local_current_value.grad,
         current_shard.select(reference_current_value.grad),
         gradient=True,
     )
+    _assert_padding_zero(local_current_value.grad, current_shard)
     for index, length in enumerate(prefix_lengths):
         shard = make_ring_sequence_shard(
             length,
@@ -246,13 +289,51 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
             shard.select(reference_prefix_values[index].grad),
             gradient=True,
         )
+        _assert_padding_zero(local_prefix_keys[index].grad, shard)
+        _assert_padding_zero(local_prefix_values[index].grad, shard)
         assert torch.count_nonzero(local_prefix_keys[index].grad).item() > 0
         assert torch.count_nonzero(local_prefix_values[index].grad).item() > 0
 
     expected_calls = 5 + 8 * len(prefix_lengths)
     assert len(calls["forward"]) == expected_calls
     assert len(calls["backward"]) == expected_calls
-    assert ring.RingBlockKind.CAUSAL in calls["forward"]
+    assert ring.RingBlockKind.CAUSAL in {
+        call["block_kind"] for call in calls["forward"]
+    }
+    physical_query_chunk = current_shard.padded_length // (2 * _EXPECTED_WORLD_SIZE)
+    assert all(
+        call["query_length"] == physical_query_chunk
+        for phase in calls.values()
+        for call in phase
+    )
+    physical_kv_chunks = {
+        current_shard.padded_length // (2 * _EXPECTED_WORLD_SIZE)
+    }
+    for prefix_length in prefix_lengths:
+        prefix_shard = make_ring_sequence_shard(
+            prefix_length,
+            cp_rank=rank,
+            cp_size=_EXPECTED_WORLD_SIZE,
+        )
+        physical_kv_chunks.add(
+            prefix_shard.padded_length // (2 * _EXPECTED_WORLD_SIZE)
+        )
+    assert {
+        call["kv_length"] for phase in calls.values() for call in phase
+    }.issubset(physical_kv_chunks)
+    has_padding = current_shard.padded_length != current_shard.global_length or any(
+        length % (2 * _EXPECTED_WORLD_SIZE) != 0 for length in prefix_lengths
+    )
+    mask_phases = torch.tensor(
+        [
+            int(any(call["has_mask"] for call in calls["forward"])),
+            int(any(call["has_mask"] for call in calls["backward"])),
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(mask_phases, op=dist.ReduceOp.MAX, group=cp_group)
+    assert mask_phases.tolist() == [int(has_padding), int(has_padding)]
     RingP2P, _ = ring._load_mindspeed_ring_primitives()
     assert RingP2P.__module__.endswith("context_parallel.utils")
 
