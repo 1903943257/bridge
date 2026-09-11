@@ -663,7 +663,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         _compare_losses(
             reference.normalized_loss,
             full_reference.normalized_loss,
-            comparison="A_vs_B",
+            comparison="full_vs_segmented (A_vs_B)",
             rank=runtime.rank,
         )
         _compare_logprobs(
@@ -671,19 +671,21 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             full_reference.target_logprobs,
             case=case,
             backend=backend,
-            comparison="A_vs_B",
+            comparison="full_vs_segmented (A_vs_B)",
             rank=runtime.rank,
         )
         _gradient_diagnostics(
             reference.parameter_gradients,
             full_reference.parameter_gradients,
-            comparison="A_vs_B",
+            comparison="full_vs_segmented (A_vs_B)",
             rank=runtime.rank,
         )
     else:
         reference = full_reference
 
-    semantic_comparison = "B_vs_C" if use_segmented_oracle else "A_vs_C"
+    semantic_comparison = (
+        "segmented_vs_tpr (B_vs_C)" if use_segmented_oracle else "full_vs_tpr (A_vs_C)"
+    )
     _compare_losses(
         output["loss"],
         reference.normalized_loss,
@@ -725,7 +727,10 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         f"{_LOGPROB_COSINE_MIN:.9f}"
     )
     if use_segmented_oracle and runtime.rank == 0:
-        print("Qwen parameter-gradient semantic comparison: comparison=B_vs_C")
+        print(
+            "Qwen parameter-gradient semantic comparison: "
+            "comparison=segmented_vs_tpr (B_vs_C)"
+        )
     _assert_real_qwen_gradients_close(
         actual_gradients,
         reference.parameter_gradients,
@@ -760,7 +765,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         _compare_losses(
             output["loss"],
             full_reference.normalized_loss,
-            comparison="A_vs_C",
+            comparison="full_vs_tpr (A_vs_C)",
             rank=runtime.rank,
         )
         full_logprob_comparison = _compare_logprobs(
@@ -768,13 +773,13 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             full_reference.target_logprobs,
             case=case,
             backend=backend,
-            comparison="A_vs_C",
+            comparison="full_vs_tpr (A_vs_C)",
             rank=runtime.rank,
         )
         full_gradient_comparison = _gradient_diagnostics(
             actual_gradients,
             full_reference.parameter_gradients,
-            comparison="A_vs_C",
+            comparison="full_vs_tpr (A_vs_C)",
             rank=runtime.rank,
         )
     else:
