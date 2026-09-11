@@ -109,6 +109,19 @@ def _validate_attention_mask(
         )
 
 
+def _attention_mask_parameters(
+    attention_mask: Tensor | None,
+    *,
+    device: torch.device,
+) -> tuple[Tensor, int, int]:
+    if attention_mask is None:
+        return _compressed_causal_mask(device), _RIGHT_DOWN_CAUSAL_MODE, 0
+    # sparse mode 0 applies pre/next_tockens in addition to atten_mask. Keep
+    # that window fully open so the physical causal/padding mask is the sole
+    # visibility contract for rectangular Q/KV layouts.
+    return attention_mask.contiguous(), _CUSTOM_MASK_MODE, _DEFAULT_PRE_TOKENS
+
+
 def rectangular_causal_attention(
     query: Tensor,
     key: Tensor,
@@ -166,12 +179,10 @@ def rectangular_causal_attention(
     query_tnd = query.squeeze(1).contiguous()
     key_tnd = key.squeeze(1).contiguous()
     value_tnd = value.squeeze(1).contiguous()
-    if attention_mask is None:
-        attention_mask = _compressed_causal_mask(query.device)
-        sparse_mode = _RIGHT_DOWN_CAUSAL_MODE
-    else:
-        attention_mask = attention_mask.contiguous()
-        sparse_mode = _CUSTOM_MASK_MODE
+    attention_mask, sparse_mode, next_tokens = _attention_mask_parameters(
+        attention_mask,
+        device=query.device,
+    )
 
     output = torch_npu.npu_fusion_attention(
         query_tnd,
@@ -184,7 +195,7 @@ def rectangular_causal_attention(
         atten_mask=attention_mask,
         scale=softmax_scale,
         pre_tockens=pre_tokens,
-        next_tockens=0,
+        next_tockens=next_tokens,
         keep_prob=1.0,
         inner_precise=inner_precise,
         sparse_mode=sparse_mode,

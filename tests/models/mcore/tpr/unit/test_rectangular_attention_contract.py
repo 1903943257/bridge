@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from verl.models.mcore.tpr.rectangular_attention import (
+    _attention_mask_parameters,
     _validate_attention_mask,
     _validate_inputs,
     rectangular_causal_attention,
@@ -62,6 +63,23 @@ def test_contract_accepts_physical_bool_attention_mask():
         kv_length=key.shape[0],
         device=query.device,
     )
+
+
+def test_custom_mask_uses_full_window_while_right_down_mask_remains_causal():
+    custom_mask = torch.zeros(3, 9, dtype=torch.bool)
+
+    selected_custom_mask, custom_mode, custom_next_tokens = _attention_mask_parameters(
+        custom_mask,
+        device=torch.device("cpu"),
+    )
+    _, right_down_mode, right_down_next_tokens = _attention_mask_parameters(
+        None,
+        device=torch.device("cpu"),
+    )
+
+    assert selected_custom_mask.data_ptr() == custom_mask.data_ptr()
+    assert (custom_mode, custom_next_tokens) == (0, 2**31 - 1)
+    assert (right_down_mode, right_down_next_tokens) == (3, 0)
 
 
 @pytest.mark.parametrize(
