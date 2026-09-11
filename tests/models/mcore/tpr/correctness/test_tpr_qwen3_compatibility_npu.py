@@ -325,6 +325,7 @@ def _assert_real_qwen_gradients_close(
     *,
     global_relative_l2_tol=_GLOBAL_GRAD_RELATIVE_L2_TOL,
     per_parameter_relative_l2_tol=_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
+    enforce_per_parameter_relative_l2=True,
 ):
     assert actual.keys() == expected.keys()
     difference_square_sum = 0.0
@@ -403,10 +404,17 @@ def _assert_real_qwen_gradients_close(
         for relative_l2, name, difference_l2, expected_l2, _, _ in per_parameter
         if relative_l2 > per_parameter_relative_l2_tol
     ]
-    assert not excessive, (
-        f"per-parameter Qwen gradient relative L2 exceeds "
-        f"{per_parameter_relative_l2_tol}: {excessive[:10]}"
-    )
+    if enforce_per_parameter_relative_l2:
+        assert not excessive, (
+            f"per-parameter Qwen gradient relative L2 exceeds "
+            f"{per_parameter_relative_l2_tol}: {excessive[:10]}"
+        )
+    elif excessive and should_print:
+        print(
+            "Qwen per-parameter gradient diagnostic outliers "
+            f"(non-blocking, tolerance={per_parameter_relative_l2_tol}): "
+            f"{excessive[:10]}"
+        )
 
 
 def test_qwen3_real_checkpoint_matches_reference_and_tpr(monkeypatch):
