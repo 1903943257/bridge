@@ -310,12 +310,6 @@ def real_qwen_cp_case(request, cp_runtime):
         logical_indices,
         logical_count,
         expected_layer_numbers=tuple(range(1, hf_config.num_hidden_layers + 1)),
-        # The complete non-divisible-topology trajectories have lengths 190
-        # and 158, so they would otherwise take the divisible sparse-mode 3
-        # fast path while TPR's 127/63/31 segments require the physical
-        # padding mask (sparse mode 0).  Keep the reference independent but
-        # compare the padding semantics under one Attention kernel contract.
-        force_explicit_attention_mask=_TOPOLOGY_NAME == "non_divisible",
     )
     reference = _move_reference_to_cpu(reference_result)
     del reference_result
