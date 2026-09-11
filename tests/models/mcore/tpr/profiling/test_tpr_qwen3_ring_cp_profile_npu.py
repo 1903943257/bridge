@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in Qwen3-1.7B Reference CP versus TPR Ring CP=2 profile.
+"""Opt-in Qwen3-0.6B Reference CP versus TPR Ring CP=2 profile.
 
 The Reference executes every complete ``P + S`` trajectory independently.
 TPR executes one shared Prefix followed by all Suffixes.  Model construction,
@@ -23,13 +23,13 @@ CP parameter-gradient synchronization.
 Run all cases from the verl repository root with two visible NPUs::
 
     TPR_RUN_QWEN_RING_CP_PROFILE=1 \
-    TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B \
+    TPR_QWEN_0_6B_PATH=/workspace/hf_models/Qwen3-0.6B \
     torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29551 \
         -m pytest -s -v -x \
         tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py
 
 Set ``TPR_QWEN_RING_CP_PROFILE_CASES`` to a comma-separated list of case IDs
-to split a long run, for example ``p4096_s512_n2``.  The main comparison keeps
+to split a long run, for example ``p16384_s2048_n2``.  The main comparison keeps
 three warmups and ten uninstrumented samples.  A separate one-warmup,
 three-sample NPU-event pass collects the latency breakdown; set
 ``TPR_QWEN_RING_CP_PROFILE_BREAKDOWN=0`` to disable that diagnostic pass.
@@ -180,9 +180,10 @@ class _ProfileResult:
 
 
 _PROFILE_CASES = (
-    _ProfileCase(4096, 512, 2),
-    _ProfileCase(4096, 512, 8),
-    _ProfileCase(8192, 1024, 8),
+    _ProfileCase(16384, 2048, 2),
+    _ProfileCase(16384, 2048, 4),
+    _ProfileCase(16384, 2048, 8),
+    _ProfileCase(16384, 2048, 16),
 )
 
 
@@ -1170,7 +1171,7 @@ def _print_case_result(result: _ProfileResult, *, rank: int) -> None:
 def _print_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
     if rank != 0:
         return
-    print("\nQwen3-1.7B BF16 Ring CP=2 Reference vs TPR profile")
+    print("\nQwen3-0.6B BF16 Ring CP=2 Reference vs TPR profile")
     print(f"warmup={_WARMUP_RUNS}, measured={_MEASURE_RUNS}; time is max across CP ranks")
     print(
         "P | S | N | Ref ms (median/mean) | TPR ms (median/mean) | "
@@ -1189,7 +1190,7 @@ def _print_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
         )
 
 
-def test_qwen3_1_7b_reference_cp_vs_tpr_ring_cp_profile(cp_runtime):
+def test_qwen3_0_6b_reference_cp_vs_tpr_ring_cp_profile(cp_runtime):
     runtime = cp_runtime
     if runtime.cp_size != _EXPECTED_WORLD_SIZE:
         raise AssertionError(
@@ -1197,7 +1198,7 @@ def test_qwen3_1_7b_reference_cp_vs_tpr_ring_cp_profile(cp_runtime):
         )
 
     model_case = next(
-        case for case in _QWEN_MODEL_CASES if case.name == "qwen3_1_7b"
+        case for case in _QWEN_MODEL_CASES if case.name == "qwen3_0_6b"
     )
     hf_config = _load_hf_config(model_case)
     model = _make_qwen_cp_model(runtime, model_case, hf_config)
