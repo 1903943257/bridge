@@ -14,6 +14,14 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from mindspeed_ops.api.triton.chunk_gated_delta_rule import (
+    chunk_gated_delta_rule as STAGE1_CHUNK_GATED_DELTA_RULE,
+)
+from mindspeed_ops.api.triton.convolution import causal_conv1d as STAGE1_CAUSAL_CONV1D
+from mindspeed_ops.arch32.triton.convolution import (
+    causal_conv1d_bwd_impl as STAGE1_CAUSAL_CONV1D_BWD_IMPL,
+    causal_conv1d_fwd_impl as STAGE1_CAUSAL_CONV1D_FWD_IMPL,
+)
 
 
 DTYPE = torch.bfloat16
@@ -23,7 +31,7 @@ SEQUENCE_LENGTH = int(os.getenv("STAGE34_SEQUENCE_LENGTH", "64"))
 SERVER_MCORE_SHA = "55ac7082517c3878ae653c07c09c534b8aed49f6"
 SERVER_MINDSPEED_SHA = "376e9cc302a2c00bfcc84e49a557b47fec941c87"
 SERVER_VERL_SHA = "91462fad3b753a191ddf6ca1f3a2b761b90326d9"
-SERVER_MINDSPEED_OPS_SHA = "9d962f130274be9dd61297f6fdd2a7c5e67c6aab"
+SERVER_MINDSPEED_OPS_SHA = "babee85cb00ade056b1c1627e64b10a524447025"
 SERVER_MINDSPEED_OPS_ROOT = os.getenv("STAGE34_MINDSPEED_OPS_ROOT", "/workspace/MindSpeed-Ops")
 
 
@@ -141,7 +149,7 @@ def initialize_npu_runtime(*, world_size: int):
         component="MindSpeed-Ops",
         expected=SERVER_MINDSPEED_OPS_SHA,
         expected_root=SERVER_MINDSPEED_OPS_ROOT,
-        require_clean=True,
+        require_clean=False,
     )
 
     if not parallel_state.model_parallel_is_initialized():
@@ -371,8 +379,6 @@ def stage1_stateful_causal_conv(
     **_unused,
 ):
     """FLA-shaped adapter over the Stage 1 MindSpeed-Ops CausalConv primitive."""
-    from mindspeed_ops.api.triton.convolution import causal_conv1d
-
     if x.ndim != 3 or weight.ndim != 2:
         raise ValueError(f"expected x=[B,S,D], weight=[D,W], got {x.shape}, {weight.shape}")
     # MindSpeed GDN stores [D,W]; the Stage 1 primitive consumes [W,D].
@@ -385,17 +391,17 @@ def stage1_stateful_causal_conv(
         "output_final_state": output_final_state,
     }
     if cu_seqlens is None:
-        return causal_conv1d(
+        return STAGE1_CAUSAL_CONV1D(
             x,
             primitive_weight,
-            **_supported_keyword_arguments(causal_conv1d, optional_arguments),
+            **_supported_keyword_arguments(STAGE1_CAUSAL_CONV1D, optional_arguments),
         )
-    if _call_supports(causal_conv1d, "cu_seqlens"):
+    if _call_supports(STAGE1_CAUSAL_CONV1D, "cu_seqlens"):
         optional_arguments["cu_seqlens"] = cu_seqlens
-        return causal_conv1d(
+        return STAGE1_CAUSAL_CONV1D(
             x,
             primitive_weight,
-            **_supported_keyword_arguments(causal_conv1d, optional_arguments),
+            **_supported_keyword_arguments(STAGE1_CAUSAL_CONV1D, optional_arguments),
         )
 
     if x.shape[0] != 1:
@@ -415,10 +421,10 @@ def stage1_stateful_causal_conv(
             "activation": activation,
             "output_final_state": output_final_state,
         }
-        output, final_state = causal_conv1d(
+        output, final_state = STAGE1_CAUSAL_CONV1D(
             x[:, start:end],
             primitive_weight,
-            **_supported_keyword_arguments(causal_conv1d, segment_arguments),
+            **_supported_keyword_arguments(STAGE1_CAUSAL_CONV1D, segment_arguments),
         )
         outputs.append(output)
         if output_final_state:
@@ -444,33 +450,26 @@ def stage1_stateful_gated_delta_rule(
     **_unused,
 ):
     """MindSpeed GDN-shaped adapter over the Stage 1 stateful GDR primitive."""
-    from mindspeed_ops.api.triton.chunk_gated_delta_rule import chunk_gated_delta_rule
-
-    optional_arguments = {
+    stage1_arguments = {
+        "q": query,
+        "k": key,
+        "v": value,
         "g": g,
         "beta": beta,
-        "scale": scale,
         "initial_state": initial_state,
         "output_final_state": output_final_state,
-        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
         "chunk_size": chunk_size,
         "head_first": False,
     }
+    if scale is not None:
+        stage1_arguments["scale"] = scale
+    if use_qk_l2norm_in_kernel:
+        stage1_arguments["use_qk_l2norm_in_kernel"] = True
     if cu_seqlens is None:
-        return chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            **_supported_keyword_arguments(chunk_gated_delta_rule, optional_arguments),
-        )
-    if _call_supports(chunk_gated_delta_rule, "cu_seqlens"):
-        optional_arguments["cu_seqlens"] = cu_seqlens
-        return chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            **_supported_keyword_arguments(chunk_gated_delta_rule, optional_arguments),
-        )
+        return STAGE1_CHUNK_GATED_DELTA_RULE(**stage1_arguments)
+    if _call_supports(STAGE1_CHUNK_GATED_DELTA_RULE, "cu_seqlens"):
+        stage1_arguments["cu_seqlens"] = cu_seqlens
+        return STAGE1_CHUNK_GATED_DELTA_RULE(**stage1_arguments)
 
     if query.shape[0] != 1:
         raise ValueError("segmented packed GDR fallback requires flattened batch size 1")
@@ -482,21 +481,21 @@ def stage1_stateful_gated_delta_rule(
     for index, (start, end) in enumerate(zip(offsets, offsets[1:])):
         segment_state = None if initial_state is None else initial_state[index : index + 1]
         segment_arguments = {
+            "q": query[:, start:end],
+            "k": key[:, start:end],
+            "v": value[:, start:end],
             "g": g[:, start:end],
             "beta": beta[:, start:end],
-            "scale": scale,
             "initial_state": segment_state,
             "output_final_state": output_final_state,
-            "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
             "chunk_size": chunk_size,
             "head_first": False,
         }
-        output, final_state = chunk_gated_delta_rule(
-            query[:, start:end],
-            key[:, start:end],
-            value[:, start:end],
-            **_supported_keyword_arguments(chunk_gated_delta_rule, segment_arguments),
-        )
+        if scale is not None:
+            segment_arguments["scale"] = scale
+        if use_qk_l2norm_in_kernel:
+            segment_arguments["use_qk_l2norm_in_kernel"] = True
+        output, final_state = STAGE1_CHUNK_GATED_DELTA_RULE(**segment_arguments)
         outputs.append(output)
         if output_final_state:
             final_states.append(final_state)

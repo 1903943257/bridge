@@ -21,8 +21,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from verl.utils.device import is_torch_npu_available
-
 from ._qwen35_baseline_utils import (
     AllToAllProbe,
     VOCAB_SIZE,
@@ -37,6 +35,7 @@ from ._qwen35_baseline_utils import (
     packed_boundary_metadata,
     packed_seq_params_metadata,
 )
+from verl.utils.device import is_torch_npu_available
 
 
 if not is_torch_npu_available(check_device=True):

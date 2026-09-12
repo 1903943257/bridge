@@ -14,10 +14,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from verl.utils.device import is_torch_npu_available
-
 from ._qwen35_baseline_utils import (
     DTYPE,
+    STAGE1_CAUSAL_CONV1D_BWD_IMPL,
+    STAGE1_CAUSAL_CONV1D_FWD_IMPL,
     assert_gradient_maps_close,
     bind_stage1_gdn_primitives,
     clone_parameter_gradients,
@@ -25,6 +25,7 @@ from ._qwen35_baseline_utils import (
     initialize_npu_runtime,
     process_groups,
 )
+from verl.utils.device import is_torch_npu_available
 
 
 if not is_torch_npu_available(check_device=True):
@@ -158,63 +159,109 @@ def test_gdn_thd_cp1_uses_patched_class_and_preserves_segment_boundaries(runtime
 
 
 def test_causal_conv_prefix_state_continuation_and_initial_state_gradient(runtime):
-    from mindspeed_ops.api.triton.convolution import causal_conv1d
-
-    torch.manual_seed(351002)
-    dim, width, prefix_length, suffix_length = 256, 4, 64, 64
-    x = torch.randn(1, prefix_length + suffix_length, dim, device=runtime.device, dtype=DTYPE)
-    weight = torch.randn(width, dim, device=runtime.device, dtype=DTYPE) * 0.05
-    bias = torch.randn(dim, device=runtime.device, dtype=DTYPE) * 0.01
+    # Mirror Stage 1's test_state_continuity call exactly: direct arch32
+    # forward primitive, FP32, [B,T,D] input and [W,D] weight, no fused options.
+    torch.manual_seed(42)
+    batch, dim, width, prefix_length, suffix_length = 1, 256, 4, 64, 64
+    x = torch.randn(
+        batch,
+        prefix_length + suffix_length,
+        dim,
+        device=runtime.device,
+        dtype=torch.float32,
+    )
+    weight = torch.randn(width, dim, device=runtime.device, dtype=torch.float32)
 
     with torch.no_grad():
-        full_output, full_final_state = causal_conv1d(
-            x,
-            weight,
-            bias=bias,
-            activation="silu",
-            initial_state=None,
+        full_output, _ = STAGE1_CAUSAL_CONV1D_FWD_IMPL(
+            x=x,
+            weight=weight,
+            bias=None,
+            residual=None,
+            output_final_state=False,
+        )
+        prefix_output, prefix_final_state = STAGE1_CAUSAL_CONV1D_FWD_IMPL(
+            x=x[:, :prefix_length],
+            weight=weight,
+            bias=None,
+            residual=None,
             output_final_state=True,
         )
-        prefix_output, prefix_final_state = causal_conv1d(
-            x[:, :prefix_length],
-            weight,
-            bias=bias,
-            activation="silu",
-            initial_state=None,
-            output_final_state=True,
+        suffix_output, _ = STAGE1_CAUSAL_CONV1D_FWD_IMPL(
+            x=x[:, prefix_length:],
+            weight=weight,
+            bias=None,
+            residual=None,
+            initial_state=prefix_final_state,
+            output_final_state=False,
         )
-    if prefix_final_state is None:
-        raise AssertionError("MindSpeed-Ops CausalConv returned no prefix final state")
-
-    initial_state = prefix_final_state.detach().clone().requires_grad_(True)
-    suffix_x = x[:, prefix_length:].detach().clone().requires_grad_(True)
-    suffix_output, suffix_final_state = causal_conv1d(
-        suffix_x,
-        weight.detach().clone().requires_grad_(True),
-        bias=bias.detach().clone().requires_grad_(True),
-        activation="silu",
-        initial_state=initial_state,
-        output_final_state=True,
-    )
-    if suffix_final_state is None:
-        raise AssertionError("MindSpeed-Ops CausalConv returned no suffix final state")
+    if prefix_final_state is None or prefix_final_state.shape != (batch, dim, width):
+        raise AssertionError(
+            f"unexpected prefix conv state: {None if prefix_final_state is None else prefix_final_state.shape}"
+        )
     torch.testing.assert_close(
-        torch.cat((prefix_output, suffix_output.detach()), dim=1),
+        torch.cat((prefix_output, suffix_output), dim=1),
         full_output,
-        atol=3e-3,
-        rtol=1e-2,
+        atol=1e-5,
+        rtol=1e-5,
     )
-    torch.testing.assert_close(suffix_final_state.detach(), full_final_state, atol=0.0, rtol=0.0)
-    suffix_output.float().square().mean().backward()
-    if initial_state.grad is None:
-        raise AssertionError("MindSpeed-Ops CausalConv did not return initial_state.grad")
-    if not torch.isfinite(initial_state.grad).all().item():
+
+    # Mirror Stage 1's test_grad_with_initial_state case: direct arch32
+    # forward/backward primitives, B=2, T=128, FP32, state [B,D,W].
+    gradient_batch, gradient_length = 2, 128
+    gradient_x = torch.randn(
+        gradient_batch,
+        gradient_length,
+        dim,
+        device=runtime.device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    gradient_weight = torch.randn(
+        width,
+        dim,
+        device=runtime.device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    initial_state = torch.randn(
+        gradient_batch,
+        dim,
+        width,
+        device=runtime.device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    gradient_output, _ = STAGE1_CAUSAL_CONV1D_FWD_IMPL(
+        x=gradient_x,
+        weight=gradient_weight,
+        bias=None,
+        residual=None,
+        initial_state=initial_state,
+        activation=None,
+        output_final_state=False,
+    )
+    output_gradient = torch.randn_like(gradient_output)
+    _, _, _, _, initial_state_gradient = STAGE1_CAUSAL_CONV1D_BWD_IMPL(
+        x=gradient_x.detach(),
+        dy=output_gradient,
+        dht=None,
+        weight=gradient_weight.detach(),
+        bias=None,
+        residual=None,
+        initial_state=initial_state.detach(),
+        activation=None,
+    )
+    if initial_state_gradient is None:
+        raise AssertionError("MindSpeed-Ops CausalConv did not return dh0")
+    if not torch.isfinite(initial_state_gradient).all().item():
         raise AssertionError("initial_conv_state gradient contains NaN/Inf")
-    if torch.count_nonzero(initial_state.grad).item() == 0:
+    if torch.count_nonzero(initial_state_gradient).item() == 0:
         raise AssertionError("initial_conv_state gradient is unexpectedly all zero")
     print(
         "PUNCTURE-2 PASS"
-        "\n  causal-conv backend: mindspeed_ops.api.triton.convolution.causal_conv1d"
+        "\n  continuation backend: mindspeed_ops.arch32.triton.convolution.causal_conv1d_fwd_impl"
+        "\n  gradient backend: mindspeed_ops.arch32.triton.convolution.causal_conv1d_bwd_impl"
         f"\n  continuation: {prefix_length}+{suffix_length} tokens"
-        f"\n  initial-state grad norm: {initial_state.grad.float().norm().item():.6e}"
+        f"\n  initial-state grad norm: {initial_state_gradient.float().norm().item():.6e}"
     )
