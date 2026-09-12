@@ -685,6 +685,99 @@ def clone_parameter_gradients(model):
     return gradients
 
 
+@dataclass(frozen=True)
+class GradientPairMetrics:
+    reference_norm: float
+    actual_norm: float
+    norm_ratio: float
+    absolute_l2: float
+    relative_l2: float
+    cosine: float
+
+
+@dataclass(frozen=True)
+class GradientMapDiagnostics:
+    aggregate: GradientPairMetrics
+    worst_name: str
+    worst: GradientPairMetrics
+
+
+def _gradient_pair_metrics(*, reference_l2, actual_l2, difference_l2, dot):
+    reference_norm = reference_l2**0.5
+    actual_norm = actual_l2**0.5
+    absolute_l2 = difference_l2**0.5
+    if reference_norm == 0.0:
+        norm_ratio = 1.0 if actual_norm == 0.0 else float("inf")
+        relative_l2 = 0.0 if absolute_l2 == 0.0 else float("inf")
+    else:
+        norm_ratio = actual_norm / reference_norm
+        relative_l2 = absolute_l2 / reference_norm
+    if reference_norm == 0.0 and actual_norm == 0.0:
+        cosine = 1.0
+    elif reference_norm == 0.0 or actual_norm == 0.0:
+        cosine = 0.0
+    else:
+        cosine = dot / (reference_norm * actual_norm)
+    return GradientPairMetrics(
+        reference_norm=reference_norm,
+        actual_norm=actual_norm,
+        norm_ratio=norm_ratio,
+        absolute_l2=absolute_l2,
+        relative_l2=relative_l2,
+        cosine=cosine,
+    )
+
+
+def gradient_map_diagnostics(reference, actual):
+    """Summarize a gradient-map comparison without applying pass/fail thresholds."""
+    if reference.keys() != actual.keys():
+        raise AssertionError(
+            f"gradient parameter sets differ: missing={reference.keys() - actual.keys()}, "
+            f"unexpected={actual.keys() - reference.keys()}"
+        )
+    if not reference:
+        raise AssertionError("cannot compare empty gradient maps")
+
+    reference_l2 = actual_l2 = difference_l2 = dot = 0.0
+    worst_name = None
+    worst_metrics = None
+    for name in reference:
+        left_f = reference[name].detach().float()
+        right_f = actual[name].detach().float()
+        if left_f.shape != right_f.shape:
+            raise AssertionError(
+                f"gradient shape differs for {name}: {left_f.shape} versus {right_f.shape}"
+            )
+        local_reference_l2 = torch.sum(left_f.square()).item()
+        local_actual_l2 = torch.sum(right_f.square()).item()
+        local_difference_l2 = torch.sum((right_f - left_f).square()).item()
+        local_dot = torch.sum(left_f * right_f).item()
+        local_metrics = _gradient_pair_metrics(
+            reference_l2=local_reference_l2,
+            actual_l2=local_actual_l2,
+            difference_l2=local_difference_l2,
+            dot=local_dot,
+        )
+        if worst_metrics is None or local_metrics.relative_l2 > worst_metrics.relative_l2:
+            worst_name = name
+            worst_metrics = local_metrics
+        reference_l2 += local_reference_l2
+        actual_l2 += local_actual_l2
+        difference_l2 += local_difference_l2
+        dot += local_dot
+
+    return GradientMapDiagnostics(
+        aggregate=_gradient_pair_metrics(
+            reference_l2=reference_l2,
+            actual_l2=actual_l2,
+            difference_l2=difference_l2,
+            dot=dot,
+        ),
+        worst_name=worst_name,
+        worst=worst_metrics,
+    )
+
+
 def assert_gradient_maps_close(reference, actual, *, rtol=8e-2, cosine_min=0.995):
     if reference.keys() != actual.keys():
         raise AssertionError(
