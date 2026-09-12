@@ -136,6 +136,45 @@ def _ring_probe():
 
 
 @contextmanager
+def _bshd_dense_attention_mask_mode(model, *, enabled):
+    """Use general-mask FA mode for verl's explicit B1SS padding mask."""
+    if not enabled:
+        yield None
+        return
+
+    import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
+
+    targets = {}
+    for layer in model.decoder.layers:
+        if isinstance(layer.self_attention, mindspeed_gdn.GatedDeltaNet):
+            continue
+        for module in layer.self_attention.modules():
+            config = getattr(module, "config", None)
+            if config is not None and hasattr(config, "sparse_mode"):
+                targets.setdefault(id(config), (config, config.sparse_mode))
+    # core_v0.16.1 uses the config-bound MindSpeed attention path, while an
+    # older patched entry reads the same option from MindSpeed's global args.
+    # Set both runtime objects so this test remains exact for the server stack.
+    from mindspeed.args_utils import get_full_args
+
+    mindspeed_args = get_full_args()
+    if hasattr(mindspeed_args, "sparse_mode"):
+        targets.setdefault(id(mindspeed_args), (mindspeed_args, mindspeed_args.sparse_mode))
+    if not targets:
+        raise AssertionError("could not locate Full-Attention sparse_mode configuration")
+
+    for target, _ in targets.values():
+        target.sparse_mode = 0
+    try:
+        if any(target.sparse_mode != 0 for target, _ in targets.values()):
+            raise AssertionError("failed to select sparse_mode=0 for the BSHD dense mask")
+        yield {"target_count": len(targets), "sparse_mode": 0}
+    finally:
+        for target, original_sparse_mode in targets.values():
+            target.sparse_mode = original_sparse_mode
+
+
+@contextmanager
 def _verl_data_path_probe(input_ids):
     import verl.models.mcore.model_forward as model_forward
 
@@ -150,6 +189,8 @@ def _verl_data_path_probe(input_ids):
         "thd_post": 0,
         "bshd_pre": 0,
         "bshd_post": 0,
+        "bshd_attention_mask_shape": None,
+        "bshd_fa_sparse_mode": None,
         "model_packed_metadata": None,
         "metadata": None,
     }
@@ -167,8 +208,11 @@ def _verl_data_path_probe(input_ids):
         return originals["thd_post"](*args, **kwargs)
 
     def bshd_pre(*args, **kwargs):
+        result = originals["bshd_pre"](*args, **kwargs)
         records["bshd_pre"] += 1
-        return originals["bshd_pre"](*args, **kwargs)
+        if records["bshd_attention_mask_shape"] is None:
+            records["bshd_attention_mask_shape"] = tuple(result[1].shape)
+        return result
 
     def bshd_post(*args, **kwargs):
         records["bshd_post"] += 1
@@ -192,18 +236,24 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
 
     data_format = "thd" if use_remove_padding else "bshd"
     model.zero_grad(set_to_none=True)
-    with _verl_data_path_probe(input_ids) as path_probe:
-        output = model_forward.gptmodel_forward_model_engine(
-            model,
-            input_ids=input_ids,
-            multi_modal_inputs={},
-            logits_processor=_logits_processor,
-            logits_processor_args={"label": input_ids},
-            value_model=False,
-            vision_model=False,
-            pad_token_id=0,
-            data_format=data_format,
-        )
+    with _bshd_dense_attention_mask_mode(
+        model,
+        enabled=not use_remove_padding,
+    ) as mask_mode:
+        with _verl_data_path_probe(input_ids) as path_probe:
+            if mask_mode is not None:
+                path_probe["bshd_fa_sparse_mode"] = mask_mode["sparse_mode"]
+            output = model_forward.gptmodel_forward_model_engine(
+                model,
+                input_ids=input_ids,
+                multi_modal_inputs={},
+                logits_processor=_logits_processor,
+                logits_processor_args={"label": input_ids},
+                value_model=False,
+                vision_model=False,
+                pad_token_id=0,
+                data_format=data_format,
+            )
     expected_prefix = "thd" if use_remove_padding else "bshd"
     other_prefix = "bshd" if use_remove_padding else "thd"
     if path_probe[f"{expected_prefix}_pre"] == 0 or path_probe[f"{expected_prefix}_post"] == 0:
@@ -212,6 +262,12 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
         raise AssertionError(f"verl unexpectedly entered its {other_prefix.upper()} data path")
     if use_remove_padding and path_probe["metadata"] is None:
         raise AssertionError("THD preprocess did not expose packed boundary metadata")
+    if not use_remove_padding:
+        mask_shape = path_probe["bshd_attention_mask_shape"]
+        if mask_shape is None or len(mask_shape) != 4 or mask_shape[:2] != (input_ids.shape[0], 1):
+            raise AssertionError(f"verl did not build the expected B1SS BSHD mask: {mask_shape}")
+        if path_probe["bshd_fa_sparse_mode"] != 0:
+            raise AssertionError("BSHD dense attention mask did not execute with sparse_mode=0")
     target_logprob = output["target_logprob"]
     output_probe = output["output_probe"]
     if not target_logprob.is_nested or not output_probe.is_nested:
@@ -233,7 +289,10 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
         keep[offset + length - 1] = False
         offset += length
     loss = -target_logprob.values()[keep].sum() / float(sum(lengths) - len(lengths))
-    loss.backward()
+    # Keep the same explicit-mask mode active for custom FA backward wrappers
+    # that consult runtime config in addition to their saved autograd context.
+    with _bshd_dense_attention_mask_mode(model, enabled=not use_remove_padding):
+        loss.backward()
     if runtime.world_size > 1:
         allreduce_parameter_gradients(model, runtime.cp_group)
     return {
@@ -329,6 +388,9 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
             f"\n  actual/padded cu_seqlens: {metadata.actual_cu_seqlens}/{metadata.padded_cu_seqlens}"
             f"\n  logical lengths after postprocess: {thd['logical_lengths']}"
             f"\n  loss BSHD/THD: {bshd['loss'].item():.8f}/{thd['loss'].item():.8f}"
+            f"\n  BSHD mask/sparse-mode: "
+            f"{bshd['path_probe']['bshd_attention_mask_shape']}/"
+            f"{bshd['path_probe']['bshd_fa_sparse_mode']}"
             f"\n  verl THD preprocess/postprocess calls: "
             f"{thd['path_probe']['thd_pre']}/{thd['path_probe']['thd_post']}"
         )
