@@ -22,6 +22,8 @@ Run from the verl repository root::
 The materialized reference executes ``P+S1`` and ``P+S2`` independently. The
 TPR path saves graph-free state for P, visits both siblings from independent
 anchors, sums dConv/dRecurrent, then recomputes P and applies the summed VJP.
+Diagnostics also compare full repeat, shared-prefix connected splitting, and
+independent connected splitting (a fresh P graph and backward per branch).
 """
 
 from __future__ import annotations
@@ -177,14 +179,16 @@ def _print_comparison(label, reference, actual):
     )
 
 
-def _diagnostic_pass(model, prefix, suffixes, prefix_target, suffix_targets, denominator, *, connected):
-    """Same weights/inputs; compare full repeat against graph-connected splitting."""
+def _diagnostic_pass(model, prefix, suffixes, prefix_target, suffix_targets, denominator, *, mode):
+    """Same weights/inputs; isolate sequence splitting from shared-prefix backward."""
+    if mode not in ("full-repeat", "connected-split", "independent-split"):
+        raise ValueError(f"unknown diagnostic mode: {mode}")
     model.zero_grad(set_to_none=True)
     prefix = prefix.detach().clone().requires_grad_(True)
     suffixes = tuple(value.detach().clone().requires_grad_(True) for value in suffixes)
     state_gradients = {}
     loss_value = 0.0
-    if connected:
+    if mode == "connected-split":
         prefix_output, state = _run_segment(model, prefix, prefix_length=0)
         state.conv_state.retain_grad()
         state.recurrent_state.retain_grad()
@@ -204,11 +208,32 @@ def _diagnostic_pass(model, prefix, suffixes, prefix_target, suffix_targets, den
         }
     else:
         for suffix, target in zip(suffixes, suffix_targets, strict=True):
-            output, _ = _run_segment(model, torch.cat((prefix, suffix)), prefix_length=0)
-            loss = _loss_part(output[:prefix.shape[0]], prefix_target, denominator=denominator)
-            loss = loss + _loss_part(output[prefix.shape[0]:], target, denominator=denominator)
+            if mode == "independent-split":
+                # Fresh P graph for each branch, with no detach at the boundary.
+                # Only the input leaf and parameters are shared for grad accumulation,
+                # exactly as in the materialized reference's two backward calls.
+                prefix_output, state = _run_segment(model, prefix, prefix_length=0)
+                state.conv_state.retain_grad()
+                state.recurrent_state.retain_grad()
+                suffix_output, _ = _run_segment(
+                    model, suffix, prefix_length=prefix.shape[0],
+                    initial_states={_GDN_LAYER_NUMBER: state},
+                )
+            else:
+                output, _ = _run_segment(model, torch.cat((prefix, suffix)), prefix_length=0)
+                prefix_output, suffix_output = output[:prefix.shape[0]], output[prefix.shape[0]:]
+            loss = _loss_part(prefix_output, prefix_target, denominator=denominator)
+            loss = loss + _loss_part(suffix_output, target, denominator=denominator)
             loss.backward()
             loss_value += loss.detach().item()
+            if mode == "independent-split":
+                for name, tensor in (("conv", state.conv_state), ("recurrent", state.recurrent_state)):
+                    if tensor.grad is None:
+                        raise AssertionError(f"independent-split: missing {name} state gradient")
+                    if name in state_gradients:
+                        state_gradients[name].add_(tensor.grad.detach())
+                    else:
+                        state_gradients[name] = tensor.grad.detach().clone()
     return {
         "inputs": {
             "prefix": prefix.grad.detach().clone(),
@@ -421,12 +446,13 @@ def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
             f"materialized-vs-TPR/{name}", {name: materialized_inputs[name]}, {name: tpr_inputs[name]}
         )
     _print_comparison("materialized-vs-TPR/parameters", reference_gradients, tpr_gradients)
-    for connected in (False, True):
+    controls = {}
+    for label in ("full-repeat", "connected-split", "independent-split"):
         control = _diagnostic_pass(
             reference_model, prefix_reference, suffix_references, prefix_target,
-            suffix_targets, denominator, connected=connected,
+            suffix_targets, denominator, mode=label,
         )
-        label = "connected-split" if connected else "full-repeat"
+        controls[label] = control
         print(f"STAGE-3.2 DIAGNOSTIC {label} loss={control['loss']:.9f}", flush=True)
         for name in materialized_inputs:
             _print_comparison(
@@ -434,22 +460,34 @@ def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
                 {name: materialized_inputs[name]}, {name: control["inputs"][name]},
             )
         _print_comparison(f"materialized-vs-{label}/parameters", reference_gradients, control["parameters"])
-        if connected:
+        if label != "full-repeat":
             for name in tpr_inputs:
                 _print_comparison(
-                    f"connected-split-vs-TPR/{name}",
+                    f"{label}-vs-TPR/{name}",
                     {name: control["inputs"][name]}, {name: tpr_inputs[name]},
                 )
-            _print_comparison("connected-split-vs-TPR/parameters", control["parameters"], tpr_gradients)
+            _print_comparison(f"{label}-vs-TPR/parameters", control["parameters"], tpr_gradients)
             for name, gradient in (
                 ("conv", relayed_gradient.conv_state),
                 ("recurrent", relayed_gradient.recurrent_state),
             ):
                 print(f"STAGE-3.2 DIAGNOSTIC {name} state-gradient dtype={gradient.dtype}", flush=True)
                 _print_comparison(
-                    f"connected-split-vs-TPR/dState/{name}",
+                    f"{label}-vs-TPR/dState/{name}",
                     {name: control["states"][name]}, {name: gradient},
                 )
+
+    independent, shared = controls["independent-split"], controls["connected-split"]
+    for group in ("inputs", "states"):
+        for name in independent[group]:
+            _print_comparison(
+                f"independent-split-vs-connected-split/{group}/{name}",
+                {name: independent[group][name]}, {name: shared[group][name]},
+            )
+    _print_comparison(
+        "independent-split-vs-connected-split/parameters",
+        independent["parameters"], shared["parameters"],
+    )
 
     prefix_input_metrics = _assert_gradient_tensor(
         prefix_reference.grad,
