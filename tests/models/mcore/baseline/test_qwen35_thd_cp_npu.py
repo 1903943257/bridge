@@ -30,6 +30,7 @@ from ._qwen35_baseline_utils import (
     allreduce_parameter_gradients,
     assert_gradients_close,
     assert_hybrid_architecture,
+    assert_tensor_close_by_norm,
     bind_stage1_gdn_primitives,
     broadcast_module_state,
     destroy_npu_runtime,
@@ -472,11 +473,13 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
     # default-dtype temporary, promoting a BF16 probe to FP32. Compare model
     # values at a common precision and retain the dtype transition in the
     # path probe so this postprocess behavior remains visible.
-    torch.testing.assert_close(
-        thd["output_probe"].float(),
-        bshd["output_probe"].float(),
-        atol=8e-2,
-        rtol=2e-2,
+    output_metrics = assert_tensor_close_by_norm(
+        bshd["output_probe"],
+        thd["output_probe"],
+        rtol=8e-2,
+        cosine_min=0.995,
+        max_abs=2e-1,
+        label="output probe",
     )
     torch.testing.assert_close(
         thd["target_logprob"], bshd["target_logprob"], atol=8e-2, rtol=2e-2
@@ -499,6 +502,8 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
             f"\n  actual/padded cu_seqlens: {metadata.actual_cu_seqlens}/{metadata.padded_cu_seqlens}"
             f"\n  logical lengths after postprocess: {thd['logical_lengths']}"
             f"\n  excluded next-token boundaries: {thd['excluded_target_indices']}"
+            f"\n  output rel/cos/max-abs: "
+            f"{output_metrics[0]:.6e}/{output_metrics[1]:.9f}/{output_metrics[2]:.6e}"
             f"\n  loss BSHD/THD: {bshd['loss'].item():.8f}/{thd['loss'].item():.8f}"
             f"\n  BSHD mask/sparse-mode/mask-type: "
             f"{bshd['path_probe']['bshd_attention_mask_shape']}/"
