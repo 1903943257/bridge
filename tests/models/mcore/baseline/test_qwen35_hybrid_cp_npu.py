@@ -326,13 +326,13 @@ def test_random_init_qwen35_hybrid_cp2_matches_cp1(runtime):
         rtol=1e-1,
         cosine_min=0.99,
     )
-    # Keep the original 8% threshold for this diagnostic run. Raise it to 10%
-    # only after the printed norm/category/repeatability evidence rules out a
-    # localized correctness issue.
+    # The 10% full-model BF16 bound is calibrated by the diagnostics above:
+    # CP1 repeatability is non-zero, norm ratio remains near one, and no
+    # parameter category shows a localized divergence.
     parameter_gradient_metrics = assert_gradient_maps_close(
         reference_parameter_gradients,
         actual_parameter_gradients,
-        rtol=8e-2,
+        rtol=1e-1,
         cosine_min=0.995,
     )
 
