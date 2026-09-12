@@ -737,23 +737,49 @@ def assert_gradients_close(reference, actual, *, rtol=8e-2, cosine_min=0.995):
     )
 
 
-def assert_tensor_gradient_close(reference, actual, *, rtol=8e-2, cosine_min=0.995):
+def assert_tensor_close_by_norm(
+    reference,
+    actual,
+    *,
+    rtol=8e-2,
+    cosine_min=0.995,
+    max_abs=None,
+    label="tensor",
+):
     reference_flat = reference.detach().float().reshape(-1)
     actual_flat = actual.detach().float().reshape(-1)
     if reference_flat.shape != actual_flat.shape:
         raise AssertionError(
-            f"input-gradient shapes differ: {reference.shape} versus {actual.shape}"
+            f"{label} shapes differ: {reference.shape} versus {actual.shape}"
         )
     reference_norm = torch.linalg.vector_norm(reference_flat)
     actual_norm = torch.linalg.vector_norm(actual_flat)
-    difference_norm = torch.linalg.vector_norm(actual_flat - reference_flat)
+    difference = actual_flat - reference_flat
+    difference_norm = torch.linalg.vector_norm(difference)
     relative_l2 = (difference_norm / reference_norm.clamp_min(1e-24)).item()
     cosine = (
         torch.dot(reference_flat, actual_flat)
         / (reference_norm * actual_norm).clamp_min(1e-24)
     ).item()
-    if relative_l2 > rtol or cosine < cosine_min:
+    max_abs_diff = difference.abs().max().item() if difference.numel() else 0.0
+    if relative_l2 > rtol or cosine < cosine_min or (
+        max_abs is not None and max_abs_diff > max_abs
+    ):
         raise AssertionError(
-            f"input-gradient mismatch: relative_l2={relative_l2:.6e}, cosine={cosine:.9f}"
+            f"{label} mismatch: relative_l2={relative_l2:.6e} (limit {rtol:.6e}), "
+            f"cosine={cosine:.9f} (minimum {cosine_min:.9f}), "
+            f"max_abs={max_abs_diff:.6e}"
+            + ("" if max_abs is None else f" (limit {max_abs:.6e})")
         )
+    return relative_l2, cosine, max_abs_diff
+
+
+def assert_tensor_gradient_close(reference, actual, *, rtol=8e-2, cosine_min=0.995):
+    relative_l2, cosine, _ = assert_tensor_close_by_norm(
+        reference,
+        actual,
+        rtol=rtol,
+        cosine_min=cosine_min,
+        label="input-gradient",
+    )
     return relative_l2, cosine
