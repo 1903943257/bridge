@@ -53,7 +53,7 @@ def runtime():
 
 @contextmanager
 def _ring_probe():
-    import mindspeed.core.transformer.dot_product_attention as dpa
+    import mindspeed.core.context_parallel.dot_product_attention as dpa
 
     original = dpa.ringattn_context_parallel
     calls = []
