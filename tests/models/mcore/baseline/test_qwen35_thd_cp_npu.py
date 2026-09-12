@@ -9,9 +9,10 @@ Run this file twice from the verl repository root::
       -m pytest -s -v \
       tests/models/mcore/baseline/test_qwen35_thd_cp_npu.py
 
-The BSHD and THD passes use separate models with identical random parameters.
-This exercises verl preprocessing and postprocessing, all 24 hybrid layers,
-target-logprob loss, and complete parameter gradients without enabling TPR.
+The BSHD CP=1 reference and THD target use separate models with identical
+random parameters. This exercises verl preprocessing and postprocessing, all
+24 hybrid layers, target-logprob loss, and complete parameter gradients
+without enabling TPR.
 """
 
 from __future__ import annotations
@@ -138,6 +139,33 @@ def _ring_probe():
 
 
 @contextmanager
+def _parallel_state_cp_override(runtime, *, cp_size):
+    """Run a verl preprocessing helper with a model-local CP topology."""
+    if cp_size == runtime.world_size:
+        yield
+        return
+    if cp_size != 1:
+        raise ValueError(f"unsupported CP override: {cp_size}")
+
+    from megatron.core import parallel_state
+
+    originals = {
+        "world_size": parallel_state.get_context_parallel_world_size,
+        "rank": parallel_state.get_context_parallel_rank,
+        "group": parallel_state.get_context_parallel_group,
+    }
+    parallel_state.get_context_parallel_world_size = lambda: 1
+    parallel_state.get_context_parallel_rank = lambda: 0
+    parallel_state.get_context_parallel_group = lambda: runtime.tp_group
+    try:
+        yield
+    finally:
+        parallel_state.get_context_parallel_world_size = originals["world_size"]
+        parallel_state.get_context_parallel_rank = originals["rank"]
+        parallel_state.get_context_parallel_group = originals["group"]
+
+
+@contextmanager
 def _bshd_dense_attention_mask_mode(model, *, enabled):
     """Use general-mask FA mode for verl's explicit B1SS padding mask."""
     if not enabled:
@@ -201,7 +229,7 @@ def _bshd_dense_attention_mask_mode(model, *, enabled):
 
 
 @contextmanager
-def _verl_data_path_probe(input_ids):
+def _verl_data_path_probe(input_ids, *, runtime, bshd_cp_size):
     import verl.models.mcore.model_forward as model_forward
 
     originals = {
@@ -240,7 +268,8 @@ def _verl_data_path_probe(input_ids):
         return result
 
     def bshd_pre(*args, **kwargs):
-        result = originals["bshd_pre"](*args, **kwargs)
+        with _parallel_state_cp_override(runtime, cp_size=bshd_cp_size):
+            result = originals["bshd_pre"](*args, **kwargs)
         records["bshd_pre"] += 1
         if records["bshd_attention_mask_shape"] is None:
             records["bshd_attention_mask_shape"] = tuple(result[1].shape)
@@ -249,7 +278,8 @@ def _verl_data_path_probe(input_ids):
     def bshd_post(*args, **kwargs):
         records["bshd_post"] += 1
         input_value = args[0] if args else kwargs["output"]
-        result = originals["bshd_post"](*args, **kwargs)
+        with _parallel_state_cp_override(runtime, cp_size=bshd_cp_size):
+            result = originals["bshd_post"](*args, **kwargs)
         records["bshd_post_dtypes"].append((str(input_value.dtype), str(result.dtype)))
         return result
 
@@ -266,7 +296,7 @@ def _verl_data_path_probe(input_ids):
         model_forward.postprocess_bshd_engine = originals["bshd_post"]
 
 
-def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
+def _run_engine_path(model, input_ids, *, use_remove_padding, model_cp_size, runtime):
     import verl.models.mcore.model_forward as model_forward
 
     data_format = "thd" if use_remove_padding else "bshd"
@@ -275,7 +305,11 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
         model,
         enabled=not use_remove_padding,
     ) as mask_mode:
-        with _verl_data_path_probe(input_ids) as path_probe:
+        with _verl_data_path_probe(
+            input_ids,
+            runtime=runtime,
+            bshd_cp_size=model_cp_size,
+        ) as path_probe:
             if mask_mode is not None:
                 path_probe["bshd_fa_sparse_mode"] = mask_mode["sparse_mode"]
                 path_probe["bshd_fa_attention_mask_type"] = mask_mode["attention_mask_type"]
@@ -337,7 +371,7 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
     # that consult runtime config in addition to their saved autograd context.
     with _bshd_dense_attention_mask_mode(model, enabled=not use_remove_padding):
         loss.backward()
-    if runtime.world_size > 1:
+    if model_cp_size > 1:
         allreduce_parameter_gradients(model, runtime.cp_group)
     return {
         "target_logprob": valid_target_logprob.detach().clone(),
@@ -351,7 +385,7 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
 
 def test_complete_qwen35_thd_matches_bshd(runtime):
     torch.manual_seed(354001)
-    bshd_model = make_qwen35_model(runtime, cp_size=runtime.world_size)
+    bshd_model = make_qwen35_model(runtime, cp_size=1)
     broadcast_module_state(bshd_model, src=0)
     assert_hybrid_architecture(bshd_model)
     torch.manual_seed(354002)
@@ -363,12 +397,17 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
 
     input_ids = _nested_tokens(runtime.device)
     with bind_stage1_gdn_primitives(mindspeed_gdn, bshd_model, thd_model) as binding:
-        bshd = _run_engine_path(
-            bshd_model,
-            input_ids,
-            use_remove_padding=False,
-            runtime=runtime,
-        )
+        with (
+            AllToAllProbe(mindspeed_gdn) as reference_a2a_probe,
+            _ring_probe() as reference_ring_calls,
+        ):
+            bshd = _run_engine_path(
+                bshd_model,
+                input_ids,
+                use_remove_padding=False,
+                model_cp_size=1,
+                runtime=runtime,
+            )
         with (
             _packed_layer_probe(thd_model) as packed_calls,
             AllToAllProbe(mindspeed_gdn) as a2a_probe,
@@ -378,8 +417,15 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
                 thd_model,
                 input_ids,
                 use_remove_padding=True,
+                model_cp_size=runtime.world_size,
                 runtime=runtime,
             )
+
+    if reference_a2a_probe.calls or reference_ring_calls:
+        raise AssertionError(
+            "CP=1 BSHD reference unexpectedly entered a CP communication kernel: "
+            f"A2A={reference_a2a_probe.calls}, Ring={len(reference_ring_calls)}"
+        )
 
     if sorted(packed_calls["gdn"]) != [layer.layer_number for layer in gdn_layers]:
         raise AssertionError(f"not every GDN received PackedSeqParams: {packed_calls['gdn']}")
@@ -447,6 +493,7 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
             f"\n  causal-conv backend: {binding['causal_conv']}"
             f"\n  gated-delta backend: {binding['gated_delta_rule']}"
             f"\n  PackedSeqParams calls: GDN={len(packed_calls['gdn'])}, FA={len(packed_calls['fa'])}"
+            "\n  CP=1 BSHD reference communication: A2A=0, Ring=0"
             f"\n  GDN A2A calls: cp2hp={a2a_probe.count('cp2hp')}, hp2cp={a2a_probe.count('hp2cp')}"
             f"\n  Full-Attention Ring calls: {len(ring_calls)}"
             f"\n  actual/padded cu_seqlens: {metadata.actual_cu_seqlens}/{metadata.padded_cu_seqlens}"
