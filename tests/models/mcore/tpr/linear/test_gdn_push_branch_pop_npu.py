@@ -32,7 +32,9 @@ from torch import Tensor, nn
 
 from verl.utils.device import is_torch_npu_available
 
-from ...baseline._qwen35_baseline_utils import (
+# pytest imports this file as tpr.linear.* and adds tests/models/mcore to
+# sys.path: baseline is a sibling top-level package, not a parent of tpr.
+from baseline._qwen35_baseline_utils import (
     DTYPE,
     HIDDEN_SIZE,
     assert_gradient_maps_close,
