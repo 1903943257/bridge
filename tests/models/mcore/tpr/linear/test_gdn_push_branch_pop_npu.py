@@ -24,9 +24,14 @@ TPR path saves graph-free state for P, visits both siblings from independent
 anchors, sums dConv/dRecurrent, then recomputes P and applies the summed VJP.
 Diagnostics also compare full repeat, shared-prefix connected splitting, and
 independent connected splitting (a fresh P graph and backward per branch).
+Single-path operator probes compare real full/split activations and gradients
+at projection, causal-conv and GDR boundaries before the original assertions.
 """
 
 from __future__ import annotations
+
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -243,6 +248,133 @@ def _diagnostic_pass(model, prefix, suffixes, prefix_target, suffix_targets, den
         "states": state_gradients,
         "loss": loss_value,
     }
+
+
+@contextmanager
+def _operator_boundary_probe(model):
+    """Retain actual seam tensors; wrappers neither replace nor detach computation."""
+    import verl.models.mcore.tpr.gated_delta_net as gdn_seam
+
+    records = {}
+
+    def capture(name, tensor, sequence_dim):
+        if name in records:
+            raise AssertionError(f"duplicate operator boundary: {name}")
+        if not tensor.requires_grad:
+            raise AssertionError(f"operator boundary has no autograd graph: {name}")
+        tensor.retain_grad()
+        records[name] = (tensor, sequence_dim)
+
+    original_conv = gdn_seam._stage1_causal_conv1d
+    original_gdr = gdn_seam._stage1_gated_delta_rule
+
+    def conv(x, *args, **kwargs):
+        capture("conv.input", x, 1)
+        output, state = original_conv(x, *args, **kwargs)
+        capture("conv.output", output, 1)
+        return output, state
+
+    def gdr(query, key, value, *, g, beta, initial_state):
+        for name, tensor in (("q", query), ("k", key), ("v", value), ("g", g), ("beta", beta)):
+            capture(f"gdr.{name}", tensor, 1)
+        output, state = original_gdr(query, key, value, g=g, beta=beta, initial_state=initial_state)
+        capture("gdr.output", output, 1)
+        return output, state
+
+    def in_proj_hook(_module, _args, output):
+        capture("in_proj.output", output[0], 0)
+
+    def out_proj_pre_hook(_module, args):
+        capture("out_proj.input", args[0], 0)
+
+    def out_proj_hook(_module, _args, output):
+        capture("out_proj.output", output[0], 0)
+
+    handles = []
+    try:
+        handles.append(model.in_proj.register_forward_hook(in_proj_hook))
+        handles.append(model.out_proj.register_forward_pre_hook(out_proj_pre_hook))
+        handles.append(model.out_proj.register_forward_hook(out_proj_hook))
+        with patch.object(gdn_seam, "_stage1_causal_conv1d", conv), patch.object(
+            gdn_seam, "_stage1_gated_delta_rule", gdr
+        ):
+            yield records
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _boundary_snapshot(records):
+    snapshot = {}
+    for name, (tensor, sequence_dim) in records.items():
+        if tensor.grad is None:
+            raise AssertionError(f"operator boundary gradient is missing: {name}")
+        # Store sequence-first snapshots for consistent prefix/suffix slicing.
+        snapshot[name] = {
+            "value": tensor.detach().movedim(sequence_dim, 0).clone(),
+            "grad": tensor.grad.detach().movedim(sequence_dim, 0).clone(),
+        }
+    return snapshot
+
+
+def _diagnose_operator_boundaries(model, prefix, suffix, prefix_target, suffix_target, denominator):
+    """Single P+S1 path: full vs connected split, using the actual GDN inputs."""
+    snapshots = {}
+    for mode in ("full", "split"):
+        model.zero_grad(set_to_none=True)
+        prefix_input = prefix.detach().clone().requires_grad_(True)
+        suffix_input = suffix.detach().clone().requires_grad_(True)
+        if mode == "full":
+            with _operator_boundary_probe(model) as full_records:
+                output, _ = _run_segment(
+                    model, torch.cat((prefix_input, suffix_input)), prefix_length=0
+                )
+            prefix_output, suffix_output = output[:prefix.shape[0]], output[prefix.shape[0]:]
+        else:
+            with _operator_boundary_probe(model) as prefix_records:
+                prefix_output, state = _run_segment(model, prefix_input, prefix_length=0)
+            with _operator_boundary_probe(model) as suffix_records:
+                suffix_output, _ = _run_segment(
+                    model, suffix_input, prefix_length=prefix.shape[0],
+                    initial_states={_GDN_LAYER_NUMBER: state},
+                )
+        loss = _loss_part(prefix_output, prefix_target, denominator=denominator)
+        loss = loss + _loss_part(suffix_output, suffix_target, denominator=denominator)
+        loss.backward()
+        print(f"STAGE-3.2 OPERATOR {mode}/P+S1 loss={loss.detach().item():.9f}", flush=True)
+        if mode == "full":
+            snapshots[mode] = _boundary_snapshot(full_records)
+        else:
+            left, right = _boundary_snapshot(prefix_records), _boundary_snapshot(suffix_records)
+            assert left.keys() == right.keys()
+            snapshots[mode] = {
+                name: {kind: torch.cat((left[name][kind], right[name][kind])) for kind in ("value", "grad")}
+                for name in left
+            }
+        snapshots[mode]["hidden.input"] = {
+            "value": torch.cat((prefix_input.detach(), suffix_input.detach())),
+            "grad": torch.cat((prefix_input.grad.detach(), suffix_input.grad.detach())),
+        }
+    assert snapshots["full"].keys() == snapshots["split"].keys()
+    # Read gradient diagnostics from the loss side towards the model input.
+    backward_order = (
+        "out_proj.output", "out_proj.input", "gdr.output", "gdr.q", "gdr.k",
+        "gdr.v", "gdr.g", "gdr.beta", "conv.output", "conv.input", "in_proj.output", "hidden.input",
+    )
+    for name in backward_order:
+        for kind in ("value", "grad"):
+            reference, actual = snapshots["full"][name][kind], snapshots["split"][name][kind]
+            if reference.shape != actual.shape:
+                raise AssertionError(f"{name}/{kind}: full/split shapes differ")
+            print(
+                f"STAGE-3.2 OPERATOR {name}/{kind} shape={tuple(reference.shape)} "
+                f"dtype={reference.dtype}/{actual.dtype}", flush=True,
+            )
+            for segment, start, end in (("P", 0, prefix.shape[0]), ("S1", prefix.shape[0], reference.shape[0])):
+                _print_comparison(
+                    f"operator-full-vs-split/{name}/{kind}/{segment}",
+                    {name: reference[start:end]}, {name: actual[start:end]},
+                )
 
 
 def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
@@ -487,6 +619,11 @@ def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
     _print_comparison(
         "independent-split-vs-connected-split/parameters",
         independent["parameters"], shared["parameters"],
+    )
+
+    _diagnose_operator_boundaries(
+        reference_model, prefix_reference, suffix_references[0], prefix_target,
+        suffix_targets[0], denominator,
     )
 
     prefix_input_metrics = _assert_gradient_tensor(
