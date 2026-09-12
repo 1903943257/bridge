@@ -39,6 +39,7 @@ from baseline._qwen35_baseline_utils import (
     HIDDEN_SIZE,
     assert_gradient_maps_close,
     destroy_npu_runtime,
+    gradient_map_diagnostics,
     initialize_npu_runtime,
     process_groups,
     qwen35_config,
@@ -157,6 +158,66 @@ def _assert_finite_nonzero(tensor: Tensor, *, label: str) -> None:
         raise AssertionError(f"{label} contains NaN/Inf")
     if torch.count_nonzero(tensor).item() == 0:
         raise AssertionError(f"{label} is unexpectedly all zero")
+
+
+def _print_comparison(label, reference, actual):
+    for name in reference:
+        for tensor in (reference[name], actual[name]):
+            if tensor is None or not torch.isfinite(tensor).all().item():
+                raise AssertionError(f"{label}/{name}: missing or non-finite tensor")
+    diagnostic = gradient_map_diagnostics(reference, actual)
+    metrics = diagnostic.aggregate
+    print(
+        f"STAGE-3.2 DIAGNOSTIC {label}: "
+        f"ref_norm={metrics.reference_norm:.6e}, actual_norm={metrics.actual_norm:.6e}, "
+        f"norm_ratio={metrics.norm_ratio:.9f}, absolute_l2={metrics.absolute_l2:.6e}, "
+        f"relative_l2={metrics.relative_l2:.6e}, cosine={metrics.cosine:.9f}, "
+        f"worst={diagnostic.worst_name}:{diagnostic.worst.relative_l2:.6e}",
+        flush=True,
+    )
+
+
+def _diagnostic_pass(model, prefix, suffixes, prefix_target, suffix_targets, denominator, *, connected):
+    """Same weights/inputs; compare full repeat against graph-connected splitting."""
+    model.zero_grad(set_to_none=True)
+    prefix = prefix.detach().clone().requires_grad_(True)
+    suffixes = tuple(value.detach().clone().requires_grad_(True) for value in suffixes)
+    state_gradients = {}
+    loss_value = 0.0
+    if connected:
+        prefix_output, state = _run_segment(model, prefix, prefix_length=0)
+        state.conv_state.retain_grad()
+        state.recurrent_state.retain_grad()
+        # Shared prefix loss has exactly the same multiplicity as the two paths.
+        loss = 2.0 * _loss_part(prefix_output, prefix_target, denominator=denominator)
+        for suffix, target in zip(suffixes, suffix_targets, strict=True):
+            output, _ = _run_segment(
+                model, suffix, prefix_length=prefix.shape[0],
+                initial_states={_GDN_LAYER_NUMBER: state},
+            )
+            loss = loss + _loss_part(output, target, denominator=denominator)
+        loss.backward()
+        loss_value = loss.detach().item()
+        state_gradients = {
+            "conv": state.conv_state.grad.detach().clone(),
+            "recurrent": state.recurrent_state.grad.detach().clone(),
+        }
+    else:
+        for suffix, target in zip(suffixes, suffix_targets, strict=True):
+            output, _ = _run_segment(model, torch.cat((prefix, suffix)), prefix_length=0)
+            loss = _loss_part(output[:prefix.shape[0]], prefix_target, denominator=denominator)
+            loss = loss + _loss_part(output[prefix.shape[0]:], target, denominator=denominator)
+            loss.backward()
+            loss_value += loss.detach().item()
+    return {
+        "inputs": {
+            "prefix": prefix.grad.detach().clone(),
+            **{f"S{i}": value.grad.detach().clone() for i, value in enumerate(suffixes, 1)},
+        },
+        "parameters": _parameter_gradients(model),
+        "states": state_gradients,
+        "loss": loss_value,
+    }
 
 
 def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
@@ -345,6 +406,51 @@ def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
     )
     torch.testing.assert_close(tpr_loss, reference_loss, atol=2e-3, rtol=2e-3)
 
+    # Preserve the original comparison before reusing reference_model for controls.
+    tpr_gradients = _parameter_gradients(tpr_model)
+    materialized_inputs = {
+        "prefix": prefix_reference.grad.detach().clone(),
+        **{f"S{i}": value.grad.detach().clone() for i, value in enumerate(suffix_references, 1)},
+    }
+    tpr_inputs = {
+        "prefix": prefix_tpr.grad.detach().clone(),
+        **{f"S{i}": value.grad.detach().clone() for i, value in enumerate(suffix_tpr, 1)},
+    }
+    for name in materialized_inputs:
+        _print_comparison(
+            f"materialized-vs-TPR/{name}", {name: materialized_inputs[name]}, {name: tpr_inputs[name]}
+        )
+    _print_comparison("materialized-vs-TPR/parameters", reference_gradients, tpr_gradients)
+    for connected in (False, True):
+        control = _diagnostic_pass(
+            reference_model, prefix_reference, suffix_references, prefix_target,
+            suffix_targets, denominator, connected=connected,
+        )
+        label = "connected-split" if connected else "full-repeat"
+        print(f"STAGE-3.2 DIAGNOSTIC {label} loss={control['loss']:.9f}", flush=True)
+        for name in materialized_inputs:
+            _print_comparison(
+                f"materialized-vs-{label}/{name}",
+                {name: materialized_inputs[name]}, {name: control["inputs"][name]},
+            )
+        _print_comparison(f"materialized-vs-{label}/parameters", reference_gradients, control["parameters"])
+        if connected:
+            for name in tpr_inputs:
+                _print_comparison(
+                    f"connected-split-vs-TPR/{name}",
+                    {name: control["inputs"][name]}, {name: tpr_inputs[name]},
+                )
+            _print_comparison("connected-split-vs-TPR/parameters", control["parameters"], tpr_gradients)
+            for name, gradient in (
+                ("conv", relayed_gradient.conv_state),
+                ("recurrent", relayed_gradient.recurrent_state),
+            ):
+                print(f"STAGE-3.2 DIAGNOSTIC {name} state-gradient dtype={gradient.dtype}", flush=True)
+                _print_comparison(
+                    f"connected-split-vs-TPR/dState/{name}",
+                    {name: control["states"][name]}, {name: gradient},
+                )
+
     prefix_input_metrics = _assert_gradient_tensor(
         prefix_reference.grad,
         prefix_tpr.grad,
@@ -359,7 +465,7 @@ def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
     )
     parameter_metrics = assert_gradient_maps_close(
         reference_gradients,
-        _parameter_gradients(tpr_model),
+        tpr_gradients,
         rtol=_GRAD_RELATIVE_L2_TOL,
         cosine_min=_GRAD_COSINE_MIN,
     )
