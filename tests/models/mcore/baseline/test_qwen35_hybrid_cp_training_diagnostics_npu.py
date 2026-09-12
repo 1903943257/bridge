@@ -198,6 +198,16 @@ class PairStepResult:
     communication: tuple[int, int, int]
 
 
+@dataclass(frozen=True)
+class TrajectorySeparationMetrics:
+    cp1_displacement: float
+    cp2_displacement: float
+    separation: float
+    separation_over_cp1: float
+    separation_over_cp2: float
+    displacement_cosine: float
+
+
 def _forward_backward_pair(runtime, reference, actual, batch, *, step):
     import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
 
@@ -327,6 +337,70 @@ class _FP32MasterSGD:
         return math.sqrt(update_squared.item())
 
 
+@torch.no_grad()
+def _trajectory_separation_metrics(theta0, cp1_parameters, cp2_parameters):
+    if theta0.keys() != cp1_parameters.keys() or theta0.keys() != cp2_parameters.keys():
+        raise AssertionError("FP32 master parameter sets differ")
+    if not theta0:
+        raise AssertionError("cannot measure an empty FP32 master trajectory")
+
+    first = next(iter(theta0.values()))
+    cp1_squared = torch.zeros((), device=first.device, dtype=torch.float32)
+    cp2_squared = torch.zeros_like(cp1_squared)
+    separation_squared = torch.zeros_like(cp1_squared)
+    displacement_dot = torch.zeros_like(cp1_squared)
+    for name in theta0:
+        initial_flat = theta0[name].reshape(-1)
+        cp1_flat = cp1_parameters[name].reshape(-1)
+        cp2_flat = cp2_parameters[name].reshape(-1)
+        if initial_flat.shape != cp1_flat.shape or initial_flat.shape != cp2_flat.shape:
+            raise AssertionError(f"FP32 master shape mismatch for {name}")
+        for start in range(0, initial_flat.numel(), _UPDATE_CHUNK_ELEMENTS):
+            end = min(start + _UPDATE_CHUNK_ELEMENTS, initial_flat.numel())
+            initial_chunk = initial_flat[start:end]
+            cp1_delta = cp1_flat[start:end] - initial_chunk
+            cp2_delta = cp2_flat[start:end] - initial_chunk
+            separation = cp2_flat[start:end] - cp1_flat[start:end]
+            cp1_squared.add_(cp1_delta.square().sum())
+            cp2_squared.add_(cp2_delta.square().sum())
+            separation_squared.add_(separation.square().sum())
+            displacement_dot.add_(torch.dot(cp1_delta, cp2_delta))
+
+    cp1_displacement = math.sqrt(cp1_squared.item())
+    cp2_displacement = math.sqrt(cp2_squared.item())
+    separation = math.sqrt(separation_squared.item())
+    separation_over_cp1 = separation / max(cp1_displacement, 1e-24)
+    separation_over_cp2 = separation / max(cp2_displacement, 1e-24)
+    if cp1_displacement == 0.0 and cp2_displacement == 0.0:
+        displacement_cosine = 1.0
+    elif cp1_displacement == 0.0 or cp2_displacement == 0.0:
+        displacement_cosine = 0.0
+    else:
+        displacement_cosine = displacement_dot.item() / (
+            cp1_displacement * cp2_displacement
+        )
+        displacement_cosine = max(-1.0, min(1.0, displacement_cosine))
+    return TrajectorySeparationMetrics(
+        cp1_displacement=cp1_displacement,
+        cp2_displacement=cp2_displacement,
+        separation=separation,
+        separation_over_cp1=separation_over_cp1,
+        separation_over_cp2=separation_over_cp2,
+        displacement_cosine=displacement_cosine,
+    )
+
+
+def _format_trajectory_separation(metrics):
+    return (
+        f"cp1_displacement={metrics.cp1_displacement:.6e}, "
+        f"cp2_displacement={metrics.cp2_displacement:.6e}, "
+        f"separation={metrics.separation:.6e}, "
+        f"separation/cp1={metrics.separation_over_cp1:.6e}, "
+        f"separation/cp2={metrics.separation_over_cp2:.6e}, "
+        f"displacement_cosine={metrics.displacement_cosine:.9f}"
+    )
+
+
 def _multibatch_tokens(device, *, step):
     positions = torch.arange(SEQUENCE_LENGTH, device=device, dtype=torch.long)
     tokens = (
@@ -448,6 +522,10 @@ def test_twenty_step_realistic_multibatch_fp32_master_sgd(runtime):
     reference, actual = _make_model_pair(runtime, seed=358001)
     reference_optimizer = _FP32MasterSGD(reference, learning_rate=_LEARNING_RATE)
     actual_optimizer = _FP32MasterSGD(actual, learning_rate=_LEARNING_RATE)
+    theta0 = {
+        name: master.detach().clone()
+        for name, master in reference_optimizer.state_map().items()
+    }
     loss_relatives = []
     gradient_ratios = []
     update_ratios = []
@@ -479,6 +557,7 @@ def test_twenty_step_realistic_multibatch_fp32_master_sgd(runtime):
 
         parameter_metrics = None
         master_metrics = None
+        separation_metrics = None
         if step in _CHECKPOINT_STEPS:
             parameter_metrics = gradient_map_diagnostics(
                 _tensor_map(reference, gradients=False),
@@ -488,6 +567,11 @@ def test_twenty_step_realistic_multibatch_fp32_master_sgd(runtime):
                 reference_optimizer.state_map(),
                 actual_optimizer.state_map(),
             ).aggregate
+            separation_metrics = _trajectory_separation_metrics(
+                theta0,
+                reference_optimizer.state_map(),
+                actual_optimizer.state_map(),
+            )
             _assert_metrics_finite(
                 parameter_metrics,
                 label="BF16 parameters",
@@ -498,7 +582,21 @@ def test_twenty_step_realistic_multibatch_fp32_master_sgd(runtime):
                 label="FP32 master parameters",
                 step=step,
             )
-            checkpoint_metrics[step] = (parameter_metrics, master_metrics, result.gradient_metrics)
+            for label, value in (
+                ("CP1 displacement", separation_metrics.cp1_displacement),
+                ("CP2 displacement", separation_metrics.cp2_displacement),
+                ("trajectory separation", separation_metrics.separation),
+                ("separation/CP1 displacement", separation_metrics.separation_over_cp1),
+                ("separation/CP2 displacement", separation_metrics.separation_over_cp2),
+                ("training displacement cosine", separation_metrics.displacement_cosine),
+            ):
+                _assert_finite(value, label=label, step=step)
+            checkpoint_metrics[step] = (
+                parameter_metrics,
+                master_metrics,
+                result.gradient_metrics,
+                separation_metrics,
+            )
 
         if runtime.rank == 0:
             print(
@@ -517,13 +615,43 @@ def test_twenty_step_realistic_multibatch_fp32_master_sgd(runtime):
                     f"{_format_metrics(parameter_metrics)}"
                     f"\n  checkpoint {step} FP32 masters: "
                     f"{_format_metrics(master_metrics)}"
+                    f"\n  checkpoint {step} trajectory separation: "
+                    f"{_format_trajectory_separation(separation_metrics)}"
                 )
 
-    final_parameter_metrics, final_master_metrics, final_gradient_metrics = checkpoint_metrics[_STEPS]
+    (
+        final_parameter_metrics,
+        final_master_metrics,
+        final_gradient_metrics,
+        final_separation_metrics,
+    ) = checkpoint_metrics[_STEPS]
     mean_reference_loss = reference_loss_sum / _STEPS
     mean_actual_loss = actual_loss_sum / _STEPS
     mean_loss_relative = _relative_difference(mean_actual_loss, mean_reference_loss)
+    separation_over_cp1 = [
+        checkpoint_metrics[step][3].separation_over_cp1
+        for step in sorted(_CHECKPOINT_STEPS)
+    ]
+    separation_over_cp2 = [
+        checkpoint_metrics[step][3].separation_over_cp2
+        for step in sorted(_CHECKPOINT_STEPS)
+    ]
+    cp1_ratio_monotonic = all(
+        right >= left for left, right in zip(separation_over_cp1, separation_over_cp1[1:])
+    )
+    cp2_ratio_monotonic = all(
+        right >= left for left, right in zip(separation_over_cp2, separation_over_cp2[1:])
+    )
     if runtime.rank == 0:
+        checkpoint_table = "".join(
+            "\n  "
+            f"{step:>2} | {metrics.cp1_displacement:.6e} | "
+            f"{metrics.cp2_displacement:.6e} | {metrics.separation:.6e} | "
+            f"{metrics.separation_over_cp1:.6e} | "
+            f"{metrics.separation_over_cp2:.6e} | "
+            f"{metrics.displacement_cosine:.9f}"
+            for step, (_, _, _, metrics) in sorted(checkpoint_metrics.items())
+        )
         print(
             "REALISTIC-MULTIBATCH 20-STEP RESULTS (THRESHOLD CALIBRATION)"
             f"\n  learning-rate/steps: {_LEARNING_RATE:.6e}/{_STEPS}"
@@ -536,5 +664,16 @@ def test_twenty_step_realistic_multibatch_fp32_master_sgd(runtime):
             f"\n  step20 BF16 parameters: {_format_metrics(final_parameter_metrics)}"
             f"\n  step20 FP32 masters: {_format_metrics(final_master_metrics)}"
             f"\n  step20 gradient: {_format_metrics(final_gradient_metrics)}"
+            f"\n  step20 trajectory separation: "
+            f"{_format_trajectory_separation(final_separation_metrics)}"
+            "\n  trajectory table:"
+            "\n  step | CP1 displacement | CP2 displacement | separation | "
+            "sep/CP1 | sep/CP2 | displacement cosine"
+            f"{checkpoint_table}"
+            f"\n  separation-ratio monotonic CP1/CP2: "
+            f"{cp1_ratio_monotonic}/{cp2_ratio_monotonic}"
+            f"\n  separation-ratio growth step1->20 CP1/CP2: "
+            f"{separation_over_cp1[-1] / max(separation_over_cp1[0], 1e-24):.6e}/"
+            f"{separation_over_cp2[-1] / max(separation_over_cp2[0], 1e-24):.6e}"
             "\n  numerical pass thresholds intentionally deferred until this first NPU run"
         )
