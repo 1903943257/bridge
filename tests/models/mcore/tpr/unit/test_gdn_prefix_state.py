@@ -20,8 +20,10 @@ from verl.models.mcore.tpr import GDNLayerState, GDNPrefixState
 
 def _layer_state(*, value=1.0, requires_grad=False):
     return GDNLayerState(
-        conv_state=torch.full((1, 12, 3), value, requires_grad=requires_grad),
-        recurrent_state=torch.full((1, 4, 8, 6), value + 10, requires_grad=requires_grad),
+        conv_state=torch.full((1, 12, 3), value, dtype=torch.float32, requires_grad=requires_grad),
+        recurrent_state=torch.full(
+            (1, 4, 8, 6), value + 10, dtype=torch.float32, requires_grad=requires_grad
+        ),
     )
 
 
