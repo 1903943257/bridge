@@ -203,7 +203,12 @@ def test_random_init_qwen35_hybrid_cp2_matches_cp1(runtime):
         label="output probe",
     )
     torch.testing.assert_close(cp_loss, reference_loss.detach(), atol=2e-2, rtol=2e-2)
-    assert_gradients_close(reference, actual)
+    parameter_gradient_metrics = assert_gradients_close(
+        reference,
+        actual,
+        rtol=1e-1,
+        cosine_min=0.995,
+    )
     input_gradient_metrics = assert_tensor_gradient_close(
         reference_input_gradient,
         global_input_gradient,
@@ -244,4 +249,8 @@ def test_random_init_qwen35_hybrid_cp2_matches_cp1(runtime):
             f"{output_metrics[0]:.6e}/{output_metrics[1]:.9f}/{output_metrics[2]:.6e}"
             f"\n  loss CP1/CP2: {reference_loss.item():.8f}/{cp_loss.item():.8f}"
             f"\n  input-grad rel/cos: {input_gradient_metrics[0]:.6e}/{input_gradient_metrics[1]:.9f}"
+            f"\n  parameter-grad rel/cos: "
+            f"{parameter_gradient_metrics[0]:.6e}/{parameter_gradient_metrics[1]:.9f}"
+            f"\n  worst parameter gradient: {parameter_gradient_metrics[2][1]}:"
+            f"{parameter_gradient_metrics[2][0]:.6e}"
         )
