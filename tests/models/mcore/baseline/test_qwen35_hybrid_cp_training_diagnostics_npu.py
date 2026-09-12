@@ -20,7 +20,16 @@ hard-fails only on non-finite values or an invalid communication contract::
       tests/models/mcore/baseline/test_qwen35_hybrid_cp_training_diagnostics_npu.py \
       -k realistic_multibatch
 
-Neither experiment changes Megatron, MindSpeed, or MindSpeed-Ops kernels.
+Experiment 3 repeats the second experiment as CP1-A versus CP1-B, providing a
+20-step repeatability floor for the same deterministic batches and optimizer::
+
+    STAGE34_RUN_CP1_REPEATABILITY=1 \
+      torchrun --master_addr=127.0.0.1 --master_port=29560 \
+      --nproc_per_node=2 -m pytest -s -v \
+      tests/models/mcore/baseline/test_qwen35_hybrid_cp_training_diagnostics_npu.py \
+      -k cp1_multistep_repeatability
+
+None of these experiments changes Megatron, MindSpeed, or MindSpeed-Ops kernels.
 """
 
 from __future__ import annotations
@@ -174,6 +183,21 @@ def _make_model_pair(runtime, *, seed):
     return reference, actual
 
 
+def _make_cp1_repeat_pair(runtime, *, seed):
+    torch.manual_seed(seed)
+    first = make_qwen35_model(runtime, cp_size=1)
+    broadcast_module_state(first, src=0)
+    first_gdn, first_fa = assert_hybrid_architecture(first)
+
+    torch.manual_seed(seed + 1)
+    second = make_qwen35_model(runtime, cp_size=1)
+    second.load_state_dict(first.state_dict(), strict=True)
+    second_gdn, second_fa = assert_hybrid_architecture(second)
+    if (len(first_gdn), len(first_fa), len(second_gdn), len(second_fa)) != (18, 6, 18, 6):
+        raise AssertionError("expected both CP1 models to contain 18 GDN and 6 Full-Attention layers")
+    return first, second
+
+
 def _local_cp_batch(runtime, tokens, positions, labels, valid):
     indices = zigzag_indices(
         SEQUENCE_LENGTH,
@@ -279,6 +303,69 @@ def _forward_backward_pair(runtime, reference, actual, batch, *, step):
         ("loss relative difference", result.loss_relative_difference),
         ("CP1 gradient norm", gradient_metrics.reference_norm),
         ("CP2 gradient norm", gradient_metrics.actual_norm),
+        ("gradient norm ratio", gradient_metrics.norm_ratio),
+        ("gradient relative L2", gradient_metrics.relative_l2),
+        ("gradient cosine", gradient_metrics.cosine),
+    ):
+        _assert_finite(value, label=label, step=step)
+    return result
+
+
+def _forward_backward_cp1_repeat(first, second, batch, *, step):
+    import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
+
+    tokens, positions, labels, valid = batch
+    first.zero_grad(set_to_none=True)
+    with (
+        AllToAllProbe(mindspeed_gdn) as first_a2a,
+        _ring_probe() as first_ring,
+    ):
+        first_logits = first(
+            input_ids=tokens,
+            position_ids=positions,
+            attention_mask=None,
+        )
+        _, first_loss = selected_output_and_loss(first_logits, labels, valid)
+        first_loss.backward()
+
+    second.zero_grad(set_to_none=True)
+    with (
+        AllToAllProbe(mindspeed_gdn) as second_a2a,
+        _ring_probe() as second_ring,
+    ):
+        second_logits = second(
+            input_ids=tokens,
+            position_ids=positions,
+            attention_mask=None,
+        )
+        _, second_loss = selected_output_and_loss(second_logits, labels, valid)
+        second_loss.backward()
+
+    if first_a2a.calls or first_ring or second_a2a.calls or second_ring:
+        raise AssertionError(
+            f"step {step}: CP1 repeat unexpectedly used communication: "
+            f"A A2A/Ring={len(first_a2a.calls)}/{len(first_ring)}, "
+            f"B A2A/Ring={len(second_a2a.calls)}/{len(second_ring)}"
+        )
+    gradient_metrics = gradient_map_diagnostics(
+        _tensor_map(first, gradients=True),
+        _tensor_map(second, gradients=True),
+    ).aggregate
+    first_loss_float = first_loss.detach().item()
+    second_loss_float = second_loss.detach().item()
+    result = PairStepResult(
+        reference_loss=first_loss_float,
+        actual_loss=second_loss_float,
+        loss_relative_difference=_relative_difference(second_loss_float, first_loss_float),
+        gradient_metrics=gradient_metrics,
+        communication=(0, 0, 0),
+    )
+    for label, value in (
+        ("CP1-A loss", result.reference_loss),
+        ("CP1-B loss", result.actual_loss),
+        ("loss relative difference", result.loss_relative_difference),
+        ("CP1-A gradient norm", gradient_metrics.reference_norm),
+        ("CP1-B gradient norm", gradient_metrics.actual_norm),
         ("gradient norm ratio", gradient_metrics.norm_ratio),
         ("gradient relative L2", gradient_metrics.relative_l2),
         ("gradient cosine", gradient_metrics.cosine),
@@ -675,5 +762,113 @@ def test_twenty_step_realistic_multibatch_fp32_master_sgd(runtime):
             f"\n  separation-ratio growth step1->20 CP1/CP2: "
             f"{separation_over_cp1[-1] / max(separation_over_cp1[0], 1e-24):.6e}/"
             f"{separation_over_cp2[-1] / max(separation_over_cp2[0], 1e-24):.6e}"
+            "\n  numerical pass thresholds intentionally deferred until this first NPU run"
+        )
+
+
+@pytest.mark.skipif(
+    os.getenv("STAGE34_RUN_CP1_REPEATABILITY") != "1",
+    reason="set STAGE34_RUN_CP1_REPEATABILITY=1 for this 20-step baseline",
+)
+def test_cp1_multistep_repeatability_fp32_master_sgd(runtime):
+    """Measure the CP1-vs-CP1 repeatability floor over the same 20 steps."""
+    if _LEARNING_RATE <= 0.0:
+        raise AssertionError("STAGE34_TRAINING_DIAGNOSTIC_LR must be positive")
+
+    first, second = _make_cp1_repeat_pair(runtime, seed=358001)
+    first_optimizer = _FP32MasterSGD(first, learning_rate=_LEARNING_RATE)
+    second_optimizer = _FP32MasterSGD(second, learning_rate=_LEARNING_RATE)
+    theta0 = {
+        name: master.detach().clone()
+        for name, master in first_optimizer.state_map().items()
+    }
+    loss_relatives = []
+    gradient_cosines = []
+    update_ratios = []
+    checkpoint_metrics = {}
+    first_loss_sum = 0.0
+    second_loss_sum = 0.0
+
+    for step in range(1, _STEPS + 1):
+        batch = _multibatch_tokens(runtime.device, step=step)
+        result = _forward_backward_cp1_repeat(
+            first,
+            second,
+            batch,
+            step=step,
+        )
+        first_update_norm = first_optimizer.step()
+        second_update_norm = second_optimizer.step()
+        update_ratio = second_update_norm / max(first_update_norm, 1e-24)
+        _assert_finite(first_update_norm, label="CP1-A FP32-master update norm", step=step)
+        _assert_finite(second_update_norm, label="CP1-B FP32-master update norm", step=step)
+        _assert_finite(update_ratio, label="FP32-master update norm ratio", step=step)
+
+        first_loss_sum += result.reference_loss
+        second_loss_sum += result.actual_loss
+        loss_relatives.append(result.loss_relative_difference)
+        gradient_cosines.append(result.gradient_metrics.cosine)
+        update_ratios.append(update_ratio)
+
+        separation_metrics = None
+        if step in _CHECKPOINT_STEPS:
+            separation_metrics = _trajectory_separation_metrics(
+                theta0,
+                first_optimizer.state_map(),
+                second_optimizer.state_map(),
+            )
+            for label, value in (
+                ("CP1-A displacement", separation_metrics.cp1_displacement),
+                ("CP1-B displacement", separation_metrics.cp2_displacement),
+                ("trajectory separation", separation_metrics.separation),
+                ("separation/CP1-A displacement", separation_metrics.separation_over_cp1),
+                ("separation/CP1-B displacement", separation_metrics.separation_over_cp2),
+                ("training displacement cosine", separation_metrics.displacement_cosine),
+            ):
+                _assert_finite(value, label=label, step=step)
+            checkpoint_metrics[step] = (separation_metrics, result.gradient_metrics)
+
+        if runtime.rank == 0:
+            print(
+                f"CP1-REPEATABILITY step={step:02d}"
+                f"\n  loss A/B/relative: {result.reference_loss:.9f}/"
+                f"{result.actual_loss:.9f}/{result.loss_relative_difference:.6e}"
+                f"\n  gradient: {_format_metrics(result.gradient_metrics)}"
+                f"\n  FP32-master update norm A/B/ratio: "
+                f"{first_update_norm:.6e}/{second_update_norm:.6e}/{update_ratio:.9f}"
+                "\n  communication A/B: A2A=0, Ring=0"
+            )
+            if separation_metrics is not None:
+                print(
+                    f"  checkpoint {step} trajectory separation: "
+                    f"{_format_trajectory_separation(separation_metrics)}"
+                )
+
+    mean_first_loss = first_loss_sum / _STEPS
+    mean_second_loss = second_loss_sum / _STEPS
+    mean_loss_relative = _relative_difference(mean_second_loss, mean_first_loss)
+    if runtime.rank == 0:
+        checkpoint_table = "".join(
+            "\n  "
+            f"{step:>2} | {metrics.cp1_displacement:.6e} | "
+            f"{metrics.cp2_displacement:.6e} | {metrics.separation:.6e} | "
+            f"{metrics.separation_over_cp1:.6e} | "
+            f"{metrics.separation_over_cp2:.6e} | "
+            f"{metrics.displacement_cosine:.9f}"
+            for step, (metrics, _) in sorted(checkpoint_metrics.items())
+        )
+        print(
+            "CP1-VS-CP1 20-STEP REPEATABILITY RESULTS"
+            f"\n  learning-rate/steps: {_LEARNING_RATE:.6e}/{_STEPS}"
+            f"\n  mean loss A/B/relative: "
+            f"{mean_first_loss:.9f}/{mean_second_loss:.9f}/{mean_loss_relative:.6e}"
+            f"\n  max per-step loss relative difference: {max(loss_relatives):.6e}"
+            f"\n  gradient cosine min/max: "
+            f"{min(gradient_cosines):.9f}/{max(gradient_cosines):.9f}"
+            f"\n  update norm ratio min/max: {min(update_ratios):.9f}/{max(update_ratios):.9f}"
+            "\n  trajectory table:"
+            "\n  step | A displacement | B displacement | separation | "
+            "sep/A | sep/B | displacement cosine"
+            f"{checkpoint_table}"
             "\n  numerical pass thresholds intentionally deferred until this first NPU run"
         )
