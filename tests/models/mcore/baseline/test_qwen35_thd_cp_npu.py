@@ -220,6 +220,8 @@ def _verl_data_path_probe(input_ids):
         "bshd_fa_attention_mask_type": None,
         "model_packed_metadata": None,
         "metadata": None,
+        "thd_post_dtypes": [],
+        "bshd_post_dtypes": [],
     }
 
     def thd_pre(*args, **kwargs):
@@ -232,7 +234,10 @@ def _verl_data_path_probe(input_ids):
 
     def thd_post(*args, **kwargs):
         records["thd_post"] += 1
-        return originals["thd_post"](*args, **kwargs)
+        input_value = args[0] if args else kwargs["output"]
+        result = originals["thd_post"](*args, **kwargs)
+        records["thd_post_dtypes"].append((str(input_value.dtype), str(result.dtype)))
+        return result
 
     def bshd_pre(*args, **kwargs):
         result = originals["bshd_pre"](*args, **kwargs)
@@ -243,7 +248,10 @@ def _verl_data_path_probe(input_ids):
 
     def bshd_post(*args, **kwargs):
         records["bshd_post"] += 1
-        return originals["bshd_post"](*args, **kwargs)
+        input_value = args[0] if args else kwargs["output"]
+        result = originals["bshd_post"](*args, **kwargs)
+        records["bshd_post_dtypes"].append((str(input_value.dtype), str(result.dtype)))
+        return result
 
     model_forward.preprocess_thd_engine = thd_pre
     model_forward.postprocess_thd_engine = thd_post
@@ -414,7 +422,16 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
             f"THD excluded wrong next-token boundaries: {thd['excluded_target_indices']}"
         )
 
-    torch.testing.assert_close(thd["output_probe"], bshd["output_probe"], atol=8e-2, rtol=2e-2)
+    # verl 0.16's CP>1 THD postprocessor reconstructs zigzag shards in a
+    # default-dtype temporary, promoting a BF16 probe to FP32. Compare model
+    # values at a common precision and retain the dtype transition in the
+    # path probe so this postprocess behavior remains visible.
+    torch.testing.assert_close(
+        thd["output_probe"].float(),
+        bshd["output_probe"].float(),
+        atol=8e-2,
+        rtol=2e-2,
+    )
     torch.testing.assert_close(
         thd["target_logprob"], bshd["target_logprob"], atol=8e-2, rtol=2e-2
     )
@@ -440,6 +457,9 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
             f"{bshd['path_probe']['bshd_attention_mask_shape']}/"
             f"{bshd['path_probe']['bshd_fa_sparse_mode']}/"
             f"{bshd['path_probe']['bshd_fa_attention_mask_type']}"
+            f"\n  postprocess input/output dtypes: "
+            f"BSHD={bshd['path_probe']['bshd_post_dtypes']}, "
+            f"THD={thd['path_probe']['thd_post_dtypes']}"
             f"\n  verl THD preprocess/postprocess calls: "
             f"{thd['path_probe']['thd_pre']}/{thd['path_probe']['thd_post']}"
         )
