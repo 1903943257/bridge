@@ -151,27 +151,51 @@ def _bshd_dense_attention_mask_mode(model, *, enabled):
         for module in layer.self_attention.modules():
             config = getattr(module, "config", None)
             if config is not None and hasattr(config, "sparse_mode"):
-                targets.setdefault(id(config), (config, config.sparse_mode))
-    # core_v0.16.1 uses the config-bound MindSpeed attention path, while an
-    # older patched entry reads the same option from MindSpeed's global args.
+                targets.setdefault(
+                    id(config),
+                    (config, config.sparse_mode, getattr(config, "attention_mask_type", None)),
+                )
+    # core_v0.16.1 uses the config-bound MindSpeed TE attention path, whose
+    # backend recomputes sparse_mode from attention_mask_type on every call.
+    # An older patched entry reads both options from MindSpeed's global args.
     # Set both runtime objects so this test remains exact for the server stack.
     from mindspeed.args_utils import get_full_args
 
     mindspeed_args = get_full_args()
     if hasattr(mindspeed_args, "sparse_mode"):
-        targets.setdefault(id(mindspeed_args), (mindspeed_args, mindspeed_args.sparse_mode))
+        targets.setdefault(
+            id(mindspeed_args),
+            (
+                mindspeed_args,
+                mindspeed_args.sparse_mode,
+                getattr(mindspeed_args, "attention_mask_type", None),
+            ),
+        )
     if not targets:
         raise AssertionError("could not locate Full-Attention sparse_mode configuration")
 
-    for target, _ in targets.values():
+    for target, _, original_mask_type in targets.values():
         target.sparse_mode = 0
+        if original_mask_type is not None:
+            target.attention_mask_type = "no_mask"
     try:
-        if any(target.sparse_mode != 0 for target, _ in targets.values()):
+        if any(target.sparse_mode != 0 for target, _, _ in targets.values()):
             raise AssertionError("failed to select sparse_mode=0 for the BSHD dense mask")
-        yield {"target_count": len(targets), "sparse_mode": 0}
+        if any(
+            original_mask_type is not None and target.attention_mask_type != "no_mask"
+            for target, _, original_mask_type in targets.values()
+        ):
+            raise AssertionError("failed to select no_mask mode for the explicit BSHD dense mask")
+        yield {
+            "target_count": len(targets),
+            "sparse_mode": 0,
+            "attention_mask_type": "no_mask",
+        }
     finally:
-        for target, original_sparse_mode in targets.values():
+        for target, original_sparse_mode, original_mask_type in targets.values():
             target.sparse_mode = original_sparse_mode
+            if original_mask_type is not None:
+                target.attention_mask_type = original_mask_type
 
 
 @contextmanager
@@ -191,6 +215,7 @@ def _verl_data_path_probe(input_ids):
         "bshd_post": 0,
         "bshd_attention_mask_shape": None,
         "bshd_fa_sparse_mode": None,
+        "bshd_fa_attention_mask_type": None,
         "model_packed_metadata": None,
         "metadata": None,
     }
@@ -243,6 +268,7 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
         with _verl_data_path_probe(input_ids) as path_probe:
             if mask_mode is not None:
                 path_probe["bshd_fa_sparse_mode"] = mask_mode["sparse_mode"]
+                path_probe["bshd_fa_attention_mask_type"] = mask_mode["attention_mask_type"]
             output = model_forward.gptmodel_forward_model_engine(
                 model,
                 input_ids=input_ids,
@@ -268,6 +294,8 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
             raise AssertionError(f"verl did not build the expected B1SS BSHD mask: {mask_shape}")
         if path_probe["bshd_fa_sparse_mode"] != 0:
             raise AssertionError("BSHD dense attention mask did not execute with sparse_mode=0")
+        if path_probe["bshd_fa_attention_mask_type"] != "no_mask":
+            raise AssertionError("BSHD dense attention mask did not execute with no_mask mode")
     target_logprob = output["target_logprob"]
     output_probe = output["output_probe"]
     if not target_logprob.is_nested or not output_probe.is_nested:
@@ -388,9 +416,10 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
             f"\n  actual/padded cu_seqlens: {metadata.actual_cu_seqlens}/{metadata.padded_cu_seqlens}"
             f"\n  logical lengths after postprocess: {thd['logical_lengths']}"
             f"\n  loss BSHD/THD: {bshd['loss'].item():.8f}/{thd['loss'].item():.8f}"
-            f"\n  BSHD mask/sparse-mode: "
+            f"\n  BSHD mask/sparse-mode/mask-type: "
             f"{bshd['path_probe']['bshd_attention_mask_shape']}/"
-            f"{bshd['path_probe']['bshd_fa_sparse_mode']}"
+            f"{bshd['path_probe']['bshd_fa_sparse_mode']}/"
+            f"{bshd['path_probe']['bshd_fa_attention_mask_type']}"
             f"\n  verl THD preprocess/postprocess calls: "
             f"{thd['path_probe']['thd_pre']}/{thd['path_probe']['thd_post']}"
         )
