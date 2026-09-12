@@ -63,6 +63,9 @@ from .parallel import (
     ulysses_cp_rectangular_attention,
 )
 from .prefix_state import (
+    GDNLayerState,
+    GDNPrefixAnchors,
+    GDNPrefixState,
     KVPrefixAnchors,
     KVPrefixState,
     PrefixState,
@@ -106,6 +109,9 @@ __all__ = [
     "HybridCPTopology",
     "HybridLocalKVBlock",
     "FixedTopologyScheduler",
+    "GDNLayerState",
+    "GDNPrefixAnchors",
+    "GDNPrefixState",
     "KVStack",
     "KVStackEntry",
     "KVPrefixAnchors",
