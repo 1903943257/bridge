@@ -2,9 +2,11 @@
 
 Run this file twice from the verl repository root::
 
-    torchrun --standalone --nproc_per_node=1 -m pytest -s -v \
+    torchrun --master_addr=127.0.0.1 --master_port=29554 --nproc_per_node=1 \
+      -m pytest -s -v \
       tests/models/mcore/baseline/test_qwen35_thd_cp_npu.py
-    torchrun --standalone --nproc_per_node=2 -m pytest -s -v \
+    torchrun --master_addr=127.0.0.1 --master_port=29555 --nproc_per_node=2 \
+      -m pytest -s -v \
       tests/models/mcore/baseline/test_qwen35_thd_cp_npu.py
 
 The BSHD and THD passes use separate models with identical random parameters.

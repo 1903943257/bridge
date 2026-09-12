@@ -2,7 +2,8 @@
 
 Run with one NPU from the verl repository root::
 
-    torchrun --standalone --nproc_per_node=1 -m pytest -s -v \
+    torchrun --master_addr=127.0.0.1 --master_port=29551 --nproc_per_node=1 \
+      -m pytest -s -v \
       tests/models/mcore/baseline/test_gdn_thd_and_conv_state_npu.py
 """
 
