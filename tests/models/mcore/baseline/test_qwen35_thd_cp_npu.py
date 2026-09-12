@@ -310,15 +310,21 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
             f"{data_format} postprocess restored target/probe lengths "
             f"{logical_lengths}/{probe_lengths}, expected {expected_lengths}"
         )
-    # The preprocess rolls labels within each sequence. Exclude each final query,
-    # whose rolled label points back to the first token rather than a next token.
+    # Each sequence's final query has no next-token target. THD and padded BSHD
+    # preprocessing may use different wrap/padding sentinels there, so exclude
+    # exactly the same logical boundary positions from both loss and logprob
+    # equivalence. Model output probes still cover every logical token.
     lengths = input_ids.offsets().diff().tolist()
     keep = torch.ones(target_logprob.values().numel(), dtype=torch.bool, device=runtime.device)
     offset = 0
+    excluded_target_indices = []
     for length in lengths:
-        keep[offset + length - 1] = False
+        excluded_index = offset + length - 1
+        keep[excluded_index] = False
+        excluded_target_indices.append(excluded_index)
         offset += length
-    loss = -target_logprob.values()[keep].sum() / float(sum(lengths) - len(lengths))
+    valid_target_logprob = target_logprob.values()[keep]
+    loss = -valid_target_logprob.sum() / float(sum(lengths) - len(lengths))
     # Keep the same explicit-mask mode active for custom FA backward wrappers
     # that consult runtime config in addition to their saved autograd context.
     with _bshd_dense_attention_mask_mode(model, enabled=not use_remove_padding):
@@ -326,7 +332,8 @@ def _run_engine_path(model, input_ids, *, use_remove_padding, runtime):
     if runtime.world_size > 1:
         allreduce_parameter_gradients(model, runtime.cp_group)
     return {
-        "target_logprob": target_logprob.values().detach().clone(),
+        "target_logprob": valid_target_logprob.detach().clone(),
+        "excluded_target_indices": tuple(excluded_target_indices),
         "output_probe": output_probe.values().detach().clone(),
         "loss": loss.detach().clone(),
         "path_probe": path_probe,
@@ -397,6 +404,16 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
     elif a2a_probe.calls or ring_calls:
         raise AssertionError("CP=1 unexpectedly entered a CP communication kernel")
 
+    expected_excluded_targets = (28, 63)
+    if bshd["excluded_target_indices"] != expected_excluded_targets:
+        raise AssertionError(
+            f"BSHD excluded wrong next-token boundaries: {bshd['excluded_target_indices']}"
+        )
+    if thd["excluded_target_indices"] != expected_excluded_targets:
+        raise AssertionError(
+            f"THD excluded wrong next-token boundaries: {thd['excluded_target_indices']}"
+        )
+
     torch.testing.assert_close(thd["output_probe"], bshd["output_probe"], atol=8e-2, rtol=2e-2)
     torch.testing.assert_close(
         thd["target_logprob"], bshd["target_logprob"], atol=8e-2, rtol=2e-2
@@ -417,6 +434,7 @@ def test_complete_qwen35_thd_matches_bshd(runtime):
             f"\n  Full-Attention Ring calls: {len(ring_calls)}"
             f"\n  actual/padded cu_seqlens: {metadata.actual_cu_seqlens}/{metadata.padded_cu_seqlens}"
             f"\n  logical lengths after postprocess: {thd['logical_lengths']}"
+            f"\n  excluded next-token boundaries: {thd['excluded_target_indices']}"
             f"\n  loss BSHD/THD: {bshd['loss'].item():.8f}/{thd['loss'].item():.8f}"
             f"\n  BSHD mask/sparse-mode/mask-type: "
             f"{bshd['path_probe']['bshd_attention_mask_shape']}/"
