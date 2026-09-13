@@ -98,3 +98,33 @@ cosine=0.999915. Individual relay gates had not yet run because the first
 parameter gate stopped the test. The new unsplit control/layer diagnostics and
 independent gate reporting await server execution; local checks are not an NPU
 correctness PASS.
+
+## First-layer shape diagnostic
+
+After locating the full/split difference before the first FA, run this narrower
+probe instead of another full 24-layer backward. It builds the same random
+model, runs the real embedding and first GDN Transformer layer only, and prints:
+
+- Embedding 128-token prefix vs independently embedded 64-token prefix.
+- Layer runs with canonical identical prefix inputs (the full embedding's
+  first 64 positions), autograd enabled, no initial states or packed metadata.
+- Input norm, in-projection, conv, GDR q/k/v/g/beta, gated norm, out-projection,
+  attention residual, MLP norm/fc1/fc2 (fc2 input exposes activation output),
+  and final layer output. Metrics compare only the first 64 token positions.
+- First nonzero difference, without declaring that any nonzero value is a bug.
+- If that boundary is a captured callable output, replay the callable using
+  canonical full-run input prefixes and the same deterministic output-gradient
+  seed. The full call's suffix seed is zero; state outputs receive no VJP seed.
+  Print isolated output/input/parameter-gradient differences. If the first
+  difference is an uncaptured residual/input seam, report it explicitly rather
+  than incorrectly blaming the next operator.
+
+No thresholds or production/kernel implementation are changed. Successful
+diagnostic execution is NOT a Stage 3.3 correctness PASS. Sync the new script
+alongside the existing Stage 3.3 test (its runtime/plan helpers are reused):
+
+```bash
+torchrun --master_addr=127.0.0.1 --master_port=29564 --nproc_per_node=1 \
+  -m pytest -s -v \
+  tests/models/mcore/tpr/linear/test_qwen35_first_layer_shape_probe_npu.py
+```
