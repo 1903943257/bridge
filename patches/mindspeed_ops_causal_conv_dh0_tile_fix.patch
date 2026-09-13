@@ -1,0 +1,118 @@
+diff --git a/mindspeed_ops/arch32/triton/convolution.py b/mindspeed_ops/arch32/triton/convolution.py
+index e62b197..bdf6252 100644
+--- a/mindspeed_ops/arch32/triton/convolution.py
++++ b/mindspeed_ops/arch32/triton/convolution.py
+@@ -452,11 +452,14 @@ def causal_conv1d_bwd_kernel(
+                     b_dh0_s = tl.zeros((BD,), dtype=tl.float32)
+                     for i_t2 in tl.static_range(0, W - 1):
+                         if i_t2 < i_w:
+-                            dy0_row = tl.load(dy + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
++                            # i_t2 is a GLOBAL suffix time, not an offset in this
++                            # tile. Each valid dh0 contribution belongs to one tile.
++                            m_t = (i_t2 >= i_t * BT) & (i_t2 < (i_t + 1) * BT) & (i_t2 < T_len)
++                            dy0_row = tl.load(dy + bos * D + i_t2 * D + o_d, mask=m_d & m_t, other=0.0).to(
+                                 tl.float32
+                             )
+                             if ACTIVATION == "swish" or ACTIVATION == "silu":  # pylint: disable=consider-using-in
+-                                y0_row = tl.load(y + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
++                                y0_row = tl.load(y + bos * D + i_t2 * D + o_d, mask=m_d & m_t, other=0.0).to(
+                                     tl.float32
+                                 )
+                                 y0_s = tl.sigmoid(y0_row)
+diff --git a/tests/unit_tests/triton/test_causal_conv1d/test_backward.py b/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+index 9a64c71..abd98f7 100644
+--- a/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
++++ b/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+@@ -108,6 +108,34 @@ class TestCausalConv1dBackward:
+         """Basic gradient correctness."""
+         self._run_bwd_test(B, T, D, W, torch.float32)
+ 
++    @pytest.mark.parametrize("bt", [1, 2, 4, 8])
++    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++    @pytest.mark.parametrize("activation", [None, "silu"])
++    def test_initial_state_gradient_across_tiles(self, monkeypatch, bt, dtype, activation):
++        """Cover BT<W, BT=W and BT>W with the existing dx/dw/dh0 oracle."""
++        import mindspeed_ops.arch32.triton.convolution as convolution
++
++        # Controlled launch grid, not the physical core count. For B=1,T=64,
++        # the unchanged tile heuristic chooses BT=bt. Keep allocation and launch
++        # sizing consistent by changing its input rather than overriding kernel BT.
++        monkeypatch.setattr(convolution, "get_vector_num", lambda: 64 // bt)
++        original = convolution.causal_conv1d_bwd_kernel
++        launches = []
++
++        class TileProbe:
++            def __getitem__(self, grid):
++                launch = original[grid]
++
++                def traced(*args, **kwargs):
++                    launches.append(kwargs["BT"])
++                    return launch(*args, **kwargs)
++
++                return traced
++
++        monkeypatch.setattr(convolution, "causal_conv1d_bwd_kernel", TileProbe())
++        self._run_bwd_test(1, 64, 256, 4, dtype, activation=activation, initial_state=True)
++        assert launches == [bt], f"requested BT={bt}, actually exercised {launches}"
++
+     def test_grad_with_bias(self):
+         self._run_bwd_test(2, 128, 256, 4, torch.float32, bias=True)
+ 
+@@ -275,6 +303,57 @@ class TestCausalConv1dVarlen:
+ class TestCausalConv1dState:
+     """initial_state / final_state semantics and gradient propagation."""
+ 
++    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++    @pytest.mark.parametrize("activation", [None, "silu"])
++    def test_short_tile_split_backward_relay(self, monkeypatch, dtype, activation):
++        """Reproduce Stage 3.2's 6144-channel 64+64 full vs split conv relay."""
++        import mindspeed_ops.arch32.triton.convolution as convolution
++
++        monkeypatch.setattr(convolution, "get_vector_num", lambda: 32)
++        torch.manual_seed(3212)
++        x_full = torch.randn(1, 128, 6144, dtype=dtype, device=DEVICE, requires_grad=True)
++        w_full = (torch.randn(4, 6144, dtype=dtype, device=DEVICE) * 0.1).requires_grad_(True)
++        dy = torch.randn_like(x_full)
++        full_output, _ = causal_conv1d(x_full, w_full, activation=activation, output_final_state=True)
++        full_output.backward(dy)
++
++        x_prefix = x_full[:, :64].detach().clone().requires_grad_(True)
++        x_suffix = x_full[:, 64:].detach().clone().requires_grad_(True)
++        w_split = w_full.detach().clone().requires_grad_(True)
++        with torch.no_grad():
++            pushed, saved = causal_conv1d(x_prefix, w_split, activation=activation, output_final_state=True)
++        anchor = saved.detach().clone().requires_grad_(True)
++        suffix_output, _ = causal_conv1d(
++            x_suffix, w_split, initial_state=anchor, activation=activation, output_final_state=True
++        )
++        suffix_output.backward(dy[:, 64:])
++        assert anchor.grad is not None
++        prefix_output, final_state = causal_conv1d(
++            x_prefix, w_split, activation=activation, output_final_state=True
++        )
++        torch.autograd.backward((prefix_output, final_state), (dy[:, :64], anchor.grad))
++
++        # Independently validate the suffix state derivative with CPU autograd.
++        h0_ref = saved.detach().cpu().float().requires_grad_(True)
++        suffix_ref = causal_conv1d_ref(
++            x_suffix.detach().cpu().float(), w_split.detach().cpu().float(),
++            initial_state=h0_ref, activation=activation,
++        )
++        suffix_ref.backward(dy[:, 64:].cpu().float())
++        tolerance = 5e-2 if dtype == torch.bfloat16 else 1e-4
++        comparisons = {
++            "output": (full_output, torch.cat((pushed, suffix_output), dim=1)),
++            "dx": (x_full.grad, torch.cat((x_prefix.grad, x_suffix.grad), dim=1)),
++            "dw": (w_full.grad, w_split.grad),
++            "dh0": (h0_ref.grad, anchor.grad),
++        }
++        for name, (reference, actual) in comparisons.items():
++            assert reference is not None and actual is not None, name
++            reference, actual = reference.detach().cpu().float(), actual.detach().cpu().float()
++            assert torch.isfinite(actual).all(), name
++            torch.testing.assert_close(actual, reference, atol=tolerance, rtol=tolerance, msg=name)
++        torch.testing.assert_close(anchor.grad[:, :, 0], torch.zeros_like(anchor.grad[:, :, 0]), atol=0, rtol=0)
++
+     def test_final_state_shape(self):
+         B, T, D, W = 2, 128, 256, 4
+         x = torch.randn(B, T, D, dtype=torch.float32, device=DEVICE)
