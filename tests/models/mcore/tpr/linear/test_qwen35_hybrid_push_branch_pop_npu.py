@@ -12,7 +12,7 @@ From the server verl root (after syncing bridge's verl/ and tests/)::
 """
 
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -81,14 +81,124 @@ def _term_logprobs(logits, segment):
     return -F.cross_entropy(logits[0].index_select(0, indices).float(), targets, reduction="none")
 
 
-def _native_reference(model, plan, device):
+class _LayerProbe:
+    """Observe decoder-layer outputs and their VJPs without changing the graph.
+
+    Full paths have separate prefix graphs: SUM their prefix output gradients
+    when comparing with the shared-prefix connected graph; never concatenate or
+    average those gradients. Forward prefix values use path 1, with repeat
+    differences printed separately. All snapshots/diagnostics live on CPU.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.tag = None
+        self.records = {}
+        self.handles = []
+
+    def __enter__(self):
+        for layer in self.model.decoder.layers:
+            number = layer.layer_number
+
+            def record(module, args, output, *, number=number):
+                tensor = output[0] if isinstance(output, tuple) else output
+                assert isinstance(tensor, torch.Tensor) and tensor.ndim == 3
+                assert tensor.shape[1] == 1 and tensor.requires_grad
+                key = (self.tag, number)
+                assert self.tag is not None and key not in self.records, key
+                entry = {"output": tensor.detach().cpu().float().clone(), "grad": None}
+                self.records[key] = entry
+
+                def capture(grad):
+                    value = grad.detach().cpu().float().clone()
+                    entry["grad"] = value if entry["grad"] is None else entry["grad"] + value
+
+                self.handles.append(tensor.register_hook(capture))
+
+            self.handles.append(layer.register_forward_hook(record))
+        return self
+
+    def __exit__(self, *exc):
+        for handle in self.handles:
+            handle.remove()
+
+    @contextmanager
+    def segment(self, tag):
+        previous, self.tag = self.tag, tag
+        try:
+            yield
+        finally:
+            self.tag = previous
+
+    def logical(self, *, full):
+        result = {}
+        repeat_max = 0.0
+        for layer in range(1, 25):
+            if full:
+                left, right = self.records[("full1", layer)], self.records[("full2", layer)]
+                assert left["grad"] is not None and right["grad"] is not None
+                repeat_max = max(repeat_max, (left["output"][:64] - right["output"][:64]).abs().max().item())
+                result[(layer, "P")] = {
+                    "output": left["output"][:64],
+                    "grad": left["grad"][:64] + right["grad"][:64],
+                }
+                for branch, entry in ((1, left), (2, right)):
+                    result[(layer, f"S{branch}")] = {k: v[64:] for k, v in entry.items()}
+            else:
+                for tag in ("P", "S1", "S2"):
+                    entry = self.records[(tag, layer)]
+                    assert entry["grad"] is not None
+                    result[(layer, tag)] = entry
+        if full:
+            print(f"STAGE-3.3 full-path shared-prefix output repeat max_abs={repeat_max:.6e}", flush=True)
+        return result
+
+
+def _layer_diagnostics(label, reference, actual):
+    """No new gate: print every layer; 'first nonzero' is not a bug threshold."""
+    first = {"output": None, "grad": None}
+    for layer in range(1, 25):
+        parts = []
+        for region in ("P", "S1", "S2"):
+            for kind in ("output", "grad"):
+                left, right = reference[(layer, region)][kind], actual[(layer, region)][kind]
+                assert torch.isfinite(left).all() and torch.isfinite(right).all()
+                metric = gradient_map_diagnostics({"tensor": left}, {"tensor": right}).aggregate
+                if metric.absolute_l2 != 0 and first[kind] is None:
+                    first[kind] = (layer, region)
+                parts.append(f"{region}/{kind}:rel={metric.relative_l2:.6e},cos={metric.cosine:.9f},"
+                             f"max_abs={(right - left).abs().max().item():.6e}")
+        name = "FA" if layer % 4 == 0 else "GDN"
+        print(f"STAGE-3.3 LAYER {label} layer={layer:02d} {name} " + " | ".join(parts), flush=True)
+    print(f"STAGE-3.3 {label} first-nonzero (not a correctness threshold): {first}", flush=True)
+
+
+def _native_reference(model, plan, device, *, tpr_context=False, probe=None):
     model.zero_grad(set_to_none=True)
     losses, outputs = [], {}
     for leaf_id in (1, 2):
         tokens = torch.cat((plan.get(0).token_ids, plan.get(leaf_id).token_ids)).to(device)
         positions = torch.arange(128, device=device).unsqueeze(0)
-        # No TPR context: both wrapper classes delegate to the native forward.
-        logits = model(tokens.unsqueeze(0), positions, attention_mask=None)
+        context_manager = nullcontext()
+        if tpr_context:
+            from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+            from verl.models.mcore.tpr.rope import build_suffix_rotary_pos_emb
+
+            context = TPRAttentionContext(
+                prefix_length=0, suffix_length=128,
+                suffix_rotary_pos_emb=build_suffix_rotary_pos_emb(
+                    model.rotary_pos_emb, prefix_length=0, suffix_length=128,
+                ),
+            )
+            context_manager = use_tpr_attention_context(context)
+        # Same full 128-token path/loss for both modes; no Push/Pop or anchors.
+        with context_manager, probe.segment(f"full{leaf_id}") if probe else nullcontext():
+            logits = model(tokens.unsqueeze(0), positions, attention_mask=None)
+        if tpr_context:
+            context.assert_new_gdn_layers(tuple(i for i in range(1, 25) if i % 4))
+            context.assert_new_kv_layers((4, 8, 12, 16, 20, 24))
+            # The diagnostic never consumes or backpropagates final-state roots.
+            del context, context_manager
         assert logits.shape == (1, 128, VOCAB_SIZE)
         loss = F.cross_entropy(logits[0, :-1].float(), tokens[1:], reduction="sum") / 254
         outputs[leaf_id] = {
@@ -236,13 +346,15 @@ def _run_engine(model, plan, monkeypatch):
     return result["loss"], executor.logprobs, _parameter_grads(model), executor.boundary_gradients
 
 
-def _connected_reference(model, plan):
+def _connected_reference(model, plan, *, probe=None):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import GDNLayerState
 
     model.zero_grad(set_to_none=True)
     executor = SegmentExecutor(model, plan)
-    root, logits = executor._forward(plan.get(0), past_key_values={}, no_grad=False)
+    with probe.segment("P") if probe else nullcontext():
+        root, logits = executor._forward(plan.get(0), past_key_values={}, no_grad=False)
+    logprobs = {0: _term_logprobs(logits, plan.get(0)).detach().cpu()}
     loss = executor._compute_loss(plan.get(0), logits)[1]
     # Identity-connected boundary clones separate external-state VJPs from
     # internal prefix uses of K/V. Retaining raw K/V.grad would count both.
@@ -253,15 +365,28 @@ def _connected_reference(model, plan):
     for tensor in boundary.values():
         tensor.retain_grad()
     for leaf_id in (1, 2):
-        _, logits = executor._forward(plan.get(leaf_id), past_key_values=kv,
-                                      initial_gdn_states=gdn, no_grad=False)
+        with probe.segment(f"S{leaf_id}") if probe else nullcontext():
+            _, logits = executor._forward(plan.get(leaf_id), past_key_values=kv,
+                                          initial_gdn_states=gdn, no_grad=False)
+        logprobs[leaf_id] = _term_logprobs(logits, plan.get(leaf_id)).detach().cpu()
         loss = loss + executor._compute_loss(plan.get(leaf_id), logits)[1]
     loss.backward()
     gradients = {}
     for name, tensor in boundary.items():
         assert tensor.grad is not None, f"missing connected boundary gradient: {name}"
         gradients[name] = tensor.grad.detach().cpu().clone()
-    return _parameter_grads(model), gradients
+    return _parameter_grads(model), gradients, loss.detach().cpu(), logprobs
+
+
+def _gate(failures, label, check, *args, **kwargs):
+    """Evaluate every numerical assertion, but fail the overall test if ANY fails."""
+    try:
+        check(*args, **kwargs)
+    except AssertionError as error:
+        failures.append(label)
+        print(f"STAGE-3.3 GATE FAIL {label}: {error}", flush=True)
+    else:
+        print(f"STAGE-3.3 GATE PASS {label}", flush=True)
 
 
 def _compare(label, reference, actual):
@@ -286,32 +411,67 @@ def test_full_qwen35_hybrid_engine_push_branch_pop(runtime, monkeypatch):
     assert model.config.attention_output_gate
     assert model.config.attention_dropout == model.config.hidden_dropout == 0
     plan = _plan()
-    # All three passes reuse unchanged parameters; no optimizer is constructed.
+    failures = []
+    # All four passes reuse unchanged parameters; no optimizer is constructed.
     with bind_stage1_gdn_primitives(mindspeed_gdn, model), _no_cp_probe(monkeypatch):
-        ref_loss, ref_logprobs, ref_grads = _native_reference(model, plan, runtime.device)
+        with _LayerProbe(model) as native_probe:
+            ref_loss, ref_logprobs, ref_grads = _native_reference(model, plan, runtime.device, probe=native_probe)
         loss, logprobs, grads, boundary = _run_engine(model, plan, monkeypatch)
         _compare("materialized-vs-TPR/parameters", ref_grads, grads)
         print(f"STAGE-3.3 loss native/TPR: {ref_loss.item():.9f}/{loss:.9f}", flush=True)
         for segment_id in (0, 1, 2):
             delta = (logprobs[segment_id] - ref_logprobs[segment_id]).abs().max().item()
             print(f"STAGE-3.3 segment={segment_id} target-logprob max_abs={delta:.9e}", flush=True)
-        connected_grads, connected_boundary = _connected_reference(model, plan)
+        with _LayerProbe(model) as split_probe:
+            connected_grads, connected_boundary, split_loss, split_logprobs = _connected_reference(
+                model, plan, probe=split_probe,
+            )
         _compare("connected-vs-TPR/parameters", connected_grads, grads)
         for kind in ("gdn", "fa"):
             left = {k: v for k, v in connected_boundary.items() if k.startswith(kind)}
             right = {k: v for k, v in boundary.items() if k.startswith(kind)}
             _compare(f"connected-vs-TPR/{kind}-state-gradient", left, right)
-        # Print both reference comparisons before assertions, so a native/split
-        # discrepancy cannot hide whether state relay itself is correct.
-        torch.testing.assert_close(torch.tensor(loss), ref_loss, atol=2e-2, rtol=2e-2)
+        with _LayerProbe(model) as full_probe:
+            full_loss, full_logprobs, full_grads = _native_reference(
+                model, plan, runtime.device, tpr_context=True, probe=full_probe,
+            )
+        # These two comparisons are diagnostic only: do not create a new
+        # acceptance threshold or assume FA alone accounts for any discrepancy.
+        for label, left_grads, right_grads, left_loss, right_loss, left_lp, right_lp in (
+            ("native-full-vs-TPR-context-full", ref_grads, full_grads,
+             ref_loss, full_loss, ref_logprobs, full_logprobs),
+            ("TPR-context-full-vs-connected-split", full_grads, connected_grads,
+             full_loss, split_loss, full_logprobs, split_logprobs),
+        ):
+            _compare(f"{label}/parameters", left_grads, right_grads)
+            print(f"STAGE-3.3 {label} loss={left_loss.item():.9f}/{right_loss.item():.9f}", flush=True)
+            for sid in (0, 1, 2):
+                print(f"STAGE-3.3 {label} segment={sid} target-logprob max_abs="
+                      f"{(left_lp[sid] - right_lp[sid]).abs().max().item():.9e}", flush=True)
+        native_layers = native_probe.logical(full=True)
+        full_layers = full_probe.logical(full=True)
+        split_layers = split_probe.logical(full=False)
+        _layer_diagnostics("native-full-vs-TPR-context-full", native_layers, full_layers)
+        _layer_diagnostics("TPR-context-full-vs-connected-split", full_layers, split_layers)
+        # Keep every original threshold. Report each gate even when another
+        # gate fails, and fail once at the end with all failing gate names.
+        _gate(failures, "materialized-vs-TPR/loss", torch.testing.assert_close,
+              torch.tensor(loss), ref_loss, atol=2e-2, rtol=2e-2)
         for segment_id in (0, 1, 2):
-            torch.testing.assert_close(logprobs[segment_id], ref_logprobs[segment_id], atol=8e-2, rtol=2e-2)
+            _gate(failures, f"materialized-vs-TPR/logprob/segment={segment_id}", torch.testing.assert_close,
+                  logprobs[segment_id], ref_logprobs[segment_id], atol=8e-2, rtol=2e-2)
         # Existing 24-layer BF16 Hybrid envelope, not the tighter relay criterion.
-        assert_gradient_maps_close(ref_grads, grads, rtol=0.10, cosine_min=0.995)
-        assert_gradient_maps_close(connected_grads, grads, rtol=0.02, cosine_min=0.999)
+        _gate(failures, "materialized-vs-TPR/parameters", assert_gradient_maps_close,
+              ref_grads, grads, rtol=0.10, cosine_min=0.995)
+        _gate(failures, "connected-vs-TPR/parameters", assert_gradient_maps_close,
+              connected_grads, grads, rtol=0.02, cosine_min=0.999)
+        assert connected_boundary.keys() == boundary.keys()
         for name in connected_boundary:
-            assert_gradient_maps_close({name: connected_boundary[name]}, {name: boundary[name]},
-                                       rtol=0.02, cosine_min=0.999)
+            _gate(failures, f"connected-vs-TPR/state/{name}", assert_gradient_maps_close,
+                  {name: connected_boundary[name]}, {name: boundary[name]}, rtol=0.02, cosine_min=0.999)
+    print("STAGE-3.3 GATE PASS communication CP1 A2A=0/Ring=0", flush=True)
+    if failures:
+        pytest.fail("Stage 3.3 failed gates (other gates were evaluated): " + ", ".join(failures))
     print("STAGE-3.3 PASS: 24 layers (18 GDN + 6 FA), CP=1, non-packed; "
           "Engine tree request; prefix own loss once at Pop; 48 boundary gradients; "
           "A2A=0/Ring=0; all cached states released", flush=True)

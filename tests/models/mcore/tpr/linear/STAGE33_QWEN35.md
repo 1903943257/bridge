@@ -18,6 +18,10 @@ Keep the MindSpeed-Ops dh0 tile fix that made Stage 3.2 pass.
 - Connected control: shared prefix graph and identity-connected boundary
   clones. Measures pure external GDN-state/FA-KV gradients independently from
   prefix-internal uses of the same tensors.
+- Unsplit TPR-context control: each independent P+Si path is still 128 tokens,
+  but runs inside a zero-prefix TPR context. There are no anchors, Push/Pop, or
+  final-state backward roots. This separates native-vs-wrapper execution
+  differences from full-vs-split continuation differences.
 
 Prefix internal next-token loss has weight 2, with one boundary target per
 branch. Suffix internal loss has weight 1. Global denominator is 254.
@@ -27,6 +31,24 @@ once (internal prefix at Pop). Both state caches must be empty after execution.
 Diagnostics are printed before numeric assertions: loss, per-segment target
 logprob max-absolute difference, all-parameter gradients, GDN and FA boundary
 gradient norms/relative-L2/cosine. A2A and Ring must both remain zero.
+
+Additional diagnostic comparisons (no new acceptance thresholds):
+
+1. `native-full-vs-TPR-context-full`: same full sequences and independent
+   backwards, different native/TPR GDN and FA execution paths.
+2. `TPR-context-full-vs-connected-split`: same TPR wrappers, full paths versus
+   a shared-prefix connected graph (includes splitting/sharing/reduction-order
+   effects; not an isolated kernel proof).
+
+Both print loss/logprob/parameter metrics and all 24 decoder-layer output and
+output-gradient metrics, separately for P/S1/S2. The full-path prefix gradients
+are **summed across both branches**, not averaged; prefix output uses path 1
+and full-path prefix repeat max-abs is also printed. Layer snapshots are on CPU.
+`first-nonzero` is diagnostic only, not a significance threshold or bug verdict.
+
+Every original numerical gate reports its own PASS/FAIL, including each of the
+48 boundary tensors. The test fails at the end if any gate fails. An early
+native parameter-gradient mismatch no longer prevents relay gates from running.
 
 Acceptance criteria (fixed before the first server run):
 
@@ -70,5 +92,9 @@ torchrun --master_addr=127.0.0.1 --master_port=29563 --nproc_per_node=1 \
   tests/models/mcore/tpr/linear/test_qwen35_hybrid_push_branch_pop_npu.py
 ```
 
-Initial status: server NPU execution pending; local syntax checks are not a
-correctness PASS. Report the printed metrics together with PASS/FAIL.
+Previous server result: native-vs-TPR parameter rel-L2=0.14378,
+cosine=0.989669 (FAIL); connected-vs-TPR aggregate rel-L2=0.01307,
+cosine=0.999915. Individual relay gates had not yet run because the first
+parameter gate stopped the test. The new unsplit control/layer diagnostics and
+independent gate reporting await server execution; local checks are not an NPU
+correctness PASS.
