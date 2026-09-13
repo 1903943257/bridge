@@ -319,7 +319,16 @@ def _boundary_snapshot(records):
 
 def _diagnose_operator_boundaries(model, prefix, suffix, prefix_target, suffix_target, denominator):
     """Single P+S1 path: full vs connected split, using the actual GDN inputs."""
+    from ._causal_conv_boundary_diagnostic import (
+        capture_conv_backward_launches,
+        print_conv_backward_source,
+        report_conv_boundary,
+        snapshot_conv_launches,
+    )
+
+    print_conv_backward_source()
     snapshots = {}
+    conv_launches = {}
     for mode in ("full", "split"):
         model.zero_grad(set_to_none=True)
         prefix_input = prefix.detach().clone().requires_grad_(True)
@@ -340,7 +349,9 @@ def _diagnose_operator_boundaries(model, prefix, suffix, prefix_target, suffix_t
                 )
         loss = _loss_part(prefix_output, prefix_target, denominator=denominator)
         loss = loss + _loss_part(suffix_output, suffix_target, denominator=denominator)
-        loss.backward()
+        with capture_conv_backward_launches() as launches:
+            loss.backward()
+        conv_launches[mode] = snapshot_conv_launches(launches, mode=mode)
         print(f"STAGE-3.2 OPERATOR {mode}/P+S1 loss={loss.detach().item():.9f}", flush=True)
         if mode == "full":
             snapshots[mode] = _boundary_snapshot(full_records)
@@ -375,6 +386,10 @@ def _diagnose_operator_boundaries(model, prefix, suffix, prefix_target, suffix_t
                     f"operator-full-vs-split/{name}/{kind}/{segment}",
                     {name: reference[start:end]}, {name: actual[start:end]},
                 )
+    report_conv_boundary(
+        conv_launches["full"], conv_launches["split"], prefix_length=prefix.shape[0],
+        compare=_print_comparison,
+    )
 
 
 def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
