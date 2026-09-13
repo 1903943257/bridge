@@ -34,6 +34,7 @@ from .parallel.execution_context import (
     build_sharded_past_anchors,
     resolve_cp_group,
 )
+from .prefix_state import GDNLayerState, GDNPrefixAnchors, GDNPrefixState
 from .rope import (
     build_sharded_rotary_pos_emb,
     disable_bound_context_parallel_sharding,
@@ -111,6 +112,17 @@ class SegmentExecutor:
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
+        self.gdn_layer_numbers = tuple(
+            sorted(module.layer_number for module in model.modules()
+                   if getattr(module, "tpr_state_kind", None) == "gdn")
+        )
+        if len(set(self.gdn_layer_numbers)) != len(self.gdn_layer_numbers):
+            raise ValueError("GDN layer numbers must be unique")
+        if set(self.gdn_layer_numbers).intersection(self.expected_layer_numbers):
+            raise ValueError("expected_layer_numbers describes FA layers only, not GDN layers")
+        if self.gdn_layer_numbers and cp_group is not None:
+            raise NotImplementedError("Stage 3 Hybrid TPR supports CP=1 only")
+        self.gdn_states: dict[SegmentId, GDNPrefixState] = {}
         if cp_group is None:
             if cp_backend is not None:
                 raise ValueError("cp_backend requires a cp_group")
@@ -144,7 +156,7 @@ class SegmentExecutor:
         return self.cp_group is not None
 
     def push(self, segment_id: SegmentId) -> SegmentForwardResult:
-        """Run a graph-free segment forward and push its new KV cache."""
+        """Save graph-free FA KV and GDN final states; do not compute owned loss."""
 
         self._ensure_healthy()
         try:
@@ -155,9 +167,13 @@ class SegmentExecutor:
                 no_grad=True,
             )
             del logits
-            context.assert_new_kv_layers(self.expected_layer_numbers)
+            self._assert_collected_layers(context)
             cached_key_values = _compact_kv_cache(context.new_key_values)
-            layer_count = len(cached_key_values)
+            layer_count = len(cached_key_values) + len(context.new_gdn_states)
+            if self.gdn_layer_numbers:
+                self.gdn_states[segment_id] = GDNPrefixState.save(
+                    segment_id, segment.length, context.new_gdn_states
+                )
             del context
             self.kv_stack.push(segment, cached_key_values, shard=self._segment_shard(segment))
             return SegmentForwardResult(
@@ -171,7 +187,7 @@ class SegmentExecutor:
             raise
 
     def pop(self, segment_id: SegmentId) -> SegmentBackwardResult:
-        """Recompute/backward the stack top and relay past-KV gradients."""
+        """Recompute owned loss once and relay FA KV / direct-parent GDN gradients."""
 
         self._ensure_healthy()
         try:
@@ -187,6 +203,8 @@ class SegmentExecutor:
                 )
             popped_entry = self.kv_stack.pop(segment_id)
             segment = popped_entry.segment
+            gdn_state = self.gdn_states.pop(segment_id) if self.gdn_layer_numbers else None
+            relayed_gdn_gradients = {} if gdn_state is None else gdn_state.consume_gradients()
             del entry
             if self.cp_enabled:
                 popped_entry.kv.release()
@@ -195,13 +213,15 @@ class SegmentExecutor:
             else:
                 anchors = self.kv_stack.build_past_anchors()
                 past_key_values = anchors.key_values
+            gdn_parent, gdn_anchors = self._gdn_parent_anchors()
             context, logits = self._forward(
                 segment,
                 past_key_values=past_key_values,
                 no_grad=False,
                 sharded_past_anchors=anchors if self.cp_enabled else None,
+                initial_gdn_states={} if gdn_anchors is None else gdn_anchors.layer_states,
             )
-            context.assert_new_kv_layers(self.expected_layer_numbers)
+            self._assert_collected_layers(context)
 
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
             owned_loss_term_count = len(self._owned_loss_terms(segment))
@@ -224,17 +244,25 @@ class SegmentExecutor:
                 key_grad, value_grad = relayed_gradients[layer_number]
                 roots.extend((new_key, new_value))
                 root_gradients.extend((key_grad, value_grad))
+            for layer_number, gradient in relayed_gdn_gradients.items():
+                new_state = context.new_gdn_states[layer_number]
+                roots.extend((new_state.conv_state, new_state.recurrent_state))
+                root_gradients.extend((gradient.conv_state, gradient.recurrent_state))
 
             if roots:
                 torch.autograd.backward(roots, grad_tensors=root_gradients)
                 self._accumulate_past_anchor_gradients(anchors)
+                if gdn_anchors is not None:
+                    gdn_parent.accumulate_anchor_gradients(gdn_anchors)
+            if gdn_state is not None:
+                gdn_state.release()
 
             return SegmentBackwardResult(
                 segment_id=segment_id,
                 loss_sum=loss_sum.detach(),
                 normalized_loss=normalized_loss.detach(),
                 loss_term_count=owned_loss_term_count,
-                relayed_layer_count=len(relayed_gradients),
+                relayed_layer_count=len(relayed_gradients) + len(relayed_gdn_gradients),
             )
         except Exception:
             self._failed = True
@@ -267,13 +295,15 @@ class SegmentExecutor:
             else:
                 anchors = self.kv_stack.build_past_anchors()
                 past_key_values = anchors.key_values
+            gdn_parent, gdn_anchors = self._gdn_parent_anchors()
             context, logits = self._forward(
                 segment,
                 past_key_values=past_key_values,
                 no_grad=False,
                 sharded_past_anchors=anchors if self.cp_enabled else None,
+                initial_gdn_states={} if gdn_anchors is None else gdn_anchors.layer_states,
             )
-            context.assert_new_kv_layers(self.expected_layer_numbers)
+            self._assert_collected_layers(context)
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
             owned_loss_term_count = len(self._owned_loss_terms(segment))
 
@@ -289,13 +319,15 @@ class SegmentExecutor:
 
             torch.autograd.backward(backward_loss)
             self._accumulate_past_anchor_gradients(anchors)
+            if gdn_anchors is not None:
+                gdn_parent.accumulate_anchor_gradients(gdn_anchors)
 
             return LeafVisitResult(
                 forward=SegmentForwardResult(
                     segment_id=segment_id,
                     prefix_length=segment.prefix_length,
                     suffix_length=segment.length,
-                    layer_count=len(context.new_key_values),
+                    layer_count=len(context.new_key_values) + len(context.new_gdn_states),
                 ),
                 backward=SegmentBackwardResult(
                     segment_id=segment_id,
@@ -316,6 +348,7 @@ class SegmentExecutor:
         past_key_values,
         no_grad: bool,
         sharded_past_anchors: ShardedPastKVAnchors | None = None,
+        initial_gdn_states: Mapping[int, GDNLayerState] | None = None,
     ) -> tuple[TPRAttentionContext, Tensor]:
         device = _model_device(self.model)
         shard = self._segment_shard(segment)
@@ -343,6 +376,11 @@ class SegmentExecutor:
                 disable_context_parallel_sharding=self.cp_enabled,
             ),
             attention_backend=attention_backend,
+            initial_gdn_states=(
+                self._gdn_parent_state().layer_states
+                if initial_gdn_states is None and self.gdn_layer_numbers and len(self.kv_stack)
+                else (initial_gdn_states or {})
+            ),
         )
         grad_context = torch.no_grad() if no_grad else torch.enable_grad()
         with grad_context:
@@ -439,6 +477,19 @@ class SegmentExecutor:
         if self._failed:
             raise RuntimeError("SegmentExecutor is failed and cannot continue")
 
+    def _assert_collected_layers(self, context: TPRAttentionContext) -> None:
+        context.assert_new_kv_layers(self.expected_layer_numbers)
+        context.assert_new_gdn_layers(self.gdn_layer_numbers)
+
+    def _gdn_parent_state(self) -> GDNPrefixState:
+        return self.gdn_states[self.kv_stack.top().segment.segment_id]
+
+    def _gdn_parent_anchors(self) -> tuple[GDNPrefixState | None, GDNPrefixAnchors | None]:
+        if not self.gdn_layer_numbers or not len(self.kv_stack):
+            return None, None
+        parent = self._gdn_parent_state()
+        return parent, parent.make_anchors()
+
 
 def _compact_kv_cache(key_values: Mapping[int, KVPair]) -> dict[int, KVPair]:
     """Copy no-grad KV views into compact, independently owned storage."""
@@ -467,6 +518,8 @@ def _infer_layer_numbers(model: nn.Module) -> tuple[int, ...]:
     result = []
     for layer in layers:
         attention = getattr(layer, "self_attention", None)
+        if getattr(attention, "tpr_state_kind", None) == "gdn":
+            continue
         layer_number = getattr(attention, "layer_number", None)
         if layer_number is None:
             raise ValueError("cannot infer layer_number from model.decoder.layers")

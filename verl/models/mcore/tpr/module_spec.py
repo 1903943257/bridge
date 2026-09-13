@@ -31,7 +31,7 @@ _SpecT = TypeVar("_SpecT")
 
 
 def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
-    """Return a copied spec whose TransformerLayers use ``TPRSelfAttention``.
+    """Copy a spec, dispatching FA/GDN to their respective TPR attention classes.
 
     Both forms used by the local verl model builders are accepted: a single
     TransformerLayer ``ModuleSpec`` and a TransformerBlock submodule object
@@ -65,11 +65,23 @@ def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
         attention_module = get_module(attention_spec)
         if attention_module is TPRSelfAttention:
             continue
+        if getattr(attention_module, "tpr_state_kind", None) == "gdn":
+            continue
+        if getattr(attention_module, "__name__", None) == "GatedDeltaNet":
+            # Import only after the NPU adaptor has installed the MindSpeed spec.
+            from mindspeed.core.ssm.gated_delta_net import GatedDeltaNet
+
+            from .gated_delta_net import TPRGatedDeltaNet
+
+            if attention_module is not GatedDeltaNet:
+                raise TypeError("TPR GDN requires the patched MindSpeed GatedDeltaNet spec")
+            layer_submodules.self_attention = replace(attention_spec, module=TPRGatedDeltaNet)
+            continue
         if attention_module is not SelfAttention:
             module_name = getattr(attention_module, "__name__", repr(attention_module))
             raise TypeError(
                 f"layer_specs[{index}] uses unsupported attention module {module_name}; "
-                "TPR MVP requires Megatron SelfAttention"
+                "TPR requires Megatron SelfAttention or patched MindSpeed GatedDeltaNet"
             )
 
         layer_submodules.self_attention = replace(attention_spec, module=TPRSelfAttention)

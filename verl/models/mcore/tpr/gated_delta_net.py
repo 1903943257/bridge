@@ -37,6 +37,8 @@ class TPRGatedDeltaNet(GatedDeltaNet):
     already validated in Stage 1.
     """
 
+    tpr_state_kind = "gdn"
+
     def forward(
         self,
         hidden_states: Tensor,

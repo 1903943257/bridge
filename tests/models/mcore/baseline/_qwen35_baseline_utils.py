@@ -585,7 +585,7 @@ def qwen35_config(*, cp_size: int):
     )
 
 
-def make_qwen35_model(runtime, *, cp_size: int):
+def make_qwen35_model(runtime, *, cp_size: int, tpr: bool = False):
     """Build the exact 24-layer 18-GDN/6-FA language stack with random weights."""
     from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
         get_transformer_block_with_experimental_attention_variant_spec,
@@ -593,9 +593,16 @@ def make_qwen35_model(runtime, *, cp_size: int):
     from megatron.core.models.gpt.gpt_model import GPTModel
 
     config = qwen35_config(cp_size=cp_size)
+    spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+    if tpr:
+        if cp_size != 1:
+            raise NotImplementedError("Stage 3 Hybrid TPR requires CP=1")
+        from verl.models.mcore.tpr.module_spec import replace_self_attention_with_tpr
+
+        spec = replace_self_attention_with_tpr(spec)
     model = GPTModel(
         config=config,
-        transformer_layer_spec=get_transformer_block_with_experimental_attention_variant_spec(config),
+        transformer_layer_spec=spec,
         vocab_size=VOCAB_SIZE,
         max_sequence_length=max(SEQUENCE_LENGTH, 128),
         pre_process=True,

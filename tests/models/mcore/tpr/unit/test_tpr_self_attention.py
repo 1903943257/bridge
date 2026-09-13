@@ -96,6 +96,33 @@ def test_no_context_delegates_to_original_self_attention(monkeypatch):
     assert recorded["packed_seq_params"] is None
 
 
+def test_qwen_output_gate_uses_mcore_gate_and_preserves_gradient(monkeypatch):
+    query = torch.randn(3, 1, 4, 8, requires_grad=True)
+    key = torch.randn(3, 1, 2, 8, requires_grad=True)
+    value = torch.randn_like(key, requires_grad=True)
+    gate = torch.randn_like(query, requires_grad=True)
+    attention = _StubTPRSelfAttention(query, key, value)
+    attention.config.attention_output_gate = True
+
+    def project(hidden_states, key_value_states, *, split_qkv, output_gate):
+        assert split_qkv and output_gate and key_value_states is None
+        return query, key, value, gate
+
+    monkeypatch.setattr(attention, "get_query_key_value_tensors", project)
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", lambda tensor, *a, **kw: tensor)
+    monkeypatch.setattr(
+        tpr_attention, "rectangular_causal_attention",
+        lambda q, k, v, **kw: q.reshape(3, 1, 32),
+    )
+    context = TPRAttentionContext(0, 3, suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8))
+    with use_tpr_attention_context(context):
+        output, _ = attention(torch.zeros(3, 1, 32), attention_mask=None)
+    expected = query.reshape(3, 1, 32) * gate.reshape(3, 1, 32).sigmoid()
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    torch.testing.assert_close(gate.grad, query.detach() * gate.sigmoid() * (1 - gate.sigmoid()))
+
+
 def test_tpr_forward_selects_layer_kv_collects_new_kv_and_preserves_prefix_grad(monkeypatch):
     prefix_length, suffix_length = 6, 3
     query = torch.randn(suffix_length, 1, 4, 8, requires_grad=True)

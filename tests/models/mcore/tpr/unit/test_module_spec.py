@@ -143,6 +143,35 @@ def test_replacement_is_idempotent():
     assert _attention_spec(converted_twice).params == _attention_spec(converted_once).params
 
 
+def test_hybrid_spec_dispatch_preserves_pattern_and_is_idempotent(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    class GatedDeltaNet:
+        pass
+
+    class TPRGatedDeltaNet(GatedDeltaNet):
+        tpr_state_kind = "gdn"
+
+    native = ModuleType("mindspeed.core.ssm.gated_delta_net")
+    native.GatedDeltaNet = GatedDeltaNet
+    adapted = ModuleType("verl.models.mcore.tpr.gated_delta_net")
+    adapted.TPRGatedDeltaNet = TPRGatedDeltaNet
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+    monkeypatch.setitem(sys.modules, adapted.__name__, adapted)
+    original = SimpleNamespace(layer_specs=[
+        _layer_spec(cls) for cls in (GatedDeltaNet,) * 3 + (SelfAttention,)
+    ])
+    converted = replace_self_attention_with_tpr(original)
+    twice = replace_self_attention_with_tpr(converted)
+    assert [_attention_spec(layer).module for layer in twice.layer_specs] == [
+        TPRGatedDeltaNet, TPRGatedDeltaNet, TPRGatedDeltaNet, TPRSelfAttention,
+    ]
+    assert _attention_spec(original.layer_specs[0]).module is GatedDeltaNet
+    for before, after in zip(original.layer_specs, converted.layer_specs, strict=True):
+        assert _attention_spec(before).params == _attention_spec(after).params
+
+
 def test_rejects_unsupported_attention_module():
     with pytest.raises(TypeError, match="unsupported attention module"):
         replace_self_attention_with_tpr(_layer_spec(_UnsupportedAttention))

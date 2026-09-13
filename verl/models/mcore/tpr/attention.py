@@ -94,12 +94,18 @@ class TPRSelfAttention(SelfAttention):
         context: TPRAttentionContext,
     ) -> tuple[Tensor, Tensor | None]:
         # Reuse Megatron's projection, GQA reshaping, and optional Q/K norms.
-        query, new_key, new_value = self.get_query_key_value_tensors(
+        output_gate = getattr(self.config, "attention_output_gate", False)
+        qkv = self.get_query_key_value_tensors(
             hidden_states,
             key_value_states=None,
             split_qkv=True,
-            output_gate=False,
+            output_gate=output_gate,
         )
+        if output_gate:
+            query, new_key, new_value, gate = qkv
+        else:
+            query, new_key, new_value = qkv
+            gate = None
 
         q_pos_emb, k_pos_emb = _as_rotary_pair(context.suffix_rotary_pos_emb)
         # A sharded backend receives rank-local RoPE that was already sliced
@@ -144,6 +150,8 @@ class TPRSelfAttention(SelfAttention):
         # Collect post-RoPE K and raw V without detach/clone, preserving the
         # graph both for descendants and for gradients into an external prefix.
         context.set_new_kv(self.layer_number, new_key, new_value)
+        if gate is not None:
+            core_attn_out = self._apply_output_gate(core_attn_out, gate)
         return apply_module(self.linear_proj)(core_attn_out)
 
     def _validate_tree_forward(
@@ -195,7 +203,6 @@ class TPRSelfAttention(SelfAttention):
         boolean_restrictions = {
             "activation checkpointing": getattr(self, "checkpoint_core_attention", False),
             "fused_single_qkv_rope": getattr(self.config, "fused_single_qkv_rope", False),
-            "attention_output_gate": getattr(self.config, "attention_output_gate", False),
             "flash_decode": getattr(self.config, "flash_decode", False),
             "QKV offload": getattr(self, "offload_qkv_linear", False),
             "core-attention offload": getattr(self, "offload_core_attention", False),
