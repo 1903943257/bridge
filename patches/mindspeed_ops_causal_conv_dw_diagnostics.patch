@@ -1,0 +1,128 @@
+diff --git a/tests/unit_tests/triton/test_causal_conv1d/test_backward.py b/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+index abd98f7..97a77ff 100644
+--- a/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
++++ b/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+@@ -36,6 +36,77 @@ if not is_arch35():
+ # ============================================================
+ 
+ 
++def _print_pair_metrics(name, reference, actual):
++    reference, actual = reference.detach().cpu().float(), actual.detach().cpu().float()
++    finite = torch.isfinite(reference).all() & torch.isfinite(actual).all()
++    if not finite.item():
++        print(
++            f"CONV-BWD {name}: ref_nonfinite={(~torch.isfinite(reference)).sum().item()} "
++            f"actual_nonfinite={(~torch.isfinite(actual)).sum().item()}", flush=True,
++        )
++        return
++    ref_norm, act_norm = reference.norm(), actual.norm()
++    delta = actual - reference
++    cosine = (reference.flatten() @ actual.flatten()) / (ref_norm * act_norm).clamp_min(1e-24)
++    print(
++        f"CONV-BWD {name}: ref_norm={ref_norm.item():.6e} actual_norm={act_norm.item():.6e} "
++        f"abs_l2={delta.norm().item():.6e} rel_l2={(delta.norm() / ref_norm.clamp_min(1e-24)).item():.6e} "
++        f"cosine={cosine.item():.9f} max_abs={delta.abs().max().item():.6e}", flush=True,
++    )
++
++
++def _check_gradient_pairs(pairs, *, atol, rtol):
++    # Print every pair before any assertion, so a dw failure cannot hide dh0.
++    for name, (reference, actual) in pairs.items():
++        _print_pair_metrics(name, reference, actual)
++    failures = []
++    for name, (reference, actual) in pairs.items():
++        try:
++            torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
++        except AssertionError as exc:
++            failures.append(f"{name}: {exc}")
++    if failures:
++        raise AssertionError("\n".join(failures))
++
++
++def _diagnose_dw_tiles(arguments):
++    """Independent CPU formula for the actual per-tile weight-gradient buffers."""
++    x = arguments["x"].detach().cpu().float()
++    dz = arguments["dy"].detach().cpu().float()
++    h0 = arguments["initial_state"].detach().cpu().float()
++    if arguments["ACTIVATION"] in ("silu", "swish"):
++        z = arguments["y"].detach().cpu().float()
++        sigmoid = z.sigmoid()
++        dz = dz * sigmoid * (1 + z * (1 - sigmoid))
++    actual = arguments["dw"].detach().cpu().float()
++    bt, width = arguments["BT"], arguments["W"]
++    batch, length, channels = x.shape
++    chunks = (length + bt - 1) // bt
++    expected = torch.zeros_like(actual)
++    for b in range(batch):
++        for tile in range(chunks):
++            for lag in range(width):
++                for t in range(tile * bt, min((tile + 1) * bt, length)):
++                    # This kernel partitions dw by the input time index.
++                    if t + lag < length:
++                        expected[b * chunks + tile, width - 1 - lag] += dz[b, t + lag] * x[b, t]
++                    if t < lag:
++                        expected[b * chunks + tile, width - 1 - lag] += dz[b, t] * h0[b, :, width - lag + t]
++    print(f"CONV-BWD dw-tiles BT={bt} BD={arguments['BD']} shape={tuple(actual.shape)}", flush=True)
++    for w in range(width):
++        _print_pair_metrics(f"dw-tiles/weight-row{w}", expected[:, w], actual[:, w])
++    error = (actual - expected).abs()
++    ranking = torch.nan_to_num(error, nan=float("inf"), posinf=float("inf"), neginf=float("inf"))
++    offset = ranking.flatten().argmax().item()
++    tile, remainder = divmod(offset, width * channels)
++    row, channel = divmod(remainder, channels)
++    print(
++        f"CONV-BWD dw-tiles worst tile={tile} row={row} channel={channel} "
++        f"expected={expected[tile, row, channel].item()} actual={actual[tile, row, channel].item()}",
++        flush=True,
++    )
++
++
+ class TestCausalConv1dBackward:
+     """Backward kernel gradient correctness."""
+ 
+@@ -88,13 +159,14 @@ class TestCausalConv1dBackward:
+         atol = 5e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+         rtol = 5e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+ 
+-        torch.testing.assert_close(dx_npu.float(), x_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
++        pairs = {"dx": (x_ref.grad.to(dtype).float(), dx_npu.float())}
+         if dw_npu is not None:
+-            torch.testing.assert_close(dw_npu.float(), w_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
++            pairs["dw"] = (w_ref.grad.to(dtype).float(), dw_npu.float())
+         if db_npu is not None and b_ref is not None:
+-            torch.testing.assert_close(db_npu.float(), b_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
++            pairs["db"] = (b_ref.grad.to(dtype).float(), db_npu.float())
+         if dh0_npu is not None and h0_ref is not None:
+-            torch.testing.assert_close(dh0_npu.float(), h0_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
++            pairs["dh0"] = (h0_ref.grad.to(dtype).float(), dh0_npu.float())
++        _check_gradient_pairs(pairs, atol=atol, rtol=rtol)
+ 
+     @pytest.mark.parametrize(
+         "B,T,D,W",
+@@ -128,7 +200,10 @@ class TestCausalConv1dBackward:
+ 
+                 def traced(*args, **kwargs):
+                     launches.append(kwargs["BT"])
+-                    return launch(*args, **kwargs)
++                    result = launch(*args, **kwargs)
++                    if bt == 1:
++                        _diagnose_dw_tiles(kwargs)
++                    return result
+ 
+                 return traced
+ 
+@@ -347,11 +422,12 @@ class TestCausalConv1dState:
+             "dw": (w_full.grad, w_split.grad),
+             "dh0": (h0_ref.grad, anchor.grad),
+         }
++        cpu_comparisons = {}
+         for name, (reference, actual) in comparisons.items():
+             assert reference is not None and actual is not None, name
+             reference, actual = reference.detach().cpu().float(), actual.detach().cpu().float()
+-            assert torch.isfinite(actual).all(), name
+-            torch.testing.assert_close(actual, reference, atol=tolerance, rtol=tolerance, msg=name)
++            cpu_comparisons[name] = (reference, actual)
++        _check_gradient_pairs(cpu_comparisons, atol=tolerance, rtol=tolerance)
+         torch.testing.assert_close(anchor.grad[:, :, 0], torch.zeros_like(anchor.grad[:, :, 0]), atol=0, rtol=0)
+ 
+     def test_final_state_shape(self):
