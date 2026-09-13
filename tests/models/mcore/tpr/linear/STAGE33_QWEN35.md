@@ -166,3 +166,36 @@ STAGE33_OUT_PROJ_CHUNK64=1 torchrun \
 Inspect whether the first-layer output becomes exact, the next first-nonzero
 boundary if it does not, and the full-model parameter-gradient/relay changes.
 Do not assume removing the earliest perturbation removes later shape effects.
+
+### Combined first-layer out_proj + MLP fc2 control
+
+`STAGE33_MLP_FC2_CHUNK64=1` additionally applies the same 128-to-two-64
+intervention to **layer 1 only**, `mlp.linear_fc2`. Both flags default to zero
+and are independent; leave the out_proj flag enabled for this follow-up.
+The helper prints separate counters for each enabled projection, restores both
+on exceptions, and leaves all later layers untouched. Both forward call shapes
+and backward accumulation order can change. Original numerical gates remain
+unchanged and any successful full-model run is still labeled CONTROLLED PASS.
+
+Only the shared `_first_layer_projection_control.py` needs updating on the
+server if the two existing diagnostic scripts are already current. The CPU
+regression file and this document are also updated in bridge.
+
+```bash
+STAGE33_OUT_PROJ_CHUNK64=1 STAGE33_MLP_FC2_CHUNK64=1 torchrun \
+  --master_addr=127.0.0.1 --master_port=29564 --nproc_per_node=1 \
+  -m pytest -s -v \
+  tests/models/mcore/tpr/linear/test_qwen35_first_layer_shape_probe_npu.py
+```
+
+```bash
+STAGE33_OUT_PROJ_CHUNK64=1 STAGE33_MLP_FC2_CHUNK64=1 torchrun \
+  --master_addr=127.0.0.1 --master_port=29563 --nproc_per_node=1 \
+  -m pytest -s -v \
+  tests/models/mcore/tpr/linear/test_qwen35_hybrid_push_branch_pop_npu.py
+```
+
+Compare against both previous logs (unmodified and out_proj-only): first-layer
+output exactness, remaining full-model parameter-gradient difference, per-layer
+output drift, and all relay gates. This is a bounded causal diagnostic, not a
+plan to keep chunking more operators until the test passes.

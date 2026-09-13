@@ -6,24 +6,8 @@ import os
 import torch
 
 
-@contextmanager
-def first_layer_projection_control(model, monkeypatch):
-    mode = os.getenv("STAGE33_OUT_PROJ_CHUNK64", "0")
-    if mode not in ("0", "1"):
-        raise ValueError("STAGE33_OUT_PROJ_CHUNK64 must be 0 or 1")
-    print(f"STAGE-3.3 CONTROL first-layer-out-proj-chunk64={mode}", flush=True)
-    if mode == "0":
-        yield False
-        return
-
-    layer = model.decoder.layers[0]
-    assert layer.layer_number == 1
-    assert getattr(layer.self_attention, "tpr_state_kind", None) == "gdn"
-    assert model.config.context_parallel_size == 1
-    projection = layer.self_attention.out_proj
-    original = projection.forward
-    counts = {"full128_to_2x64": 0, "prefix64_unchanged": 0}
-
+def _controlled_forward(original, counts):
+    # Factory binds each projection and its own counters independently.
     def controlled(hidden, *args, **kwargs):
         assert hidden.ndim == 3 and hidden.shape[1] == 1, hidden.shape
         if hidden.shape[0] == 64:
@@ -42,11 +26,41 @@ def first_layer_projection_control(model, monkeypatch):
         assert all(isinstance(part, torch.Tensor) for part in pieces)
         return torch.cat(pieces, dim=0)
 
+    return controlled
+
+
+@contextmanager
+def first_layer_projection_control(model, monkeypatch):
+    modes = {}
+    for name, variable in (("out_proj", "STAGE33_OUT_PROJ_CHUNK64"),
+                           ("mlp_fc2", "STAGE33_MLP_FC2_CHUNK64")):
+        mode = os.getenv(variable, "0")
+        if mode not in ("0", "1"):
+            raise ValueError(f"{variable} must be 0 or 1")
+        modes[name] = mode == "1"
+        print(f"STAGE-3.3 CONTROL first-layer-{name}-chunk64={mode}", flush=True)
+    if not any(modes.values()):
+        yield False
+        return
+
+    layer = model.decoder.layers[0]
+    assert layer.layer_number == 1
+    assert getattr(layer.self_attention, "tpr_state_kind", None) == "gdn"
+    assert model.config.context_parallel_size == 1
+    projections = {}
+    if modes["out_proj"]:
+        projections["out_proj"] = layer.self_attention.out_proj
+    if modes["mlp_fc2"]:
+        projections["mlp_fc2"] = layer.mlp.linear_fc2
+    counters = {name: {"full128_to_2x64": 0, "prefix64_unchanged": 0} for name in projections}
     with monkeypatch.context() as patch:
-        patch.setattr(projection, "forward", controlled)
+        for name, projection in projections.items():
+            patch.setattr(projection, "forward", _controlled_forward(projection.forward, counters[name]))
         try:
             yield True
         finally:
-            print(f"STAGE-3.3 CONTROL calls={counts}; first-layer projection restored on exit", flush=True)
-    assert counts["full128_to_2x64"] > 0, "intervention did not execute"
-    assert counts["prefix64_unchanged"] > 0, "unchanged short path did not execute"
+            for name, counts in counters.items():
+                print(f"STAGE-3.3 CONTROL {name} calls={counts}; restored on exit", flush=True)
+    for name, counts in counters.items():
+        assert counts["full128_to_2x64"] > 0, f"{name} intervention did not execute"
+        assert counts["prefix64_unchanged"] > 0, f"{name} unchanged short path did not execute"
