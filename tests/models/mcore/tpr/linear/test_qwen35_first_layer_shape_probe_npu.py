@@ -26,6 +26,17 @@ def _snapshot(value):
     return value.detach().clone() if isinstance(value, torch.Tensor) else value
 
 
+def _gated_norm_output_view(output, args):
+    """Undo MindSpeed's [B*S*H,D] flattening for diagnostics/VJP seeds only."""
+    x = args[0]
+    assert x.ndim == 4, ("gated norm input must be [B,S,H,D]", x.shape)
+    batch, sequence, heads, dim = x.shape
+    assert tuple(output.shape) == (batch * sequence * heads, dim), (
+        "unexpected MindSpeed gated norm output layout", output.shape, x.shape,
+    )
+    return output.reshape(batch, sequence, heads, dim)
+
+
 def _metric(name, full, short, axis=0):
     left = full.narrow(axis, 0, 64).detach().cpu().float()
     right = short.detach().cpu().float()
@@ -46,7 +57,7 @@ class _Trace:
         assert name not in self.records, name
         self.records[name] = {"value": _snapshot(value), "axis": axis}
 
-    def call(self, name, fn, args, kwargs, axes, out_axis):
+    def call(self, name, fn, args, kwargs, axes, out_axis, output_view=None):
         # Snapshot BEFORE invocation; some kernels may use mutable buffers.
         copied_args = tuple(_snapshot(x) for x in args)
         copied_kwargs = {k: _snapshot(v) for k, v in kwargs.items()}
@@ -54,8 +65,12 @@ class _Trace:
             value = args[key] if isinstance(key, int) else kwargs[key]
             self.save(f"{name}.input.{key}", value, axis)
         output = fn(*args, **kwargs)
-        self.save(f"{name}.output", _tensor(output), out_axis)
-        self.records[f"{name}.output"]["replay"] = (fn, copied_args, copied_kwargs, axes)
+        observed = _tensor(output)
+        if output_view is not None:
+            observed = output_view(observed, args)
+        self.save(f"{name}.output", observed, out_axis)
+        self.records[f"{name}.output"]["replay"] = (fn, copied_args, copied_kwargs, axes, output_view)
+        # Never change the layout returned to the actual model.
         return output
 
 
@@ -95,7 +110,8 @@ def _trace_layer(layer, monkeypatch):
                               {0: 1, 1: 1, 2: 1, "g": 1, "beta": 1}, 1)
 
         def norm(*args, **kwargs):
-            return trace.call("gated_norm", original_norm, args, kwargs, {0: 1, 1: 1}, 1)
+            return trace.call("gated_norm", original_norm, args, kwargs, {0: 1, 1: 1}, 1,
+                              output_view=_gated_norm_output_view)
 
         patch.setattr(gdn_module, "_stage1_causal_conv1d", conv)
         patch.setattr(gdn_module, "_stage1_gated_delta_rule", gdr)
@@ -120,7 +136,7 @@ def _forward(layer, hidden):
 
 
 def _replay(layer, record):
-    fn, original_args, original_kwargs, axes = record["replay"]
+    fn, original_args, original_kwargs, axes, output_view = record["replay"]
     out_axis = record["axis"]
     results = []
     seed = None
@@ -142,6 +158,10 @@ def _replay(layer, record):
         args = tuple(leaf(i, v) for i, v in enumerate(original_args))
         kwargs = {k: leaf(k, v) for k, v in original_kwargs.items()}
         output = _tensor(fn(*args, **kwargs))
+        if output_view is not None:
+            # Use the same logical layout for prefix slicing AND backward seed.
+            # reshape preserves autograd back to the original flattened output.
+            output = output_view(output, args)
         assert output.shape[out_axis] == length
         prefix = output.narrow(out_axis, 0, 64)
         if seed is None:
