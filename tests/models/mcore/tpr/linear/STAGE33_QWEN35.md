@@ -1,5 +1,23 @@
 # Stage 3.3: complete Qwen3.5 Hybrid puncture
 
+## Frozen numerical-drift known issue (handoff to Stage 4)
+
+Per user decision, stop per-layer Linear investigation. Unmodified CP1
+full-vs-TPR parameter-gradient relative-L2 was ~0.14395, cosine ~0.989631:
+the original baseline remains FAIL. With **test-only first-layer out_proj and
+MLP fc2 chunk64 controls**, all original gates passed: parameter rel-L2
+0.0958853/cosine 0.9953958; connected-vs-TPR parameter rel-L2 0.0107295;
+GDN boundary gradients exact, FA boundary rel-L2 ~1.15e-5. Layer 1 outputs
+became exact, first forward divergence moved to layer 2. This is CONTROLLED
+PASS, not a production numerical fix or proof of long-term training stability.
+
+Track shape-dependent projection perturbations and downstream amplification as
+a numerical-drift known issue. Do not loosen thresholds or extend chunk
+controls layer by layer. Proceed with Stage 4.1/4.2; after small-Hybrid CP2 and
+before full-Qwen CP integration, run the planned CP1 20-50-step A/B to answer
+whether the differences materially affect training. Stage 4 details are in
+`../parallel/STAGE4_GDN.md`.
+
 Scope: random Qwen3.5-0.8B, 24 layers (18 GDN + 6 Full Attention), BF16,
 SiLU, CP/TP/PP/DP=1, non-packed, dropout=0. No weights or Bridge provider needed.
 P, S1 and S2 each contain 64 tokens; this does not certify BT=1 or Stage 4.
