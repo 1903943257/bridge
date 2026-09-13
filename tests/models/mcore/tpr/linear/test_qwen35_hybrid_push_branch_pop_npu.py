@@ -20,6 +20,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from ._first_layer_projection_control import first_layer_projection_control
+
 from verl.utils.device import is_torch_npu_available
 
 # pytest collects baseline and tpr as sibling packages in the server tree.
@@ -413,7 +415,8 @@ def test_full_qwen35_hybrid_engine_push_branch_pop(runtime, monkeypatch):
     plan = _plan()
     failures = []
     # All four passes reuse unchanged parameters; no optimizer is constructed.
-    with bind_stage1_gdn_primitives(mindspeed_gdn, model), _no_cp_probe(monkeypatch):
+    with (bind_stage1_gdn_primitives(mindspeed_gdn, model), _no_cp_probe(monkeypatch),
+          first_layer_projection_control(model, monkeypatch) as projection_control):
         with _LayerProbe(model) as native_probe:
             ref_loss, ref_logprobs, ref_grads = _native_reference(model, plan, runtime.device, probe=native_probe)
         loss, logprobs, grads, boundary = _run_engine(model, plan, monkeypatch)
@@ -472,6 +475,7 @@ def test_full_qwen35_hybrid_engine_push_branch_pop(runtime, monkeypatch):
     print("STAGE-3.3 GATE PASS communication CP1 A2A=0/Ring=0", flush=True)
     if failures:
         pytest.fail("Stage 3.3 failed gates (other gates were evaluated): " + ", ".join(failures))
-    print("STAGE-3.3 PASS: 24 layers (18 GDN + 6 FA), CP=1, non-packed; "
+    status = "CONTROLLED PASS (not unmodified baseline PASS)" if projection_control else "PASS"
+    print(f"STAGE-3.3 {status}: 24 layers (18 GDN + 6 FA), CP=1, non-packed; "
           "Engine tree request; prefix own loss once at Pop; 48 boundary gradients; "
           "A2A=0/Ring=0; all cached states released", flush=True)

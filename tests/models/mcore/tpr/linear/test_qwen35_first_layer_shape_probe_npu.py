@@ -16,6 +16,7 @@ from .test_qwen35_hybrid_push_branch_pop_npu import (
     _no_cp_probe,
 )
 from baseline._qwen35_baseline_utils import make_qwen35_model, gradient_map_diagnostics
+from ._first_layer_projection_control import first_layer_projection_control
 
 
 def _tensor(output):
@@ -201,7 +202,7 @@ def test_first_layer_full_vs_prefix(runtime, monkeypatch):
     plan = _plan()
     tokens = torch.cat((plan.get(0).token_ids, plan.get(1).token_ids)).to(runtime.device).unsqueeze(0)
     positions = torch.arange(128, device=runtime.device).unsqueeze(0)
-    with _no_cp_probe(monkeypatch):
+    with _no_cp_probe(monkeypatch), first_layer_projection_control(model, monkeypatch):
         with torch.no_grad():
             full_input = model.embedding(input_ids=tokens, position_ids=positions)
             short_input = model.embedding(input_ids=tokens[:, :64], position_ids=positions[:, :64])

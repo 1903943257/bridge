@@ -128,3 +128,41 @@ torchrun --master_addr=127.0.0.1 --master_port=29564 --nproc_per_node=1 \
   -m pytest -s -v \
   tests/models/mcore/tpr/linear/test_qwen35_first_layer_shape_probe_npu.py
 ```
+
+## First-layer out-projection causal control (opt-in)
+
+`STAGE33_OUT_PROJ_CHUNK64=1` temporarily changes only layer 1 GDN out_proj:
+128-token inputs are projected as two contiguous 64-token calls and concatenated
+with autograd intact; existing 64-token calls are unchanged. This applies to
+native-full and TPR-context-full equally. Other layers, weights, dtype, state
+relay, optimizer and acceptance thresholds are unchanged. Chunking also changes
+this projection's backward reduction order, so this is an execution-shape
+intervention, not a forward-rounding-only proof.
+
+The default (`0` or unset) remains the original test. The control prints its
+mode and full/short call counts and restores the original method on exit.
+A PASS with this control enabled does NOT certify the unmodified baseline.
+
+Sync `_first_layer_projection_control.py`, both updated Qwen test scripts and,
+optionally, `unit/test_first_layer_projection_control.py` before running.
+First compare the controlled first-layer trace with the existing baseline log:
+
+```bash
+STAGE33_OUT_PROJ_CHUNK64=1 torchrun \
+  --master_addr=127.0.0.1 --master_port=29564 --nproc_per_node=1 \
+  -m pytest -s -v \
+  tests/models/mcore/tpr/linear/test_qwen35_first_layer_shape_probe_npu.py
+```
+
+Then measure the remaining full-model difference with all original gates:
+
+```bash
+STAGE33_OUT_PROJ_CHUNK64=1 torchrun \
+  --master_addr=127.0.0.1 --master_port=29563 --nproc_per_node=1 \
+  -m pytest -s -v \
+  tests/models/mcore/tpr/linear/test_qwen35_hybrid_push_branch_pop_npu.py
+```
+
+Inspect whether the first-layer output becomes exact, the next first-nonzero
+boundary if it does not, and the full-model parameter-gradient/relay changes.
+Do not assume removing the earliest perturbation removes later shape effects.
