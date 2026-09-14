@@ -216,3 +216,34 @@ torchrun --master_addr=127.0.0.1 --master_port=29567 --nproc_per_node=2 \
 
 Local validation is syntax/static only; NPU PASS is not claimed. After 4.3,
 run the planned CP1 short multi-step A/B before 4.4 Full Qwen CP2; THD remains 4.5.
+
+### Server feedback: CP state gate FAIL; localization pending
+
+Reported loss CP1-connected/CP2-connected/CP2-tree:
+13.204019547 / 13.203976631 / 13.203976631.
+CP1 vs CP2 parameter rel-L2 ~0.0166; individual boundary gradients exceed 0.02:
+GDN1 conv 0.02343, recurrent 0.02211; FA4 key ~0.0238--0.0267 in another
+diagnostic. CP2 connected vs tree state rel-L2 ~1e-6--5e-6. Communication
+matches: CP1 zero; CP2 connected A2A54/9, Ring3/P2P10; tree72/12, Ring4/P2P11.
+This localizes the failing comparison, **not the responsible operator**.
+No thresholds changed and Stage 4.3 is not declared PASS.
+
+Sync the updated test plus `_hybrid_divergence_probe.py` in this directory.
+Enable observational connected-path hooks (tree path unchanged):
+
+```bash
+STAGE43_TRACE=1 torchrun --master_addr=127.0.0.1 --master_port=29567 --nproc_per_node=2 \
+  -m pytest -s -v tests/models/mcore/tpr/parallel/test_small_hybrid_tree_cp_npu.py
+```
+
+The trace covers embedding, each layer input/output, attention input/output,
+GDN/FA projections, norm/MLP boundaries and final norm. Compare CP1's matching
+zigzag slice against CP2 locally for both values and VJPs; no extra CP
+collectives or division of rank-local activation gradients. Each rank/segment
+prints first nonzero forward and reverse-boundary-order backward locations,
+plus norms/absolute-L2/relative-L2/cosine/max-abs. All eight boundary gradient
+metrics print before gating. This is module-boundary localization; it does not
+trace inside conv/GDR/Ring kernels. A nonzero backward difference may be inherited
+from a different upstream gradient and requires a same-upstream replay before
+attributing it to a backward implementation. CPU snapshots can affect execution
+timing; trace-off remains the original correctness run.

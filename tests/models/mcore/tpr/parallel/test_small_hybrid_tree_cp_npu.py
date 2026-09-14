@@ -5,7 +5,8 @@ projection controls, optimizer, Engine integration or THD claims.
 """
 
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import os
 
 import pytest
 import torch
@@ -91,6 +92,10 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree):
 
     model.zero_grad(set_to_none=True)
     outputs, input_gradients, own_losses = {}, {}, Counter()
+    trace = None
+    if not tree and os.getenv("STAGE43_TRACE", "0") == "1":
+        from ._hybrid_divergence_probe import HybridDivergenceProbe
+        trace = HybridDivergenceProbe(model)
 
     class ObservedExecutor(SegmentExecutor):
         def _forward(self, segment, **kwargs):
@@ -113,7 +118,8 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree):
             layout_handles = [layer.self_attention.register_forward_pre_hook(check_layout, with_kwargs=True)
                               for layer in model.decoder.layers]
             try:
-                context, logits = super()._forward(segment, **kwargs)
+                with trace.segment(segment.segment_id) if trace is not None else nullcontext():
+                    context, logits = super()._forward(segment, **kwargs)
             finally:
                 handle.remove()
                 for layout_handle in layout_handles:
@@ -202,7 +208,8 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree):
         input_gradients[sid] = value.cpu().float()
     print(f"STAGE-4.3 CP={cp} tree={tree} loss={loss.item():.9f} "
           f"A2A={a2a.count('cp2hp')}/{a2a.count('hp2cp')} Ring={dict(counts)}", flush=True)
-    return dict(loss=loss.cpu(), output=outputs, input=input_gradients, parameters=parameters, state=states)
+    return dict(loss=loss.cpu(), output=outputs, input=input_gradients,
+                parameters=parameters, state=states, trace=trace)
 
 
 def _shard_states(states, rank):
@@ -233,6 +240,8 @@ def test_small_hybrid_cp2_tree(runtime, monkeypatch):
     plan = _plan()
     cp1 = _run(reference, plan, runtime, monkeypatch, cp=1, tree=False)
     cp2 = _run(target, plan, runtime, monkeypatch, cp=2, tree=False)
+    if cp1["trace"] is not None:
+        cp1["trace"].compare(cp2["trace"], rank=runtime.cp_group.rank(), metrics=gradient_map_diagnostics)
     tree = _run(target, plan, runtime, monkeypatch, cp=2, tree=True)
     cp1["state"] = _shard_states(cp1["state"], runtime.cp_group.rank())
     failures = []
@@ -242,6 +251,11 @@ def test_small_hybrid_cp2_tree(runtime, monkeypatch):
             for name, value in left[kind].items():
                 assert torch.isfinite(value).all() and torch.isfinite(right[kind][name]).all()
             print(f"STAGE-4.3 {label}/{kind}: {gradient_map_diagnostics(left[kind], right[kind])}", flush=True)
+            if kind == "state":
+                for name in left[kind]:
+                    print(f"STAGE-4.3 rank={runtime.cp_group.rank()} {label}/state/{name}: "
+                          f"{gradient_map_diagnostics({name: left[kind][name]}, {name: right[kind][name]})}",
+                          flush=True)
             try:
                 # Retain the Stage 4.1/4.2 CP/relay envelope; no new relaxation.
                 assert_gradient_maps_close(left[kind], right[kind], rtol=.02, cosine_min=.999)
