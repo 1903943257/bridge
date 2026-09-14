@@ -153,6 +153,20 @@ class FACoreReplay:
             cp_own = run(own, local_upstream, 2)
             if layer == 4:
                 from ._ring_merge_probe import ring_merge_probe, report_ring_merge
+                from unittest.mock import patch
+                from verl.models.mcore.tpr.parallel import ring_attention as ring
+                fp32_merge = ring._merge_attention
+
+                def legacy_merge(previous, current, *, query_length):
+                    if previous is None:
+                        return current
+                    output, maximum, total = fp32_merge(previous, current, query_length=query_length)
+                    return output.to(previous[0].dtype), maximum, total
+
+                # A/B at identical canonical inputs AND dO, including the
+                # legacy rounded saved output used by fused backward.
+                with patch.object(ring, "_merge_attention", legacy_merge):
+                    cp_legacy = run(canonical, local_upstream, 2)
                 with ring_merge_probe() as merge_probe:
                     cp_canonical = run(canonical, local_upstream, 2)
             else:
@@ -177,6 +191,7 @@ class FACoreReplay:
                     expected = sliced(oracle[n])
                     report("FP32-reference-vs-CP1/" + n, expected, sliced(full[n]))
                     report("FP32-reference-vs-CP2/" + n, expected, cp_canonical[n])
+                    report("FP32-reference-vs-CP2-legacy-merge/" + n, expected, cp_legacy[n])
                 # Four global 32-token bands expose zigzag/boundary concentration
                 # without dumping tensors. Each rank owns two bands.
                 bands = {}

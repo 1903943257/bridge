@@ -497,9 +497,12 @@ def _merge_attention(
     *,
     query_length: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    # Keep the online-softmax accumulator FP32, including the first block.
+    # Casting after every merge repeatedly rounds the partial context in BF16.
+    current = tuple(t.float() for t in current)
     if previous is None:
         return current
-    previous_output, previous_max, previous_sum = previous
+    previous_output, previous_max, previous_sum = (t.float() for t in previous)
     current_output, current_max, current_sum = current
     actual_seq_qlen = (query_length,)
 
@@ -526,12 +529,17 @@ def _merge_attention(
     current_output_scale = current_output_scale.expand(-1, -1, head_dim)
     merged_output = previous_output * previous_output_scale
     merged_output.add_(current_output * current_output_scale)
-    merged_output = merged_output.to(previous_output.dtype)
     return (
         merged_output,
         _unflatten_tnd_softmax(merged_max, actual_seq_qlen),
         _unflatten_tnd_softmax(merged_sum, actual_seq_qlen),
     )
+
+
+def _finalize_attention_result(result, *, dtype):
+    """One final output cast shared by the caller and fused backward save."""
+    output, maximum, total = result
+    return output.to(dtype).contiguous(), maximum, total
 
 
 def _flatten_tnd_softmax(
@@ -731,7 +739,9 @@ class _RingTPRAttention(torch.autograd.Function):
                         )
             if merged is None:
                 raise RuntimeError(f"query range {query_range} has no visible KV block")
-            query_results.append(merged)
+            # Fused backward consumes the final context in query dtype, not
+            # the FP32 accumulator. Save the same rounded context we return.
+            query_results.append(_finalize_attention_result(merged, dtype=query.dtype))
 
         saved_blocks = []
         for source_blocks in segment_blocks:

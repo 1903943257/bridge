@@ -638,3 +638,37 @@ python -m pytest -q tests/models/mcore/tpr/unit/test_ring_merge_probe.py
 
 AST checks passed locally. PyTorch CPU tests and NPU shadow results remain
 pending; do not infer a merge fix or PASS until the actual comparison returns.
+
+### FP32 Ring accumulation implementation
+
+Server shadow results: oracle blocks through FP32 merge matched whole attention
+within ~3e-7 relative-L2. Actual blocks merged in FP32 then cast once to BF16
+reduced L4 reference error from ~0.354% to ~0.233%. Block max/sum were FP32;
+block output was BF16. This identifies repeated output rounding as a concrete
+forward error source, not evidence that all cross-CP/backward error is solved.
+That run cross-CP FAILED, Engine-relay PASSED (both ranks, zero waived gates).
+
+Production `verl/models/mcore/tpr/parallel/ring_attention.py` now promotes the
+first block and maintains FP32 output/max/sum throughout merging. Each query
+chunk is cast once to query dtype before being saved for fused backward and
+returned. Existing validity masking, block kernels, communication, gradient
+accumulation and numerical gates are unchanged. This is an implementation
+change, not just a shadow; NPU F/B validation remains pending.
+
+L4 replay adds old per-merge BF16 rounding as a test-only A/B with the same
+canonical inputs and dO; both old/new outputs and five gradients are compared
+to CPU FP32 reference. `merge/...native-accumulator` is before the final cast,
+`merge/...native-final-cast` matches output dtype. Do not compare the former
+directly to historical BF16 native results without accounting for that cast.
+
+Sync the production Ring file, `_fa_core_replay.py`, `_ring_merge_probe.py`,
+and `test_ring_cp_attention_contract.py`. Run existing controlled FA replay
+command (TRACE=0), reviewing L4 new/legacy F/B metrics before accepting the
+full-model results. CPU regression covers 1/5/8 blocks and final saved dtype:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_ring_cp_attention_contract.py
+```
+
+Local AST checks only; PyTorch/NPU are unavailable locally. No training
+stability or new numerical PASS is claimed.

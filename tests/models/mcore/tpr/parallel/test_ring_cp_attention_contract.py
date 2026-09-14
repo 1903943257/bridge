@@ -224,3 +224,20 @@ def test_tnd_online_softmax_merge_handles_noncontiguous_layout_conversion():
 def test_invalid_ring_shard_requests_are_rejected(factory):
     with pytest.raises(ValueError):
         factory()
+
+
+@pytest.mark.parametrize("blocks", [1, 5, 8])
+def test_merge_keeps_fp32_until_final_output_for_backward(blocks):
+    generator = torch.Generator().manual_seed(44)
+    values = [torch.randn(4, 2, 8, generator=generator).bfloat16() for _ in range(blocks)]
+    merged = None
+    for value in values:
+        merged = ring._merge_attention(merged, (value, torch.zeros(1, 2, 4, 8),
+                                                 torch.ones(1, 2, 4, 8)), query_length=4)
+        assert all(t.dtype == torch.float32 for t in merged)
+    expected = torch.stack([v.float() for v in values]).mean(0)
+    torch.testing.assert_close(merged[0], expected, atol=2e-7, rtol=2e-6)
+    final = ring._finalize_attention_result(merged, dtype=torch.bfloat16)
+    assert final[0].dtype == torch.bfloat16 and final[0].is_contiguous()
+    assert final[1] is merged[1] and final[2] is merged[2]
+    torch.testing.assert_close(final[0], merged[0].bfloat16(), atol=0, rtol=0)
