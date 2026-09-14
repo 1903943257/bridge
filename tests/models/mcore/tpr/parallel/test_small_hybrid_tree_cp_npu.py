@@ -238,12 +238,18 @@ def test_small_hybrid_cp2_tree(runtime, monkeypatch):
     for model in (reference, target):
         assert [type(l.self_attention) for l in model.decoder.layers] == [TPRGatedDeltaNet] * 3 + [TPRSelfAttention]
     plan = _plan()
-    cp1 = _run(reference, plan, runtime, monkeypatch, cp=1, tree=False)
+    from ._first_gdn_zigzag_control import first_gdn_zigzag_control
+
+    with first_gdn_zigzag_control(reference, monkeypatch) as (controlled, counts):
+        cp1 = _run(reference, plan, runtime, monkeypatch, cp=1, tree=False)
+    if controlled:
+        assert counts["full128_to_zigzag_2x64"] == 3, counts
+        print("STAGE-4.3 CONTROL: standalone native replay skipped; use connected TRACE for intervention", flush=True)
     cp2 = _run(target, plan, runtime, monkeypatch, cp=2, tree=False)
     if cp1["trace"] is not None:
         cp1["trace"].compare(cp2["trace"], rank=runtime.cp_group.rank(), metrics=gradient_map_diagnostics)
     tree = _run(target, plan, runtime, monkeypatch, cp=2, tree=True)
-    if cp1["trace"] is not None:
+    if cp1["trace"] is not None and not controlled:
         # All measured model F/B runs and communication counts are complete.
         cp1["trace"].replay_first_out_proj(
             cp2["trace"], rank=runtime.cp_group.rank(), metrics=gradient_map_diagnostics,
@@ -276,6 +282,7 @@ def test_small_hybrid_cp2_tree(runtime, monkeypatch):
         except AssertionError as exc:
             failures.append(f"{label}/loss: {exc}")
     if failures:
-        pytest.fail("\n".join(failures))
+        pytest.fail(("CONTROLLED FAIL (not baseline)\n" if controlled else "") + "\n".join(failures))
     if runtime.rank == 0:
-        print("STAGE-4.3 PASS: GDN x3 + FA, connected CP controls + tree relay; not Full-Qwen/THD")
+        status = "CONTROLLED PASS (not unmodified baseline PASS)" if controlled else "PASS"
+        print(f"STAGE-4.3 {status}: GDN x3 + FA, connected CP controls + tree relay; not Full-Qwen/THD")

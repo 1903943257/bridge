@@ -274,3 +274,37 @@ forward localization control, not a backward same-upstream replay. If own-input
 reproduction fails, contiguous layout/dispatch or repeatability must be resolved
 before attributing the observed original difference solely to sequence length.
 Actual replay results remain pending on NPU.
+
+### Optional causal control: CP1 layer1 out_proj 128 -> zigzag 2x64
+
+Server replay found identical outputs across CP1/CP2 module instances on the
+same shape/input, but full vs shard within one instance differed (segment2:
+rank0 rel-L2 1.10e-5/max-abs 2.44e-4; rank1 2.78e-6/6.10e-5).
+This identifies a shape-dependent local difference, not proof that it explains
+all final gradient drift.
+
+`STAGE43_OUT_PROJ_ZIGZAG64=1` intervenes ONLY during CP1 connected F/B:
+first GDN out_proj processes token groups [0:32,96:128] and [32:96], then
+inverts their permutation. This retains autograd and parameter-gradient
+accumulation; it is not contiguous `split(64)`. Three full calls (P/S1/S2)
+must be controlled. CP2, other layers, kernels and thresholds remain unchanged.
+The module is restored on exit. Standalone native replay is skipped in this
+mode because captured controlled outputs must not be labelled native replay.
+
+Sync `_first_gdn_zigzag_control.py`, the updated main test, and optionally
+`../unit/test_first_gdn_zigzag_control.py`; keep the existing trace helper.
+
+```bash
+STAGE43_TRACE=1 STAGE43_OUT_PROJ_ZIGZAG64=1 \
+  torchrun --master_addr=127.0.0.1 --master_port=29567 --nproc_per_node=2 \
+  -m pytest -s -v tests/models/mcore/tpr/parallel/test_small_hybrid_tree_cp_npu.py
+python -m pytest -v tests/models/mcore/tpr/unit/test_first_gdn_zigzag_control.py
+```
+
+Compare to the trace-on/control-off results: does first-layer out_proj (and
+then the whole first layer) become exact, and how much do output/input/parameter
+and all individual state errors drop? Whole-layer exactness is an observation,
+not guaranteed by controlling only out_proj. Passing existing gates is labelled
+**CONTROLLED PASS (not unmodified baseline PASS)**. No threshold for 'significant
+drop' is invented. Default control=0 preserves the baseline. Server results
+and CPU torch regression results remain pending; local checks are static only.
