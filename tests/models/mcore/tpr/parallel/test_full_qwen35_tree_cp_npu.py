@@ -118,7 +118,7 @@ def _engine_run(model, plan, executor_type, runtime, monkeypatch):
         model.config.finalize_model_grads_func = None
 
 
-def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=False, gdn_capture=None):
+def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=False, gdn_capture=None, closure_capture=None):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
     from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
@@ -180,7 +180,8 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=
             try:
                 with (drift.segment(model, segment.segment_id) if drift is not None else nullcontext(),
                       fa_capture.capture(model, segment.segment_id, monkeypatch) if fa_capture is not None else nullcontext(),
-                      gdn_capture.capture(model, segment.segment_id, monkeypatch) if gdn_capture is not None else nullcontext()):
+                      gdn_capture.capture(model, segment.segment_id, monkeypatch) if gdn_capture is not None else nullcontext(),
+                      closure_capture.capture(model, segment.segment_id) if closure_capture is not None else nullcontext()):
                     context, logits = super()._forward(segment, **kwargs)
             finally:
                 for handle in handles:
@@ -401,6 +402,12 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
               f"parameter_SUM={'once' if cp == 2 else 'none'} state_SUM=none "
               f"Engine_loss_scale={'1/2 (cancels CP factor)' if tree else 'global denominator only'}", flush=True)
         gdn_capture = None
+        closure_capture = None
+        closure_enabled = os.getenv("STAGE44_PROPAGATION_CLOSURE", "0") == "1" and label in ("CP1-connected", "CP2-connected")
+        if closure_enabled:
+            from ._propagation_closure import ClosureCapture, propagation_closure
+            if cp == 1:
+                closure_capture = ClosureCapture()
         if os.getenv("STAGE44_GDN_REPLAY", "0") == "1" and label in ("CP1-connected", "CP2-connected"):
             from ._gdn_layer_replay import GDNLayerReplay, replay_gdn
             gdn_capture = GDNLayerReplay()
@@ -408,7 +415,15 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
             result = _run(model, plan, runtime, monkeypatch, cp=cp, tree=tree,
                             trace=os.getenv("STAGE44_TRACE", "0") == "1" and label in ("CP1-connected", "CP2-connected"),
                             fa_replay=os.getenv("STAGE44_FA_REPLAY", "0") == "1" and label in ("CP1-connected", "CP2-connected"),
-                            gdn_capture=gdn_capture)
+                            gdn_capture=gdn_capture, closure_capture=closure_capture)
+        if closure_enabled:
+            if cp == 1:
+                closure_reference = propagation_closure(model, closure_capture, None, runtime,
+                                                        monkeypatch, gradient_map_diagnostics, cp=1)
+            else:
+                propagation_closure(model, None, closure_reference, runtime,
+                                    monkeypatch, gradient_map_diagnostics, cp=2)
+                del closure_reference
         # Replay after the measured model run and control scope, while L5 is
         # still alive. Replay does not contribute to model metrics/counters.
         if gdn_capture is not None:

@@ -702,3 +702,38 @@ STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=0 STAGE44_FA_REPLAY=0 STAGE44_GDN_REPLAY
 ```
 
 Local AST check passed. NPU results pending; no PyTorch is installed locally.
+
+### Short L5-L8 propagation closure
+
+`STAGE44_PROPAGATION_CLOSURE=1` snapshots CP1 S2 at the full L5 Transformer
+block entrance: hidden, each of L5/L6/L7's own initial conv/recurrent state,
+and L8 prefix KV plus suffix RoPE. Broadcast canonical tensors from rank0;
+slice native sequence shards and per-section GDN channels/heads for CP2.
+Check all L5-L8 parameters identical. Run full Transformer blocks L5 through
+L8 (norm, residual, attention, MLP), never resetting hidden between blocks.
+CP1 controls all 16 projection-module calls to zigzag64. This is a controlled
+forward experiment, including any fused norm in those projection modules.
+
+Print exact/relative-L2/max-abs at block input/output, GDN final conv/recurrent
+state, and L8 post-RoPE Q/K/V, prefix KV, core output. Print first nonexact
+boundary and local repeat exactness. L8 KV is explicitly aligned so a new FA
+seed is not confused with a pre-existing prefix difference. GDN states are
+per-layer initial states: L5 final state is NOT passed into L6 as its initial
+state. No backward or optimizer step, no new gate, no production code change.
+Measured full-model runs/counters precede the extra local closure replay.
+
+This can establish one period's propagation behavior. It does not by itself
+prove six periods' quantitative error accumulation or the 9% backward gap.
+If L5-L7 and L8 Q/K/V align while L8 core differs, that supports a new FA
+seed in this period. If an earlier boundary differs, replay that block next.
+
+Sync `_propagation_closure.py`, updated full-model test and optional CPU test:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/unit/test_propagation_closure.py
+mkdir -p tests/models/mcore/tpr/logs
+STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=0 STAGE44_FA_REPLAY=0 STAGE44_GDN_REPLAY=0 STAGE44_PROPAGATION_CLOSURE=1 torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py > tests/models/mcore/tpr/logs/stage4_4_5.logs 2>&1
+```
+
+Redirect overwrites the log. AST checks passed locally; CPU/NPU tests pending
+because local PyTorch/NPU are unavailable. No numerical PASS claimed.
