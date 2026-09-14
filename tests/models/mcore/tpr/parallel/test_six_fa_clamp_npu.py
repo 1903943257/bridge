@@ -91,7 +91,7 @@ def _forward_paths(model, runtime, monkeypatch, *, cp, reference):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors
     from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
-    plan = _plan(runtime.device)
+    plan = _plan()
     executor = SegmentExecutor(model, plan, expected_layer_numbers=FA_LAYERS,
                                cp_group=runtime.cp_group if cp == 2 else None,
                                cp_backend="ring" if cp == 2 else None)
@@ -144,7 +144,7 @@ def _compare(reference, actual, runtime, label):
         state_metrics = {n: pair(left_states[n], t) for n, t in actual["states"][sid].items()}
         worst_state = max(state_metrics, key=lambda n: state_metrics[n][1])
         output = pair(reference["probes"][sid].index_select(0, indices), actual["probes"][sid])
-        terms = _plan(runtime.device).get(sid).loss_terms
+        terms = _plan().get(sid).loss_terms
         owned = set(indices.tolist())
         selected = torch.tensor([i for i, term in enumerate(terms) if term.query_offset in owned], dtype=torch.long)
         logprob = pair(reference["logprobs"][sid].index_select(0, selected), actual["logprobs"][sid])
