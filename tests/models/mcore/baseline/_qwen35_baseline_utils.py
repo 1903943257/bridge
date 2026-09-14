@@ -807,7 +807,9 @@ def assert_gradient_maps_close(reference, actual, *, rtol=8e-2, cosine_min=0.995
         act2 += torch.sum(right_f.square()).item()
         dot += torch.sum(left_f * right_f).item()
         relative = (local_diff2 / max(local_ref2, 1e-24)) ** 0.5
-        worst = max(worst, (relative, name))
+        # Segment probes use integer keys; parameter maps use strings. Rank
+        # only by error, never compare heterogeneous names when errors tie.
+        worst = max(worst, (relative, name), key=lambda item: item[0])
     relative_l2 = (diff2 / max(ref2, 1e-24)) ** 0.5
     cosine = dot / max((ref2 * act2) ** 0.5, 1e-24)
     if relative_l2 > rtol or cosine < cosine_min:
