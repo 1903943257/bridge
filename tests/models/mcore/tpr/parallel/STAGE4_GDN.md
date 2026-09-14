@@ -737,3 +737,41 @@ STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=0 STAGE44_FA_REPLAY=0 STAGE44_GDN_REPLAY
 
 Redirect overwrites the log. AST checks passed locally; CPU/NPU tests pending
 because local PyTorch/NPU are unavailable. No numerical PASS claimed.
+
+### Six-FA forward + new-KV clamp
+
+`test_six_fa_clamp_npu.py` is a separate forward-only causal intervention, not
+a training implementation or Ring kernel fix. It runs identical seed 440001,
+24-layer models on P/S1/S2: CP1 with all projection-module shape controls,
+CP2 native, CP2 clamped. Dropout is zero and every initial tensor is checked.
+No backward/optimizer is invoked and model parameter .grad must remain None.
+
+At each of L4/8/12/16/20/24, for every segment, CP2 executes real Ring before
+replacing its core output (before output gate/projection) with the matching
+CP1 native-zigzag slice. `set_new_kv` stores matching CP1 post-RoPE key/raw value
+instead of the actual new KV, so descendants consume clamped prefix state.
+Root and both independent suffixes are covered. GDN states, residuals, layer
+outputs, output gates, norms and MLPs are never clamped. CP1 core/KV captures
+must agree across ranks before using rank0 copies. This is a joint core+KV
+intervention, not a separate attribution of their individual contributions.
+
+Audit 18 core replacements + 36 KV replacements; real CP2 A2A=324/54,
+FA Ring=18, P2P=60. Report per-segment first nonexact layer among all 24,
+six FA-layer outputs, worst of all 48 final-state tensors and all-state
+exactness, logits probe and logical target-logprob differences. Compare native
+and clamped against CP1; no numerical threshold or training PASS is introduced.
+Pytest completion only certifies execution/audits, not training equivalence.
+
+Use the current FP32 Ring merge production file plus the existing Stage4
+helpers. Sync the new test and this document. This test always uses CP1 shape
+control; other replay flags are irrelevant. From the server verl root:
+
+```bash
+mkdir -p tests/models/mcore/tpr/logs
+torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_six_fa_clamp_npu.py > tests/models/mcore/tpr/logs/stage4_4_5.logs 2>&1
+```
+
+Log is overwritten. Local AST checks passed; NPU results pending (no local
+PyTorch/NPU). Even exact clamped forward/state only supports sufficiency of
+these interventions for this fixture; it does not validate unclamped gradients,
+all hybrid architectures, or the planned 20/50-step training stability.
