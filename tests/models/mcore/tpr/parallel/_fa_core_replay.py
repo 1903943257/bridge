@@ -40,6 +40,8 @@ class FACoreReplay:
                 assert k.shape[0] == v.shape[0] == 256 and q.shape[0] == 128
                 assert kwargs.get("dropout_p", 0) == 0
                 assert kwargs.get("attention_mask") is None
+                assert kwargs.get("pre_tokens", 2**31 - 1) >= 256
+                assert kwargs.get("inner_precise", 0) == 0
                 record(q, k[128:], v[128:], k[:128], v[:128], kwargs.get("softmax_scale"), output)
             return output
 
@@ -49,6 +51,12 @@ class FACoreReplay:
                 blocks = kwargs["prefix_blocks"]
                 assert len(blocks) == 1 and blocks[0].segment_id == 0
                 assert blocks[0].shard.global_length == kwargs["current_shard"].global_length == 128
+                for captured_shard in (blocks[0].shard, kwargs["current_shard"]):
+                    expected = ring.make_ring_sequence_shard(
+                        128, cp_rank=dist.get_rank(kwargs["cp_group"]), cp_size=2)
+                    assert captured_shard.padded_length == 128
+                    assert torch.equal(captured_shard.global_indices(device="cpu"),
+                                       expected.global_indices(device="cpu"))
                 record(q, k, v, blocks[0].key, blocks[0].value, kwargs.get("softmax_scale"), output)
             return output
 
@@ -145,6 +153,35 @@ class FACoreReplay:
             cp_own = run(own, local_upstream, 2)
             cp_canonical = run(canonical, local_upstream, 2)
             cp_repeat = run(canonical, local_upstream, 2)
+            if layer == 4:
+                from ._fa_fp32_reference import fp32_reference
+                oracle = fp32_reference(global_canonical, full_upstream)
+                scale = reference["scale"]
+                effective_scale = reference["q"].shape[-1] ** -0.5 if scale is None else scale
+                print(f"STAGE-4.4 FA-FP32 r={rank} L04 AUDIT: CPU FP32 explicit matmul/softmax; "
+                      f"Q={tuple(global_canonical['q'].shape)} KV={tuple(global_canonical['k'].shape)} "
+                      f"scale={effective_scale} dropout=0; KV=[P0:128,S2:128]; "
+                      "query i visible KV=0..128+i inclusive (129..256 keys); "
+                      "CP1 right-down causal/window>=256/inner_precise=0; "
+                      "CP2 prefix/current native zigzag, no padding; "
+                      "reference uses full dO, KV gradients sliced only, no extra SUM; "
+                      "semantic contract audit, not an audit of every launched Ring mask", flush=True)
+                for n in ("output", *names):
+                    expected = sliced(oracle[n])
+                    report("FP32-reference-vs-CP1/" + n, expected, sliced(full[n]))
+                    report("FP32-reference-vs-CP2/" + n, expected, cp_canonical[n])
+                # Four global 32-token bands expose zigzag/boundary concentration
+                # without dumping tensors. Each rank owns two bands.
+                bands = {}
+                for start in (0, 32, 64, 96):
+                    selected = (indices >= start) & (indices < start + 32)
+                    if selected.any():
+                        expected = sliced(oracle["output"])[selected]
+                        bands[f"{start}:{start+32}"] = tuple(
+                            float((value[selected].float() - expected).abs().max())
+                            for value in (sliced(full["output"]), cp_canonical["output"]))
+                print(f"STAGE-4.4 FA-FP32 r={rank} L04 output band max_abs "
+                      f"(CP1,CP2) vs reference={bands}; diagnostic only", flush=True)
             report("own-input-reproduce/CP1", reference["output"], full_own["output"])
             report("own-input-reproduce/CP2", own["output"], cp_own["output"])
             for n in ("output", *names):

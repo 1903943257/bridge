@@ -567,3 +567,39 @@ gradient gates against the baseline logs. Canonical replay in this run uses the
 controlled CP1 capture. Controlled PASS/FAIL is labelled in MODE/SUMMARY/pytest;
 it cannot change the unmodified baseline status. All thresholds remain intact.
 Local syntax/selector checks only; NPU and torch tied-weight VJP test pending.
+
+### L4 independent FP32 reference (diagnostic only)
+
+Server uniform-control results: L1-L3 forward exact; first divergence L4 FA,
+with exact Q/K/V/prefix K/V but ~0.4% core output difference. Cross-CP output
+fell from ~5.89% to ~4.01%, parameter gradient from ~14.4% to ~9.64%.
+Cross-CP and Engine-relay gates both FAILED in that run; no thresholds waived.
+
+With `STAGE44_FA_REPLAY=1`, L4 now additionally compares CP1 and CP2 canonical
+replays against `_fa_fp32_reference.py`: CPU FP32 matmul, explicit prefix/current
+causal mask, softmax, GQA head expansion and autograd. Uses the same rank0 full
+canonical post-RoPE values and full dO; compares output and dQ/dK/dV/dPK/dPV on
+each rank's zigzag indices. Reference gradients stay FP32 (no BF16 downcast).
+KV gradients are derived from all global queries, sliced without another SUM.
+
+Compact audit prints effective scale, shapes, ordered KV [prefix,current],
+inclusive causal offset, dropout=0 and native unpadded shard checks. It checks
+the caller's semantic contract, not every physical Ring kernel mask. Output
+max-absolute errors in each owned 32-token band help identify boundary effects.
+Reference does not replace any model operator and adds no numerical gate.
+
+Sync `_fa_core_replay.py`, new `_fa_fp32_reference.py`, and new CPU test
+`unit/test_fa_fp32_reference.py` (plus the existing full-model control files).
+Run from the server verl root; omit TRACE to keep this run's logs smaller:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/unit/test_fa_fp32_reference.py
+STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=0 STAGE44_FA_REPLAY=1 \
+  torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 \
+  -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py
+```
+
+Interpret CP1-vs-reference and CP2-vs-reference separately, including boundary
+bands and same-upstream VJPs; do not infer acceptable training error from a
+small local forward gap. Local AST checks passed; CPU unit tests and NPU replay
+remain unrun locally because PyTorch/NPU are unavailable.
