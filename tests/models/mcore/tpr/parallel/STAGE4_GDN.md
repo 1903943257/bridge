@@ -603,3 +603,38 @@ Interpret CP1-vs-reference and CP2-vs-reference separately, including boundary
 bands and same-upstream VJPs; do not infer acceptable training error from a
 small local forward gap. Local AST checks passed; CPU unit tests and NPU replay
 remain unrun locally because PyTorch/NPU are unavailable.
+
+### L4 Ring block/merge shadow diagnostic
+
+The CPU reference run found CP1 output error ~0.175%, CP2 ~0.354% against
+FP32; canonical CP1/CP2 gap ~0.394%. Cross-CP and relay remained FAIL.
+Production `_merge_attention` casts every merged output back to the previous
+output dtype. The new `_ring_merge_probe.py` observes the existing L4 canonical
+Ring replay, including actual block order, kernel inputs and physical masks.
+It returns every original block/merge result unchanged: no production edits,
+extra Ring communication, backward change or threshold adjustment.
+
+Two forward shadows use the existing merge function:
+
+- CPU FP32 reference block output/max/sum, merged on NPU in FP32.
+- Actual kernel block output/max/sum promoted to FP32 before each merge;
+  report before and after one final cast to the original query dtype.
+
+Both are compared to the independent whole-attention CPU FP32 reference.
+Print actual output/max/sum dtypes, block counts per query chunk and worst
+block output relative-L2, max absolute error, sum relative-L2 and LSE absolute
+error. Replica softmax lanes are checked. Unexpected fully-masked launched
+rows fail explicitly in this unpadded fixture rather than inventing a policy.
+This audits launched block masks but does not independently prove skipped-block
+classification; the whole-reference comparison remains necessary.
+
+Sync `_fa_core_replay.py`, `_ring_merge_probe.py`, and the new CPU unit test.
+Run the prior controlled FA replay command unchanged (TRACE=0). New compact
+lines contain `merge/` and `RING-MERGE`; existing diagnostics remain available.
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/unit/test_ring_merge_probe.py
+```
+
+AST checks passed locally. PyTorch CPU tests and NPU shadow results remain
+pending; do not infer a merge fix or PASS until the actual comparison returns.

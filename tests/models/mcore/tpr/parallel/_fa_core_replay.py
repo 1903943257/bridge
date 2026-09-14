@@ -151,11 +151,18 @@ class FACoreReplay:
             full = run(global_canonical, full_upstream, 1)
             full_repeat = run(global_canonical, full_upstream, 1)
             cp_own = run(own, local_upstream, 2)
-            cp_canonical = run(canonical, local_upstream, 2)
+            if layer == 4:
+                from ._ring_merge_probe import ring_merge_probe, report_ring_merge
+                with ring_merge_probe() as merge_probe:
+                    cp_canonical = run(canonical, local_upstream, 2)
+            else:
+                cp_canonical = run(canonical, local_upstream, 2)
             cp_repeat = run(canonical, local_upstream, 2)
             if layer == 4:
                 from ._fa_fp32_reference import fp32_reference
                 oracle = fp32_reference(global_canonical, full_upstream)
+                report_ring_merge(merge_probe, sliced(oracle["output"]), report, rank, canonical["q"].dtype)
+                del merge_probe
                 scale = reference["scale"]
                 effective_scale = reference["q"].shape[-1] ** -0.5 if scale is None else scale
                 print(f"STAGE-4.4 FA-FP32 r={rank} L04 AUDIT: CPU FP32 explicit matmul/softmax; "
