@@ -672,3 +672,33 @@ python -m pytest -q tests/models/mcore/tpr/parallel/test_ring_cp_attention_contr
 
 Local AST checks only; PyTorch/NPU are unavailable locally. No training
 stability or new numerical PASS is claimed.
+
+### L5 GDN canonical continuation replay
+
+`STAGE44_GDN_REPLAY=1` captures only L5/S2 hidden input and initial conv/recurrent
+state from CP1-connected and CP2-connected. After each measured run, while its
+L5 module is alive, `_gdn_layer_replay.py` replays the real `_tpr_forward` seam
+(not Engine scheduling) with cloned leaves. CP1 in_proj/out_proj use zigzag64;
+CP2 uses native stateful CP A2A. CP1 canonical inputs are broadcast from rank0.
+Conv state is sharded separately within Q/K/V channels; recurrent state along
+heads. Parameters must match exactly. Fixed CPU-seeded nonzero cotangents are
+provided for output AND both final states, not captured own-upstream gradients.
+
+Diagnostics: input shape/stride/dtype, input/state drift, same-input output and
+final states, input/initial-state VJPs, aggregate parameter VJP, CP1/CP2 repeat,
+and CP2 canonical-vs-own under identical cotangents. Parameter VJPs SUM once;
+state VJPs are owner-local without SUM. Model .grad buffers are not populated
+by replay (`autograd.grad`), and measured metrics/communication counters are
+captured before replay. Extra replay collectives are not part of model counts.
+No gate changes. This distinguishes locally introduced differences from input
+perturbation effects; a nonzero result alone does not diagnose a kernel bug.
+
+Sync the new helper and updated full-model test. Keep other replay/TRACE off to
+reduce logs. From server verl root (the redirect overwrites this log):
+
+```bash
+mkdir -p tests/models/mcore/tpr/logs
+STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=0 STAGE44_FA_REPLAY=0 STAGE44_GDN_REPLAY=1 torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py > tests/models/mcore/tpr/logs/stage4_4_5.logs 2>&1
+```
+
+Local AST check passed. NPU results pending; no PyTorch is installed locally.
