@@ -121,7 +121,9 @@ class SegmentExecutor:
         if set(self.gdn_layer_numbers).intersection(self.expected_layer_numbers):
             raise ValueError("expected_layer_numbers describes FA layers only, not GDN layers")
         if self.gdn_layer_numbers and cp_group is not None:
-            raise NotImplementedError("Stage 3 Hybrid TPR supports CP=1 only")
+            backend_name = cp_backend if isinstance(cp_backend, str) else getattr(cp_backend, "backend_name", None)
+            if backend_name != "ring":
+                raise NotImplementedError("Hybrid TPR requires explicit Ring CP2 (or CP=1)")
         self.gdn_states: dict[SegmentId, GDNPrefixState] = {}
         if cp_group is None:
             if cp_backend is not None:
@@ -138,6 +140,10 @@ class SegmentExecutor:
                 parallel_size=self.cp_size,
                 parallel_rank=self.cp_rank,
             )
+            if self.gdn_layer_numbers and (
+                self.cp_size != 2 or any(s.length % 4 for s in plan.segments.values())
+            ):
+                raise NotImplementedError("Hybrid GDN CP requires CP2 and unpadded lengths divisible by 4")
             for segment in plan.segments.values():
                 try:
                     self.cp_backend.validate_segment_length(segment.length)

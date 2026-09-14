@@ -33,8 +33,8 @@ class TPRGatedDeltaNet(GatedDeltaNet):
     """GDN that exposes causal-conv and recurrent state only in TPR mode.
 
     The ordinary path delegates to MindSpeed unchanged. The TPR path is the
-    Stage 3 CP=1/non-packed seam over the stateful MindSpeed-Ops primitives
-    already validated in Stage 1.
+    CP=1/non-packed seam over the stateful MindSpeed-Ops primitives already
+    validated in Stage 1, or the Stage 4 stateful A2A seam at Ring CP=2.
     """
 
     tpr_state_kind = "gdn"
@@ -79,6 +79,15 @@ class TPRGatedDeltaNet(GatedDeltaNet):
     ) -> tuple[Tensor, Tensor | None]:
         sequence_length, batch, _ = hidden_states.shape
         initial_state = context.get_initial_gdn_state(self.layer_number)
+
+        if self.cp_size == 2:
+            from .parallel.gdn_state import forward_gdn_cp_with_state
+
+            output, final_state = forward_gdn_cp_with_state(
+                self, hidden_states, initial_state=initial_state
+            )
+            context.set_new_gdn_state(self.layer_number, final_state)
+            return output
 
         qkvzba, input_bias = self.in_proj(hidden_states)
         if input_bias is not None:
@@ -159,16 +168,28 @@ class TPRGatedDeltaNet(GatedDeltaNet):
                 "TPR GDN mode requires hidden_states [sequence, 1, hidden], "
                 f"got {tuple(hidden_states.shape)}"
             )
-        if hidden_states.shape[0] != context.suffix_length:
+        if hidden_states.shape[0] != context.local_suffix_length:
             raise ValueError(
                 f"GDN segment length {hidden_states.shape[0]} does not match "
-                f"context suffix length {context.suffix_length}"
+                f"context local suffix length {context.local_suffix_length}"
             )
-        if self.cp_size != 1 or self.tp_size != 1 or self.sp_size != 1:
+        context_cp = 1 if context.attention_backend is None else context.attention_backend.parallel_size
+        if context_cp != self.cp_size:
+            raise ValueError(f"GDN CP={self.cp_size} does not match context CP={context_cp}")
+        if self.cp_size not in (1, 2) or self.tp_size != 1 or self.sp_size != 1:
             raise NotImplementedError(
-                "Stage 3 TPR GDN requires CP=TP=SP=1, got "
+                "TPR GDN requires CP=1/2 and TP=SP=1, got "
                 f"CP={self.cp_size}, TP={self.tp_size}, SP={self.sp_size}"
             )
+        if self.cp_size == 2:
+            from .parallel.ring_attention import RingCPAttentionBackend
+
+            if not isinstance(context.attention_backend, RingCPAttentionBackend):
+                raise NotImplementedError("TPR GDN CP2 requires the native-zigzag Ring backend")
+            if (context.attention_backend.parallel_size != 2
+                    or context.local_suffix_length * 2 != context.suffix_length
+                    or context.local_suffix_length % 2):
+                raise NotImplementedError("TPR GDN CP2 requires unpadded, aligned zigzag segments")
         unsupported = {
             "inference_context": inference_context,
             "inference_params": inference_params,

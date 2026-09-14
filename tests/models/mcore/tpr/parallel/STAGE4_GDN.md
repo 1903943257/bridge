@@ -148,5 +148,71 @@ torchrun --master_addr=127.0.0.1 --master_port=29566 --nproc_per_node=2 \
   -m pytest -s -v tests/models/mcore/tpr/parallel/test_pure_gdn_tree_cp_npu.py
 ```
 
-Status: Stage 4.2 implemented; NPU results pending. The Stage 3.3 numerical
-known issue and BT=1 coverage item remain tracked; neither is declared fixed.
+Status: **Stage 4.2 all PASS, reported from the server (2026-09-14).**
+The Stage 3.3 numerical known issue and BT=1 coverage item remain tracked;
+neither is declared fixed. No new numerical metrics were supplied for this run.
+
+### Stage 4.2 concise closeout
+
+- Problem: a single CP2 GDN does not establish multilayer tree-state relay.
+- Goal: three real GDN layers, R -> P -> (S1, S2), CP2/non-packed.
+- Method: graph-free Push; independent sibling anchors; summed state gradients;
+  reverse Pop with each prefix's owned loss once, then relay to its parent.
+- New code: `parallel/gdn_tree.py`, `test_pure_gdn_tree_cp_npu.py`,
+  `unit/test_gdn_branch_executor.py`; reused the Stage 4.1 state seam.
+- Tests/results: all four controls and output/loss/input/parameter/state gates
+  PASS; A2A contract and release checks PASS. Pure GDN only; no FA/Engine claim.
+
+## Stage 4.3: small Hybrid CP2 (implemented, server results pending)
+
+Random Qwen dimensions, **GDN -> GDN -> GDN -> FA**, including real norms/MLPs,
+BF16, CP1/CP2, non-packed. Tree P128 -> (S1_128, S2_128). No projection controls,
+optimizer or kernel changes. This is the production SegmentExecutor seam,
+not yet Full-Qwen Engine integration or THD.
+
+`TPRGatedDeltaNet` uses the passed Stage 4.1 A2A seam in a CP2 Ring context.
+SegmentExecutor retains direct-parent GDN state and all-ancestor FA KV relay.
+Other CP algorithms, CP4 and padded GDN segments are rejected. CP1 is unchanged.
+
+FA uses the existing **TPR Ring extension with real MindSpeed RingP2P**:
+external Prefix KV requires a rectangular block schedule, not the equal-length
+native `dot_product_attention.ringattn_context_parallel` entry. Tests probe both
+the Ring attention calls and actual RingP2P sends, without replacing their math.
+
+Three runs with identical parameters:
+
+1. CP1 connected segmented graph (no A2A/Ring).
+2. CP2 connected segmented graph (A2A cp2hp/hp2cp=54/9, FA Ring=3).
+3. CP2 Push/Visit/Pop (A2A=72/12, FA Ring=4, actual RingP2P sends >0).
+
+Compare output probes, loss, embedding-output/input gradients, all parameter
+gradients, and all **8 boundary gradients** (three conv/recurrent pairs, FA K/V).
+CP1 states are sliced by Q/K/V section or recurrent heads; FA KV by native
+zigzag token placement. Boundary clones in connected controls exclude the
+prefix-owned loss from external dState. Graph-free saves, owned loss once,
+sibling accumulation and cache release are checked.
+
+Retain Stage 4.1/4.2 CP/relay gates: rel-L2 <=0.02, cosine >=0.999;
+loss relative difference <=0.002, finite values. No numerical-drift waiver.
+Standalone parameter gradients are SUM-reduced once; cancel the executor's
+Engine-oriented CP loss multiplier in the test only. Boundary gradients are
+rank-local and must not be all-reduced.
+
+Sync modified/new files (in addition to existing Stage 4.1/4.2 prerequisites):
+
+```text
+verl/models/mcore/tpr/gated_delta_net.py
+verl/models/mcore/tpr/segment_executor.py
+tests/models/mcore/baseline/_qwen35_baseline_utils.py
+tests/models/mcore/tpr/parallel/test_small_hybrid_tree_cp_npu.py
+tests/models/mcore/tpr/unit/test_hybrid_segment_executor.py
+```
+
+```bash
+python -m pytest -v tests/models/mcore/tpr/unit/test_hybrid_segment_executor.py
+torchrun --master_addr=127.0.0.1 --master_port=29567 --nproc_per_node=2 \
+  -m pytest -s -v tests/models/mcore/tpr/parallel/test_small_hybrid_tree_cp_npu.py
+```
+
+Local validation is syntax/static only; NPU PASS is not claimed. After 4.3,
+run the planned CP1 short multi-step A/B before 4.4 Full Qwen CP2; THD remains 4.5.

@@ -101,6 +101,37 @@ def test_hybrid_multilevel_relay_matches_connected_graph(direct_leaf):
     executor.kv_stack.assert_empty()
 
 
-def test_hybrid_rejects_cp_before_execution():
-    with pytest.raises(NotImplementedError, match="CP=1"):
-        SegmentExecutor(_Hybrid(), _plan(), expected_layer_numbers=(2,), cp_group=object())
+@pytest.mark.parametrize("backend", [None, "allgather", "ulysses", "hybrid"])
+def test_hybrid_rejects_non_ring_cp_before_execution(backend):
+    with pytest.raises(NotImplementedError, match="Ring CP2"):
+        SegmentExecutor(_Hybrid(), _plan(), expected_layer_numbers=(2,),
+                        cp_group=object(), cp_backend=backend)
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_hybrid_rejects_padded_segments_or_cp4(monkeypatch, cp_size):
+    from types import SimpleNamespace
+    from verl.models.mcore.tpr import segment_executor as module
+
+    monkeypatch.setattr(module, "resolve_cp_group", lambda group: (cp_size, 0))
+    monkeypatch.setattr(module, "resolve_tpr_cp_backend", lambda *args, **kwargs: SimpleNamespace())
+    # _plan has length 2 segments: native GDN A2A cannot accept Ring's padding.
+    with pytest.raises(NotImplementedError, match="unpadded lengths"):
+        SegmentExecutor(_Hybrid(), _plan(), expected_layer_numbers=(2,),
+                        cp_group=object(), cp_backend="ring")
+
+
+def test_hybrid_accepts_explicit_aligned_ring_cp2(monkeypatch):
+    from types import SimpleNamespace
+    from verl.models.mcore.tpr import segment_executor as module
+
+    lengths = []
+    backend = SimpleNamespace(validate_segment_length=lengths.append)
+    monkeypatch.setattr(module, "resolve_cp_group", lambda group: (2, 0))
+    monkeypatch.setattr(module, "resolve_tpr_cp_backend", lambda *args, **kwargs: backend)
+    plan = SegmentPlan([SegmentSpec(0, None, torch.tensor([1, 2, 3, 4]), 0, 0,
+                                   (SegmentLossTerm(0, 2),))], root_id=0)
+    executor = SegmentExecutor(_Hybrid(), plan, expected_layer_numbers=(2,),
+                               cp_group=object(), cp_backend="ring")
+    assert executor.cp_size == 2 and executor.gdn_layer_numbers == (1,)
+    assert lengths == [4]
