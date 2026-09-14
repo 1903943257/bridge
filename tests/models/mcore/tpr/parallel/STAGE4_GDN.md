@@ -5,9 +5,9 @@ Sequence agreed with the user:
 1. 4.1 single stateful GDN CP2 (this change).
 2. 4.2 pure-GDN TPR + CP2: Push/Branch/Pop and multi-level state relay.
 3. 4.3 small Hybrid CP2, real GDN/GDN/GDN/FA pattern.
-4. Before full-Qwen CP integration: one CP1 20-50-step A/B to assess actual
-   training impact of the tracked full/split numerical drift.
-5. 4.4 full Qwen3.5 CP2.
+4. 4.4 full Qwen3.5 CP2 (moved ahead of the short training A/B).
+5. One CP1 20-50-step A/B to assess actual training impact of the tracked
+   full/split numerical drift; this alone does not establish CP2 training stability.
 6. 4.5 THD/remove-padding.
 
 Stage 3.3 per-layer Linear investigation stops here. See its known-issue note;
@@ -163,7 +163,7 @@ neither is declared fixed. No new numerical metrics were supplied for this run.
 - Tests/results: all four controls and output/loss/input/parameter/state gates
   PASS; A2A contract and release checks PASS. Pure GDN only; no FA/Engine claim.
 
-## Stage 4.3: small Hybrid CP2 (implemented, server results pending)
+## Stage 4.3: small Hybrid CP2 (server CONTROLLED PASS; baseline gate still fails)
 
 Random Qwen dimensions, **GDN -> GDN -> GDN -> FA**, including real norms/MLPs,
 BF16, CP1/CP2, non-packed. Tree P128 -> (S1_128, S2_128). No projection controls,
@@ -214,8 +214,8 @@ torchrun --master_addr=127.0.0.1 --master_port=29567 --nproc_per_node=2 \
   -m pytest -s -v tests/models/mcore/tpr/parallel/test_small_hybrid_tree_cp_npu.py
 ```
 
-Local validation is syntax/static only; NPU PASS is not claimed. After 4.3,
-run the planned CP1 short multi-step A/B before 4.4 Full Qwen CP2; THD remains 4.5.
+Initial local validation was syntax/static only. Server results are recorded
+below. Updated order: 4.4 Full Qwen CP2, then CP1 short multi-step A/B; THD remains 4.5.
 
 ### Server feedback: CP state gate FAIL; localization pending
 
@@ -337,3 +337,72 @@ is in layer2, per rank/segment. This is not a claim about unobserved internal
 ops. Compare existing output/input/parameter/all-eight-state metrics to both
 baseline and out_proj-only runs. Results pending; CONTROLLED PASS/FAIL labelling
 and original numerical thresholds are retained.
+
+### Stage 4.3 closeout: double-control server PASS
+
+Both ranks: all observed first-layer boundaries/output exact; first divergence
+moved to layer2 attention.out_proj. Double-control output/input/parameter rel-L2
+~0.00455/0.0134/0.01204 versus baseline ~0.00823/0.0180/0.0166.
+State aggregate rank0/rank1=0.01788/0.01332; worst=0.01916/0.01926.
+CP2 connected vs tree: output exact, input/parameter ~0.00350/0.00344,
+state ~1e-6. **CONTROLLED PASS only**, not unmodified-baseline PASS.
+Stop layerwise controls; retain this numerical-drift known issue.
+
+## Stage 4.4: Full Qwen CP2 Engine tree (implemented; NPU pending)
+
+New test: `test_full_qwen35_tree_cp_npu.py`. Random Qwen3.5-0.8B dimensions,
+24 layers/18 GDN/6 FA, BF16, dropout=0, TP/PP/EP/DP=1, non-packed.
+Tree P128 -> (S1_128, S2_128), with shared-prefix owned loss weighted for both
+materialized trajectories, including each branch's distinct boundary label.
+Three independent runs have identical initial weights and inputs:
+
+1. CP1 connected segmented graph.
+2. CP2 connected segmented graph.
+3. CP2 Engine `forward_backward_batch` + explicit `TPRForwardBackwardRequest`.
+
+The third run executes the real thin entry, CP runtime resolution, fixed tree
+scheduler and SegmentExecutor. Only an observing executor subclass is injected;
+no scheduling/forward/backward math is replaced. The Engine fixture supplies a
+random GPT model, no distributed optimizer, and a real SUM parameter-gradient
+finalizer called exactly once. `grad_scale_func=loss/2` cancels the executor's
+CP multiplier to match the connected globally sum-normalized objective.
+The Engine itself aggregates CP loss; the test does not reduce it twice.
+This validates Engine tree routing, **not DDP/optimizer initialization or updates**.
+
+Checks:
+
+- Every forward dispatches all 24 layers; layer boundaries `[128/CP,1,1024]`.
+- GDN states: CP-local conv `[1,3072,4]`, recurrent `[1,8,128,128]`.
+- All 48 boundary gradients: 36 GDN conv/recurrent and 12 FA K/V, each separately.
+- Logical output probes, target logprobs, loss, embedding-output/input gradients,
+  all parameter gradients; finite values. State gradients remain rank-local.
+- Graph-free Push; P owned loss once at Pop, each leaf once; caches released.
+- CP1 no A2A/Ring. CP2 connected A2A324/54, FA Ring18; Engine tree A2A432/72,
+  FA Ring24. Real MindSpeed RingP2P must execute (TPR rectangular Ring extension).
+
+Two independent numerical reports: `cross-CP-connected` and
+`CP2-connected-vs-Engine-tree`. Retain 4.3 rel-L2<=0.02/cosine>=0.999 gates
+for outputs/input/parameters/state, loss rtol<=0.002. Target-logprob maps use
+the same rel-L2/cosine envelope. Every state gate is evaluated even after an
+earlier one fails. Both ranks' failure flags are combined; any failure keeps
+the overall test FAIL. Cross-CP failure cannot silently invalidate or promote
+the independently reported Engine-relay result. No shape controls are installed;
+nonzero Stage 3.3/4.3 control environment variables are rejected.
+
+Only one model is kept on NPU at a time; initial weights and gradient snapshots
+remain on CPU. Host memory must accommodate the initial state plus three full
+gradient maps. No automatic architecture/sequence reduction on OOM.
+
+Sync the new test and this document, with existing Stage 4.3 prerequisites
+already synchronized (`test_small_hybrid_tree_cp_npu.py` supplies its plan,
+communication probe and state-sharding helper). No production file or third-party
+source change is required in this stage. Existing Engine TPR patch/entry from
+Stage 3.3 and CP2 Ring/GDN dispatch from Stage 4.3 must be installed.
+
+```bash
+torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 \
+  -m pytest -s -v tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py
+```
+
+Local syntax/static checks only (no local torch/pytest/NPU). Actual loss/gradient
+metrics and PASS/FAIL await the server. Next: CP1 20-50-step A/B, then 4.5 THD.
