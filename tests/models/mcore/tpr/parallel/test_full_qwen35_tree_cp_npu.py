@@ -288,6 +288,31 @@ def _compare(label, reference, actual, *, rank):
     return failures
 
 
+def _relay_diagnostic(label, reference, actual, *, rank):
+    """Print repeatability/relay evidence only; never change numerical gates."""
+    left_loss, right_loss = reference["loss"].item(), actual["loss"].item()
+    print(f"STAGE-4.4 DIAGNOSTIC rank={rank} {label}/loss: "
+          f"reference={left_loss:.9f} actual={right_loss:.9f} "
+          f"relative_diff={abs(right_loss-left_loss)/max(abs(left_loss), 1e-24):.9e}", flush=True)
+    for kind in ("parameters", "state"):
+        print(f"STAGE-4.4 DIAGNOSTIC rank={rank} {label}/{kind}: "
+              f"{gradient_map_diagnostics(reference[kind], actual[kind])}", flush=True)
+    name = "gdn.5.conv"
+    left, right = reference["state"][name], actual["state"][name]
+    assert left.shape == right.shape == (1, 3072, 4), (left.shape, right.shape)
+    assert torch.isfinite(left).all() and torch.isfinite(right).all()
+    print(f"STAGE-4.4 DIAGNOSTIC rank={rank} {label}/{name}: "
+          f"shape={tuple(left.shape)} dtype={left.dtype}/{right.dtype}; "
+          "slots=last-axis (state storage order)", flush=True)
+    for slot in (None, 0, 1, 2, 3):
+        first, second = (left, right) if slot is None else (left[..., slot], right[..., slot])
+        tag = "all" if slot is None else f"slot{slot}"
+        pair = gradient_map_diagnostics({name: first}, {name: second}).aggregate
+        print(f"STAGE-4.4 DIAGNOSTIC rank={rank} {label}/{name}/{tag}: "
+              f"exact={torch.equal(first, second)} {pair} "
+              f"max_abs={(second.float()-first.float()).abs().max().item():.9e}", flush=True)
+
+
 def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
     from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
@@ -298,7 +323,11 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     plan = _plan()
     initial = None
     results = []
-    for cp, tree in ((1, False), (2, False), (2, True)):
+    # Append repeat AFTER the original three runs: preserve their order. Build
+    # the same CP2 model from the same initial state/seed, no optimizer update.
+    for label, cp, tree in (("CP1-connected", 1, False), ("CP2-connected", 2, False),
+                            ("CP2-Engine-tree", 2, True), ("CP2-connected-repeat", 2, False)):
+        print(f"STAGE-4.4 RUN rank={runtime.rank} {label}", flush=True)
         torch.manual_seed(440001)
         model = make_qwen35_model(runtime, cp_size=cp, tpr=True, num_layers=24)
         gdn, fa = assert_hybrid_architecture(model)
@@ -316,7 +345,14 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
         del model, gdn, fa
         gc.collect()
         torch.npu.empty_cache()
-    cp1, cp2, tree = results
+    cp1, cp2, tree, repeat = results
+    # Print on BOTH ranks before numerical gates can fail. A repeat diagnostic
+    # is not subtracted from error and cannot waive a failing relay assertion.
+    _relay_diagnostic("CP2-connected-vs-repeat", cp2, repeat, rank=runtime.rank)
+    _relay_diagnostic("CP2-connected-vs-Engine-tree", cp2, tree, rank=runtime.rank)
+    _relay_diagnostic("CP2-repeat-vs-Engine-tree", repeat, tree, rank=runtime.rank)
+    del repeat
+    results.pop()
     cp1["state"] = _shard_states(cp1["state"], runtime.cp_group.rank())
     cross = _compare("cross-CP-connected", cp1, cp2, rank=runtime.rank)
     relay = _compare("CP2-connected-vs-Engine-tree", cp2, tree, rank=runtime.rank)

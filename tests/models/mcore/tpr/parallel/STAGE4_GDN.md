@@ -406,3 +406,29 @@ torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 \
 
 Local syntax/static checks only (no local torch/pytest/NPU). Actual loss/gradient
 metrics and PASS/FAIL await the server. Next: CP1 20-50-step A/B, then 4.5 THD.
+
+### Stage 4.4 first server run and focused relay diagnostic
+
+Initial server report: cross-CP output/input/parameter/state rel-L2 approximately
+0.05892/0.13832/0.14342/0.13010. Engine relay also has a distinct failing
+`gdn.5.conv` gate: rel-L2=0.02209246, cosine=0.999766760. Overall **FAIL**;
+neither failure is waived or automatically attributed to BF16 rounding.
+
+The test now appends one CP2 connected repeat after the original three runs,
+with a freshly built identical model loaded from the same initial parameters,
+same seed/plan, and no optimizer update. It uses the original connected path,
+including its existing communication and lifecycle checks. Peak host storage
+now includes four gradient snapshots; still only one model is kept on NPU.
+
+Both ranks print `STAGE-4.4 DIAGNOSTIC` for connected-vs-repeat,
+connected-vs-Engine-tree, and repeat-vs-Engine-tree:
+
+- Loss values/relative difference; aggregate parameter and state metrics.
+- `gdn.5.conv` full tensor and slots 0..3 on its final state axis: exactness,
+  reference/actual norm, norm ratio, absolute-L2, relative-L2, cosine, max-abs.
+- Slot numbers mean state storage order; no unsupported temporal interpretation.
+
+Diagnostics execute before the original gates. No repeatability error is
+subtracted and no new numerical threshold is introduced. Sync the updated
+`test_full_qwen35_tree_cp_npu.py` and run the same port-29568 command above.
+Local syntax checks only; repeat NPU results pending.
