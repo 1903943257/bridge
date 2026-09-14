@@ -33,20 +33,26 @@ def zigzag_control_forward(original, counts):
 
 @contextmanager
 def first_gdn_zigzag_control(model, monkeypatch):
-    mode = os.getenv("STAGE43_OUT_PROJ_ZIGZAG64", "0")
-    if mode not in ("0", "1"):
-        raise ValueError("STAGE43_OUT_PROJ_ZIGZAG64 must be 0 or 1")
-    print(f"STAGE-4.3 CONTROL layer1-out-proj-zigzag64={mode}", flush=True)
-    counts = {"full128_to_zigzag_2x64": 0}
-    if mode == "0":
+    modes = {}
+    for name, variable in (("out_proj", "STAGE43_OUT_PROJ_ZIGZAG64"),
+                           ("mlp_fc2", "STAGE43_MLP_FC2_ZIGZAG64")):
+        mode = os.getenv(variable, "0")
+        if mode not in ("0", "1"):
+            raise ValueError(f"{variable} must be 0 or 1")
+        modes[name] = mode == "1"
+        print(f"STAGE-4.3 CONTROL layer1-{name}-zigzag64={mode}", flush=True)
+    counts = {name: {"full128_to_zigzag_2x64": 0} for name, enabled in modes.items() if enabled}
+    if not counts:
         yield False, counts
         return
     layer = model.decoder.layers[0]
     assert layer.layer_number == 1 and layer.self_attention.tpr_state_kind == "gdn"
     assert model.config.context_parallel_size == 1
-    projection = layer.self_attention.out_proj
+    projections = {"out_proj": layer.self_attention.out_proj, "mlp_fc2": layer.mlp.linear_fc2}
     with monkeypatch.context() as patch:
-        patch.setattr(projection, "forward", zigzag_control_forward(projection.forward, counts))
+        for name in counts:
+            projection = projections[name]
+            patch.setattr(projection, "forward", zigzag_control_forward(projection.forward, counts[name]))
         try:
             yield True, counts
         finally:

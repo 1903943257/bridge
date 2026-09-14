@@ -243,7 +243,7 @@ def test_small_hybrid_cp2_tree(runtime, monkeypatch):
     with first_gdn_zigzag_control(reference, monkeypatch) as (controlled, counts):
         cp1 = _run(reference, plan, runtime, monkeypatch, cp=1, tree=False)
     if controlled:
-        assert counts["full128_to_zigzag_2x64"] == 3, counts
+        assert all(value["full128_to_zigzag_2x64"] == 3 for value in counts.values()), counts
         print("STAGE-4.3 CONTROL: standalone native replay skipped; use connected TRACE for intervention", flush=True)
     cp2 = _run(target, plan, runtime, monkeypatch, cp=2, tree=False)
     if cp1["trace"] is not None:

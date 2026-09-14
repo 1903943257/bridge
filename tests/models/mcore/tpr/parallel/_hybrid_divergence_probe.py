@@ -105,6 +105,13 @@ class HybridDivergenceProbe:
                           f"exact={exact} {pair} max_abs={(right-left).abs().max().item():.9e}",
                           flush=True)
             first_forward = next((n for n in names if differences["value"][n]), None)
+            layer1_names = [n for n in names if n.startswith("layer1.")]
+            layer1_exact = all(not differences["value"][n] for n in layer1_names)
+            print(f"STAGE-4.3 LAYER1 rank={rank} segment={sid}: "
+                  f"all-probed-forward-boundaries-exact={layer1_exact}; "
+                  f"layer-output-exact={not differences['value']['layer1.output']}; "
+                  f"first-forward-in-layer2={first_forward is not None and first_forward.startswith('layer2.')}",
+                  flush=True)
             # Reverse module-boundary order within this segment, NOT wall-clock
             # autograd order across sibling graphs and state edges.
             first_backward = next((n for n in reversed(names) if differences["grad"][n]), None)

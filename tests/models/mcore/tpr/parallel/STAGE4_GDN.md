@@ -308,3 +308,32 @@ not guaranteed by controlling only out_proj. Passing existing gates is labelled
 **CONTROLLED PASS (not unmodified baseline PASS)**. No threshold for 'significant
 drop' is invented. Default control=0 preserves the baseline. Server results
 and CPU torch regression results remain pending; local checks are static only.
+
+### Additive layer1 MLP fc2 control
+
+Server out_proj-only control removed that first difference; first nonzero moved
+to layer1 MLP linear_fc2. Output/input/parameter rel-L2 dropped to approximately
+0.00627/0.0150/0.01376, but individual state gates still failed (worst 0.02824).
+It does not establish an unmodified baseline PASS.
+
+`STAGE43_MLP_FC2_ZIGZAG64=1` independently applies the same rank-zigzag 2x64
+intervention to CP1 layer1 MLP linear_fc2 only. Both switches default to zero.
+Each enabled projection must count exactly three interventions (P/S1/S2).
+The control remains bias-free and differentiable, restoring token order and
+original methods on exit. No CP2/kernel/threshold change.
+
+Sync `_first_gdn_zigzag_control.py`, `_hybrid_divergence_probe.py`,
+`test_small_hybrid_tree_cp_npu.py`, and the optional unit regression file.
+
+```bash
+STAGE43_TRACE=1 STAGE43_OUT_PROJ_ZIGZAG64=1 STAGE43_MLP_FC2_ZIGZAG64=1 \
+  torchrun --master_addr=127.0.0.1 --master_port=29567 --nproc_per_node=2 \
+  -m pytest -s -v tests/models/mcore/tpr/parallel/test_small_hybrid_tree_cp_npu.py
+```
+
+`STAGE-4.3 LAYER1` explicitly reports whether all observed layer1 forward
+boundaries (including layer output) are exact and whether the first difference
+is in layer2, per rank/segment. This is not a claim about unobserved internal
+ops. Compare existing output/input/parameter/all-eight-state metrics to both
+baseline and out_proj-only runs. Results pending; CONTROLLED PASS/FAIL labelling
+and original numerical thresholds are retained.
