@@ -79,5 +79,74 @@ Optional CPU shape contract regression (on an environment with torch/pytest):
 python -m pytest -v tests/models/mcore/tpr/unit/test_gdn_cp_state_shapes.py
 ```
 
-Status: implemented; server NPU results pending. 4.1 is not marked PASS until
-both cases run successfully on both ranks. No Stage 4.2 completion is claimed.
+Status: **Stage 4.1 PASS**, as reported by the user after server execution.
+This covers the scoped single-layer cases above, not tree or packed execution.
+
+## 4.2 pure-GDN TPR + CP2
+
+`parallel/gdn_tree.py` adds a residual `GDNCPStack` and focused
+`GDNCPBranchExecutor`. Each block is `hidden + GDN(hidden)`; no MLP/FA/norm
+is added outside the GDN. It uses Stage 4.1's stateful CP seam unchanged.
+
+- Push saves graph-free, compact per-layer states and a detached local input
+  for recomputation, without evaluating its own loss.
+- Visit creates independent direct-parent anchors, backward, then accumulates
+  conv/recurrent state gradients on the parent. No global all-reduce of state
+  gradients is appropriate: states remain in their rank-local HP placement.
+- Pop consumes the sibling gradient sum once, recomputes its saved input,
+  backward through its own loss plus state VJPs, then relays to its parent and
+  releases its saved state.
+- Parameters must remain unchanged while prefixes are active. Duplicate IDs,
+  wrong parents/Pop order and post-failure reuse are rejected. All ranks must
+  supply identical event order; automatic distributed schedule negotiation and
+  rank-migration/serialized state restore are not implemented.
+
+The NPU test uses **three real GDN layers** and a two-level tree
+`R -> P -> (S1,S2)`. Every segment has 128 global tokens, BF16+SiLU, CP2
+local zigzag length=64. R/P loss multiplicity=2 and S1/S2=1; global denominator
+is `2 * 3 * 128 * 1024`. The executor does not multiply losses by CP or reduce
+parameters; the test SUM-reduces parameter gradients exactly once after each
+complete CP2 backward. Four independently rerun controls share identical weights:
+
+1. CP1 independent full trajectories R+P+S1 and R+P+S2 (Stage 3.2 implementation).
+2. CP1 connected segmented graph, including boundary clones for state VJPs.
+3. CP2 connected segmented graph (Stage 4.1 seam).
+4. CP2 graph-free Push/Visit/Pop, with intermediate P gradients relayed to R.
+
+Gates print independently, then the test fails if any gate fails:
+
+- CP1 materialized vs CP2 tree: outputs/input/parameter gradients rel-L2 <=0.08,
+  cosine >=0.995 (Stage 3.2 envelope).
+- CP1 connected vs CP2 connected and CP2 connected vs tree: <=0.02/>=0.999
+  (Stage 4.1 envelope); every conv/recurrent boundary gradient at R and P also
+  compared individually using correct per-section CP1 slices.
+- Loss relative difference <=0.002, finite outputs and compared gradients.
+- CP1 A2A=0; CP2 connected cp2hp/hp2cp=72/12; CP2 tree=108/18 per rank.
+- Both prefix own losses evaluated once, direct-parent-only accumulation,
+  both states released, executor empty. There is no FA/Ring in this test.
+
+This is focused pure-GDN tree execution, **not a GPT/Engine/tree-request test**;
+production Engine/Hybrid dispatch remains unchanged. No packed metadata,
+projection chunk control, optimizer step, or third-party kernel edit is added.
+
+Sync these files to corresponding server verl paths:
+
+```text
+verl/models/mcore/tpr/parallel/gdn_tree.py
+tests/models/mcore/tpr/parallel/test_pure_gdn_tree_cp_npu.py
+tests/models/mcore/tpr/parallel/test_stateful_gdn_cp_npu.py
+tests/models/mcore/tpr/unit/test_gdn_branch_executor.py
+```
+
+The existing Stage 4.1 `gdn_state.py` and baseline helpers are prerequisites.
+The updated 4.1 test helper only adds an optional layer_number argument; its
+single-layer defaults and gates are unchanged.
+
+```bash
+python -m pytest -v tests/models/mcore/tpr/unit/test_gdn_branch_executor.py
+torchrun --master_addr=127.0.0.1 --master_port=29566 --nproc_per_node=2 \
+  -m pytest -s -v tests/models/mcore/tpr/parallel/test_pure_gdn_tree_cp_npu.py
+```
+
+Status: Stage 4.2 implemented; NPU results pending. The Stage 3.3 numerical
+known issue and BT=1 coverage item remain tracked; neither is declared fixed.

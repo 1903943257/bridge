@@ -26,7 +26,7 @@ def runtime():
     destroy_npu_runtime(value)
 
 
-def _model(runtime, cp):
+def _model(runtime, cp, layer_number=1):
     from megatron.core.models.backends import LocalSpecProvider
     from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
     import mindspeed.core.ssm.gated_delta_net as native
@@ -40,7 +40,7 @@ def _model(runtime, cp):
     )
     cls = TPRGatedDeltaNet if cp == 1 else native.GatedDeltaNet
     return cls(
-        qwen35_config(cp_size=cp), submodules=submodules, layer_number=1,
+        qwen35_config(cp_size=cp), submodules=submodules, layer_number=layer_number,
         bias=False, conv_bias=False, conv_init=0.1, use_qk_l2norm=True,
         A_init_range=(1, 16), pg_collection=process_groups(runtime, cp_size=cp),
     ).to(device=runtime.device, dtype=DTYPE).train()
