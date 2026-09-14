@@ -7,6 +7,7 @@ this does not validate the production distributed optimizer/DDP wrapper.
 """
 
 from collections import Counter
+from contextlib import nullcontext
 import gc
 import os
 import sys
@@ -117,7 +118,7 @@ def _engine_run(model, plan, executor_type, runtime, monkeypatch):
         model.config.finalize_model_grads_func = None
 
 
-def _run(model, plan, runtime, monkeypatch, *, cp, tree):
+def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
     from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
@@ -129,6 +130,10 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree):
     instances, forwards, saved_states = [], [], []
     outputs, logprobs, input_gradients, state_gradients = {}, {}, {}, {}
     loss_calls = Counter()
+    drift = None
+    if trace:
+        from ._full_hybrid_drift_diagnostic import LayerDriftProbe
+        drift = LayerDriftProbe(cp, runtime.cp_group.rank())
 
     class ObservedExecutor(SegmentExecutor):
         def __init__(self, *args, **kwargs):
@@ -155,10 +160,22 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree):
                     output.register_hook(gradient)
 
             handles = [model.embedding.register_forward_hook(embedding)]
+            def check_model_inputs(module, args, kw):
+                shard = self._segment_shard(segment)
+                index = shard.global_indices(device=kw["input_ids"].device)
+                if cp == 2:
+                    rank = runtime.cp_group.rank()
+                    expected = torch.cat((torch.arange(rank*32, (rank+1)*32, device=index.device),
+                                          torch.arange((3-rank)*32, (4-rank)*32, device=index.device)))
+                    assert torch.equal(index, expected), "FA shard does not match native GDN zigzag"
+                assert torch.equal(kw["input_ids"][0], segment.token_ids.to(index.device).index_select(0, index))
+                assert torch.equal(kw["position_ids"][0], index + segment.position_start)
+            handles.append(model.register_forward_pre_hook(check_model_inputs, with_kwargs=True))
             handles += [layer.self_attention.register_forward_pre_hook(layout, with_kwargs=True)
                         for layer in model.decoder.layers]
             try:
-                context, logits = super()._forward(segment, **kwargs)
+                with drift.segment(model, segment.segment_id) if drift is not None else nullcontext():
+                    context, logits = super()._forward(segment, **kwargs)
             finally:
                 for handle in handles:
                     handle.remove()
@@ -258,11 +275,18 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree):
           f"A2A={a2a.count('cp2hp')}/{a2a.count('hp2cp')} Ring={dict(counts)} "
           "boundary-gradients=48 owned-loss-once=True caches-empty=True", flush=True)
     return dict(loss=loss.cpu(), output=outputs, logprob=logprobs, input=input_gradients,
-                parameters=parameters, state=state_gradients)
+                parameters=parameters, state=state_gradients, drift=drift)
+
+
+def _brief(pair):
+    return (f"norm={pair.reference_norm:.6e}/{pair.actual_norm:.6e} ratio={pair.norm_ratio:.6f} "
+            f"abs={pair.absolute_l2:.6e} rel={pair.relative_l2:.6e} cos={pair.cosine:.9f}")
 
 
 def _compare(label, reference, actual, *, rank):
     failures = []
+    state_worst = []
+    verbose = os.getenv("STAGE44_VERBOSE", "0") == "1"
     for kind in ("output", "logprob", "input", "parameters", "state"):
         left, right = reference[kind], actual[kind]
         assert left.keys() == right.keys()
@@ -273,7 +297,11 @@ def _compare(label, reference, actual, *, rank):
             try:
                 for name in first:
                     assert torch.isfinite(first[name]).all() and torch.isfinite(second[name]).all()
-                print(f"STAGE-4.4 rank={rank} {label}/{item}: {gradient_map_diagnostics(first, second)}", flush=True)
+                diagnostic = gradient_map_diagnostics(first, second)
+                if item.startswith("state/"):
+                    state_worst.append((diagnostic.aggregate.relative_l2, item, diagnostic.aggregate.cosine))
+                if verbose or not item.startswith("state/"):
+                    print(f"STAGE-4.4 r={rank} {label}/{item}: {_brief(diagnostic.aggregate)}", flush=True)
                 # Preserve the Stage 4.3 CP/relay envelope, not an assumed
                 # larger allowance based on layer count. Print every failure.
                 assert_gradient_maps_close(first, second, rtol=.02, cosine_min=.999)
@@ -284,7 +312,8 @@ def _compare(label, reference, actual, *, rank):
         torch.testing.assert_close(reference["loss"], actual["loss"], atol=0, rtol=.002)
     except AssertionError as exc:
         failures.append(f"{label}/loss: {exc}")
-    print(f"STAGE-4.4 GATE {label}: {'FAIL' if failures else 'PASS'}", flush=True)
+    print(f"STAGE-4.4 r={rank} {label}/state-top3(rel,name,cos): {sorted(state_worst, reverse=True)[:3]}", flush=True)
+    print(f"STAGE-4.4 GATE r={rank} {label}: {'FAIL' if failures else 'PASS'} failed_checks={len(failures)}", flush=True)
     return failures
 
 
@@ -296,7 +325,9 @@ def _relay_diagnostic(label, reference, actual, *, rank):
           f"relative_diff={abs(right_loss-left_loss)/max(abs(left_loss), 1e-24):.9e}", flush=True)
     for kind in ("parameters", "state"):
         print(f"STAGE-4.4 DIAGNOSTIC rank={rank} {label}/{kind}: "
-              f"{gradient_map_diagnostics(reference[kind], actual[kind])}", flush=True)
+              f"{_brief(gradient_map_diagnostics(reference[kind], actual[kind]).aggregate)}", flush=True)
+    if os.getenv("STAGE44_VERBOSE", "0") != "1":
+        return
     name = "gdn.5.conv"
     left, right = reference["state"][name], actual["state"][name]
     assert left.shape == right.shape == (1, 3072, 4), (left.shape, right.shape)
@@ -321,6 +352,13 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
                  "STAGE33_OUT_PROJ_CHUNK64", "STAGE33_MLP_FC2_CHUNK64"):
         assert os.getenv(name, "0") == "0", f"disable {name}: Stage 4.4 is unmodified baseline"
     plan = _plan()
+    from ._full_hybrid_drift_diagnostic import plan_digest, parameter_summary
+    digest = plan_digest(plan)
+    fingerprint = torch.tensor(list(bytes.fromhex(digest)), dtype=torch.uint8, device=runtime.device)
+    fingerprints = [torch.empty_like(fingerprint) for _ in range(2)]
+    dist.all_gather(fingerprints, fingerprint, group=runtime.cp_group)
+    assert all(torch.equal(value, fingerprint) for value in fingerprints), "plan/labels differ across ranks"
+    assert plan.total_loss_weight == 510
     initial = None
     results = []
     # Append repeat AFTER the original three runs: preserve their order. Build
@@ -340,12 +378,27 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
                        for n, t in model.state_dict().items()}
         else:
             model.load_state_dict(initial, strict=True)
-        results.append(_run(model, plan, runtime, monkeypatch, cp=cp, tree=tree))
+        # Equality audit includes every loaded parameter/buffer, not just a
+        # seed or checksum. Snapshots are temporary CPU copies, one at a time.
+        for name, value in model.state_dict().items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(value.detach().cpu(), initial[name]), f"initial state mismatch: {name}"
+        assert plan_digest(plan) == digest
+        print(f"STAGE-4.4 AUDIT r={runtime.rank} {label}: initial_tensors=exact "
+              f"plan={digest[:16]} loss_weight=510 CP={cp} "
+              f"parameter_SUM={'once' if cp == 2 else 'none'} state_SUM=none "
+              f"Engine_loss_scale={'1/2 (cancels CP factor)' if tree else 'global denominator only'}", flush=True)
+        results.append(_run(model, plan, runtime, monkeypatch, cp=cp, tree=tree,
+                            trace=os.getenv("STAGE44_TRACE", "0") == "1" and label in ("CP1-connected", "CP2-connected")))
         # Drop layer tuples too; they otherwise retain the full decoder.
         del model, gdn, fa
         gc.collect()
         torch.npu.empty_cache()
     cp1, cp2, tree, repeat = results
+    parameter_summary(cp1["parameters"], cp2["parameters"], gradient_map_diagnostics, runtime.rank)
+    if cp1["drift"] is not None:
+        cp1["drift"].compare(cp2["drift"], gradient_map_diagnostics)
+        cp1["drift"] = cp2["drift"] = None
     # Print on BOTH ranks before numerical gates can fail. A repeat diagnostic
     # is not subtracted from error and cannot waive a failing relay assertion.
     _relay_diagnostic("CP2-connected-vs-repeat", cp2, repeat, rank=runtime.rank)
@@ -362,6 +415,10 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     print(f"STAGE-4.4 SUMMARY cross-CP={'FAIL' if failed[0].item() else 'PASS'} "
           f"Engine-relay={'FAIL' if failed[1].item() else 'PASS'}; no thresholds waived", flush=True)
     if failed.any().item():
-        pytest.fail("\n".join(cross + relay) or "numerical gate failed on peer rank")
+        messages = cross + relay
+        if os.getenv("STAGE44_VERBOSE", "0") != "1" and len(messages) > 8:
+            # Keep relay failures visible even when all cross-CP states fail.
+            messages = cross[:4] + relay[:4] + [f"{len(cross)} cross-CP and {len(relay)} relay checks failed; STAGE44_VERBOSE=1 for full list"]
+        pytest.fail("\n".join(messages) or "numerical gate failed on peer rank", pytrace=False)
     if runtime.rank == 0:
         print("STAGE-4.4 PASS: full 18 GDN + 6 FA, CP2 Engine tree, non-packed; training stability not yet evaluated")

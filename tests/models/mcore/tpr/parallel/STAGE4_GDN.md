@@ -432,3 +432,51 @@ Diagnostics execute before the original gates. No repeatability error is
 subtracted and no new numerical threshold is introduced. Sync the updated
 `test_full_qwen35_tree_cp_npu.py` and run the same port-29568 command above.
 Local syntax checks only; repeat NPU results pending.
+
+### Latest server closeout and cross-CP investigation
+
+Full report: loss CP1=13.334442139; CP2 connected/tree/repeat=13.335098267.
+Cross-CP parameter rel-L2=14.30%/14.39%, state=12.94%/20.18% (rank-local).
+CP2 connected vs tree: output/logprob/loss exact, parameter=1.71%,
+state=0.48%/0.67%; **Engine-relay PASS**. Connected repeat parameter=1.80%,
+state=1.47%/1.50%, with gdn.5.conv rank0~2.01%. Overall cross-CP FAIL remains;
+relay PASS is not full numerical equivalence or proof of training stability.
+Defer the training A/B until the cross-CP discrepancy is better explained.
+
+#### Bounded diagnostics (no gate changes)
+
+Sync the updated full test plus `_full_hybrid_drift_diagnostic.py`.
+Default logging now prints only aggregate metrics, each gate's failure count,
+top-three state errors, and parameter category aggregates (GDN/FA/MLP/norm/
+embedding-output; tied embeddings counted once by named_parameters).
+All 48 state assertions still run. Pytest's final message is capped, preserving
+both cross-CP and relay failures. `STAGE44_VERBOSE=1` restores individual state
+metrics, gdn.5.conv slot details, and the full failure list.
+
+Fairness audit: exact initial parameter/buffer tensor equality after load;
+full plan/position/label/weight SHA256 agreement across ranks; loss denominator
+510; model input/position checks; FA shard indices checked independently against
+GDN native zigzag. Existing code paths enforce parameter SUM once and no state
+SUM; their normalization conventions are printed, not inferred from norm ratio.
+
+`STAGE44_TRACE=1` captures CP1/CP2 connected module boundaries ONLY (no tree or
+repeat trace). For each rank, 24 compact lines report max(P,S1,S2) rel-L2 at
+layer/attention/MLP input and output, forward and backward. The first nonzero
+boundary per segment and top-three positive error increases are printed. These
+are observational locations, not evidence of local kernel error: backward uses
+each run's own upstream gradient, and max-across-segment differences need not
+come from the same segment. Snapshots select CP1's matching zigzag rank slice
+on CPU; no diagnostic allreduce/average of activation or state gradients.
+
+```bash
+STAGE44_TRACE=1 torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 \
+  -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py
+python -m pytest -q tests/models/mcore/tpr/unit/test_full_hybrid_drift_metadata.py
+```
+
+The original four model runs and numerical gates are unchanged. Additional CPU
+snapshot/equality checks can affect timing; trace-off remains the reference
+runtime. No same-upstream replay or uniform Linear shape control is enabled in
+this change: choose those intervention targets from the full-model growth map,
+rather than presume the first four layers explain the full 14% gradient gap.
+Local AST and extracted metadata checks passed; torch unit/NPU execution pending.
