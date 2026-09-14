@@ -118,7 +118,7 @@ def _engine_run(model, plan, executor_type, runtime, monkeypatch):
         model.config.finalize_model_grads_func = None
 
 
-def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False):
+def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=False):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
     from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
@@ -131,6 +131,10 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False):
     outputs, logprobs, input_gradients, state_gradients = {}, {}, {}, {}
     loss_calls = Counter()
     drift = None
+    fa_capture = None
+    if fa_replay:
+        from ._fa_core_replay import FACoreReplay
+        fa_capture = FACoreReplay(cp)
     if trace:
         from ._full_hybrid_drift_diagnostic import LayerDriftProbe
         drift = LayerDriftProbe(cp, runtime.cp_group.rank())
@@ -174,7 +178,8 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False):
             handles += [layer.self_attention.register_forward_pre_hook(layout, with_kwargs=True)
                         for layer in model.decoder.layers]
             try:
-                with drift.segment(model, segment.segment_id) if drift is not None else nullcontext():
+                with (drift.segment(model, segment.segment_id) if drift is not None else nullcontext(),
+                      fa_capture.capture(model, segment.segment_id, monkeypatch) if fa_capture is not None else nullcontext()):
                     context, logits = super()._forward(segment, **kwargs)
             finally:
                 for handle in handles:
@@ -275,7 +280,7 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False):
           f"A2A={a2a.count('cp2hp')}/{a2a.count('hp2cp')} Ring={dict(counts)} "
           "boundary-gradients=48 owned-loss-once=True caches-empty=True", flush=True)
     return dict(loss=loss.cpu(), output=outputs, logprob=logprobs, input=input_gradients,
-                parameters=parameters, state=state_gradients, drift=drift)
+                parameters=parameters, state=state_gradients, drift=drift, fa_capture=fa_capture)
 
 
 def _brief(pair):
@@ -389,12 +394,16 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
               f"parameter_SUM={'once' if cp == 2 else 'none'} state_SUM=none "
               f"Engine_loss_scale={'1/2 (cancels CP factor)' if tree else 'global denominator only'}", flush=True)
         results.append(_run(model, plan, runtime, monkeypatch, cp=cp, tree=tree,
-                            trace=os.getenv("STAGE44_TRACE", "0") == "1" and label in ("CP1-connected", "CP2-connected")))
+                            trace=os.getenv("STAGE44_TRACE", "0") == "1" and label in ("CP1-connected", "CP2-connected"),
+                            fa_replay=os.getenv("STAGE44_FA_REPLAY", "0") == "1" and label in ("CP1-connected", "CP2-connected")))
         # Drop layer tuples too; they otherwise retain the full decoder.
         del model, gdn, fa
         gc.collect()
         torch.npu.empty_cache()
     cp1, cp2, tree, repeat = results
+    if cp1["fa_capture"] is not None:
+        cp1["fa_capture"].compare(cp2["fa_capture"], runtime, gradient_map_diagnostics)
+        cp1["fa_capture"] = cp2["fa_capture"] = None
     parameter_summary(cp1["parameters"], cp2["parameters"], gradient_map_diagnostics, runtime.rank)
     if cp1["drift"] is not None:
         cp1["drift"].compare(cp2["drift"], gradient_map_diagnostics)

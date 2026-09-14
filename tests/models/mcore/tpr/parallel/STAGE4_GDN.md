@@ -480,3 +480,46 @@ runtime. No same-upstream replay or uniform Linear shape control is enabled in
 this change: choose those intervention targets from the full-model growth map,
 rather than presume the first four layers explain the full 14% gradient gap.
 Local AST and extracted metadata checks passed; torch unit/NPU execution pending.
+
+#### L4/L24 FA attention-core isolation (opt-in)
+
+Server audits passed. Full-model layer outputs drift gradually from ~0.04--0.05%
+at L1 to ~6% at L24; late FA attention boundaries have the largest forward
+increases. All parameter categories have ~13.5--14.4% gradient error.
+Engine relay remains PASS. These observations identify replay targets, not a
+Ring kernel defect; own-upstream backward traces cannot isolate local VJP error.
+
+Sync `_fa_core_replay.py` plus the updated full-model test. Run:
+
+```bash
+STAGE44_FA_REPLAY=1 torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 \
+  -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py
+```
+
+Leave STAGE44_TRACE/VERBOSE unset to avoid repeating the full layer/slot logs.
+Capture only S2 at L4/L24: post-RoPE Q/current K/V, root Prefix KV, exact scale,
+raw attention-core output and its upstream gradient. No projection/output gate
+is included. Scope is the existing P128 + S2_128 causal rectangular mask;
+Ring prefix identity/length and current length are asserted.
+
+After all four model runs, execute forward AND autograd.grad replays:
+
+- Own captured input replay vs captured output (CP1 and CP2).
+- Canonical full CP1 vs canonical zigzag Ring CP2 on identical logical inputs.
+- Identical explicit upstream dO for dQ/dK/dV/dPrefixK/dPrefixV comparisons.
+- CP1 and CP2 canonical repeatability; CP2 canonical vs CP2 own-input replay.
+
+Canonical full inputs AND dO come from rank0 CP1 and are broadcast before
+sharding. Independent rank-local CP1 backward results must not be mixed into
+one Ring objective. CP1 gradients are sliced to the corresponding rank; Ring
+already returns owner-local KV gradients, so no further SUM/CP averaging occurs.
+QKV dtype is preserved; replay storage is contiguous CPU snapshot -> NPU clone.
+Original-input reproduction must be checked before interpreting canonical
+differences. Captured CP2 dO is printed for context but not used in these replay
+VJPs. No model parameter backward/update, shape control, or numerical gate change.
+
+Only `FA-REPLAY` scalar metrics are printed for the two target layers/ranks.
+Replay communication is additional diagnostic traffic, outside original model
+communication counters. These are diagnostics, not an automatic PASS waiver;
+original cross-CP FAIL can still end pytest after all replay data is printed.
+Local AST checks passed; actual replay output and NPU gradients await the server.
