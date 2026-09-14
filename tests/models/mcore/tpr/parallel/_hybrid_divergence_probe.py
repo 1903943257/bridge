@@ -32,7 +32,8 @@ class HybridDivergenceProbe:
             key = (sid, name)
             if key in self.records:
                 raise AssertionError(f"duplicate connected probe {key}")
-            entry = {"value": tensor.detach().cpu().float().clone(), "grad": None}
+            entry = {"value": tensor.detach().cpu().float().clone(), "grad": None,
+                     "dtype": tensor.dtype, "stride": tuple(tensor.stride())}
             self.records[key] = entry
             order.append(name)
             if tensor.requires_grad:
@@ -110,3 +111,81 @@ class HybridDivergenceProbe:
             print(f"STAGE-4.3 FIRST rank={rank} segment={sid}: forward={first_forward}; "
                   f"backward(reverse-boundary-order)={first_backward}. "
                   "Own-upstream VJPs; not a same-upstream kernel replay.", flush=True)
+
+    def replay_first_out_proj(self, actual, *, rank, metrics):
+        """Forward-only replay with connected-mode autograd enabled, no backward.
+
+        Canonical input = CP1's captured full token sequence, made contiguous.
+        Both module instances see identical full and identical zigzag inputs.
+        Compare raw projection outputs (no deferred bias addition), matching
+        the hook. This does not replace any full-model computation.
+        """
+        reference = self.model.decoder.layers[0].self_attention.out_proj
+        target = actual.model.decoder.layers[0].self_attention.out_proj
+        left_state, right_state = reference.state_dict(), target.state_dict()
+        assert left_state.keys() == right_state.keys()
+        for name in left_state:
+            left, right = left_state[name], right_state[name]
+            equal = torch.equal(left, right) if isinstance(left, torch.Tensor) else left == right
+            assert equal, f"out_proj parameter/buffer differs: {name}"
+        parameters = list(reference.parameters()) + list(target.parameters())
+        versions = [p._version for p in parameters]
+        device = next(reference.parameters()).device
+        assert reference.training and target.training
+
+        def run(module, value, dtype):
+            # Keep the training forward dispatch; do not use no_grad/inference
+            # and do not call backward or mutate existing parameter gradients.
+            with torch.enable_grad():
+                x = value.to(device=device, dtype=dtype).contiguous().requires_grad_(True)
+                result = module(x)
+                output = result[0] if isinstance(result, tuple) else result
+                return output.detach().cpu().float().clone()
+
+        for sid in self.order:
+            name = "layer1.attention.out_proj"
+            full_entry = self.records[(sid, name + ".input")]
+            local_entry = actual.records[(sid, name + ".input")]
+            full, own_local = full_entry["value"], local_entry["value"]
+            assert full_entry["dtype"] == local_entry["dtype"]
+            dtype = full_entry["dtype"]
+            length = full.shape[0]
+            assert length % 4 == 0
+            chunk = length // 4
+            indices = torch.cat((torch.arange(rank * chunk, (rank + 1) * chunk),
+                                 torch.arange((3 - rank) * chunk, (4 - rank) * chunk)))
+            canonical_local = full.index_select(0, indices)
+            assert canonical_local.shape == own_local.shape
+
+            def report(label, left, right):
+                assert left.shape == right.shape, (label, left.shape, right.shape)
+                assert torch.isfinite(left).all() and torch.isfinite(right).all()
+                pair = metrics({label: left}, {label: right}).aggregate
+                print(f"STAGE-4.3 OUT-PROJ-REPLAY rank={rank} segment={sid} {label}: "
+                      f"exact={torch.equal(left, right)} {pair} "
+                      f"max_abs={(right-left).abs().max().item():.9e}", flush=True)
+
+            print(f"STAGE-4.3 OUT-PROJ-REPLAY rank={rank} segment={sid} "
+                  f"dtype={dtype} full/local={tuple(full.shape)}/{tuple(own_local.shape)} "
+                  f"captured-strides={full_entry['stride']}/{local_entry['stride']} "
+                  "replay-layout=contiguous parameters=exact grad-enabled=True backward=False", flush=True)
+            report("captured-input", canonical_local, own_local)
+            captured_full = self.records[(sid, name + ".output")]["value"]
+            captured_local = actual.records[(sid, name + ".output")]["value"]
+            report("captured-output", captured_full.index_select(0, indices), captured_local)
+
+            full_ref = run(reference, full, dtype)
+            full_cp = run(target, full, dtype)
+            local_ref = run(reference, canonical_local, dtype)
+            local_cp = run(target, canonical_local, dtype)
+            own_cp = run(target, own_local, dtype)
+            report("CP1-own-input-reproduction", captured_full, full_ref)
+            report("CP2-own-input-reproduction", captured_local, own_cp)
+            report("same-full-input-CP1-vs-CP2-module", full_ref, full_cp)
+            report("same-local-input-CP1-vs-CP2-module", local_ref, local_cp)
+            report("canonical-full-vs-shard-CP1-module", full_ref.index_select(0, indices), local_ref)
+            report("canonical-full-vs-shard-CP2-module", full_cp.index_select(0, indices), local_cp)
+            report("CP2-canonical-vs-own-input", local_cp, own_cp)
+            report("CP1-full-repeat", full_ref, run(reference, full, dtype))
+            report("CP2-local-repeat", local_cp, run(target, canonical_local, dtype))
+        assert [p._version for p in parameters] == versions, "replay mutated projection parameters"

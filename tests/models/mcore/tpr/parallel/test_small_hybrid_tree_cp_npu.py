@@ -243,6 +243,11 @@ def test_small_hybrid_cp2_tree(runtime, monkeypatch):
     if cp1["trace"] is not None:
         cp1["trace"].compare(cp2["trace"], rank=runtime.cp_group.rank(), metrics=gradient_map_diagnostics)
     tree = _run(target, plan, runtime, monkeypatch, cp=2, tree=True)
+    if cp1["trace"] is not None:
+        # All measured model F/B runs and communication counts are complete.
+        cp1["trace"].replay_first_out_proj(
+            cp2["trace"], rank=runtime.cp_group.rank(), metrics=gradient_map_diagnostics,
+        )
     cp1["state"] = _shard_states(cp1["state"], runtime.cp_group.rank())
     failures = []
     for label, left, right in (("CP1-connected-vs-CP2-connected", cp1, cp2),

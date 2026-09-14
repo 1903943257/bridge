@@ -247,3 +247,30 @@ trace inside conv/GDR/Ring kernels. A nonzero backward difference may be inherit
 from a different upstream gradient and requires a same-upstream replay before
 attributing it to a backward implementation. CPU snapshots can affect execution
 timing; trace-off remains the original correctness run.
+
+### First-layer out_proj canonical-input replay
+
+Latest trace reports the first forward difference at
+`layer1.attention.out_proj.output` for segment2 on both ranks. The first
+reverse-boundary VJP difference at `final_norm.output` uses different upstream
+gradients and is not evidence of a backward kernel defect.
+
+With `STAGE43_TRACE=1`, after all three measured runs, the probe now replays
+first-layer out_proj for P/S1/S2 (same command above). Sync both the probe and
+test file. Parameters/buffers must match. Canonical input is the captured CP1
+full input, restored to its original dtype in contiguous storage; its native
+zigzag slice supplies the same-input local controls. Print:
+
+- Captured CP1/CP2 input and output, own-input output reproduction.
+- Same full input and same local input through both module instances.
+- Full versus local shape within each instance on canonical inputs.
+- CP2 canonical versus captured-own input, plus full/local repeatability.
+- Shapes, original dtype/strides, exact equality, norms, rel-L2, cosine, max-abs.
+
+Forward autograd remains enabled like connected mode, but no replay backward
+is called. No full-model substitution, optimizer/kernel change, or new numerical
+threshold. Replay is outside the measured communication contract. This is a
+forward localization control, not a backward same-upstream replay. If own-input
+reproduction fails, contiguous layout/dispatch or repeatability must be resolved
+before attributing the observed original difference solely to sequence length.
+Actual replay results remain pending on NPU.
