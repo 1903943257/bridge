@@ -523,3 +523,47 @@ Replay communication is additional diagnostic traffic, outside original model
 communication counters. These are diagnostics, not an automatic PASS waiver;
 original cross-CP FAIL can still end pytest after all replay data is printed.
 Local AST checks passed; actual replay output and NPU gradients await the server.
+
+#### Uniform projection-module shape control
+
+Complete replay report confirms own-input CP1/CP2 forward reproduction exact;
+canonical repeat output exact and gradient repeat differences tiny. L4/L24
+canonical output remains ~0.4%, gradient ~0.3--0.8%. In contrast, L24 CP2
+canonical-vs-own input replay produces ~16--18% output and ~15--23% gradient
+differences under the same upstream dO. This supports input perturbation
+amplification. It does not establish that all upstream error comes from Linear.
+That report's Engine relay also FAILs three individual state gates (~2.009%,
+2.022%, 2.127%) despite aggregate errors near connected repeat; keep that status.
+
+`STAGE44_LINEAR_ZIGZAG64=1` now applies one test-only CP1 intervention to:
+36 GDN in/out projections, 12 FA QKV/output projections, 48 MLP fc1/fc2
+projections, and the vocabulary head (97 modules). Each 128-token call becomes
+rank0 [0:32,96:128] and rank1 [32:96] calls, followed by inverse permutation.
+Autograd and external tied embedding weight arguments remain connected.
+Require CP=TP=1, no sequence parallelism, bias-free outputs, native token-major
+inputs. Each target must run exactly three times (291 interventions total).
+CP2 connected/tree/repeat are run with their original module forwards.
+
+Scope is the actual projection module: implementations that fuse input norm
+inside it also execute that norm at the controlled shape. Actual module class
+counts are logged; this is not automatically pure-GEMM isolation. Embedding
+lookup, standalone norms, GDN/attention core and CP communication are unchanged.
+Including the vocabulary head can also affect loss/upstream gradients directly;
+inspect layer traces and FA inputs as well as final gradient improvement.
+
+Sync `_full_linear_shape_control.py` and the updated full-model test; retain
+the existing `_first_gdn_zigzag_control.py`, drift and FA replay helpers.
+
+```bash
+STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=1 STAGE44_FA_REPLAY=1 \
+  torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 \
+  -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py
+python -m pytest -q tests/models/mcore/tpr/unit/test_first_gdn_zigzag_control.py
+```
+
+TRACE and FA_REPLAY remain independently optional; VERBOSE stays off for concise
+logs. Compare controlled layer drift, L4/L24 captured FA inputs and complete
+gradient gates against the baseline logs. Canonical replay in this run uses the
+controlled CP1 capture. Controlled PASS/FAIL is labelled in MODE/SUMMARY/pytest;
+it cannot change the unmodified baseline status. All thresholds remain intact.
+Local syntax/selector checks only; NPU and torch tied-weight VJP test pending.

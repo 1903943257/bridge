@@ -352,6 +352,12 @@ def _relay_diagnostic(label, reference, actual, *, rank):
 def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
     from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
+    from ._full_linear_shape_control import full_linear_shape_control
+
+    control = os.getenv("STAGE44_LINEAR_ZIGZAG64", "0")
+    assert control in ("0", "1"), "STAGE44_LINEAR_ZIGZAG64 must be 0 or 1"
+    controlled = control == "1"
+    print(f"STAGE-4.4 MODE {'CONTROLLED (CP1 projection shapes)' if controlled else 'BASELINE'}", flush=True)
 
     for name in ("STAGE43_OUT_PROJ_ZIGZAG64", "STAGE43_MLP_FC2_ZIGZAG64",
                  "STAGE33_OUT_PROJ_CHUNK64", "STAGE33_MLP_FC2_CHUNK64"):
@@ -393,9 +399,12 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
               f"plan={digest[:16]} loss_weight=510 CP={cp} "
               f"parameter_SUM={'once' if cp == 2 else 'none'} state_SUM=none "
               f"Engine_loss_scale={'1/2 (cancels CP factor)' if tree else 'global denominator only'}", flush=True)
-        results.append(_run(model, plan, runtime, monkeypatch, cp=cp, tree=tree,
+        with full_linear_shape_control(model, monkeypatch, enabled=controlled and cp == 1, rank=runtime.rank):
+            result = _run(model, plan, runtime, monkeypatch, cp=cp, tree=tree,
                             trace=os.getenv("STAGE44_TRACE", "0") == "1" and label in ("CP1-connected", "CP2-connected"),
-                            fa_replay=os.getenv("STAGE44_FA_REPLAY", "0") == "1" and label in ("CP1-connected", "CP2-connected")))
+                            fa_replay=os.getenv("STAGE44_FA_REPLAY", "0") == "1" and label in ("CP1-connected", "CP2-connected"))
+        results.append(result)
+        del result
         # Drop layer tuples too; they otherwise retain the full decoder.
         del model, gdn, fa
         gc.collect()
@@ -416,18 +425,21 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     del repeat
     results.pop()
     cp1["state"] = _shard_states(cp1["state"], runtime.cp_group.rank())
-    cross = _compare("cross-CP-connected", cp1, cp2, rank=runtime.rank)
+    cross = _compare("cross-CP-connected" + ("/CONTROLLED" if controlled else ""), cp1, cp2, rank=runtime.rank)
     relay = _compare("CP2-connected-vs-Engine-tree", cp2, tree, rank=runtime.rank)
     # All ranks complete all diagnostics before reporting local failures.
     failed = torch.tensor([bool(cross), bool(relay)], device=runtime.device, dtype=torch.int32)
     dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=runtime.cp_group)
     print(f"STAGE-4.4 SUMMARY cross-CP={'FAIL' if failed[0].item() else 'PASS'} "
-          f"Engine-relay={'FAIL' if failed[1].item() else 'PASS'}; no thresholds waived", flush=True)
+          f"Engine-relay={'FAIL' if failed[1].item() else 'PASS'}; "
+          f"mode={'CONTROLLED' if controlled else 'BASELINE'}; no thresholds waived", flush=True)
     if failed.any().item():
         messages = cross + relay
         if os.getenv("STAGE44_VERBOSE", "0") != "1" and len(messages) > 8:
             # Keep relay failures visible even when all cross-CP states fail.
             messages = cross[:4] + relay[:4] + [f"{len(cross)} cross-CP and {len(relay)} relay checks failed; STAGE44_VERBOSE=1 for full list"]
-        pytest.fail("\n".join(messages) or "numerical gate failed on peer rank", pytrace=False)
+        message = "\n".join(messages) or "numerical gate failed on peer rank"
+        pytest.fail(("CONTROLLED FAIL\n" if controlled else "") + message, pytrace=False)
     if runtime.rank == 0:
-        print("STAGE-4.4 PASS: full 18 GDN + 6 FA, CP2 Engine tree, non-packed; training stability not yet evaluated")
+        status = "CONTROLLED PASS (not unmodified baseline PASS)" if controlled else "PASS"
+        print(f"STAGE-4.4 {status}: full 18 GDN + 6 FA, CP2 Engine tree, non-packed; training stability not yet evaluated")

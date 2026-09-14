@@ -51,3 +51,26 @@ def test_projection_switches_and_restoration(monkeypatch, out_enabled, fc2_enabl
         assert set(counts) == {name for name, flag in (("out_proj", out_enabled), ("mlp_fc2", fc2_enabled)) if flag}
         assert all(c["full128_to_zigzag_2x64"] == 1 for c in counts.values())
     assert (out.forward, fc2.forward) == originals
+
+
+def test_zigzag_control_preserves_external_tied_weight_vjp():
+    """The full-model control includes GPT's head with weight=embedding.weight."""
+    generator = torch.Generator().manual_seed(44)
+    x = torch.randn(128, 1, 3, generator=generator, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(7, 3, generator=generator, dtype=torch.float64, requires_grad=True)
+    upstream = torch.randn(128, 1, 7, generator=generator, dtype=torch.float64)
+
+    def original(hidden, *, weight, runtime_gather_output):
+        assert runtime_gather_output is False
+        return torch.nn.functional.linear(hidden, weight), None
+
+    full, _ = original(x, weight=weight, runtime_gather_output=False)
+    counts = {"full128_to_zigzag_2x64": 0}
+    controlled, bias = zigzag_control_forward(original, counts)(
+        x, weight=weight, runtime_gather_output=False)
+    assert bias is None
+    torch.testing.assert_close(controlled, full, atol=1e-12, rtol=1e-12)
+    expected = torch.autograd.grad(full, (x, weight), grad_outputs=upstream)
+    actual = torch.autograd.grad(controlled, (x, weight), grad_outputs=upstream)
+    for left, right in zip(expected, actual):
+        torch.testing.assert_close(left, right, atol=1e-12, rtol=1e-12)
