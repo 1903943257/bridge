@@ -856,8 +856,13 @@ values, objective and communications, print metrics, not correctness PASS.
 Model snapshots/gradient references require several GB of CPU RAM.
 
 CP2 full-model audits: whole FA=6, GDN A2A=108/18; segmented FA=12,
-GDN A2A=216/36. Ring P2P whole=12 / segmented=36; AllGather/ReduceScatter
-whole=18/18 / segmented=48/48, Ring P2P=0. Same existing whole-QKV AllGather
+GDN A2A=216/36. Ring P2P whole=12 / segmented=35; AllGather/ReduceScatter
+whole=18/18 / segmented=48/45, Ring P2P=0. P has no own loss and its final
+FA core output is not used by saved prefix K/V, which are produced before
+the core. Thus this final P FA executes forward but no core backward:
+three fewer ReduceScatters, or one fewer Ring gradient circulation. This
+differs from the earlier tree fixture with loss on the root itself.
+Same existing whole-QKV AllGather
 reference, not a performance-oriented KV-only implementation.
 
 Sync the two new tests and run them together, saving the log:

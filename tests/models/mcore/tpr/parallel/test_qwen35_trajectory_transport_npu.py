@@ -140,10 +140,16 @@ def test_qwen35_whole_segmented_transport(runtime, monkeypatch):
                     assert a2a.count("hp2cp") == (36 if segmented else 18)
                     assert comm["fa_ring"] == (12 if segmented else 6)
                     if ag is not None:
-                        assert ag["all_gather"] == ag["reduce_scatter"] == (48 if segmented else 18)
+                        # P has no loss. Its last FA core output has no route
+                        # to S: saved prefix K/V are produced before the core.
+                        # That call gathers Q/K/V but has no backward VJP.
+                        assert ag["all_gather"] == (48 if segmented else 18)
+                        assert ag["reduce_scatter"] == (45 if segmented else 18)
                         assert comm["ring_p2p"] == 0
                     else:
-                        assert comm["ring_p2p"] == (36 if segmented else 12)
+                        # Same dead P-last-FA output: one KV-owner gradient
+                        # circulation is absent, while all forwards still run.
+                        assert comm["ring_p2p"] == (35 if segmented else 12)
                 else:
                     assert not comm and not a2a.calls
             refs[label] = result
