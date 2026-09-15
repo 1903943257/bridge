@@ -7,8 +7,10 @@ This stage is the performance milestone, **not THD/remove-padding**.
 
 ## Execution and fairness
 
-- Default matrix: N=2/4/8/16; (P,S)=(64,192)/(128,128)/(192,64).
-  Same total length 256, ratios 1:3 / 1:1 / 3:1. CPU-seeded identical
+- Default matrix: N=2/4/8/16;
+  (P,S)=(16384,1024)/(16384,2048)/(8192,8192), with 1k=1024 tokens.
+  Ratios 16:1 / 8:1 / 1:1; total lengths 17408 / 18432 / 16384.
+  CPU-seeded identical
   prefix/branch tokens, one unchanged model reused across all runs.
 - Ref: N independent whole P+S calls via leaf execution; no cached state
   crosses trajectories. TPR: real `FixedTopologyScheduler` and
@@ -123,8 +125,10 @@ python -m pytest -q tests/models/mcore/tpr/unit/test_prefix_reuse_metrics.py
 Optional subset/sizing: `STAGE45_BRANCHES=2,4`,
 `STAGE45_LENGTHS=256:768,512:512,768:256`. Lengths must be multiples of 64.
 The model's max sequence length is set from the largest requested P+S.
-A subset is a smoke test, not the complete matrix. Default short lengths
-bound initial runtime; larger-length runs are needed for long-context claims.
+A subset is a smoke test, not the complete matrix. The long default lengths
+increase runtime and peak memory substantially, especially the full-vocabulary
+logits and replicated whole-QKV FA. An OOM is reported as such, not silently
+handled by shortening a case or changing the execution path.
 
 Rank0 prints progress, one `STAGE45_CASE` JSON per case (median timing/memory,
 profile medians, raw clean samples and communication counts), then a compact

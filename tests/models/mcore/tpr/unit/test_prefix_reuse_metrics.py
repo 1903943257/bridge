@@ -15,8 +15,9 @@ class PrefixReuseMetricsTest(unittest.TestCase):
         cases = metrics.benchmark_cases()
         self.assertEqual(len(cases), 12)
         self.assertEqual({n for n, _, _ in cases}, {2, 4, 8, 16})
-        self.assertEqual({p / s for _, p, s in cases}, {1 / 3, 1, 3})
-        self.assertTrue(all(p + s == 256 for _, p, s in cases))
+        self.assertEqual({(p, s) for _, p, s in cases}, {(16384, 1024), (16384, 2048), (8192, 8192)})
+        self.assertEqual({p / s for _, p, s in cases}, {16, 8, 1})
+        self.assertEqual(max(p + s for _, p, s in cases), 18432)
 
     def test_reject_invalid_matrix(self):
         for n, lengths in (("1", "64:64"), ("2,2", "64:64"),
