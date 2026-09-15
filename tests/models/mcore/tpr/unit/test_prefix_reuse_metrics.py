@@ -13,11 +13,11 @@ spec.loader.exec_module(metrics)
 class PrefixReuseMetricsTest(unittest.TestCase):
     def test_default_matrix(self):
         cases = metrics.benchmark_cases()
-        self.assertEqual(len(cases), 12)
+        self.assertEqual(len(cases), 8)
         self.assertEqual({n for n, _, _ in cases}, {2, 4, 8, 16})
-        self.assertEqual({(p, s) for _, p, s in cases}, {(16384, 1024), (16384, 2048), (8192, 8192)})
-        self.assertEqual({p / s for _, p, s in cases}, {16, 8, 1})
-        self.assertEqual(max(p + s for _, p, s in cases), 18432)
+        self.assertEqual({(p, s) for _, p, s in cases}, {(8192, 1024), (8192, 8192)})
+        self.assertEqual({p / s for _, p, s in cases}, {8, 1})
+        self.assertEqual(max(p + s for _, p, s in cases), 16384)
 
     def test_reject_invalid_matrix(self):
         for n, lengths in (("1", "64:64"), ("2,2", "64:64"),

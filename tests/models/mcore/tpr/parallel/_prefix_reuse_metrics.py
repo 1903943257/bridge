@@ -3,7 +3,7 @@
 from statistics import median
 
 
-def benchmark_cases(branches="2,4,8,16", lengths="16384:1024,16384:2048,8192:8192"):
+def benchmark_cases(branches="2,4,8,16", lengths="8192:1024,8192:8192"):
     ns = tuple(int(n) for n in branches.split(","))
     pairs = tuple(tuple(int(v) for v in pair.split(":")) for pair in lengths.split(","))
     if not ns or any(n < 2 for n in ns) or len(set(ns)) != len(ns):

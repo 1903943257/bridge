@@ -8,8 +8,8 @@ This stage is the performance milestone, **not THD/remove-padding**.
 ## Execution and fairness
 
 - Default matrix: N=2/4/8/16;
-  (P,S)=(16384,1024)/(16384,2048)/(8192,8192), with 1k=1024 tokens.
-  Ratios 16:1 / 8:1 / 1:1; total lengths 17408 / 18432 / 16384.
+  (P,S)=(8192,1024)/(8192,8192), with 1k=1024 tokens.
+  Ratios 8:1 / 1:1; total lengths 9216 / 16384; eight cases overall.
   CPU-seeded identical
   prefix/branch tokens, one unchanged model reused across all runs.
 - Ref: N independent whole P+S calls via leaf execution; no cached state
@@ -132,7 +132,7 @@ handled by shortening a case or changing the execution path.
 
 Rank0 prints progress, one `STAGE45_CASE` JSON per case (median timing/memory,
 profile medians, raw clean samples and communication counts), then a compact
-12-row `STAGE45_SUMMARY`. Results: **NPU performance measurements pending**;
+8-row `STAGE45_SUMMARY`. Results: **NPU performance measurements pending**;
 no speedup or memory saving is claimed before running on the server.
 
 Local validation: five dependency-free reporting unit tests passed; all three

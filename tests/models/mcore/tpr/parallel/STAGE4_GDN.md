@@ -879,6 +879,6 @@ whole drift to blockwise Ring or extra segmented drift to Prefix KV handling.
 ### Stage 4.5: AllGather-only Prefix Reuse performance
 
 See [STAGE45_PERFORMANCE.md](STAGE45_PERFORMANCE.md) for scope, timing
-definitions, communication audits and the 12-case server command. Ring
+definitions, communication audits and the 8-case server command. Ring
 diagnosis is paused; no upstream Ring bug or training correctness PASS is
 inferred from this benchmark. No production Ring or threshold changes.

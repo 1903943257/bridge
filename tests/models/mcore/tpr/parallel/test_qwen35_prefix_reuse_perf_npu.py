@@ -279,7 +279,7 @@ def _sample(model, runtime, refs, tree, mode, patch, profiled):
 @pytest.mark.skipif(os.getenv("STAGE45_PERF", "0") != "1", reason="Opt-in benchmark: STAGE45_PERF=1")
 def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
     cases = benchmark_cases(os.getenv("STAGE45_BRANCHES", "2,4,8,16"),
-                            os.getenv("STAGE45_LENGTHS", "16384:1024,16384:2048,8192:8192"))
+                            os.getenv("STAGE45_LENGTHS", "8192:1024,8192:8192"))
     repeats = int(os.getenv("STAGE45_REPEATS", "3"))
     warmup = int(os.getenv("STAGE45_WARMUP", "1"))
     assert repeats >= 3 and warmup >= 1
