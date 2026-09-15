@@ -820,3 +820,53 @@ STAGE44_FA_BACKEND=allgather_whole STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=0 STA
 
 Redirect overwrites the log. Local AST checks passed; local PyTorch/NPU are
 unavailable, so distributed numerical/collective validation remains pending.
+
+### Whole causal vs Prefix/Suffix transport matrix
+
+No Ring changes. Two additional NPU tests distinguish the current Ring
+implementation's empty-prefix causal path from its explicit prefix path.
+"Ring whole" still uses this repository's Ring callable, not a separate
+upstream-native implementation; conclusions must be scoped accordingly.
+
+`test_fa_transport_matrix_npu.py`: six CP1/AllGather/Ring x whole/rectangular
+core paths, identical CPU-seeded BF16 QKV (Hq=8,Hkv=2,D=256), scale=1/16.
+P=64,S=64. Whole has zero dO on P and the same nonzero dO on S as rectangular.
+Compare S output,dQ,dK,dV and prefix dK/dV, reconstructing CP2 zigzag gradients
+in chronological order. Rectangular-vs-whole CP1 is reported too. This is a
+core test, with no projection weights to confound transport comparisons.
+
+`test_qwen35_trajectory_transport_npu.py`: full random 24-layer model, same
+initial tensors checked across six cases: CP1 whole/segmented, AllGather
+whole/segmented, Ring whole/segmented. Same P64+S64 tokens and global positions.
+Only S[0:63] predicting S[1:64] contributes to loss; root loss is empty, total
+weight is 63. Explicit local loss sum/63 plus CP SUM (no Executor CP factor).
+Prefix graph remains connected and sibling/tree scheduling is not involved.
+Compare loss, logical target logprob, full P+S embedding-output input gradient,
+and all parameter gradients. Explicit boundary state VJPs exist only for
+segmented paths: compare them to CP1 segmented, never fabricate whole GDN
+intermediate-state gradients. Whole state gradient is labelled N/A.
+
+Default `STAGE44_MATRIX_LINEAR_CONTROL=1` makes CP1 projection modules use
+native zigzag rank-sized calls for whole128 and segment64 (including fused
+normalization). Set 0 separately for unmodified projection execution. This
+control does not make whole and segmented M identical to one another, so CP1
+whole-vs-segmented and AllGather whole-vs-segmented are essential controls.
+No exactness is assumed and no thresholds are relaxed: tests audit finite
+values, objective and communications, print metrics, not correctness PASS.
+Model snapshots/gradient references require several GB of CPU RAM.
+
+CP2 full-model audits: whole FA=6, GDN A2A=108/18; segmented FA=12,
+GDN A2A=216/36. Ring P2P whole=12 / segmented=36; AllGather/ReduceScatter
+whole=18/18 / segmented=48/48, Ring P2P=0. Same existing whole-QKV AllGather
+reference, not a performance-oriented KV-only implementation.
+
+Sync the two new tests and run them together, saving the log:
+
+```bash
+mkdir -p tests/models/mcore/tpr/logs
+STAGE44_MATRIX_LINEAR_CONTROL=1 torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_fa_transport_matrix_npu.py tests/models/mcore/tpr/parallel/test_qwen35_trajectory_transport_npu.py > tests/models/mcore/tpr/logs/stage4_4_5.logs 2>&1
+```
+
+Local AST checks passed; no local PyTorch/NPU, numerical results pending.
+Read FA-MATRIX individual VJPs and TRAJECTORY comparisons before attributing
+whole drift to blockwise Ring or extra segmented drift to Prefix KV handling.
