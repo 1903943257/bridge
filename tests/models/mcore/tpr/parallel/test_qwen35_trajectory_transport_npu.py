@@ -14,6 +14,7 @@ from .test_full_qwen35_tree_cp_npu import (
 from .test_fa_transport_matrix_npu import metric
 from ._whole_fa_allgather import install_whole_fa_allgather
 from ._ordinary_ring_control import install_ordinary_ring
+from ._trajectory_fa_trace import trace_l4
 from .test_small_hybrid_tree_cp_npu import _communication_probe
 
 
@@ -137,7 +138,9 @@ def test_qwen35_whole_segmented_transport(runtime, monkeypatch):
                 ag = install_whole_fa_allgather(patch) if backend == "allgather" else None
                 if backend == "native_ring":
                     install_ordinary_ring(patch)
-                with projection_control(model, patch, cp == 1 and control == "1"), _communication_probe(patch) as (comm, a2a):
+                with projection_control(model, patch, cp == 1 and control == "1"), \
+                     _communication_probe(patch) as (comm, a2a), \
+                     trace_l4(model, patch, backend=backend, rank=runtime.cp_group.rank(), enabled=not segmented):
                     result = execute(model, runtime, cp=cp, segmented=segmented)
                 if cp == 2:
                     assert a2a.count("cp2hp") == (216 if segmented else 108)

@@ -45,3 +45,11 @@ is compared because equivalent decompositions can use different max offsets.
 Full-model logs loss/logprob/input/parameter gradients; GDN A2A and FA/P2P
 contracts remain asserted. Numeric diagnostics do not imply training PASS and
 do not relax existing correctness thresholds. NPU results pending server run.
+
+The whole trajectory additionally prints `TRAJECTORY-L4` for every transport.
+`native_ring` requires one native-entry hit, two SBH FA calls and reverse-order
+backward with the same shapes as the single-layer test. `ring` requires five TND
+calls. Trace keeps metadata only, tags L4 autograd contexts for backward, and
+does not trace segmented execution. CP1/AllGather automatic kernel backward
+may not appear in the Python-level `npu_fusion_attention_grad` trace; an empty
+list there is not evidence that autograd skipped backward.
