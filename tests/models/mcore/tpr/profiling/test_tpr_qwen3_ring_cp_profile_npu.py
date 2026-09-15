@@ -35,8 +35,8 @@ Run all cases from the verl repository root with two visible NPUs::
         -m pytest -s -v -x \
         tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py
 
-Set ``TPR_QWEN_RING_CP_PROFILE_CASES`` to a comma-separated list of case IDs
-to split a long run, for example ``p16384_s2048_n2``.  The main comparison keeps
+Edit ``_PROFILE_CASES`` below to choose cases; every listed case is run.
+The main comparison keeps
 three warmups and ten uninstrumented samples.  A separate one-warmup,
 three-sample NPU-event pass collects the latency breakdown; set
 ``TPR_QWEN_RING_CP_PROFILE_BREAKDOWN=0`` to disable that diagnostic pass.
@@ -304,21 +304,6 @@ class _NPUEventRecorder:
         }
         calls = {category: len(pairs) for category, pairs in self._pairs.items()}
         return totals, calls
-
-
-def _selected_profile_cases() -> tuple[_ProfileCase, ...]:
-    value = os.getenv("TPR_QWEN_RING_CP_PROFILE_CASES", "all").strip().lower()
-    if value in ("", "all"):
-        return _PROFILE_CASES
-    requested = {item.strip() for item in value.split(",") if item.strip()}
-    known = {case.case_id: case for case in _PROFILE_CASES}
-    unknown = requested.difference(known)
-    if unknown:
-        raise ValueError(
-            "unknown TPR_QWEN_RING_CP_PROFILE_CASES entries "
-            f"{sorted(unknown)}; expected a subset of {tuple(known)}"
-        )
-    return tuple(case for case in _PROFILE_CASES if case.case_id in requested)
 
 
 def _tokens(start: int, length: int, vocab_size: int) -> torch.Tensor:
@@ -1435,7 +1420,7 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
     torch.npu.synchronize()
 
     results = []
-    for case in _selected_profile_cases():
+    for case in _PROFILE_CASES:
         reference_plans, tpr_plan = _make_case_plans(
             case,
             vocab_size=hf_config.vocab_size,
