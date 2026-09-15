@@ -67,3 +67,25 @@ Printed paired comparisons: whole TND/SBH, native 2-call TND/SBH, old TND
 5-call/native TND 2-call, whole SBH/native SBH. Every pair reports output,
 dQ/dK/dV and LSE. The old/new TND pair still includes native merge and reduction
 differences; it is not a pure FA-call-count-only ablation. No thresholds changed.
+
+## Native output oracle / official-style GQA
+
+`test_native_ring_output_oracle_npu.py` is standalone from VERL attention and
+runtime helpers. Its HCCL WORLD is CP2; singleton inner window, no overlap,
+cache_policy=None matches ordinary official UT configuration. Reference is
+whole SBH FA. QKV/upstream use the prior matrix seed, BF16, full-query VJP.
+Original official test uses MHA/longer sequences and is marked skipped upstream;
+this is an adapted GQA control, not a claim of reproducing an upstream PASS.
+
+```bash
+mkdir -p tests/models/mcore/tpr/logs
+torchrun --master_addr=127.0.0.1 --master_port=29557 --nproc_per_node=2 -m pytest -s -v tests/models/mcore/tpr/parallel/test_native_ring_output_oracle_npu.py > tests/models/mcore/tpr/logs/stage4_4_5.logs 2>&1
+```
+
+Two tests: direct official-style output/dQ/dK/dV metrics; captured two-step
+output oracle on CPU FP32 (no float64). Compare native vs same-kernel FP32
+correction both before/after final BF16 rounding, kernel context merge vs FP32
+block computation, and FP32 decomposition vs whole FP32. Save CPU captures to
+`logs/native_output_oracle_rank{0,1}.pt` (replaced on rerun). Only metadata/metrics
+are printed. Shapes and finiteness are asserted; numerical metrics are diagnostic,
+not relaxed correctness gates. NPU execution remains pending server validation.
