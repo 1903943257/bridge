@@ -53,3 +53,17 @@ calls. Trace keeps metadata only, tags L4 autograd contexts for backward, and
 does not trace segmented execution. CP1/AllGather automatic kernel backward
 may not appear in the Python-level `npu_fusion_attention_grad` trace; an empty
 list there is not evidence that autograd skipped backward.
+
+## Single-layer layout matrix
+
+The same `test_ordinary_ring_schedule_npu.py` command now also executes
+`cp1_sbh` (one whole SBH call) and `native_tnd` (native two-step schedule with
+test-only SBH/TND kernel-boundary conversion). Production Ring is unchanged.
+Both additions use the same QKV and full-query upstream as existing paths.
+Native TND preserves native communication, correction/casts and reverse VJP;
+traces record the actual TND kernel arguments, not the shim's SBH arguments.
+
+Printed paired comparisons: whole TND/SBH, native 2-call TND/SBH, old TND
+5-call/native TND 2-call, whole SBH/native SBH. Every pair reports output,
+dQ/dK/dV and LSE. The old/new TND pair still includes native merge and reduction
+differences; it is not a pure FA-call-count-only ablation. No thresholds changed.

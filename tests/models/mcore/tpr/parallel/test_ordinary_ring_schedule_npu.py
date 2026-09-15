@@ -12,6 +12,7 @@ from .test_full_qwen35_tree_cp_npu import runtime, gather_native_zigzag
 from .test_fa_transport_matrix_npu import metric
 from ._whole_fa_allgather import install_whole_fa_allgather
 from ._ordinary_ring_control import install_ordinary_ring
+from ._native_ring_tnd_layout import install_native_tnd_layout
 
 
 def test_ordinary_ring_schedule(runtime, monkeypatch):
@@ -29,14 +30,14 @@ def test_ordinary_ring_schedule(runtime, monkeypatch):
     shard = ring.make_ring_sequence_shard(128, cp_rank=runtime.cp_group.rank(), cp_size=2)
     idx = shard.global_indices(device="cpu")
     results = {}
-    for backend in ("cp1", "allgather", "old_ring", "native_ring"):
-        cp = backend != "cp1"
+    for backend in ("cp1", "cp1_sbh", "allgather", "old_ring", "native_ring", "native_tnd"):
+        cp = backend not in ("cp1", "cp1_sbh")
         inputs = [(x[idx] if cp else x).to(runtime.device).clone().requires_grad_() for x in base]
         calls, backward_calls, stats = [], [], []
         with monkeypatch.context() as patch:
             if backend == "allgather":
                 install_whole_fa_allgather(patch)
-            elif backend == "native_ring":
+            elif backend in ("native_ring", "native_tnd"):
                 install_ordinary_ring(patch)
             original_fwd = torch_npu.npu_fusion_attention
             original_bwd = torch_npu.npu_fusion_attention_grad
@@ -51,12 +52,12 @@ def test_ordinary_ring_schedule(runtime, monkeypatch):
             def forward(*args, **kwargs):
                 result = original_fwd(*args, **kwargs)
                 calls.append((tuple(args[0].shape), tuple(args[1].shape), args[4], kwargs["sparse_mode"]))
-                if backend == "cp1":
+                if backend in ("cp1", "cp1_sbh"):
                     stats.append((result[1].detach().clone(), result[2].detach().clone()))
                 return result
 
             def backward(*args, **kwargs):
-                backward_calls.append((args[0].shape[0], args[1].shape[0]))
+                backward_calls.append((tuple(args[0].shape), tuple(args[1].shape), args[5], kwargs["sparse_mode"]))
                 return original_bwd(*args, **kwargs)
 
             def update(*args, **kwargs):
@@ -69,23 +70,40 @@ def test_ordinary_ring_schedule(runtime, monkeypatch):
             patch.setattr(native, "causal_out_update", update)
             if backend == "old_ring":
                 patch.setattr(ring, "_finalize_attention_result", finalize)
+            if backend == "native_tnd":
+                # Install outside the trace so trace sees real TND kernel args,
+                # not the native SBH arguments entering the conversion shim.
+                install_native_tnd_layout(patch, torch_npu)
             if cp:
                 output = ring.ring_cp_attention(*inputs, prefix_blocks=(), current_shard=shard,
                     cp_group=runtime.cp_group, softmax_scale=0.0625)
+            elif backend == "cp1_sbh":
+                # Same scale/window/mask/precision as CP1 TND; layout only.
+                output = torch_npu.npu_fusion_attention(
+                    *(x.flatten(2).contiguous() for x in inputs), 8, "SBH",
+                    pse=None, padding_mask=None,
+                    atten_mask=ring._compressed_causal_mask(runtime.device),
+                    scale=0.0625, pre_tockens=ring._MAX_TOKENS, next_tockens=0,
+                    keep_prob=1.0, inner_precise=0, sparse_mode=3,
+                )[0]
             else:
                 output = rectangular_causal_attention(*inputs, softmax_scale=0.0625)
             grads = torch.autograd.grad(output, inputs, (upstream[idx] if cp else upstream).to(runtime.device))
 
         if backend == "old_ring":
             assert len(calls) == len(backward_calls) == 5, (calls, backward_calls)
-        if backend == "native_ring":
+        if backend == "cp1_sbh":
+            assert calls == [((128, 1, 2048), (128, 1, 512), "SBH", 3)], calls
+        if backend in ("native_ring", "native_tnd"):
             remote = (32, 64) if runtime.cp_group.rank() == 0 else (64, 32)
             expected = [(64, 64), remote]
             assert [(q[0], k[0]) for q, k, _, _ in calls] == expected, calls
-            assert [layout for _, _, layout, _ in calls] == ["SBH", "SBH"], calls
+            layout = "TND" if backend == "native_tnd" else "SBH"
+            assert [item[2] for item in calls] == [layout, layout], calls
             assert [mode for _, _, _, mode in calls] == [3, 0], calls
-            assert calls[0][:2] == ((64, 1, 2048), (64, 1, 512)), calls
-            assert backward_calls == list(reversed(expected)), backward_calls
+            shapes = ((64, 8, 256), (64, 2, 256)) if layout == "TND" else ((64, 1, 2048), (64, 1, 512))
+            assert calls[0][:2] == shapes, calls
+            assert backward_calls == list(reversed(calls)), backward_calls
 
         def full(x):
             x = x.detach()
@@ -104,7 +122,15 @@ def test_ordinary_ring_schedule(runtime, monkeypatch):
             results[backend]["lse"] = lse
             metric(f"whole/CP1-vs-{backend}/LSE", {"lse": results["cp1"]["lse"]}, {"lse": lse}, runtime.rank)
         print(f"ORDINARY-SCHEDULE r={runtime.rank} {backend} fwd={calls} bwd={backward_calls}", flush=True)
-    for name in ("output", "dQ", "dK", "dV"):
-        metric(f"whole/old-vs-native/{name}", {name: results["old_ring"][name]},
-               {name: results["native_ring"][name]}, runtime.rank)
+    for left, right, label in (
+        ("cp1", "cp1_sbh", "layout-whole-TND-vs-SBH"),
+        ("native_tnd", "native_ring", "layout-native-2call-TND-vs-SBH"),
+        ("old_ring", "native_tnd", "old-5call-vs-native-2call-TND"),
+        ("cp1_sbh", "native_ring", "SBH-whole-vs-native-2call"),
+    ):
+        for name in ("output", "dQ", "dK", "dV", "lse"):
+            metric(f"whole/{label}/{name}", {name: results[left][name]},
+                   {name: results[right][name]}, runtime.rank)
+    print("NOTE: old-5call-vs-native-2call also differs in merge/casts/backward reduction; "
+          "the two layout comparisons keep their respective schedules fixed.", flush=True)
     print("ORDINARY-SCHEDULE COMPLETE: diagnostic metrics, not a training correctness PASS", flush=True)
