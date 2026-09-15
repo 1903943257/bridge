@@ -70,7 +70,7 @@ def test_ordinary_ring_schedule(runtime, monkeypatch):
             if backend == "old_ring":
                 patch.setattr(ring, "_finalize_attention_result", finalize)
             if cp:
-                output = ring.ring_cp_attention(*inputs, current_shard=shard,
+                output = ring.ring_cp_attention(*inputs, prefix_blocks=(), current_shard=shard,
                     cp_group=runtime.cp_group, softmax_scale=0.0625)
             else:
                 output = rectangular_causal_attention(*inputs, softmax_scale=0.0625)
