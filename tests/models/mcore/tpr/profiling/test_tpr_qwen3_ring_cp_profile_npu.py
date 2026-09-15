@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in Qwen3-0.6B Reference CP versus TPR Ring CP=2 profile.
+"""Opt-in Qwen3-0.6B/1.7B/4B Reference versus TPR profile with CP=1/2/4.
 
 The Reference executes every complete ``P + S`` trajectory independently.
 TPR executes one shared Prefix followed by all Suffixes.  Model construction,
 checkpoint loading, plan construction, warmup, and gradient clearing are not
 timed.  Each measured sample includes forward, loss, backward, and one final
-CP parameter-gradient synchronization.
+CP parameter-gradient synchronization (omitted for CP=1).
+
+Select TPR_QWEN_PROFILE_SIZE=0.6B, 1.7B or 4B (default: 0.6B).
+Checkpoints default to /workspace/hf_models/Qwen3-<size>; override with
+TPR_QWEN_MODEL_PATH or the size-specific TPR_QWEN_0_6B_PATH,
+TPR_QWEN_1_7B_PATH or TPR_QWEN_4B_PATH. CP is WORLD_SIZE, set by
+torchrun --nproc_per_node=1, 2 or 4. CP=1 uses local rectangular attention;
+CP>1 uses Ring. All sizes use the same MindSpeed bootstrap and loss path.
 
 Run all cases from the verl repository root with two visible NPUs::
 
@@ -45,13 +52,18 @@ import sys
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
+from transformers import AutoConfig
+from megatron.core import parallel_state
 
 import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
+import verl.models.mcore.tpr.attention as local_attention
 from verl.models.mcore.tpr import (
     FixedTopologyScheduler,
     PhysicalExecutionKind,
@@ -62,11 +74,8 @@ from verl.models.mcore.tpr import (
 )
 from verl.utils.device import is_torch_npu_available
 
-from ..parallel._tpr_cp_test_utils import cp_runtime
+from ..correctness.test_tpr_qwen3_compatibility_npu import _validate_checkpoint_files
 from ..parallel.test_tpr_qwen3_cp_equivalence_npu import (
-    _QWEN_MODEL_CASES,
-    _assert_qwen_cp_architecture,
-    _load_hf_config,
     _make_qwen_cp_model,
 )
 
@@ -79,13 +88,77 @@ pytestmark = pytest.mark.skipif(
     reason="Set TPR_RUN_QWEN_RING_CP_PROFILE=1 for the Qwen Ring CP profile",
 )
 
-_EXPECTED_WORLD_SIZE = 2
+_EXPECTED_WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 _WARMUP_RUNS = 3
 _MEASURE_RUNS = 10
 _BREAKDOWN_WARMUP_RUNS = 1
 _BREAKDOWN_MEASURE_RUNS = 3
 _RUN_BREAKDOWN = os.getenv("TPR_QWEN_RING_CP_PROFILE_BREAKDOWN", "1") == "1"
 _GIB = 1024**3
+
+
+@pytest.fixture(scope="module")
+def profile_runtime():
+    if _EXPECTED_WORLD_SIZE not in (1, 2, 4):
+        raise ValueError("This profile supports WORLD_SIZE=1, 2 or 4")
+    import torch_npu  # noqa: F401
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="hccl")
+
+    # Match the production NPU bootstrap before Megatron initializes its
+    # model-parallel RNG tracker. MindSpeed also redirects the legacy
+    # ``torch.cuda`` RNG calls in this Megatron revision to torch_npu.
+    pytest_argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = pytest_argv
+
+    from mindspeed.args_utils import get_full_args
+
+    vars(get_full_args()).pop("", None)
+    repatch(
+        {
+            "context_parallel_size": _EXPECTED_WORLD_SIZE,
+            "context_parallel_algo": "megatron_cp_algo",
+        }
+    )
+
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=_EXPECTED_WORLD_SIZE,
+            expert_model_parallel_size=1,
+        )
+
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    model_parallel_cuda_manual_seed(260907)
+
+    cp_group = parallel_state.get_context_parallel_group()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+    if cp_group.size() != _EXPECTED_WORLD_SIZE or tp_group.size() != 1 or pp_group.size() != 1:
+        raise AssertionError(
+            f"unexpected topology: TP={tp_group.size()}, PP={pp_group.size()}, CP={cp_group.size()}"
+        )
+    yield SimpleNamespace(
+        rank=dist.get_rank(cp_group),
+        cp_size=cp_group.size(),
+        device=torch.device("npu", local_rank),
+        cp_group=cp_group,
+        tp_group=tp_group,
+        pp_group=pp_group,
+    )
+
+    dist.barrier(group=cp_group)
+    parallel_state.destroy_model_parallel()
+    dist.destroy_process_group()
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,10 +435,10 @@ def _run_plan(model, plan, runtime, expected_layer_numbers) -> _RunObservation:
         model,
         plan,
         expected_layer_numbers=expected_layer_numbers,
-        cp_group=runtime.cp_group,
-        cp_backend="ring",
+        cp_group=runtime.cp_group if runtime.cp_size > 1 else None,
+        cp_backend="ring" if runtime.cp_size > 1 else None,
     )
-    if executor.cp_backend is None or executor.cp_backend.backend_name != "ring":
+    if runtime.cp_size > 1 and (executor.cp_backend is None or executor.cp_backend.backend_name != "ring"):
         raise AssertionError("profile did not resolve the Ring CP backend")
     result = FixedTopologyScheduler(plan, executor).run()
     return _RunObservation(
@@ -378,6 +451,8 @@ def _run_plan(model, plan, runtime, expected_layer_numbers) -> _RunObservation:
 
 
 def _finalize_cp_parameter_gradients(model, runtime) -> None:
+    if runtime.cp_size == 1:
+        return
     for name, parameter in model.named_parameters():
         if parameter.grad is None:
             raise AssertionError(f"missing parameter gradient before CP finalize: {name}")
@@ -457,12 +532,14 @@ def _profile_runner(
     # Probe separately so instrumentation cannot affect the latency samples.
     layer_trace = []
     adapter_calls = 0
-    original_ring_forward = ring_attention._RingTPRAttention.forward
+    adapter_owner = ring_attention._RingTPRAttention if runtime.cp_size > 1 else local_attention
+    adapter_name = "forward" if runtime.cp_size > 1 else "rectangular_causal_attention"
+    original_adapter = getattr(adapter_owner, adapter_name)
 
-    def counted_ring_forward(ctx, *args):
+    def counted_adapter(*args, **kwargs):
         nonlocal adapter_calls
         adapter_calls += 1
-        return original_ring_forward(ctx, *args)
+        return original_adapter(*args, **kwargs)
 
     handles = [
         layer.self_attention.register_forward_pre_hook(
@@ -474,7 +551,8 @@ def _profile_runner(
         model.zero_grad(set_to_none=True)
         dist.barrier(group=runtime.cp_group)
         with patch.object(
-            ring_attention._RingTPRAttention, "forward", staticmethod(counted_ring_forward)
+            adapter_owner, adapter_name,
+            staticmethod(counted_adapter) if runtime.cp_size > 1 else counted_adapter
         ):
             observation = run()
             torch.npu.synchronize()
@@ -1027,6 +1105,10 @@ def _format_forward_backward(forward_ms: float, backward_ms: float) -> str:
 
 
 def _print_breakdown_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
+    # This table derives attention from Ring-specific events. The local path
+    # is covered by the module-level controlled breakdown instead.
+    if _EXPECTED_WORLD_SIZE == 1:
+        return
     if rank != 0 or not results or results[0].reference_breakdown is None:
         return
     print("\nRing CP latency breakdown (all paired cells are forward/backward ms)")
@@ -1263,7 +1345,7 @@ def _print_case_result(result: _ProfileResult, *, rank: int) -> None:
     print(f"\nP={case.prefix_length}, S={case.suffix_length}, N={case.trajectory_count}, CP={_EXPECTED_WORLD_SIZE}")
     print(f"Model parameters: {reference.parameter_count / 1e9:.3f}B")
     print("Latency: per-sample maximum across CP ranks; memory: maximum per-rank statistic.")
-    print("Probe calls: Ring adapter entries on rank 0; FA block calls are reported separately.")
+    print("Probe calls: attention adapter entries on rank 0; FA block calls describe Ring only.")
     for name, stats in (("Reference", reference), ("TPR", tpr)):
         print(f"{name}:")
         print(f"  median latency:     {stats.median_ms:.3f} ms")
@@ -1290,7 +1372,7 @@ def _print_case_result(result: _ProfileResult, *, rank: int) -> None:
 def _print_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
     if rank != 0:
         return
-    print(f"\nControlled fused-reference summary (Ring CP={_EXPECTED_WORLD_SIZE})\n")
+    print(f"\nControlled fused-reference summary (CP={_EXPECTED_WORLD_SIZE})\n")
     print("| P | S | N | Ref median ms | TPR median ms | Speedup | Ref incr. GiB | TPR incr. GiB | Incr. reduction |")
     print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for result in results:
@@ -1302,19 +1384,48 @@ def _print_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
               f"{reduction * 100:.2f}% |")
 
 
-def test_qwen3_0_6b_reference_cp_vs_tpr_ring_cp_profile(cp_runtime):
-    runtime = cp_runtime
+def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
+    runtime = profile_runtime
     if runtime.cp_size != _EXPECTED_WORLD_SIZE:
         raise AssertionError(
             f"Ring profile requires CP={_EXPECTED_WORLD_SIZE}, got {runtime.cp_size}"
         )
 
-    model_case = next(
-        case for case in _QWEN_MODEL_CASES if case.name == "qwen3_0_6b"
-    )
-    hf_config = _load_hf_config(model_case)
+    size = os.getenv("TPR_QWEN_PROFILE_SIZE", "0.6B")
+    choices = {
+        "0.6B": ("TPR_QWEN_0_6B_PATH", 500_000_000, 700_000_000),
+        "1.7B": ("TPR_QWEN_1_7B_PATH", 1_500_000_000, 1_900_000_000),
+        "4B": ("TPR_QWEN_4B_PATH", 3_500_000_000, 4_500_000_000),
+    }
+    if size not in choices:
+        raise ValueError(f"Unsupported TPR_QWEN_PROFILE_SIZE={size!r}; choose {tuple(choices)}")
+    path_env, minimum, maximum = choices[size]
+    model_path = Path(os.getenv(path_env, os.getenv("TPR_QWEN_MODEL_PATH", f"/workspace/hf_models/Qwen3-{size}")))
+    _validate_checkpoint_files(model_path)
+    hf_config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
+    if hf_config.model_type != "qwen3":
+        raise ValueError(f"Expected dense Qwen3, got {hf_config.model_type!r}")
+    model_case = SimpleNamespace(path=model_path)
     model = _make_qwen_cp_model(runtime, model_case, hf_config)
-    _assert_qwen_cp_architecture(model, runtime, model_case, hf_config)
+    config = model.config
+    assert config.context_parallel_size == runtime.cp_size
+    for actual, expected in (
+        (config.num_layers, hf_config.num_hidden_layers),
+        (config.hidden_size, hf_config.hidden_size),
+        (config.ffn_hidden_size, hf_config.intermediate_size),
+        (config.num_attention_heads, hf_config.num_attention_heads),
+        (config.num_query_groups, hf_config.num_key_value_heads),
+        (config.kv_channels, hf_config.head_dim),
+    ):
+        assert actual == expected
+    assert len(model.decoder.layers) == hf_config.num_hidden_layers
+    assert model.share_embeddings_and_output_weights == hf_config.tie_word_embeddings
+    parameters = sum(parameter.numel() for parameter in model.parameters())
+    assert minimum <= parameters <= maximum, f"Qwen3-{size}: unexpected parameter count {parameters}"
+    if runtime.rank == 0:
+        print(f"Qwen3-{size}: checkpoint={model_path}, CP={runtime.cp_size}")
+        if runtime.cp_size == 1:
+            print("Local rectangular attention; Ring-only diagnostic counters are zero.")
     if next(model.parameters()).dtype != torch.bfloat16:
         raise AssertionError("Ring CP profile model must use BF16 parameters")
     expected_layer_numbers = tuple(
