@@ -127,10 +127,17 @@ class _ProfileStats:
     mean_ms: float
     peak_allocated_bytes: int
     baseline_allocated_bytes: int
+    std_ms: float
+    peak_reserved_bytes: int
+    parameter_count: int
+    adapter_probe_calls: int
+    layer_count: int
+    physical_phase_count: int
+    max_incremental_peak_bytes: int
 
     @property
     def incremental_peak_bytes(self) -> int:
-        return max(0, self.peak_allocated_bytes - self.baseline_allocated_bytes)
+        return self.max_incremental_peak_bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,6 +454,39 @@ def _profile_runner(
     *,
     expected_trace: tuple[tuple[PhysicalExecutionKind, int], ...],
 ) -> _ProfileStats:
+    # Probe separately so instrumentation cannot affect the latency samples.
+    layer_trace = []
+    adapter_calls = 0
+    original_ring_forward = ring_attention._RingTPRAttention.forward
+
+    def counted_ring_forward(ctx, *args):
+        nonlocal adapter_calls
+        adapter_calls += 1
+        return original_ring_forward(ctx, *args)
+
+    handles = [
+        layer.self_attention.register_forward_pre_hook(
+            lambda module, _args: layer_trace.append(module.layer_number)
+        )
+        for layer in model.decoder.layers
+    ]
+    try:
+        model.zero_grad(set_to_none=True)
+        dist.barrier(group=runtime.cp_group)
+        with patch.object(
+            ring_attention._RingTPRAttention, "forward", staticmethod(counted_ring_forward)
+        ):
+            observation = run()
+            torch.npu.synchronize()
+        _validate_observation(observation, expected_trace=expected_trace)
+        del observation
+    finally:
+        for handle in handles:
+            handle.remove()
+    layer_numbers = tuple(layer.self_attention.layer_number for layer in model.decoder.layers)
+    assert tuple(layer_trace) == layer_numbers * len(expected_trace)
+    assert adapter_calls == len(layer_trace)
+
     for warmup_index in range(_WARMUP_RUNS):
         model.zero_grad(set_to_none=True)
         dist.barrier(group=runtime.cp_group)
@@ -474,11 +514,19 @@ def _profile_runner(
         latencies_ms.append(_global_max_float(elapsed_ms, runtime))
 
     local_peak = int(torch.npu.max_memory_allocated())
+    local_reserved_peak = int(torch.npu.max_memory_reserved())
     return _ProfileStats(
         median_ms=statistics.median(latencies_ms),
         mean_ms=statistics.mean(latencies_ms),
         peak_allocated_bytes=_global_max_int(local_peak, runtime),
         baseline_allocated_bytes=_global_max_int(local_baseline, runtime),
+        std_ms=statistics.pstdev(latencies_ms),
+        peak_reserved_bytes=_global_max_int(local_reserved_peak, runtime),
+        parameter_count=sum(parameter.numel() for parameter in model.parameters()),
+        adapter_probe_calls=adapter_calls,
+        layer_count=len(layer_numbers),
+        physical_phase_count=len(expected_trace),
+        max_incremental_peak_bytes=_global_max_int(max(0, local_peak - local_baseline), runtime),
     )
 
 
@@ -495,6 +543,10 @@ _BREAKDOWN_SUFFIXES = (
     "fa_forward",
     "fa_backward",
     "merge_forward",
+    "attention_forward",
+    "attention_backward",
+    "mlp_forward",
+    "mlp_backward",
 )
 
 
@@ -661,10 +713,34 @@ def _collect_breakdown(
                 raise RuntimeError("profile model forward ended outside an execution phase")
             recorder.end(f"{phase}.model_forward")
 
-        handles = (
+        handles = [
             model.register_forward_pre_hook(model_forward_start),
             model.register_forward_hook(model_forward_end),
-        )
+        ]
+
+        def add_module_hooks(module, category):
+            def begin(*_args):
+                recorder.begin(f"{active_phase[0]}.{category}_forward")
+
+            def end(*_args):
+                recorder.end(f"{active_phase[0]}.{category}_forward")
+
+            def backward_begin(*_args):
+                recorder.begin(f"{active_phase[0]}.{category}_backward")
+
+            def backward_end(*_args):
+                recorder.end(f"{active_phase[0]}.{category}_backward")
+
+            handles.extend((
+                module.register_forward_pre_hook(begin),
+                module.register_forward_hook(end),
+                module.register_full_backward_pre_hook(backward_begin),
+                module.register_full_backward_hook(backward_end),
+            ))
+
+        for layer in model.decoder.layers:
+            add_module_hooks(layer.self_attention, "attention")
+            add_module_hooks(layer.mlp, "mlp")
         module = sys.modules[__name__]
         try:
             with ExitStack() as stack:
@@ -1146,48 +1222,84 @@ def _print_attribution(
     print(f"  Dominant measured consumer: {dominant_name} ({dominant_ms:.1f} ms)")
 
 
+def _print_controlled_breakdown(name, breakdown, *, path, sibling_count):
+    phases = _breakdown_phases(path)
+    print(f"{name} diagnostic breakdown (median of {_BREAKDOWN_MEASURE_RUNS} runs):")
+    print(f"  synchronized wall: {breakdown.wall_median_ms:.3f} ms")
+
+    def row(label, keys, *, per_leaf=False):
+        total = sum(breakdown.categories.get(key, 0.0) for key in keys)
+        calls = sum(breakdown.calls.get(key, 0) for key in keys)
+        suffix = f", {total / sibling_count:.3f} ms/leaf" if per_leaf else ""
+        print(f"  {label:<24} {total:>10.3f} ms ({calls} calls{suffix})")
+        return total
+
+    if path == "tpr":
+        row("root_push", ("prefix_push.operation",))
+        leaf = row("leaf_visit", ("branch_visit.operation",), per_leaf=True)
+        leaf_backward = row("leaf_visit_backward", ("branch_visit.backward",))
+        pop = row("root_pop", ("prefix_pop.operation",))
+        pop_backward = row("root_pop_backward", ("prefix_pop.backward",))
+    model_forward = row("model_forward", tuple(f"{phase}.model_forward" for phase in phases))
+    if path == "reference":
+        row("reference_backward", ("full.backward",))
+    for category in ("attention_forward", "attention_backward", "mlp_forward", "mlp_backward",
+                     "loss_forward", "fa_forward", "fa_backward", "comm_forward", "comm_backward"):
+        row(category, tuple(f"{phase}.{category}" for phase in phases))
+    row("gradient_finalize", ("gradient_finalize",))
+    if path == "tpr":
+        print(f"  leaf non-backward        {leaf - leaf_backward:>10.3f} ms (derived)")
+        print(f"  root_pop non-backward    {pop - pop_backward:>10.3f} ms (derived)")
+    backward = sum(breakdown.categories.get(f"{phase}.backward", 0.0) for phase in phases)
+    print(f"  wall - model graph      {breakdown.wall_median_ms - model_forward - backward:>10.3f} ms (approximate)")
+
+
 def _print_case_result(result: _ProfileResult, *, rank: int) -> None:
     if rank != 0:
         return
     case = result.case
-    print(
-        f"Ring CP profile case {case.case_id}:\n"
-        f"  Reference logical tokens N*(P+S): {case.reference_logical_tokens}\n"
-        f"  TPR logical executed tokens P+N*S: {case.tpr_logical_executed_tokens}\n"
-        f"  logical loss terms: {case.loss_term_count}\n"
-        f"  Reference median/mean: {result.reference.median_ms:.3f} / "
-        f"{result.reference.mean_ms:.3f} ms\n"
-        f"  TPR median/mean: {result.tpr.median_ms:.3f} / "
-        f"{result.tpr.mean_ms:.3f} ms\n"
-        f"  TPR speedup median/mean: {result.median_speedup:.3f}x / "
-        f"{result.mean_speedup:.3f}x\n"
-        f"  Reference peak allocated: {_format_gib(result.reference.peak_allocated_bytes)} "
-        f"(incremental {_format_gib(result.reference.incremental_peak_bytes)})\n"
-        f"  TPR peak allocated: {_format_gib(result.tpr.peak_allocated_bytes)} "
-        f"(incremental {_format_gib(result.tpr.incremental_peak_bytes)})"
-    )
+    reference, tpr = result.reference, result.tpr
+    assert reference.parameter_count == tpr.parameter_count
+    print(f"\nP={case.prefix_length}, S={case.suffix_length}, N={case.trajectory_count}, CP={_EXPECTED_WORLD_SIZE}")
+    print(f"Model parameters: {reference.parameter_count / 1e9:.3f}B")
+    print("Latency: per-sample maximum across CP ranks; memory: maximum per-rank statistic.")
+    print("Probe calls: Ring adapter entries on rank 0; FA block calls are reported separately.")
+    for name, stats in (("Reference", reference), ("TPR", tpr)):
+        print(f"{name}:")
+        print(f"  median latency:     {stats.median_ms:.3f} ms")
+        print(f"  mean latency:       {stats.mean_ms:.3f} ms")
+        print(f"  std:                {stats.std_ms:.3f} ms")
+        print(f"  baseline allocated: {_format_gib(stats.baseline_allocated_bytes)}")
+        print(f"  peak allocated:     {_format_gib(stats.peak_allocated_bytes)}")
+        print(f"  incremental peak:   {_format_gib(stats.incremental_peak_bytes)}")
+        print(f"  peak reserved:      {_format_gib(stats.peak_reserved_bytes)} (auxiliary)")
+        print(f"  adapter probe calls: {stats.adapter_probe_calls}")
+    print(f"TPR adapter trace verified: {tpr.layer_count} layers, "
+          f"{tpr.physical_phase_count} physical phases, {tpr.adapter_probe_calls} adapter calls")
+    for name, path, breakdown in (("Reference", "reference", result.reference_breakdown),
+                                  ("TPR", "tpr", result.tpr_breakdown)):
+        if breakdown is not None:
+            _print_controlled_breakdown(name, breakdown, path=path, sibling_count=case.trajectory_count)
+    ratio = reference.incremental_peak_bytes / max(tpr.incremental_peak_bytes, 1)
+    reduction = 1.0 - tpr.incremental_peak_bytes / max(reference.incremental_peak_bytes, 1)
+    print(f"Speedup (median): {result.median_speedup:.3f}x")
+    print(f"Incremental-peak ratio: {ratio:.3f}x")
+    print(f"Incremental-peak reduction: {reduction * 100:.2f}%")
 
 
 def _print_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
     if rank != 0:
         return
-    print("\nQwen3-0.6B BF16 Ring CP=2 Reference vs TPR profile")
-    print(f"warmup={_WARMUP_RUNS}, measured={_MEASURE_RUNS}; time is max across CP ranks")
-    print(
-        "P | S | N | Ref ms (median/mean) | TPR ms (median/mean) | "
-        "Speedup (median) | Ref Peak Mem | TPR Peak Mem"
-    )
-    print("-" * 118)
+    print(f"\nControlled fused-reference summary (Ring CP={_EXPECTED_WORLD_SIZE})\n")
+    print("| P | S | N | Ref median ms | TPR median ms | Speedup | Ref incr. GiB | TPR incr. GiB | Incr. reduction |")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for result in results:
-        case = result.case
-        print(
-            f"{case.prefix_length} | {case.suffix_length} | {case.trajectory_count} | "
-            f"{result.reference.median_ms:.3f}/{result.reference.mean_ms:.3f} | "
-            f"{result.tpr.median_ms:.3f}/{result.tpr.mean_ms:.3f} | "
-            f"{result.median_speedup:.3f}x | "
-            f"{_format_gib(result.reference.peak_allocated_bytes)} | "
-            f"{_format_gib(result.tpr.peak_allocated_bytes)}"
-        )
+        case, reference, tpr = result.case, result.reference, result.tpr
+        reduction = 1.0 - tpr.incremental_peak_bytes / max(reference.incremental_peak_bytes, 1)
+        print(f"| {case.prefix_length} | {case.suffix_length} | {case.trajectory_count} | "
+              f"{reference.median_ms:.3f} | {tpr.median_ms:.3f} | {result.median_speedup:.3f}x | "
+              f"{reference.incremental_peak_bytes / _GIB:.3f} | {tpr.incremental_peak_bytes / _GIB:.3f} | "
+              f"{reduction * 100:.2f}% |")
 
 
 def test_qwen3_0_6b_reference_cp_vs_tpr_ring_cp_profile(cp_runtime):
@@ -1288,5 +1400,5 @@ def test_qwen3_0_6b_reference_cp_vs_tpr_ring_cp_profile(cp_runtime):
         _print_case_result(result, rank=runtime.rank)
 
     final_results = tuple(results)
-    _print_summary(final_results, rank=runtime.rank)
     _print_breakdown_summary(final_results, rank=runtime.rank)
+    _print_summary(final_results, rank=runtime.rank)
