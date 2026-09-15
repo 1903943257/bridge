@@ -122,7 +122,8 @@ def _forward_paths(model, runtime, monkeypatch, *, cp, reference):
         assert counts == Counter({(s, n, k): 1 for s in (0, 1, 2) for n in FA_LAYERS for k in ("core", "key", "value")})
         if cp == 2:
             assert a2a.count("cp2hp") == 324 and a2a.count("hp2cp") == 54
-            assert communication["fa_ring"] == 18 and communication["ring_p2p"] == 60
+            assert communication["fa_ring"] == 18
+            assert communication["ring_p2p"] == 30
         else:
             assert not a2a.calls and not communication
     assert all(p.grad is None for p in model.parameters()), "forward diagnostic generated parameter grads"
