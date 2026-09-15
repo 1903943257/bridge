@@ -153,6 +153,12 @@ def test_qwen35_whole_segmented_transport(runtime, monkeypatch):
                         assert ag["all_gather"] == (48 if segmented else 18)
                         assert ag["reduce_scatter"] == (45 if segmented else 18)
                         assert comm["ring_p2p"] == 0
+                    elif backend == "native_ring":
+                        # Native CP2 full-cache still communicates KV on the
+                        # first backward step, then returns accumulated dKV.
+                        # Per FA: forward KV + backward KV + backward dKV.
+                        assert not segmented
+                        assert comm["ring_p2p"] == 6 * 3
                     else:
                         # Same dead P-last-FA output: one KV-owner gradient
                         # circulation is absent, while all forwards still run.
