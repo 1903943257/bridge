@@ -169,3 +169,8 @@ exception is unwinding. Framework/HCCL destructor errors may still occur;
 restart both worker processes after a device exception. These changes do not
 recover a poisoned device context or suppress the original pytest failure.
 Set `STAGE45_SYNC_DIAG=0` (default) for normal performance measurements.
+
+For first-Visit stateful Conv/GDR backward isolation, see
+[STAGE45_STATEFUL_OPS.md](STAGE45_STATEFUL_OPS.md): subprocess-isolated
+initial-state/sequence-length A/B and opt-in `STAGE45_OPS_TRACE=1` backend
+boundary/launch tracing. No OPS gate, kernel or tiling overrides are applied.

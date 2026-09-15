@@ -237,6 +237,9 @@ def _sample(model, runtime, refs, tree, mode, patch, profiled, trace=None):
         if trace:
             from verl.models.mcore.tpr.segment_executor import SegmentExecutor
             trace.install(local_patch, SegmentExecutor, torch.autograd)
+            if os.getenv("STAGE45_OPS_TRACE", "0") == "1":
+                from ._stateful_ops_probe import install_ops_probe
+                install_ops_probe(local_patch, trace.label)
         if profile:
             profile.install(local_patch, model)
         else:
@@ -300,6 +303,8 @@ def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
     diagnostic = os.getenv("STAGE45_SYNC_DIAG", "0")
     assert diagnostic in ("0", "1")
     diagnostic = diagnostic == "1"
+    assert os.getenv("STAGE45_OPS_TRACE", "0") in ("0", "1")
+    assert os.getenv("STAGE45_OPS_TRACE", "0") != "1" or diagnostic, "OPS trace requires STAGE45_SYNC_DIAG=1"
     assert repeats >= 3 and warmup >= 1
     monkeypatch.setattr(baseline, "SEQUENCE_LENGTH", max(p + s for _, p, s in cases))
     torch.manual_seed(450001)
