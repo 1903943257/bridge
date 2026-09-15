@@ -118,7 +118,7 @@ def _engine_run(model, plan, executor_type, runtime, monkeypatch):
         model.config.finalize_model_grads_func = None
 
 
-def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=False, gdn_capture=None, closure_capture=None):
+def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=False, gdn_capture=None, closure_capture=None, fa_transport=None):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
     from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
@@ -127,6 +127,7 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=
     gdn_numbers = tuple(layer.layer_number for layer in gdn_layers)
     fa_numbers = tuple(layer.layer_number for layer in fa_layers)
     model.zero_grad(set_to_none=True)
+    transport_before = Counter(fa_transport) if fa_transport is not None else None
     instances, forwards, saved_states = [], [], []
     outputs, logprobs, input_gradients, state_gradients = {}, {}, {}, {}
     loss_calls = Counter()
@@ -268,7 +269,8 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=
         num_forwards = 4 if tree else 3
         assert a2a.count("cp2hp") == num_forwards * 18 * 6
         assert a2a.count("hp2cp") == num_forwards * 18
-        assert counts["fa_ring"] == num_forwards * 6 and counts["ring_p2p"] > 0
+        assert counts["fa_ring"] == num_forwards * 6
+        assert counts["ring_p2p"] == 0 if fa_transport is not None else counts["ring_p2p"] > 0
     else:
         assert not a2a.calls and not counts
     parameters = _cpu({n: p.grad for n, p in model.named_parameters() if p.requires_grad})
@@ -278,8 +280,17 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=
         if cp == 2:
             tensor = gather_native_zigzag(tensor, runtime.cp_group)
         input_gradients[sid] = tensor.cpu().float()
+    if fa_transport is not None:
+        delta = Counter({n: fa_transport[n] - transport_before[n] for n in fa_transport})
+        expected = (dict(fa_allgather=24 if tree else 18, all_gather=96 if tree else 78, reduce_scatter=78)
+                    if cp == 2 else {})
+        assert +delta == Counter(expected), f"whole-FA collective contract: {delta}, expected={expected}"
+        print(f"STAGE-4.4 FA-TRANSPORT CP={cp} tree={tree} AllGatherWholeFA={dict(delta)} Ring-P2P=0", flush=True)
+    display_counts = dict(counts)
+    if fa_transport is not None:
+        display_counts = {("fa_allgather" if n == "fa_ring" else n): v for n, v in counts.items()}
     print(f"STAGE-4.4 CP={cp} Engine-tree={tree} loss={loss.item():.9f} "
-          f"A2A={a2a.count('cp2hp')}/{a2a.count('hp2cp')} Ring={dict(counts)} "
+          f"A2A={a2a.count('cp2hp')}/{a2a.count('hp2cp')} FA={display_counts} "
           "boundary-gradients=48 owned-loss-once=True caches-empty=True", flush=True)
     return dict(loss=loss.cpu(), output=outputs, logprob=logprobs, input=input_gradients,
                 parameters=parameters, state=state_gradients, drift=drift, fa_capture=fa_capture)
@@ -356,6 +367,16 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
     from ._full_linear_shape_control import full_linear_shape_control
 
+    fa_backend = os.getenv("STAGE44_FA_BACKEND", "ring")
+    assert fa_backend in ("ring", "allgather_whole")
+    fa_transport = None
+    if fa_backend == "allgather_whole":
+        from ._whole_fa_allgather import install_whole_fa_allgather
+        for flag in ("STAGE44_FA_REPLAY", "STAGE44_GDN_REPLAY", "STAGE44_PROPAGATION_CLOSURE"):
+            assert os.getenv(flag, "0") == "0", f"disable {flag} for the transport A/B"
+        fa_transport = install_whole_fa_allgather(monkeypatch)
+    print(f"STAGE-4.4 FA-BACKEND={fa_backend}; CP2 native zigzag/GDN A2A unchanged", flush=True)
+
     control = os.getenv("STAGE44_LINEAR_ZIGZAG64", "0")
     assert control in ("0", "1"), "STAGE44_LINEAR_ZIGZAG64 must be 0 or 1"
     controlled = control == "1"
@@ -415,7 +436,7 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
             result = _run(model, plan, runtime, monkeypatch, cp=cp, tree=tree,
                             trace=os.getenv("STAGE44_TRACE", "0") == "1" and label in ("CP1-connected", "CP2-connected"),
                             fa_replay=os.getenv("STAGE44_FA_REPLAY", "0") == "1" and label in ("CP1-connected", "CP2-connected"),
-                            gdn_capture=gdn_capture, closure_capture=closure_capture)
+                            gdn_capture=gdn_capture, closure_capture=closure_capture, fa_transport=fa_transport)
         if closure_enabled:
             if cp == 1:
                 closure_reference = propagation_closure(model, closure_capture, None, runtime,
@@ -463,7 +484,7 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=runtime.cp_group)
     print(f"STAGE-4.4 SUMMARY cross-CP={'FAIL' if failed[0].item() else 'PASS'} "
           f"Engine-relay={'FAIL' if failed[1].item() else 'PASS'}; "
-          f"mode={'CONTROLLED' if controlled else 'BASELINE'}; no thresholds waived", flush=True)
+          f"mode={'CONTROLLED' if controlled else 'BASELINE'}; FA-backend={fa_backend}; no thresholds waived", flush=True)
     if failed.any().item():
         messages = cross + relay
         if os.getenv("STAGE44_VERBOSE", "0") != "1" and len(messages) > 8:

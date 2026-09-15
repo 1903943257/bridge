@@ -775,3 +775,48 @@ Log is overwritten. Local AST checks passed; NPU results pending (no local
 PyTorch/NPU). Even exact clamped forward/state only supports sufficiency of
 these interventions for this fixture; it does not validate unclamped gradients,
 all hybrid architectures, or the planned 20/50-step training stability.
+
+### Whole-FA AllGather transport A/B (test only)
+
+`STAGE44_FA_BACKEND=allgather_whole` replaces the FA callable in the full
+Stage4.4 test, leaving Ring as the default and all production files unchanged.
+GDN A2A, native zigzag token/state ownership, Engine scheduling, labels, and
+parameter-gradient SUM remain unchanged. Existing contiguous AllGather CP
+policy is deliberately NOT selected: it would change GDN's layout contract.
+
+Each FA gathers Q and each prefix/current K/V with the existing differentiable
+AllGather primitive, reorders rank-order chunks [0,3,1,2] to [0,1,2,3], runs
+the same whole rectangular FA as CP1 with ordered prefix/current KV, and
+returns only owner-local query outputs. Gathering Q as well as KV isolates
+whole-vs-blockwise attention and avoids introducing a new local-query shape
+or mask variant. It repeats full FA computation per rank: correctness oracle,
+not a scalable/performance implementation. No clamp of outputs or states.
+
+Autograd routes disjoint query losses through SUM ReduceScatter for gathered
+Q/K/V; there is no extra CP division or state-gradient SUM. The four real F/B
+paths remain CP1-connected, CP2-connected, CP2-Engine-tree, CP2-repeat.
+Communication audit per CP2 rank:
+
+| Path | FA calls | AllGather | ReduceScatter | Ring P2P |
+|---|---:|---:|---:|---:|
+| connected / repeat | 18 | 78 | 78 | 0 |
+| Engine tree | 24 | 96 | 78 | 0 |
+
+Tree's graph-free Push adds 18 gathers but no backward collectives. GDN A2A
+counts retain the existing 324/54 and 432/72 contracts. Summary prints the FA
+backend explicitly; old numerical gates are not relaxed. Other local replay
+flags must be off. Use CP1 shape control first for comparison with recent
+controlled Ring runs; optionally disable it in a separate baseline A/B.
+
+Sync `_whole_fa_allgather.py`, `test_full_qwen35_tree_cp_npu.py`, and optional
+CPU test `unit/test_whole_fa_allgather.py`. The user's new backward-clamp file
+is empty in the local workspace and has not been inspected or changed.
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/unit/test_whole_fa_allgather.py
+mkdir -p tests/models/mcore/tpr/logs
+STAGE44_FA_BACKEND=allgather_whole STAGE44_LINEAR_ZIGZAG64=1 STAGE44_TRACE=0 STAGE44_FA_REPLAY=0 STAGE44_GDN_REPLAY=0 STAGE44_PROPAGATION_CLOSURE=0 torchrun --master_addr=127.0.0.1 --master_port=29568 --nproc_per_node=2 -m pytest -s -q --tb=short tests/models/mcore/tpr/parallel/test_full_qwen35_tree_cp_npu.py > tests/models/mcore/tpr/logs/stage4_4_5.logs 2>&1
+```
+
+Redirect overwrites the log. Local AST checks passed; local PyTorch/NPU are
+unavailable, so distributed numerical/collective validation remains pending.
