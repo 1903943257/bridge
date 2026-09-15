@@ -23,7 +23,11 @@ def install_native_tnd_layout(patch, torch_npu):
         result = forward(to_tnd(q, head_dim), to_tnd(k, head_dim), to_tnd(v, head_dim),
                          n, "TND", actual_seq_qlen=[q.shape[0]],
                          actual_seq_kvlen=[k.shape[0]], **kwargs)
-        # B=1 TND stats are head-major, same semantic layout as SBH.
+        # TND exposes [T,N,8], with per-sequence head-major storage (see
+        # MindSpeed flatten_softmax). B=1 SBH exposes [1,N,S,8]. Reinterpret
+        # shape without transposing the underlying head-major values.
+        for tensor in result[1:3]:
+            assert tuple(tensor.shape) == (q.shape[0], n, 8), tensor.shape
         return (to_sbh(result[0]), result[1].reshape(1, n, q.shape[0], 8).contiguous(),
                 result[2].reshape(1, n, q.shape[0], 8).contiguous(), *result[3:])
 
@@ -33,7 +37,7 @@ def install_native_tnd_layout(patch, torch_npu):
         kwargs = dict(kwargs)
         kwargs["attention_in"] = to_tnd(kwargs["attention_in"], head_dim)
         for key in ("softmax_max", "softmax_sum"):
-            kwargs[key] = kwargs[key].reshape(1, n, q.shape[0], 8).contiguous()
+            kwargs[key] = kwargs[key].reshape(q.shape[0], n, 8).contiguous()
         result = backward(to_tnd(q, head_dim), to_tnd(k, head_dim), to_tnd(v, head_dim),
                           to_tnd(dy, head_dim), n, "TND",
                           actual_seq_qlen=[q.shape[0]], actual_seq_kvlen=[k.shape[0]], **kwargs)
