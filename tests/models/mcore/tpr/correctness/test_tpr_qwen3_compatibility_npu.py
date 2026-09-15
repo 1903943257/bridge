@@ -129,6 +129,8 @@ def _load_qwen3_torch_spec_weights(model, hf_config, model_path):
         loaded_parameter_ids.add(id(target))
 
     copy_weight(model.embedding.word_embeddings.weight, "model.embed_tokens.weight")
+    if not hf_config.tie_word_embeddings:
+        copy_weight(model.output_layer.weight, "lm_head.weight")
     head_dim = hf_config.head_dim
     num_query_heads = hf_config.num_attention_heads
     num_query_groups = hf_config.num_key_value_heads
