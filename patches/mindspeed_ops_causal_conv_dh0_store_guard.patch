@@ -1,0 +1,26 @@
+diff --git a/mindspeed_ops/arch32/triton/convolution.py b/mindspeed_ops/arch32/triton/convolution.py
+index bdf6252..3f9d271 100644
+--- a/mindspeed_ops/arch32/triton/convolution.py
++++ b/mindspeed_ops/arch32/triton/convolution.py
+@@ -445,7 +445,11 @@ def causal_conv1d_bwd_kernel(
+                 )
+                 b_dx += b_wdy
+ 
+-            if USE_INITIAL_STATE:
++            # dh0 has only min(NT, ceil(W / BT)) partial-state slots,
++            # not one slot for every time tile. Only suffix times < W-1
++            # can depend on h0. A masked-zero LOAD is not a safe STORE:
++            # later tiles must not address the compact dh0 allocation.
++            if USE_INITIAL_STATE and i_t * BT < W - 1:
+                 for i_w in tl.static_range(1, W):
+                     # dh0[i_w] = sum_{t=0}^{i_w-1} dy0[t, :] * w[i_w-1-t, :]
+                     # 逐行 load dy0 避免预加载 [BT,BD] 炸 UB，消除三维 i1 broadcast
+@@ -687,6 +691,8 @@ def causal_conv1d_bwd_impl(
+         else:
+             eff_NT = triton.cdiv(T, BT)
+ 
++        # Kernel dh0 writes are restricted to contributing head tiles.
++        # Slot 0 and noncontributing partials remain zero for the final SUM.
+         dh0 = initial_state.new_zeros(min(eff_NT, triton.cdiv(W, BT)), *initial_state.shape)
+     else:
+         dh0 = None

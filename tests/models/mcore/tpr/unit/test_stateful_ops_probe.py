@@ -27,6 +27,19 @@ class BoundsTest(unittest.TestCase):
         result = conv_dh0_allocation_audit(1024, 8, 1, 3072, 4, 128 * 3072 * 4)
         self.assertFalse(result["unguarded_store_out_of_bounds"])
 
+    def test_head_tile_guard_is_in_bounds_and_keeps_every_contribution(self):
+        for t in (4, 64, 128, 256, 512, 1024):
+            for bt in (1, 2, 4, 8, 16, 32):
+                for w in (2, 3, 4):
+                    nt = (t + bt - 1) // bt
+                    allocated_tiles = min(nt, (w + bt - 1) // bt)
+                    writers = [tile for tile in range(nt) if tile * bt < w - 1]
+                    self.assertTrue(all(tile < allocated_tiles for tile in writers))
+                    for slot in range(1, w):
+                        covered = [time for tile in writers for time in range(min(slot, t))
+                                   if tile * bt <= time < (tile + 1) * bt]
+                        self.assertEqual(covered, list(range(min(slot, t))))
+
 
 if __name__ == "__main__":
     unittest.main()
