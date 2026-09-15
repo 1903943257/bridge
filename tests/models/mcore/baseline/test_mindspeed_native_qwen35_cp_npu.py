@@ -5,6 +5,7 @@ All 24 layer inputs/outputs and their gradients are compared in logical order.
 """
 
 import gc
+from copy import deepcopy
 from contextlib import contextmanager
 
 import pytest
@@ -68,10 +69,22 @@ def test_mindspeed_native_qwen35_cp(runtime, monkeypatch):
         assert model.config.attention_dropout == model.config.hidden_dropout == 0
         if initial is None:
             broadcast_module_state(model, src=0)
-            initial = {n: v.detach().cpu().clone() for n, v in model.state_dict().items()}
+            initial = {
+                n: v.detach().cpu().clone() if isinstance(v, torch.Tensor) else deepcopy(v)
+                for n, v in model.state_dict().items()
+            }
         else:
             model.load_state_dict(initial, strict=True)
-        assert all(torch.equal(v.detach().cpu(), initial[n]) for n, v in model.state_dict().items())
+        current = model.state_dict()
+        assert current.keys() == initial.keys(), 'initial state keys differ'
+        for name, value in current.items():
+            expected = initial[name]
+            if isinstance(value, torch.Tensor):
+                assert isinstance(expected, torch.Tensor), name
+                assert torch.equal(value.detach().cpu(), expected), name
+            else:
+                # TE extra-state entries can legitimately be None.
+                assert type(value) is type(expected) and value == expected, name
         tokens, positions, labels, valid = full_tokens(runtime.device)
         if cp == 2:
             idx = zigzag_indices(SEQUENCE_LENGTH, cp_rank=runtime.cp_group.rank(),
