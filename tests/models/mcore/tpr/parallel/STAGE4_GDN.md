@@ -875,3 +875,10 @@ STAGE44_MATRIX_LINEAR_CONTROL=1 torchrun --master_addr=127.0.0.1 --master_port=2
 Local AST checks passed; no local PyTorch/NPU, numerical results pending.
 Read FA-MATRIX individual VJPs and TRAJECTORY comparisons before attributing
 whole drift to blockwise Ring or extra segmented drift to Prefix KV handling.
+
+### Stage 4.5: AllGather-only Prefix Reuse performance
+
+See [STAGE45_PERFORMANCE.md](STAGE45_PERFORMANCE.md) for scope, timing
+definitions, communication audits and the 12-case server command. Ring
+diagnosis is paused; no upstream Ring bug or training correctness PASS is
+inferred from this benchmark. No production Ring or threshold changes.
