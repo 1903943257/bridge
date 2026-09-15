@@ -139,3 +139,33 @@ Local validation: five dependency-free reporting unit tests passed; all three
 new Python files parsed successfully. Local PyTorch/pytest/NPU are unavailable,
 so distributed execution, timing hooks and collective contracts remain to be
 validated on the server.
+
+## Long-sequence failure localization (not a performance run)
+
+`STAGE45_SYNC_DIAG=1` logs both ranks with case, Ref/TPR, repetition and
+warmup/repeat phase. Nested paths identify independent Ref branch, Push,
+Visit, Pop, segment ID/length/prefix length, `_forward` (including no_grad),
+loss construction and autograd backward. Each boundary prints PRE_SYNC,
+BEGIN, POST_SYNC, END; FIRST_ERROR identifies pre_sync/body/post_sync.
+Only the innermost first failure is tagged; the original exception is re-raised.
+Pre-sync failure can belong to previously queued work, not the named body.
+
+Diagnostics preserve warmup/repetition order but skip the separate fine profile
+and suppress timing/speedup reports. Communication and finite checks remain.
+No per-layer tensors are copied or printed. This locates a failing phase, not
+the individual kernel within it. Synchronization may change reproducibility;
+a diagnostic success does not prove the unsynchronized run is fixed.
+
+```bash
+mkdir -p tests/models/mcore/tpr/logs
+STAGE45_PERF=1 STAGE45_SYNC_DIAG=1 STAGE45_BRANCHES=2 STAGE45_LENGTHS=8192:1024 STAGE45_WARMUP=1 STAGE45_REPEATS=3 torchrun --master_addr=127.0.0.1 --master_port=29557 --nproc_per_node=2 -m pytest -s -v --tb=short tests/models/mcore/tpr/parallel/test_qwen35_prefix_reuse_perf_npu.py > tests/models/mcore/tpr/logs/stage4_4_5.logs 2>&1
+```
+
+Read the last END and first FIRST_ERROR per rank, particularly Visit/backward
+(suffix initial-state gradient) vs Pop/backward (prefix final-state VJP).
+After failed execution, test-level cleanup does not zero gradients or enter
+the teardown barrier. Timers do not record end events/synchronize while an
+exception is unwinding. Framework/HCCL destructor errors may still occur;
+restart both worker processes after a device exception. These changes do not
+recover a poisoned device context or suppress the original pytest failure.
+Set `STAGE45_SYNC_DIAG=0` (default) for normal performance measurements.

@@ -21,6 +21,7 @@ from verl.utils.device import is_torch_npu_available
 from baseline import _qwen35_baseline_utils as baseline
 from ._prefix_reuse_metrics import benchmark_cases, summarize_case
 from ._whole_fa_allgather import install_whole_fa_allgather
+from ._stage45_sync_trace import SyncTrace
 
 if not is_torch_npu_available(check_device=True):
     pytest.skip("Requires two Ascend NPUs", allow_module_level=True)
@@ -29,8 +30,13 @@ if not is_torch_npu_available(check_device=True):
 @pytest.fixture(scope="module")
 def runtime():
     value = baseline.initialize_npu_runtime(world_size=2)
+    value.stage45_failed = False
     yield value
-    baseline.destroy_npu_runtime(value)
+    if value.stage45_failed:
+        print(f"STAGE45 r={value.rank} skip teardown barrier after failed execution; "
+              "restart both worker processes before rerun", flush=True)
+    else:
+        baseline.destroy_npu_runtime(value)
 
 
 def _plans(n, p, s):
@@ -71,7 +77,10 @@ class _Profile:
         self.stack.append(frame)
         try:
             yield
-        finally:
+        except BaseException:
+            self.stack.pop()
+            raise
+        else:
             torch.npu.synchronize()
             elapsed = (time.perf_counter() - frame[0]) * 1000
             self.stack.pop()
@@ -143,7 +152,9 @@ class _PhaseEvents:
         start.record()
         try:
             yield
-        finally:
+        except BaseException:
+            raise
+        else:
             end.record()
             self.pairs[name].append((start, end))
 
@@ -162,7 +173,7 @@ class _PhaseEvents:
                 for key in ("forward", "backward", "prefix_recompute", "parameter_sum")}
 
 
-def _execute(model, runtime, refs, tree, mode, profile, events):
+def _execute(model, runtime, refs, tree, mode, profile, events, trace=None):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.fixed_topology_scheduler import FixedTopologyScheduler
 
@@ -182,9 +193,10 @@ def _execute(model, runtime, refs, tree, mode, profile, events):
     # Cancel Executor CP multiplier: explicit parameter SUM, not DP averaging.
     if mode == "ref":
         losses = []
-        for plan in refs:
+        for branch, plan in enumerate(refs, 1):
             ex = executor(plan, 1 / (2 * len(refs)))
-            result = ex.visit_leaf(0)
+            with trace.span(f"ref_branch={branch}") if trace else nullcontext():
+                result = ex.visit_leaf(0)
             losses.append(result.backward.normalized_loss / len(refs))
             assert not len(ex.kv_stack) and not ex.gdn_states
         loss = torch.stack(losses).sum()
@@ -207,7 +219,7 @@ def _rank_max(values, runtime):
     return dict(zip(names, tensor.cpu().tolist()))
 
 
-def _sample(model, runtime, refs, tree, mode, patch, profiled):
+def _sample(model, runtime, refs, tree, mode, patch, profiled, trace=None):
     import mindspeed.core.ssm.gated_delta_net as gdn
     from verl.models.mcore.tpr.parallel import ring_attention as ring
 
@@ -222,6 +234,9 @@ def _sample(model, runtime, refs, tree, mode, patch, profiled):
             raise AssertionError("Stage 4.5 must not execute Ring P2P")
 
         local_patch.setattr(transport, "async_send_recv", forbidden_ring)
+        if trace:
+            from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+            trace.install(local_patch, SegmentExecutor, torch.autograd)
         if profile:
             profile.install(local_patch, model)
         else:
@@ -235,7 +250,7 @@ def _sample(model, runtime, refs, tree, mode, patch, profiled):
             reserved_start = torch.npu.memory_reserved()
             started = time.perf_counter()
             with profile.span("schedule") if profile else nullcontext():
-                loss = _execute(model, runtime, refs, tree, mode, profile, events)
+                loss = _execute(model, runtime, refs, tree, mode, profile, events, trace)
             torch.npu.synchronize()
             elapsed = (time.perf_counter() - started) * 1000
             # Capture before finite checks, reporting collectives, or CPU copies.
@@ -282,6 +297,9 @@ def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
                             os.getenv("STAGE45_LENGTHS", "8192:1024,8192:8192"))
     repeats = int(os.getenv("STAGE45_REPEATS", "3"))
     warmup = int(os.getenv("STAGE45_WARMUP", "1"))
+    diagnostic = os.getenv("STAGE45_SYNC_DIAG", "0")
+    assert diagnostic in ("0", "1")
+    diagnostic = diagnostic == "1"
     assert repeats >= 3 and warmup >= 1
     monkeypatch.setattr(baseline, "SEQUENCE_LENGTH", max(p + s for _, p, s in cases))
     torch.manual_seed(450001)
@@ -295,6 +313,9 @@ def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
               "S-only next-token objective; no Ring/clamp/Linear-control; "
               "clean total includes one parameter SUM; synchronized profile is separate", flush=True)
     summary = []
+    if diagnostic:
+        print(f"STAGE45-DIAG r={runtime.rank} SYNCHRONIZED DIAGNOSTICS ONLY; "
+              "no performance medians/speedup will be reported", flush=True)
     try:
         for case_index, (n, p, s) in enumerate(cases):
             refs, tree = _plans(n, p, s)
@@ -304,7 +325,7 @@ def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
             # Alternate Ref/TPR ordering across cases; each starts an independent
             # warm-cache regime (empty_cache BEFORE warmup, not timed reps).
             modes = ("ref", "tpr") if case_index % 2 == 0 else ("tpr", "ref")
-            for profiled in (False, True):
+            for profiled in ((False,) if diagnostic else (False, True)):
                 for mode in modes:
                     model.zero_grad(set_to_none=True)
                     gc.collect()
@@ -313,11 +334,22 @@ def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
                         print(f"STAGE-4.5 RUN N={n} P={p} S={s} {mode} profile={profiled}", flush=True)
                     rows = []
                     for rep in range(warmup + repeats):
-                        row, comm = _sample(model, runtime, refs, tree, mode, monkeypatch, profiled)
+                        label = (f"r={runtime.rank} N={n} P={p} S={s} mode={mode} "
+                                 f"rep={rep + 1}/{warmup + repeats} "
+                                 f"phase={'warmup' if rep < warmup else 'repeat'}")
+                        trace = SyncTrace(torch.npu.synchronize,
+                                          lambda message: print(message, flush=True), label) if diagnostic else None
+                        with trace.span("sample") if trace else nullcontext():
+                            row, comm = _sample(model, runtime, refs, tree, mode, monkeypatch, profiled, trace)
+                        if diagnostic:
+                            print(f"STAGE45-DIAG {label} COMPLETE loss={row['loss']:.9f} "
+                                  f"communication={comm}", flush=True)
                         if rep >= warmup:
                             rows.append(row)
                     (profiles if profiled else samples)[mode] = rows
                     communications[mode] = comm
+            if diagnostic:
+                continue
             result = summarize_case(n, p, s, samples["ref"], samples["tpr"])
             result["profile_median"] = {
                 mode: {key: median(row[key] for row in rows) for key in rows[0]}
@@ -328,7 +360,9 @@ def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
             summary.append(result)
             if runtime.rank == 0:
                 print("STAGE45_CASE " + json.dumps(result, sort_keys=True), flush=True)
-        if runtime.rank == 0:
+        if diagnostic:
+            print(f"STAGE45-DIAG r={runtime.rank} COMPLETE; performance results suppressed", flush=True)
+        elif runtime.rank == 0:
             print("STAGE45_SUMMARY N P S ref_ms tpr_ms ref_F/B_ms tpr_F/B_ms ideal measured saving_realization loss_rel")
             for row in summary:
                 print(f"{row['N']} {row['P']} {row['S']} {row['ref']['total_ms']:.3f} "
@@ -339,5 +373,8 @@ def test_qwen35_allgather_prefix_reuse_performance(runtime, monkeypatch):
                       f"{row['measured_speedup']:.3f} {row['saving_realization_fraction']:.3f} "
                       f"{row['loss_relative_diff']:.6e}")
             print("STAGE45 performance measurement complete; NOT a numerical correctness/training PASS")
-    finally:
+    except BaseException:
+        runtime.stage45_failed = True
+        raise
+    else:
         model.zero_grad(set_to_none=True)
