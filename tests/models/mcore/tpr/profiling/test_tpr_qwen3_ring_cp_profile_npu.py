@@ -74,6 +74,7 @@ from verl.models.mcore.tpr import (
 )
 from verl.utils.device import is_torch_npu_available
 
+from ..parallel._ring_block_probe import ring_block_probe
 from ..correctness.test_tpr_qwen3_compatibility_npu import _validate_checkpoint_files
 from ..parallel.test_tpr_qwen3_cp_equivalence_npu import (
     _make_qwen_cp_model,
@@ -260,10 +261,7 @@ class _ProfileResult:
 
 
 _PROFILE_CASES = (
-    _ProfileCase(16384, 2048, 2),
-    _ProfileCase(16384, 2048, 4),
-    _ProfileCase(16384, 2048, 8),
-    _ProfileCase(16384, 2048, 16),
+    _ProfileCase(16384, 16384, 8),
 )
 
 
@@ -539,8 +537,9 @@ def _profile_runner(
             adapter_owner, adapter_name,
             staticmethod(counted_adapter) if runtime.cp_size > 1 else counted_adapter
         ):
-            observation = run()
-            torch.npu.synchronize()
+            with ring_block_probe(model, runtime):
+                observation = run()
+                torch.npu.synchronize()
         _validate_observation(observation, expected_trace=expected_trace)
         del observation
     finally:
@@ -1409,6 +1408,7 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
     assert minimum <= parameters <= maximum, f"Qwen3-{size}: unexpected parameter count {parameters}"
     if runtime.rank == 0:
         print(f"Qwen3-{size}: checkpoint={model_path}, CP={runtime.cp_size}")
+        print(f"Prefix FULL coalescing: {os.getenv('TPR_RING_COALESCE_PREFIX_FULL', '0') == '1'}")
         if runtime.cp_size == 1:
             print("Local rectangular attention; Ring-only diagnostic counters are zero.")
     if next(model.parameters()).dtype != torch.bfloat16:

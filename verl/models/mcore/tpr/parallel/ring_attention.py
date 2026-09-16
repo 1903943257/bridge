@@ -24,6 +24,7 @@ schedule and gradient routing.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -93,6 +94,7 @@ class _RingAttentionConfig:
     query_heads: int
     head_dim: int
     softmax_scale: float
+    coalesce_prefix_full: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +313,7 @@ def _normalize_inputs(
         query_heads=query.shape[2],
         head_dim=query.shape[-1],
         softmax_scale=float(scale),
+        coalesce_prefix_full=os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1",
     )
     return blocks, config
 
@@ -370,6 +373,25 @@ def _iter_range_slices(
     if local_start != shard.local_length:
         raise RuntimeError("Ring physical ranges do not cover the local tensor")
     return tuple(result)
+
+
+def _prefix_full_slices(tensor, shard, *, enabled):
+    """View one fully valid source buffer as a single FULL-attention KV block.
+
+    Logical zigzag ranges are non-adjacent, but their physical storage is
+    adjacent. FULL visibility is independent of their logical positions.
+    Synthetic ranges below describe packed positions only; callers must never
+    use them for causal classification. Padded shards keep the original path.
+    The local slice also maps dK/dV directly into the original source buffer.
+    """
+    if enabled and shard.global_length == shard.padded_length:
+        length = shard.local_length
+        return (_RingRangeSlice((0, length), (0, length), slice(0, length), tensor),)
+    return _iter_range_slices(tensor, shard)
+
+
+# Patched only in untimed probes; no event dictionaries on the hot path.
+_trace_ring_block = None
 
 
 def _range_validity(item: _RingRangeSlice, *, device: torch.device) -> Tensor:
@@ -701,8 +723,13 @@ class _RingTPRAttention(torch.autograd.Function):
                         cp_size=config.cp_size,
                         padded_length=padded_length,
                     )
-                    key_slices = _iter_range_slices(source_key.squeeze(1), source_shard)
-                    value_slices = _iter_range_slices(source_value.squeeze(1), source_shard)
+                    coalesced = is_prefix and config.coalesce_prefix_full and global_length == padded_length
+                    key_slices = _prefix_full_slices(
+                        source_key.squeeze(1), source_shard, enabled=coalesced,
+                    )
+                    value_slices = _prefix_full_slices(
+                        source_value.squeeze(1), source_shard, enabled=coalesced,
+                    )
                     for key_item, value_item in zip(key_slices, value_slices, strict=True):
                         if (
                             key_item.logical_range != value_item.logical_range
@@ -716,6 +743,22 @@ class _RingTPRAttention(torch.autograd.Function):
                             kv_range,
                             is_prefix=is_prefix,
                         )
+                        if _trace_ring_block is not None:
+                            _trace_ring_block(
+                                phase="forward", rank=config.cp_rank,
+                                ring_step=(config.cp_rank - source_rank) % config.cp_size,
+                                source_rank=source_rank, segment_index=segment_index,
+                                segment_type="prefix" if is_prefix else "current",
+                                query_range=query_item.logical_range,
+                                query_chunk=query_item.physical_range[0] // (config.current_shard.padded_length // (2 * config.cp_size)),
+                                kv_ranges=source_shard.global_ranges if coalesced else (key_item.logical_range,),
+                                kv_chunks=tuple(start // (padded_length // (2 * config.cp_size)) for start, _ in
+                                                (source_shard.physical_global_ranges if coalesced else (key_item.physical_range,))),
+                                block_type=block_kind.value,
+                                query_length=query_part.shape[0], kv_length=key_item.tensor.shape[0],
+                                fa_called=block_kind is not RingBlockKind.SKIP,
+                                coalesced=coalesced,
+                            )
                         if block_kind is RingBlockKind.SKIP:
                             continue
                         attention_mask, _, _ = _physical_block_attention_mask(
@@ -834,8 +877,13 @@ class _RingTPRAttention(torch.autograd.Function):
                         cp_size=config.cp_size,
                         padded_length=padded_length,
                     )
-                    key_slices = _iter_range_slices(source_key.squeeze(1), source_shard)
-                    value_slices = _iter_range_slices(source_value.squeeze(1), source_shard)
+                    coalesced = is_prefix and config.coalesce_prefix_full and global_length == padded_length
+                    key_slices = _prefix_full_slices(
+                        source_key.squeeze(1), source_shard, enabled=coalesced,
+                    )
+                    value_slices = _prefix_full_slices(
+                        source_value.squeeze(1), source_shard, enabled=coalesced,
+                    )
                     for key_item, value_item in zip(key_slices, value_slices, strict=True):
                         if (
                             key_item.logical_range != value_item.logical_range
@@ -849,6 +897,22 @@ class _RingTPRAttention(torch.autograd.Function):
                             kv_range,
                             is_prefix=is_prefix,
                         )
+                        if _trace_ring_block is not None:
+                            _trace_ring_block(
+                                phase="backward", rank=config.cp_rank,
+                                ring_step=(config.cp_rank - source_rank) % config.cp_size,
+                                source_rank=source_rank, segment_index=segment_index,
+                                segment_type="prefix" if is_prefix else "current",
+                                query_range=query_item.logical_range,
+                                query_chunk=query_item.physical_range[0] // (config.current_shard.padded_length // (2 * config.cp_size)),
+                                kv_ranges=source_shard.global_ranges if coalesced else (key_item.logical_range,),
+                                kv_chunks=tuple(start // (padded_length // (2 * config.cp_size)) for start, _ in
+                                                (source_shard.physical_global_ranges if coalesced else (key_item.physical_range,))),
+                                block_type=block_kind.value,
+                                query_length=query_part.shape[0], kv_length=key_item.tensor.shape[0],
+                                fa_called=block_kind is not RingBlockKind.SKIP,
+                                coalesced=coalesced,
+                            )
                         if block_kind is RingBlockKind.SKIP:
                             continue
                         attention_mask, _, valid_kv = _physical_block_attention_mask(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CP=2 correctness for the MindSpeed Ring TPR attention extension.
+"""CP=2/4 correctness for the MindSpeed Ring TPR attention extension.
 
 Run with::
 
@@ -35,7 +35,7 @@ import verl.models.mcore.tpr.parallel.ring_attention as ring
 from verl.models.mcore.tpr import RingLocalKVBlock, make_ring_sequence_shard
 from verl.utils.device import is_torch_npu_available
 
-_EXPECTED_WORLD_SIZE = 2
+_EXPECTED_WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 _DTYPE = torch.bfloat16
 _OUTPUT_ATOL = 8e-3
 _OUTPUT_RTOL = 2e-2
@@ -47,8 +47,8 @@ if not is_torch_npu_available(check_device=True):
     pytest.skip("Requires an Ascend NPU", allow_module_level=True)
 
 pytestmark = pytest.mark.skipif(
-    int(os.getenv("WORLD_SIZE", "1")) != _EXPECTED_WORLD_SIZE,
-    reason="Run this test with torchrun --nproc_per_node=2",
+    _EXPECTED_WORLD_SIZE not in (2, 4),
+    reason="Run this test with torchrun --nproc_per_node=2 or 4",
 )
 
 
@@ -62,7 +62,7 @@ def cp_runtime():
     if owns_process_group:
         dist.init_process_group(backend="hccl")
     if dist.get_world_size() != _EXPECTED_WORLD_SIZE:
-        raise RuntimeError(f"Ring CP test requires world_size=2, got {dist.get_world_size()}")
+        raise RuntimeError(f"Ring CP test expected world_size={_EXPECTED_WORLD_SIZE}, got {dist.get_world_size()}")
     yield torch.device("npu", local_rank), dist.group.WORLD
     dist.barrier()
     if owns_process_group:
@@ -177,6 +177,10 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
     query_heads,
     kv_heads,
 ):
+    _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_heads, kv_heads)
+
+
+def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_heads, kv_heads):
     device, cp_group = cp_runtime
     rank = dist.get_rank(cp_group)
     head_dim = 64
@@ -294,7 +298,11 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
         assert torch.count_nonzero(local_prefix_keys[index].grad).item() > 0
         assert torch.count_nonzero(local_prefix_values[index].grad).item() > 0
 
-    expected_calls = 5 + 8 * len(prefix_lengths)
+    coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1"
+    expected_calls = 2 * _EXPECTED_WORLD_SIZE + 1 + sum(
+        (2 if coalesce and length % (2 * _EXPECTED_WORLD_SIZE) == 0 else 4)
+        * _EXPECTED_WORLD_SIZE for length in prefix_lengths
+    )
     assert len(calls["forward"]) == expected_calls
     assert len(calls["backward"]) == expected_calls
     assert ring.RingBlockKind.CAUSAL in {
@@ -317,6 +325,11 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
         )
         physical_kv_chunks.add(
             prefix_shard.padded_length // (2 * _EXPECTED_WORLD_SIZE)
+        )
+    if coalesce:
+        physical_kv_chunks.update(
+            length // _EXPECTED_WORLD_SIZE for length in prefix_lengths
+            if length % (2 * _EXPECTED_WORLD_SIZE) == 0
         )
     assert {
         call["kv_length"] for phase in calls.values() for call in phase
@@ -345,3 +358,28 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
             f"\n  Fused-attention blocks/rank: {expected_calls}"
         )
     dist.barrier(group=cp_group)
+
+    return (
+        actual.detach().cpu(),
+        tuple(t.grad.detach().cpu() for t in
+              (local_query, local_current_key, local_current_value,
+               *local_prefix_keys, *local_prefix_values)),
+        len(calls["forward"]), len(calls["backward"]),
+    )
+
+
+@pytest.mark.parametrize("prefix_lengths,current_length", [((128,), 128), ((128, 64), 64), ((127,), 63)])
+def test_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length):
+    snapshots = []
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", enabled)
+        snapshots.append(_check_ring_cp_attention(
+            cp_runtime, prefix_lengths, current_length, 4, 2,
+        ))
+    before, after = snapshots
+    _assert_close(after[0], before[0])
+    for actual, expected in zip(after[1], before[1], strict=True):
+        _assert_close(actual, expected, gradient=True)
+    saved = sum(2 * _EXPECTED_WORLD_SIZE for length in prefix_lengths
+                if length % (2 * _EXPECTED_WORLD_SIZE) == 0)
+    assert before[2] - after[2] == before[3] - after[3] == saved
