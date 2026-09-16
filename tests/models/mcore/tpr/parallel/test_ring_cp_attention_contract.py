@@ -241,3 +241,40 @@ def test_merge_keeps_fp32_until_final_output_for_backward(blocks):
     assert final[0].dtype == torch.bfloat16 and final[0].is_contiguous()
     assert final[1] is merged[1] and final[2] is merged[2]
     torch.testing.assert_close(final[0], merged[0].bfloat16(), atol=0, rtol=0)
+
+
+def test_query_coalescing_slices_head_major_statistics_and_reassembles():
+    length, heads, dim, lanes = 12, 4, 16, 8
+    output = torch.arange(length * heads * dim).reshape(length, heads, dim).float()
+    # Deliberately distinct values across heads and query rows catch slicing
+    # [T,H,8] as if the physical storage were token-major.
+    head_major = torch.arange(heads * length * lanes).reshape(heads, length, lanes).float()
+    maximum = head_major.view(length, heads, lanes)
+    total = (head_major + 10000).view(length, heads, lanes)
+    restored_max, restored_sum = torch.empty_like(maximum), torch.empty_like(total)
+    for rows in (slice(0, 6), slice(6, 12)):
+        part = ring._slice_tnd_result((output, maximum, total), rows)
+        assert part[0].untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
+        torch.testing.assert_close(part[0], output[rows], atol=0, rtol=0)
+        torch.testing.assert_close(part[1].view(heads, 6, lanes), head_major[:, rows], atol=0, rtol=0)
+        torch.testing.assert_close(part[2].view(heads, 6, lanes), head_major[:, rows] + 10000, atol=0, rtol=0)
+        for full, chunk in zip((restored_max, restored_sum), part[1:], strict=True):
+            full.view(heads, length, lanes)[:, rows, :].copy_(chunk.view(heads, 6, lanes))
+    torch.testing.assert_close(restored_max, maximum, atol=0, rtol=0)
+    torch.testing.assert_close(restored_sum, total, atol=0, rtol=0)
+
+
+def test_query_coalescing_requires_original_contiguous_unpadded_view():
+    config = SimpleNamespace(
+        coalesce_prefix_full=True, coalesce_prefix_query=True,
+        segment_lengths=(128, 64), segment_padded_lengths=(128, 64),
+    )
+    q = torch.randn(16, 1, 4, 8)
+    assert ring._can_coalesce_prefix_query(q, config)
+    halves = q.squeeze(1).chunk(2, dim=0)
+    assert all(item.untyped_storage().data_ptr() == q.untyped_storage().data_ptr() for item in halves)
+    assert halves[1].storage_offset() - halves[0].storage_offset() == halves[0].numel()
+    noncontiguous = q.transpose(0, 2).contiguous().transpose(0, 2)
+    assert not ring._can_coalesce_prefix_query(noncontiguous, config)
+    config.segment_padded_lengths = (128, 72)
+    assert not ring._can_coalesce_prefix_query(q, config)

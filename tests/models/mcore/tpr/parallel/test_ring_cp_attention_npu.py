@@ -121,6 +121,17 @@ def _kernel_probe():
     original_forward = ring._block_attention_forward
     original_backward = ring._block_attention_backward
     calls = {"forward": [], "backward": []}
+    transport = {"forward": 0, "backward": 0}
+    original_circulate = ring._circulate_kv
+    original_reduce = ring._reduce_ring_gradients_to_owner
+
+    def circulate(*args, **kwargs):
+        transport["forward"] += 1
+        return original_circulate(*args, **kwargs)
+
+    def reduce(*args, **kwargs):
+        transport["backward"] += 1
+        return original_reduce(*args, **kwargs)
 
     def traced_forward(*args, **kwargs):
         calls["forward"].append(
@@ -144,11 +155,17 @@ def _kernel_probe():
         )
         return original_backward(*args, **kwargs)
 
+    ring._circulate_kv = circulate
+    ring._reduce_ring_gradients_to_owner = reduce
     ring._block_attention_forward = traced_forward
     ring._block_attention_backward = traced_backward
     try:
         yield calls
+        assert transport["forward"] == transport["backward"]
+        calls["transport"] = transport
     finally:
+        ring._circulate_kv = original_circulate
+        ring._reduce_ring_gradients_to_owner = original_reduce
         ring._block_attention_forward = original_forward
         ring._block_attention_backward = original_backward
 
@@ -180,10 +197,10 @@ def test_ring_cp_attention_matches_full_causal_forward_backward(
     _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_heads, kv_heads)
 
 
-def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_heads, kv_heads):
+def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_heads, kv_heads,
+                             *, noncontiguous_query=False, head_dim=64):
     device, cp_group = cp_runtime
     rank = dist.get_rank(cp_group)
-    head_dim = 64
     scale = head_dim**-0.5
     current_shard = make_ring_sequence_shard(
         current_length,
@@ -203,6 +220,9 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
     ]
 
     local_query = _local_leaf(global_query, current_shard)
+    if noncontiguous_query:
+        local_query = local_query.transpose(0, 2).contiguous().transpose(0, 2).detach().requires_grad_(True)
+        assert not local_query.squeeze(1).is_contiguous()
     local_current_key = _local_leaf(global_current_key, current_shard)
     local_current_value = _local_leaf(global_current_value, current_shard)
     local_prefix_keys = []
@@ -298,9 +318,15 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
         assert torch.count_nonzero(local_prefix_keys[index].grad).item() > 0
         assert torch.count_nonzero(local_prefix_values[index].grad).item() > 0
 
+    transport = calls.pop("transport")
+    assert transport == {"forward": len(prefix_lengths) + 1, "backward": len(prefix_lengths) + 1}
     coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1"
+    query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1"
+                   and bool(prefix_lengths) and not noncontiguous_query
+                   and all(length % (2 * _EXPECTED_WORLD_SIZE) == 0
+                           for length in (*prefix_lengths, current_length)))
     expected_calls = 2 * _EXPECTED_WORLD_SIZE + 1 + sum(
-        (2 if coalesce and length % (2 * _EXPECTED_WORLD_SIZE) == 0 else 4)
+        (1 if query_merge else 2 if coalesce and length % (2 * _EXPECTED_WORLD_SIZE) == 0 else 4)
         * _EXPECTED_WORLD_SIZE for length in prefix_lengths
     )
     assert len(calls["forward"]) == expected_calls
@@ -310,7 +336,7 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
     }
     physical_query_chunk = current_shard.padded_length // (2 * _EXPECTED_WORLD_SIZE)
     assert all(
-        call["query_length"] == physical_query_chunk
+        call["query_length"] in ({physical_query_chunk, 2 * physical_query_chunk} if query_merge else {physical_query_chunk})
         for phase in calls.values()
         for call in phase
     )
@@ -370,6 +396,7 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
 
 @pytest.mark.parametrize("prefix_lengths,current_length", [((128,), 128), ((128, 64), 64), ((127,), 63)])
 def test_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length):
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "0")
     snapshots = []
     for enabled in ("0", "1"):
         monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", enabled)
@@ -382,4 +409,27 @@ def test_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, 
         _assert_close(actual, expected, gradient=True)
     saved = sum(2 * _EXPECTED_WORLD_SIZE for length in prefix_lengths
                 if length % (2 * _EXPECTED_WORLD_SIZE) == 0)
+    assert before[2] - after[2] == before[3] - after[3] == saved
+
+
+@pytest.mark.parametrize("prefix_lengths,current_length,noncontiguous", [
+    ((128,), 128, False), ((128, 64), 64, False), ((127,), 63, False),
+    ((128,), 63, False), ((128,), 128, True),
+])
+def test_prefix_query_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length, noncontiguous):
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
+    snapshots = []
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", enabled)
+        snapshots.append(_check_ring_cp_attention(
+            cp_runtime, prefix_lengths, current_length, 16, 8,
+            noncontiguous_query=noncontiguous, head_dim=128,
+        ))
+    before, after = snapshots
+    _assert_close(after[0], before[0])
+    for actual, expected in zip(after[1], before[1], strict=True):
+        _assert_close(actual, expected, gradient=True)
+    eligible = not noncontiguous and all(length % (2 * _EXPECTED_WORLD_SIZE) == 0
+                                        for length in (*prefix_lengths, current_length))
+    saved = _EXPECTED_WORLD_SIZE * len(prefix_lengths) if eligible else 0
     assert before[2] - after[2] == before[3] - after[3] == saved

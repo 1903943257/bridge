@@ -95,6 +95,7 @@ class _RingAttentionConfig:
     head_dim: int
     softmax_scale: float
     coalesce_prefix_full: bool = False
+    coalesce_prefix_query: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +315,7 @@ def _normalize_inputs(
         head_dim=query.shape[-1],
         softmax_scale=float(scale),
         coalesce_prefix_full=os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1",
+        coalesce_prefix_query=os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1",
     )
     return blocks, config
 
@@ -392,6 +394,97 @@ def _prefix_full_slices(tensor, shard, *, enabled):
 
 # Patched only in untimed probes; no event dictionaries on the hot path.
 _trace_ring_block = None
+
+
+def _can_coalesce_prefix_query(query: Tensor, config: _RingAttentionConfig) -> bool:
+    # Check the original Q view, BEFORE the baseline contiguous conversion.
+    # Do not add a packing allocation just to make the new path eligible.
+    return (
+        config.coalesce_prefix_full
+        and config.coalesce_prefix_query
+        and len(config.segment_lengths) > 1
+        and config.segment_lengths == config.segment_padded_lengths
+        and query.squeeze(1).is_contiguous()
+    )
+
+
+def _slice_tnd_result(result, local_slice):
+    """Slice TND output and CANN's head-major softmax statistics.
+
+    CANN exposes statistics with shape [T,H,8] but single-sequence storage
+    order [H,T,8]. A query slice is therefore NOT stats[local_slice].
+    Only the small statistics need a contiguous chunk representation.
+    """
+    output, maximum, total = result
+    length, heads = output.shape[:2]
+    chunk_length = local_slice.stop - local_slice.start
+    stats = tuple(
+        item.view(heads, length, item.shape[-1])[:, local_slice, :]
+        .contiguous().view(chunk_length, heads, item.shape[-1])
+        for item in (maximum, total)
+    )
+    return output[local_slice], *stats
+
+
+def _trace_merged_query(config, query, key, segment_index, source_rank, phase):
+    if _trace_ring_block is None:
+        return
+    source_shard = make_ring_sequence_shard(
+        config.segment_lengths[segment_index], cp_rank=source_rank,
+        cp_size=config.cp_size,
+        padded_length=config.segment_padded_lengths[segment_index],
+    )
+    q_chunk = config.current_shard.padded_length // (2 * config.cp_size)
+    k_chunk = source_shard.padded_length // (2 * config.cp_size)
+    _trace_ring_block(
+        phase=phase, rank=config.cp_rank,
+        ring_step=(config.cp_rank - source_rank) % config.cp_size,
+        source_rank=source_rank, segment_index=segment_index, segment_type="prefix",
+        query_range=config.current_shard.global_ranges,
+        query_chunk=tuple(start // q_chunk for start, _ in config.current_shard.physical_global_ranges),
+        kv_ranges=source_shard.global_ranges,
+        kv_chunks=tuple(start // k_chunk for start, _ in source_shard.physical_global_ranges),
+        block_type=RingBlockKind.FULL.value,
+        query_length=query.shape[0], kv_length=key.shape[0], fa_called=True,
+        coalesced=True, query_coalesced=True,
+        query_storage_ptr=query.untyped_storage().data_ptr(),
+        query_storage_offset=query.storage_offset(), query_shape=tuple(query.shape),
+        query_stride=tuple(query.stride()),
+    )
+
+
+def _merged_prefix_forward(query_tnd, segment_blocks, config):
+    """One FULL FA per Prefix source; Q and KV inputs are existing views."""
+    merged = None
+    for segment_index, source_blocks in enumerate(segment_blocks[:-1]):
+        for source_rank, (key, value) in enumerate(source_blocks):
+            _trace_merged_query(config, query_tnd, key, segment_index, source_rank, "forward")
+            current = _block_attention_forward(
+                query_tnd, key.squeeze(1), value.squeeze(1),
+                query_heads=config.query_heads, softmax_scale=config.softmax_scale,
+                block_kind=RingBlockKind.FULL, attention_mask=None,
+            )
+            merged = _merge_attention(merged, current, query_length=query_tnd.shape[0])
+    return merged
+
+
+def _merged_prefix_backward(query_tnd, grad_output, final_result, segment_blocks,
+                            segment_contributions, query_gradient, config):
+    """FA sums both Q chunks' dKV; add it exactly once before existing reduction."""
+    output, maximum, total = final_result
+    for segment_index, source_blocks in enumerate(segment_blocks[:-1]):
+        for source_rank, (key, value) in enumerate(source_blocks):
+            _trace_merged_query(config, query_tnd, key, segment_index, source_rank, "backward")
+            dq, dk, dv = _block_attention_backward(
+                query_tnd, key.squeeze(1), value.squeeze(1), grad_output,
+                attention_output=output, softmax_max=maximum, softmax_sum=total,
+                query_heads=config.query_heads, softmax_scale=config.softmax_scale,
+                block_kind=RingBlockKind.FULL, attention_mask=None,
+            )
+            query_gradient.add_(dq)
+            key_buffer, value_buffer = segment_contributions[segment_index][source_rank]
+            key_buffer.add_(dk.unsqueeze(1))
+            value_buffer.add_(dv.unsqueeze(1))
 
 
 def _range_validity(item: _RingRangeSlice, *, device: torch.device) -> Tensor:
@@ -705,15 +798,22 @@ class _RingTPRAttention(torch.autograd.Function):
                 _circulate_kv(local_kv[2 * index], local_kv[2 * index + 1], config)
             )
 
+        ctx.query_coalesced = _can_coalesce_prefix_query(query, config)
         query_tnd = query.squeeze(1).contiguous()
+        prefix_result = (
+            _merged_prefix_forward(query_tnd, segment_blocks, config)
+            if ctx.query_coalesced else None
+        )
         query_results = []
         query_slices = _iter_range_slices(query_tnd, config.current_shard)
         for query_item in query_slices:
             query_range = query_item.logical_range
             query_part = query_item.tensor
-            merged = None
+            merged = _slice_tnd_result(prefix_result, query_item.local_slice) if ctx.query_coalesced else None
             for segment_index, source_blocks in enumerate(segment_blocks):
                 is_prefix = segment_index + 1 < len(segment_blocks)
+                if ctx.query_coalesced and is_prefix:
+                    continue
                 global_length = config.segment_lengths[segment_index]
                 padded_length = config.segment_padded_lengths[segment_index]
                 for source_rank, (source_key, source_value) in enumerate(source_blocks):
@@ -786,14 +886,11 @@ class _RingTPRAttention(torch.autograd.Function):
             # the FP32 accumulator. Save the same rounded context we return.
             query_results.append(_finalize_attention_result(merged, dtype=query.dtype))
 
+        del prefix_result
         saved_blocks = []
         for source_blocks in segment_blocks:
             for key, value in source_blocks:
                 saved_blocks.extend((key, value))
-        saved_results = []
-        for output, softmax_max, softmax_sum in query_results:
-            saved_results.extend((output, softmax_max, softmax_sum))
-        ctx.save_for_backward(query, *saved_blocks, *saved_results)
         ctx.config = config
         ctx.block_tensor_count = len(saved_blocks)
         output = query.new_zeros((query.shape[0], config.query_heads, config.head_dim))
@@ -805,6 +902,24 @@ class _RingTPRAttention(torch.autograd.Function):
                     result_output.dtype
                 )
             output[query_item.local_slice] = result_output
+        if ctx.query_coalesced:
+            # Save the already-created returned output, not a concatenated copy.
+            # One final stats pair replaces the per-chunk saved pairs. No packing
+            # per Ring source and no retained extra Prefix results.
+            length, heads = query.shape[0], config.query_heads
+            full_stats = tuple(
+                query_results[0][index].new_empty((length, heads, query_results[0][index].shape[-1]))
+                for index in (1, 2)
+            )
+            for item, result in zip(query_slices, query_results, strict=True):
+                for full, part in zip(full_stats, result[1:], strict=True):
+                    full.view(heads, length, full.shape[-1])[:, item.local_slice, :].copy_(
+                        part.view(heads, item.physical_length, part.shape[-1])
+                    )
+            ctx.save_for_backward(query, *saved_blocks, output, *full_stats)
+        else:
+            saved_results = [tensor for result in query_results for tensor in result]
+            ctx.save_for_backward(query, *saved_blocks, *saved_results)
         return output.reshape(query.shape[0], 1, config.query_heads * config.head_dim)
 
     @staticmethod
@@ -845,6 +960,13 @@ class _RingTPRAttention(torch.autograd.Function):
         ]
 
         query_slices = _iter_range_slices(query_tnd, config.current_shard)
+        if ctx.query_coalesced:
+            final_result = tuple(result_tensors)
+            _merged_prefix_backward(
+                query_tnd, grad_output_tnd, final_result, segment_blocks,
+                segment_contributions, query_gradient, config,
+            )
+            query_results = tuple(_slice_tnd_result(final_result, item.local_slice) for item in query_slices)
         grad_slices = _iter_range_slices(grad_output_tnd, config.current_shard)
         for query_item, grad_item, final_result in zip(
             query_slices,
@@ -868,6 +990,8 @@ class _RingTPRAttention(torch.autograd.Function):
             final_output, final_max, final_sum = final_result
             for segment_index, source_blocks in enumerate(segment_blocks):
                 is_prefix = segment_index + 1 < len(segment_blocks)
+                if ctx.query_coalesced and is_prefix:
+                    continue
                 global_length = config.segment_lengths[segment_index]
                 padded_length = config.segment_padded_lengths[segment_index]
                 for source_rank, (source_key, source_value) in enumerate(source_blocks):

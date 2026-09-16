@@ -16,6 +16,7 @@ def ring_block_probe(model, runtime):
     original_forward = ring._RingTPRAttention.forward
     original_backward = ring._RingTPRAttention.backward
     first_leaf = []
+    layout_reported = False
     detailed = os.getenv("TPR_RING_BLOCK_TRACE", "0") == "1"
 
     def trace(**event):
@@ -31,7 +32,23 @@ def ring_block_probe(model, runtime):
             print(f"Ring block trace: {scope} {event}")
 
     def forward(ctx, *args):
+        nonlocal layout_reported
         ctx.profile_block_scope = dict(scope)
+        if (detailed and runtime.rank == 0 and not layout_reported
+                and scope["operation"] == "visit_leaf"
+                and scope["layer"] == model.decoder.layers[0].self_attention.layer_number
+                and len(args[-1].segment_lengths) > 1):
+            query, config = args[0], args[-1]
+            q = query.squeeze(1)
+            layout_reported = True
+            print(f"Q layout: base_ptr={q.untyped_storage().data_ptr():#x}, "
+                  f"shape={tuple(q.shape)}, stride={q.stride()}, offset={q.storage_offset()}, "
+                  f"can_zero_copy_merge={q.is_contiguous()}, "
+                  f"fast_path_eligible={ring._can_coalesce_prefix_query(query, config)}")
+            for item in ring._iter_range_slices(q, config.current_shard):
+                print(f"  Q chunk: logical={item.logical_range}, rows={item.local_slice}, "
+                      f"base_ptr={item.tensor.untyped_storage().data_ptr():#x}, "
+                      f"offset={item.tensor.storage_offset()}, stride={item.tensor.stride()}")
         return original_forward(ctx, *args)
 
     def backward(ctx, *args):

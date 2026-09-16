@@ -38,8 +38,9 @@ def _compare(actual, expected):
         assert metrics.cosine >= utils._GRAD_COSINE_MIN
 
 
+@pytest.mark.parametrize("merge_mode", ["kv", "query"])
 @pytest.mark.parametrize("prefix_length,suffix_length", [(128, 64), (127, 63)])
-def test_ring_coalescing_tree_off_on(profile_runtime, monkeypatch, prefix_length, suffix_length):
+def test_ring_coalescing_tree_off_on(profile_runtime, monkeypatch, prefix_length, suffix_length, merge_mode):
     runtime = profile_runtime
     assert runtime.cp_size in (2, 4)
     torch.manual_seed(261000)
@@ -49,7 +50,8 @@ def test_ring_coalescing_tree_off_on(profile_runtime, monkeypatch, prefix_length
     second = utils._tokens(1301, suffix_length)
     plan = utils._equivalence_tpr_plan(prefix, first, second)
     indices, count = utils._logical_logprob_indices(torch.cat((prefix, first)), torch.cat((prefix, second)))
-    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "0")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "0")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1" if merge_mode == "query" else "0")
     reference = utils._run_independent_segmented_cp_reference(
         model, prefix, first, second, runtime, indices, count, cp_backend="ring",
     )
@@ -64,7 +66,8 @@ def test_ring_coalescing_tree_off_on(profile_runtime, monkeypatch, prefix_length
     monkeypatch.setattr(SegmentExecutor, "pop", pop)
     baseline = None
     for enabled in ("0", "1", "1"):
-        monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", enabled)
+        flag = "TPR_RING_COALESCE_PREFIX_QUERY" if merge_mode == "query" else "TPR_RING_COALESCE_PREFIX_FULL"
+        monkeypatch.setenv(flag, enabled)
         captured.clear()
         actual = utils._run_tpr_cp(model, plan, runtime, indices, count, cp_backend="ring")
         # _EquivalenceRun is frozen; construct a result including the captured KV gradients.

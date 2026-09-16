@@ -2,10 +2,11 @@
 
 ## Status
 
-Implemented as an opt-in first-stage optimization. Default is OFF:
+KV coalescing is an opt-in first-stage optimization. Default is OFF:
 `TPR_RING_COALESCE_PREFIX_FULL=0`. ON is `1`. The setting is captured in each
 attention invocation's saved config, so backward uses the forward decision.
-No Q coalescing, new mask, checkpointing, scheduler or transport changes.
+Optional second-stage Q coalescing is described below. Neither stage changes
+masks, checkpointing, scheduler or transport.
 
 Local validation executes the actual production forward/backward dispatch
 loops with shape-only tensor/FA/transport stubs, for every rank in CP=2/4.
@@ -119,3 +120,113 @@ do not install the trace callback. Preserve both logs and compare Reference/TPR
 latency, speedup, FA counts, Ring communication, FA, merge/framework, complete
 attention time, peak allocated and peak reserved. No optimized timing or peak
 memory numbers are available yet.
+
+## Second stage: zero-copy Prefix Q coalescing
+
+Enable `TPR_RING_COALESCE_PREFIX_FULL=1` and
+`TPR_RING_COALESCE_PREFIX_QUERY=1`. Q coalescing also defaults OFF.
+
+### Layout assessment
+
+In the existing forward, `query.squeeze(1).contiguous()` creates `query_tnd`;
+`_iter_range_slices` takes adjacent row views from it. For the fixed Qwen3-1.7B
+case, each CP rank has 4096 local query rows, 16 heads and head_dim 128:
+
+```text
+Q TND shape: [4096, 16, 128]
+contiguous stride: [2048, 128, 1] (elements)
+Q0 physical rows: [0:2048],     offset = base_offset
+Q1 physical rows: [2048:4096],  offset = base_offset + 4194304 elements
+Q01: entire existing TND buffer; no cat or Q packing workspace
+```
+
+The two logical ranges are non-adjacent, but physical rows are adjacent. Their
+RoPE positions were already applied. The FULL kernel uses TND with
+`actual_seq_qlen=[4096]`, `actual_seq_kvlen=[source_local_length]`. Query rows
+do not attend to each other, so combining them does not change visibility.
+The detailed untimed probe prints actual storage pointer, offset, shape and
+stride for the first rank-0/layer-1 leaf. Numeric addresses are runtime values;
+no NPU layout measurement has been obtained locally.
+
+Eligibility checks the ORIGINAL `query.squeeze(1)` before the baseline
+contiguous conversion. If it is not contiguous, any segment is padded, KV
+merge is OFF, or no external Prefix exists, Q coalescing falls back. For
+unpadded Prefix + padded Current this is the 17-block KV-only path; padded
+Prefix also retains its original per-chunk KV fallback. No Q packing is used
+to force eligibility.
+
+### Forward/backward and final statistics
+
+Prefix FULL execution uses all local Q rows once per Prefix source. One online
+softmax accumulator spans those rows; it is then split into chunk views for
+the unchanged Current causal loop. Splitting output/dQ along sequence rows is
+zero-copy. FA backward sums contributions to shared dK/dV from both query
+chunks, and each source's dKV buffer receives that result exactly once.
+
+CANN TND statistics expose shape `[T,H,8]` with single-sequence **head-major**
+storage `[H,T,8]`. They cannot be split with `stats[:T/2]`. The helper slices
+the query axis of `[H,T,8]` and makes a contiguous small chunk statistic. The
+final full-query max/sum pair is assembled once after Current attention and
+saved in place of the old per-chunk pairs. Backward uses these FINAL global
+statistics and output, not the Prefix-only intermediate normalizer. It then
+slices the final result for the unchanged Current backward calls.
+
+The returned full output already existed in the baseline and is reused as
+the saved full output. There is no extra output concat, Q workspace or saved
+per-source Prefix output. The saved max/sum element count is unchanged. The
+fixed case's full FP32 max/sum pair totals 4 MiB; conversion and larger FA
+outputs can affect transient peaks. Zero-copy Q does NOT establish that peak
+memory or runtime are unchanged: allocated/reserved peaks and kernel workspace
+must be measured. No memory/performance improvement is claimed before that.
+
+### Dispatch and transport gates
+
+The dependency-free test executes the production dispatch loops using shape
+stubs and checks every CP=2/4 rank, Q-buffer aliasing, and communication wrapper
+calls. CP=4 expectations for the fixed case are:
+
+| Metric | KV-only | Q+KV |
+|---|---:|---:|
+| Prefix FA per leaf/layer | 8 | 4 |
+| Current FA per leaf/layer | 9 | 9 |
+| Total per leaf/layer | 17 | 13 |
+| Prefix FA across leaves, each direction | 1792 | 896 |
+| Total forward FA | 4312 | 3416 |
+| Total backward FA | 4060 | 3164 |
+| Forward communication wrappers | 504 | 504 |
+| Backward communication wrappers | 476 | 476 |
+
+The shape tests passed locally; the NPU tests have NOT been run. The existing
+single-layer test now includes Q OFF/ON with Qwen-like GQA/head_dim, multiple
+Prefix segments, padded Prefix/Current and non-contiguous Q fallback. Both
+modes are checked against the dense oracle and each other with existing
+tolerances, including nonzero Prefix gradients and unchanged transport counts.
+Tree tests now parameterize KV-only and Q-merge comparisons, using the same
+loss/logprob/parameter/Prefix-gradient tolerances and repeated ON iteration.
+
+Run the two correctness commands above with CP=2 and then CP=4; no additional
+Q switch is needed because these tests set it internally. Also run the
+head-major layout contract checks where PyTorch is installed:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_ring_cp_attention_contract.py
+```
+
+After all correctness gates pass, keep the fixed case/model/CP and compare:
+
+```bash
+mkdir -p tests/models/mcore/tpr/log1
+for QMERGE in 0 1; do
+  TPR_RUN_QWEN_RING_CP_PROFILE=1 TPR_QWEN_PROFILE_SIZE=1.7B \
+  TPR_RING_COALESCE_PREFIX_FULL=1 TPR_RING_COALESCE_PREFIX_QUERY=$QMERGE \
+  TPR_RING_BLOCK_TRACE=1 TPR_QWEN_RING_CP_PROFILE_BREAKDOWN=1 \
+  torchrun --nproc_per_node=4 --master_port=29565 -m pytest -s -v -x \
+    tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py \
+    > tests/models/mcore/tpr/log1/query_merge_${QMERGE}.log 2>&1 || break
+done
+```
+
+Compare TPR median, attention and FA forward/backward, actual FA counters,
+merge/framework, Ring communication, peak allocated and reserved. The Q switch
+must change neither Reference dispatch nor Ring transport counts. At present
+there are no measured Q-merge latency or peak-memory results.
