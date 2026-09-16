@@ -47,6 +47,12 @@ observes the real backward function's BT, NT, eff_NT and dh0.shape before launch
 it does not replace the kernel or change its inputs. This is a diagnostic script,
 not a timing benchmark. The pre-call formula is explicitly labeled as derived
 from the inspected checkout; observed locals are authoritative if code changes.
+Python tracing is best-effort: autograd can execute backward on another thread,
+outside the scope of `sys.settrace`. Missing trace events produce a diagnostic
+message, not a failed case. In that situation actual runtime path/BT/allocation
+remain unverified. Successful backward plus NPU synchronization and required
+gradient presence determine execution PASS; they do not establish numerical
+correctness or verify the internal dispatch path.
 
 ## Important source-version distinction
 
