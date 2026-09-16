@@ -43,6 +43,7 @@ def git_info(source):
 
 
 def run_case(args):
+    T = args.length
     print(f"\n{'=' * 60}\nCase {args.case}\n{'=' * 60}", flush=True)
     print(f"Python: {platform.python_version()} ({sys.executable})")
     for name in ("torch", "torch_npu", "triton", "triton-ascend"):
@@ -76,8 +77,9 @@ def run_case(args):
                 print(f"  {number}: {line.strip()}")
         dtype = torch.bfloat16
         print(f"dtype: {dtype}; B={B} T={T} D={D} W={W}")
-        print("activation=None; bias=None; residual=None; cu_seqlens=None; "
-              "output_final_state=False (isolate initial-state backward)")
+        activation = None if args.activation == "none" else args.activation
+        print(f"activation={activation}; bias={args.bias}; residual=None; cu_seqlens=None; "
+              f"final_state_mode={args.final}")
         cores = impl.get_vector_num()
         bt = min(8 if args.case != "none" else 32,
                  triton.next_power_of_2(triton.cdiv(max(16, B * T), cores)))
@@ -92,10 +94,11 @@ def run_case(args):
         device = f"npu:{args.device}"
         x = torch.randn(B, T, D, device=device, dtype=dtype, requires_grad=True)
         weight = torch.randn(W, D, device=device, dtype=dtype, requires_grad=True)
+        bias = torch.randn(D, device=device, dtype=dtype, requires_grad=True) if args.bias else None
         state = None if args.case == "none" else torch.randn(
             B, D, W, device=device, dtype=dtype,
             requires_grad=args.case == "state_grad")
-        for name, tensor in (("x", x), ("weight", weight), ("initial_state", state)):
+        for name, tensor in (("x", x), ("weight", weight), ("bias", bias), ("initial_state", state)):
             print(f"{name}: None" if tensor is None else
                   f"{name}: shape={tuple(tensor.shape)}, stride={tensor.stride()}, "
                   f"dtype={tensor.dtype}, requires_grad={tensor.requires_grad}")
@@ -121,18 +124,36 @@ def run_case(args):
         torch.npu.synchronize()
         stage = "Forward"
         y, final_state = api.causal_conv1d(x, weight, initial_state=state,
-                                         output_final_state=False)
+                                         bias=bias, activation=activation,
+                                         output_final_state=args.final != "off")
         torch.npu.synchronize()
-        print(f"output: shape={tuple(y.shape)}, dtype={y.dtype}; final_state={final_state}")
+        print(f"output: shape={tuple(y.shape)}, dtype={y.dtype}; "
+              f"final_state.shape={None if final_state is None else tuple(final_state.shape)}")
         print("Forward: PASS", flush=True)
         stage = "Backward"
-        previous_trace = sys.gettrace()
-        sys.settrace(trace)
+        original_bwd = impl.causal_conv1d_bwd_impl
+        def observed_bwd(*pos, **kw):
+            # Called on the actual autograd thread. Only observe; forward all
+            # original arguments to the unchanged implementation/kernel.
+            bound = inspect.signature(original_bwd).bind(*pos, **kw)
+            dht = bound.arguments.get("dht")
+            print(f"Actual backward dht: {None if dht is None else (tuple(dht.shape), dht.dtype)}",
+                  flush=True)
+            previous_trace = sys.gettrace()
+            sys.settrace(trace)
+            try:
+                return original_bwd(*pos, **kw)
+            finally:
+                sys.settrace(previous_trace)
+        impl.causal_conv1d_bwd_impl = observed_bwd
         try:
-            y.float().sum().backward()
+            loss = y.float().sum()
+            if args.final == "nonzero":
+                loss = loss + final_state.float().sum()
+            loss.backward()
             torch.npu.synchronize()
         finally:
-            sys.settrace(previous_trace)
+            impl.causal_conv1d_bwd_impl = original_bwd
         # Autograd may invoke Python backward on a worker thread; sys.settrace
         # only observes the installing thread. Missing telemetry is not a
         # backward failure and does not prove which implementation executed.
@@ -144,6 +165,8 @@ def run_case(args):
             print("Diagnostic: backward entered, but launch locals were not captured.",
                   flush=True)
         assert x.grad is not None and weight.grad is not None
+        if bias is not None:
+            assert bias.grad is not None
         if args.case == "state_grad":
             assert state.grad is not None
         print("Backward: PASS", flush=True)
@@ -159,13 +182,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=("all", *CASES), default="all")
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--length", type=int, default=64)
+    parser.add_argument("--activation", choices=("none", "silu"), default="none")
+    parser.add_argument("--bias", action="store_true")
+    parser.add_argument("--final", choices=("off", "unused", "nonzero"), default="off")
     args = parser.parse_args()
+    if args.length <= 0:
+        parser.error("--length must be positive")
     if args.case != "all":
         return run_case(args)
     results = []
     for case in CASES:
-        result = subprocess.run([sys.executable, "-u", str(Path(__file__).resolve()),
-                                 "--case", case, "--device", str(args.device)])
+        command = [sys.executable, "-u", str(Path(__file__).resolve()),
+                   "--case", case, "--device", str(args.device),
+                   "--length", str(args.length), "--activation", args.activation,
+                   "--final", args.final]
+        if args.bias:
+            command.append("--bias")
+        result = subprocess.run(command)
         results.append((case, result.returncode))
     print("\nResult summary (fresh process per case):", flush=True)
     for case, code in results:

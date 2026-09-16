@@ -1,5 +1,48 @@
 # Stateful causal_conv1d backward reproducer
 
+## Stage 4.5 follow-up
+
+The user confirmed the original failing command is Stage 4.5 with
+`STAGE45_BRANCHES=2 STAGE45_LENGTHS=8192:1024`, CP2. The original minimal
+T=64/no-activation/no-final-output smoke is not the same kernel branch coverage.
+Keep that control, then run the suffix-size Conv with SiLU and requested but
+unused final state (the adapter always requests final state):
+
+```bash
+python -u repro_causal_conv1d_initial_state_bwd_oob.py --length 1024 --activation silu --final unused > dh0_t1024_silu_unused.log 2>&1
+```
+
+Use `--final off` and `--final nonzero` as separate controls; `--bias` is an
+optional bias-path probe (native GDN defaults conv_bias=False). CP->HP splits
+channels, not this operator's time dimension: use T=1024,D=3072 for CP2.
+Random h0 is not the real P8192 Prefix state, and sum loss does not recreate
+the model's upstream gradient. A PASS cannot rule out the full-model failure.
+The script now temporarily wraps only the Python backward launcher, forwards
+all arguments unchanged, and installs tracing on its actual calling thread.
+It prints actual dht presence/shape/dtype; the kernel and tile selection are
+unchanged. Missing telemetry remains diagnostic, not failure.
+
+If Conv passes, use the existing independent Conv/GDR matrix to separate the
+two operators (one fresh process per combination):
+
+```bash
+python tests/models/mcore/tpr/parallel/run_stateful_ops_ab.py --device 0 --lengths 1024 --finals off,unused,nonzero > stateful_ops_t1024.log 2>&1
+```
+
+### Separate GDR initial-state gates
+
+`patches/mindspeed_ops_gdr_initial_state_gates.patch` exports only the two
+launcher guard removals from MindSpeed-Ops commit 9d962f1. It does not change
+Conv or any kernel. These are experimental GDR enablement gates, not a Conv
+bug fix. From the affected server MindSpeed-Ops root, with sibling Bridge:
+
+```bash
+git apply --check ../bridge/patches/mindspeed_ops_gdr_initial_state_gates.patch && git apply ../bridge/patches/mindspeed_ops_gdr_initial_state_gates.patch
+```
+
+If checking fails, inspect the loaded source/version; do not force application.
+The local checkout already has both gates removed (reverse check passes).
+
 Run from the Bridge repository root in the Ascend environment with MindSpeed-Ops
 installed. The script imports that installed package directly and prints its
 actual source path and commit; it does not import Bridge/VERL:

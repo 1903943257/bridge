@@ -1,0 +1,28 @@
+diff --git a/mindspeed_ops/api/triton/chunk_gated_delta_rule.py b/mindspeed_ops/api/triton/chunk_gated_delta_rule.py
+index d6eb782..7db72d0 100644
+--- a/mindspeed_ops/api/triton/chunk_gated_delta_rule.py
++++ b/mindspeed_ops/api/triton/chunk_gated_delta_rule.py
+@@ -307,9 +307,6 @@ def chunk_gated_delta_rule(
+             f"beta current shape len is {len(beta.shape)}, beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
+         )
+ 
+-    if initial_state is not None:
+-        raise ValueError("The chunk_gated_delta_rule_fwd_h does not support initial_state.")
+-
+     if head_first:
+         warnings.warn(
+             "head_first is deprecated and will be removed in a future version. "
+diff --git a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
+index cc7b258..1dad508 100644
+--- a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
++++ b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
+@@ -249,9 +249,6 @@ def chunk_gated_delta_rule_fwd_h(
+     save_new_value: bool = True,
+     cu_seqlens: Optional[torch.LongTensor] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    if initial_state is not None:
+-        raise ValueError("The chunk_gated_delta_rule_fwd_h does not support initial_state.")
+-
+     if gk is not None:
+         raise ValueError("The chunk_gated_delta_rule_fwd_h does not support gk.")
+ 
