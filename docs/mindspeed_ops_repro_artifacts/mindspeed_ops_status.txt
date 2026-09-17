@@ -1,0 +1,8 @@
+ M mindspeed_ops/api/triton/chunk_gated_delta_rule.py
+ M mindspeed_ops/arch32/triton/convolution.py
+ M mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
+ M tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+?? mindspeed_ops/mindspeed_ops_C.cpython-311-x86_64-linux-gnu.so
+?? mindspeed_ops_commit.txt
+?? mindspeed_ops_status.txt
+?? tests/unit_tests/triton/test_chunk_gated_delta_rule_stateful_experiment.py

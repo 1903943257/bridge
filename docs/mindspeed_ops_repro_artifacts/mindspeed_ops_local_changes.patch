@@ -1,0 +1,286 @@
+# TRANSCRIBED FROM CHAT: review evidence only; NOT safe for `git apply`.
+# Rich-text paste lost Python indentation and some diff +/- markers.
+# The original pasted payload, including its trailing commit/status text, is retained below.
+这是patch内的diff --git a/mindspeed_ops/api/triton/chunk_gated_delta_rule.py b/mindspeed_ops/api/triton/chunk_gated_delta_rule.py
+index d6eb782..dea2191 100644
+--- a/mindspeed_ops/api/triton/chunk_gated_delta_rule.py
++++ b/mindspeed_ops/api/triton/chunk_gated_delta_rule.py
+@@ -307,8 +307,8 @@ def chunk_gated_delta_rule(
+             f"beta current shape len is {len(beta.shape)}, beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
+         )
+ 
+
+- if initial_state is not None:
+- raise ValueError("The chunk_gated_delta_rule_fwd_h does not support initial_state.")
+
+- # if initial_state is not None:
+- #     raise ValueError("The chunk_gated_delta_rule_fwd_h does not support initial_state.")
+
+ 
+     if head_first:
+         warnings.warn(
+diff --git a/mindspeed_ops/arch32/triton/convolution.py b/mindspeed_ops/arch32/triton/convolution.py
+index e62b197..e61f888 100644
+--- a/mindspeed_ops/arch32/triton/convolution.py
++++ b/mindspeed_ops/arch32/triton/convolution.py
+@@ -452,10 +452,15 @@ def causal_conv1d_bwd_kernel(
+                     b_dh0_s = tl.zeros((BD,), dtype=tl.float32)
+                     for i_t2 in tl.static_range(0, W - 1):
+                         if i_t2 < i_w:
+
+- # i_t2 is a GLOBAL suffix time, not an offset in this
+- # tile. Each valid dh0 contribution belongs to one tile.
+- # m_t = (i_t2 >= i_t * BT) & (i_t2 < (i_t + 1) * BT) & (i_t2 < T_len)
+- # dy0_row = tl.load(dy + bos * D + i_t2 * D + o_d, mask=m_d & m_t, other=0.0).to(
+                             dy0_row = tl.load(dy + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
+                                 tl.float32
+                             )
+                             if ACTIVATION == "swish" or ACTIVATION == "silu":  # pylint: disable=consider-using-in
+- # y0_row = tl.load(y + bos * D + i_t2 * D + o_d, mask=m_d & m_t, other=0.0).to(
+                                 y0_row = tl.load(y + bos * D + (i_t * BT + i_t2) * D + o_d, mask=m_d, other=0.0).to(
+                                     tl.float32
+                                 )
+diff --git a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
+index cc7b258..9d90abb 100644
+--- a/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
++++ b/mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
+@@ -249,8 +249,8 @@ def chunk_gated_delta_rule_fwd_h(
+     save_new_value: bool = True,
+     cu_seqlens: Optional[torch.LongTensor] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+- if initial_state is not None:
+- raise ValueError("The chunk_gated_delta_rule_fwd_h does not support initial_state.")
+
+- # if initial_state is not None:
+- #     raise ValueError("The chunk_gated_delta_rule_fwd_h does not support initial_state.")
+
+ 
+     if gk is not None:
+         raise ValueError("The chunk_gated_delta_rule_fwd_h does not support gk.")
+diff --git a/tests/unit_tests/triton/test_causal_conv1d/test_backward.py b/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+index 9a64c71..97a77ff 100644
+--- a/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
++++ b/tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+@@ -36,6 +36,77 @@ if not is_arch35():
+ # ============================================================
+ 
+ 
++def _print_pair_metrics(name, reference, actual):
+
+- reference, actual = reference.detach().cpu().float(), actual.detach().cpu().float()
+- finite = torch.isfinite(reference).all() & torch.isfinite(actual).all()
+- if not finite.item():
+- print(
+- f"CONV-BWD {name}: ref_nonfinite={(~torch.isfinite(reference)).sum().item()} "
+- f"actual_nonfinite={(~torch.isfinite(actual)).sum().item()}", flush=True,
+- )
+- return
+- ref_norm, act_norm = reference.norm(), actual.norm()
+- delta = actual - reference
+- cosine = (reference.flatten() @ actual.flatten()) / (ref_norm * act_norm).clamp_min(1e-24)
+- print(
+- f"CONV-BWD {name}: ref_norm={ref_norm.item():.6e} actual_norm={act_norm.item():.6e} "
+- f"abs_l2={delta.norm().item():.6e} rel_l2={(delta.norm() / ref_norm.clamp_min(1e-24)).item():.6e} "
+- f"cosine={cosine.item():.9f} max_abs={delta.abs().max().item():.6e}", flush=True,
+- )
+- 
+- 
+
++def _check_gradient_pairs(pairs, *, atol, rtol):
+
+- # Print every pair before any assertion, so a dw failure cannot hide dh0.
+- for name, (reference, actual) in pairs.items():
+- _print_pair_metrics(name, reference, actual)
+- failures = []
+- for name, (reference, actual) in pairs.items():
+- try:
+- torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
+- except AssertionError as exc:
+- failures.append(f"{name}: {exc}")
+- if failures:
+- raise AssertionError("\n".join(failures))
+- 
+- 
+
++def _diagnose_dw_tiles(arguments):
+
+- """Independent CPU formula for the actual per-tile weight-gradient buffers."""
+- x = arguments["x"].detach().cpu().float()
+- dz = arguments["dy"].detach().cpu().float()
+- h0 = arguments["initial_state"].detach().cpu().float()
+- if arguments["ACTIVATION"] in ("silu", "swish"):
+- z = arguments["y"].detach().cpu().float()
+- sigmoid = z.sigmoid()
+- dz = dz * sigmoid * (1 + z * (1 - sigmoid))
+- actual = arguments["dw"].detach().cpu().float()
+- bt, width = arguments["BT"], arguments["W"]
+- batch, length, channels = x.shape
+- chunks = (length + bt - 1) // bt
+- expected = torch.zeros_like(actual)
+- for b in range(batch):
+- for tile in range(chunks):
+- for lag in range(width):
+- for t in range(tile * bt, min((tile + 1) * bt, length)):
+- # This kernel partitions dw by the input time index.
+- if t + lag < length:
+- expected[b * chunks + tile, width - 1 - lag] += dz[b, t + lag] * x[b, t]
+- if t < lag:
+- expected[b * chunks + tile, width - 1 - lag] += dz[b, t] * h0[b, :, width - lag + t]
+- print(f"CONV-BWD dw-tiles BT={bt} BD={arguments['BD']} shape={tuple(actual.shape)}", flush=True)
+- for w in range(width):
+- _print_pair_metrics(f"dw-tiles/weight-row{w}", expected[:, w], actual[:, w])
+- error = (actual - expected).abs()
+- ranking = torch.nan_to_num(error, nan=float("inf"), posinf=float("inf"), neginf=float("inf"))
+- offset = ranking.flatten().argmax().item()
+- tile, remainder = divmod(offset, width * channels)
+- row, channel = divmod(remainder, channels)
+- print(
+- f"CONV-BWD dw-tiles worst tile={tile} row={row} channel={channel} "
+- f"expected={expected[tile, row, channel].item()} actual={actual[tile, row, channel].item()}",
+- flush=True,
+- )
+- 
+- 
+
+ class TestCausalConv1dBackward:
+     """Backward kernel gradient correctness."""
+ 
+@@ -88,13 +159,14 @@ class TestCausalConv1dBackward:
+         atol = 5e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+         rtol = 5e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+ 
+
+- torch.testing.assert_close(dx_npu.float(), x_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
+
+- pairs = {"dx": (x_ref.grad.to(dtype).float(), dx_npu.float())}
+         if dw_npu is not None:
+
+- torch.testing.assert_close(dw_npu.float(), w_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
+
+- pairs["dw"] = (w_ref.grad.to(dtype).float(), dw_npu.float())
+         if db_npu is not None and b_ref is not None:
+
+- torch.testing.assert_close(db_npu.float(), b_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
+
+- pairs["db"] = (b_ref.grad.to(dtype).float(), db_npu.float())
+         if dh0_npu is not None and h0_ref is not None:
+
+- torch.testing.assert_close(dh0_npu.float(), h0_ref.grad.to(dtype).float(), atol=atol, rtol=rtol)
+
+- pairs["dh0"] = (h0_ref.grad.to(dtype).float(), dh0_npu.float())
+- _check_gradient_pairs(pairs, atol=atol, rtol=rtol)
+
+ 
+     @pytest.mark.parametrize(
+         "B,T,D,W",
+@@ -108,6 +180,37 @@ class TestCausalConv1dBackward:
+         """Basic gradient correctness."""
+         self._run_bwd_test(B, T, D, W, torch.float32)
+ 
+
+- @pytest.mark.parametrize("bt", [1, 2, 4, 8])
+- @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+- @pytest.mark.parametrize("activation", [None, "silu"])
+- def test_initial_state_gradient_across_tiles(self, monkeypatch, bt, dtype, activation):
+- """Cover BT<W, BT=W and BT>W with the existing dx/dw/dh0 oracle."""
+- import mindspeed_ops.arch32.triton.convolution as convolution
+- 
+- # Controlled launch grid, not the physical core count. For B=1,T=64,
+- # the unchanged tile heuristic chooses BT=bt. Keep allocation and launch
+- # sizing consistent by changing its input rather than overriding kernel BT.
+- monkeypatch.setattr(convolution, "get_vector_num", lambda: 64 // bt)
+- original = convolution.causal_conv1d_bwd_kernel
+- launches = []
+- 
+- class TileProbe:
+- def **getitem**(self, grid):
+- launch = original[grid]
+- 
+- def traced(*args, **kwargs):
+- launches.append(kwargs["BT"])
+- result = launch(*args, **kwargs)
+- if bt == 1:
+- _diagnose_dw_tiles(kwargs)
+- return result
+- 
+- return traced
+- 
+- monkeypatch.setattr(convolution, "causal_conv1d_bwd_kernel", TileProbe())
+- self._run_bwd_test(1, 64, 256, 4, dtype, activation=activation, initial_state=True)
+- assert launches == [bt], f"requested BT={bt}, actually exercised {launches}"
+- 
+
+     def test_grad_with_bias(self):
+         self._run_bwd_test(2, 128, 256, 4, torch.float32, bias=True)
+ 
+@@ -275,6 +378,58 @@ class TestCausalConv1dVarlen:
+ class TestCausalConv1dState:
+     """initial_state / final_state semantics and gradient propagation."""
+ 
+
+- @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+- @pytest.mark.parametrize("activation", [None, "silu"])
+- def test_short_tile_split_backward_relay(self, monkeypatch, dtype, activation):
+- """Reproduce Stage 3.2's 6144-channel 64+64 full vs split conv relay."""
+- import mindspeed_ops.arch32.triton.convolution as convolution
+- 
+- monkeypatch.setattr(convolution, "get_vector_num", lambda: 32)
+- torch.manual_seed(3212)
+- x_full = torch.randn(1, 128, 6144, dtype=dtype, device=DEVICE, requires_grad=True)
+- w_full = (torch.randn(4, 6144, dtype=dtype, device=DEVICE) * 0.1).requires_grad_(True)
+- dy = torch.randn_like(x_full)
+- full_output, _ = causal_conv1d(x_full, w_full, activation=activation, output_final_state=True)
+- full_output.backward(dy)
+- 
+- x_prefix = x_full[:, :64].detach().clone().requires_grad_(True)
+- x_suffix = x_full[:, 64:].detach().clone().requires_grad_(True)
+- w_split = w_full.detach().clone().requires_grad_(True)
+- with torch.no_grad():
+- pushed, saved = causal_conv1d(x_prefix, w_split, activation=activation, output_final_state=True)
+- anchor = saved.detach().clone().requires_grad_(True)
+- suffix_output, _ = causal_conv1d(
+- x_suffix, w_split, initial_state=anchor, activation=activation, output_final_state=True
+- )
+- suffix_output.backward(dy[:, 64:])
+- assert anchor.grad is not None
+- prefix_output, final_state = causal_conv1d(
+- x_prefix, w_split, activation=activation, output_final_state=True
+- )
+- torch.autograd.backward((prefix_output, final_state), (dy[:, :64], anchor.grad))
+- 
+- # Independently validate the suffix state derivative with CPU autograd.
+- h0_ref = saved.detach().cpu().float().requires_grad_(True)
+- suffix_ref = causal_conv1d_ref(
+- x_suffix.detach().cpu().float(), w_split.detach().cpu().float(),
+- initial_state=h0_ref, activation=activation,
+- )
+- suffix_ref.backward(dy[:, 64:].cpu().float())
+- tolerance = 5e-2 if dtype == torch.bfloat16 else 1e-4
+- comparisons = {
+- "output": (full_output, torch.cat((pushed, suffix_output), dim=1)),
+- "dx": (x_full.grad, torch.cat((x_prefix.grad, x_suffix.grad), dim=1)),
+- "dw": (w_full.grad, w_split.grad),
+- "dh0": (h0_ref.grad, anchor.grad),
+- }
+- cpu_comparisons = {}
+- for name, (reference, actual) in comparisons.items():
+- assert reference is not None and actual is not None, name
+- reference, actual = reference.detach().cpu().float(), actual.detach().cpu().float()
+- cpu_comparisons[name] = (reference, actual)
+- _check_gradient_pairs(cpu_comparisons, atol=tolerance, rtol=tolerance)
+- torch.testing.assert_close(anchor.grad[:, :, 0], torch.zeros_like(anchor.grad[:, :, 0]), atol=0, rtol=0)
+- 
+
+     def test_final_state_shape(self):
+         B, T, D, W = 2, 128, 256, 4
+         x = torch.randn(B, T, D, dtype=torch.float32, device=DEVICE)
+这是commitbabee85cb00ade056b1c1627e64b10a524447025
+这是status  M mindspeed_ops/api/triton/chunk_gated_delta_rule.py
+ M mindspeed_ops/arch32/triton/convolution.py
+ M mindspeed_ops/arch32/triton/gdn/chunk_gated_delta_rule_fwd_h.py
+ M tests/unit_tests/triton/test_causal_conv1d/test_backward.py
+?? mindspeed_ops/mindspeed_ops_C.cpython-311-x86_64-linux-gnu.so
+?? mindspeed_ops_commit.txt
+?? mindspeed_ops_status.txt
+?? tests/unit_tests/triton/test_chunk_gated_delta_rule_stateful_experiment.py
