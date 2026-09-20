@@ -1,0 +1,185 @@
+"""Dependency-free lifecycle tests. Tensor/stream stubs do not prove NPU correctness."""
+
+import importlib.util
+from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace as NS
+import unittest
+from unittest.mock import Mock, patch
+
+
+SOURCE = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/activation_offload.py"
+
+
+class Tensor:
+    device = "npu:0"
+
+    def __init__(self, pointer):
+        self.pointer = pointer
+
+    def untyped_storage(self):
+        return NS(data_ptr=lambda: self.pointer)
+
+
+class Module:
+    def __init__(self):
+        self.forward = Mock()
+        self.handles = []
+
+    def register_forward_hook(self, hook):
+        self.forward_hook = hook
+        handle = NS(remove=Mock())
+        self.handles.append(handle)
+        return handle
+
+    def register_backward_hook(self, hook):
+        self.backward_hook = hook
+        handle = NS(remove=Mock())
+        self.handles.append(handle)
+        return handle
+
+
+class AdapterTest(unittest.TestCase):
+    def setUp(self):
+        context = ModuleType("_offload_test.context")
+        context.get_tpr_attention_context = lambda: None
+        torch = ModuleType("torch")
+        torch.Tensor = Tensor
+        self.stream = NS(wait_stream=Mock())
+        torch.npu = NS(current_stream=lambda: self.stream)
+        self.args = NS(swap_attention=False, pipeline_model_parallel_size=1)
+        training = ModuleType("megatron.training")
+        training.get_args = lambda: self.args
+        native_module = ModuleType("mindspeed.core.memory.swap_attention.prefetch")
+        native_module.get_args = training.get_args
+        native_package = ModuleType("mindspeed.core.memory.swap_attention")
+        native_package.prefetch = native_module
+        self.native = NS(
+            swap_tensors=[], prefetch_list=[], prefetch_data_ptr_list=[],
+            slice_tensor_storage_ptr_list=[], data_ptr={}, slice_tensor_storage_ptr={},
+            unpack_hook=Mock(side_effect=lambda item: item if isinstance(item, Tensor) else item.tensor),
+            h2d=Mock(), sync_d2h=Mock(), prefetch_stream=NS(synchronize=Mock()),
+            hook_swap_manager_forward=Mock(side_effect=lambda f, name: Mock(wraps=f)),
+        )
+        native_module.SwapPrefetch = Mock(return_value=self.native)
+        native_module.SwapPrefetch.swap_prefetch = None
+        native_module.get_layer_id = lambda name: "0"
+        self.imports = patch.dict(sys.modules, {
+            "torch": torch, "_offload_test.context": context,
+            "megatron.training": training,
+            "mindspeed.core.memory.swap_attention.prefetch": native_module,
+            "mindspeed.core.memory.swap_attention": native_package,
+        })
+        self.imports.start()
+        self.addCleanup(self.imports.stop)
+        spec = importlib.util.spec_from_file_location("_offload_test.activation_offload", SOURCE)
+        self.adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.adapter)
+        self.layer, self.attention = Module(), Module()
+        self.layer.self_attention = self.attention
+        self.layer.named_children = lambda: [("self_attention", self.attention)]
+        self.model = NS(
+            config=NS(swap_attention=True),
+            modules=lambda: [self.layer, self.attention],
+            named_modules=lambda: [("decoder.layers.0", self.layer)],
+            parameters=lambda: [],
+        )
+
+    def test_off_does_not_import_native_or_install_hooks(self):
+        self.model.config.swap_attention = False
+        with self.adapter.mindspeed_swap_attention(self.model, cp_size=4) as native:
+            self.assertIsNone(native)
+        self.assertFalse(self.layer.handles)
+
+    def test_global_flag_and_explicit_override(self):
+        self.model.config = NS()
+        self.args.swap_attention = True
+        self.assertTrue(self.adapter.swap_enabled(self.model))
+        self.model.config.swap_attention = False
+        self.assertFalse(self.adapter.swap_enabled(self.model))
+
+    def test_cp_and_checkpoint_rejected(self):
+        with self.assertRaisesRegex(NotImplementedError, "CP=1"):
+            self.adapter.validate_activation_offload(self.model, 2)
+        for name in ("recompute_granularity", "cpu_offloading", "fine_grained_activation_offloading"):
+            setattr(self.model.config, name, True)
+            with self.assertRaises(NotImplementedError):
+                self.adapter.validate_activation_offload(self.model, 1)
+            delattr(self.model.config, name)
+
+    def test_hooks_restore_after_success_and_error(self):
+        original = self.attention.forward
+        for fail in (False, True):
+            try:
+                with self.adapter.mindspeed_swap_attention(self.model) as native:
+                    self.assertIs(native, self.native)
+                    self.assertIsNot(self.attention.forward, original)
+                    if fail:
+                        raise ValueError("forward failed")
+            except ValueError:
+                pass
+            self.assertIs(self.attention.forward, original)
+            for handle in self.layer.handles:
+                handle.remove.assert_called_once()
+            self.layer.handles.clear()
+        self.assertEqual(self.native.prefetch_stream.synchronize.call_count, 2)
+
+    def test_exported_storage_and_aliases_stay_resident(self):
+        def item(ptr):
+            return NS(tensor=Tensor(ptr), storage_data_ptr=ptr, first_tensor=False, last_tensor=False)
+        first, alias, ordinary = item(3), item(3), item(4)
+        self.native.swap_tensors = [first, alias, ordinary]
+        self.adapter._protect_exports(self.native, {("npu:0", 3)})
+        self.assertTrue(first.tpr_resident and alias.tpr_resident)
+        self.assertEqual(self.native.swap_tensors, [ordinary])
+        self.assertEqual(self.native.data_ptr, {4: 0})
+        self.assertTrue(ordinary.first_tensor)
+        self.native.prefetch_stream.synchronize.assert_called_once()
+
+    def test_direct_state_root_reloads_with_native_h2d(self):
+        tensor = Tensor(42)
+        item = NS(tensor=tensor, stat="host", layer_name="decoder.layers.0.self_attention", h2d_event=object())
+        self.native.h2d.side_effect = lambda name: setattr(item, "stat", "h2d")
+        with self.adapter.mindspeed_swap_attention(self.model):
+            self.assertIs(self.native.unpack_hook(item), tensor)
+        self.native.h2d.assert_called_once_with(item.layer_name)
+        self.stream.wait_stream.assert_called_once_with(self.native.prefetch_stream)
+
+    def test_exported_handle_does_not_reload(self):
+        tensor = Tensor(42)
+        with self.adapter.mindspeed_swap_attention(self.model):
+            self.assertIs(self.native.unpack_hook(NS(tensor=tensor, tpr_resident=True)), tensor)
+        self.native.h2d.assert_not_called()
+
+    def test_duplicate_handle_without_own_event_reloads_owner(self):
+        item = NS(tensor=Tensor(42), stat="h2d", layer_name="decoder.layers.0.self_attention")
+        with self.adapter.mindspeed_swap_attention(self.model):
+            self.assertIs(self.native.unpack_hook(item), item.tensor)
+        self.native.h2d.assert_called_once_with(item.layer_name)
+        self.stream.wait_stream.assert_called_once_with(self.native.prefetch_stream)
+
+    def test_mindspeed_args_without_training_launcher(self):
+        training = sys.modules["megatron.training"]
+        training.get_args = Mock(side_effect=AssertionError("args is not initialized."))
+        mind_args = ModuleType("mindspeed.args_utils")
+        mind_args.get_full_args = lambda: self.args
+        self.args.swap_attention = True
+        self.model.config = NS()
+        with patch.dict(sys.modules, {"mindspeed.args_utils": mind_args}):
+            self.assertTrue(self.adapter.swap_enabled(self.model))
+            with self.adapter.mindspeed_swap_attention(self.model):
+                pass
+
+    def test_missing_targets_and_double_install_rejected(self):
+        self.model.config.swap_modules = "missing"
+        with self.assertRaisesRegex(RuntimeError, "matched no"):
+            with self.adapter.mindspeed_swap_attention(self.model):
+                pass
+        self.attention.no_checkpoint_adaptive_recompute_forward = object()
+        with self.assertRaisesRegex(RuntimeError, "already has"):
+            with self.adapter.mindspeed_swap_attention(self.model):
+                pass
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .context import KVPair, TPRAttentionContext, use_tpr_attention_context
+from .activation_offload import validate_activation_offload, with_activation_offload
 from .kv_stack import KVStack
 from .parallel.backend import TPRCPBackend, resolve_tpr_cp_backend
 from .parallel.execution_context import (
@@ -151,6 +152,7 @@ class SegmentExecutor:
                     raise ValueError(
                         f"segment {segment.segment_id} {exc}"
                     ) from exc
+        validate_activation_offload(model, self.cp_size)
         self._failed = False
 
     @property
@@ -192,6 +194,7 @@ class SegmentExecutor:
             self._failed = True
             raise
 
+    @with_activation_offload
     def pop(self, segment_id: SegmentId) -> SegmentBackwardResult:
         """Recompute owned loss once and relay FA KV / direct-parent GDN gradients."""
 
@@ -274,6 +277,7 @@ class SegmentExecutor:
             self._failed = True
             raise
 
+    @with_activation_offload
     def visit_leaf(self, segment_id: SegmentId) -> LeafVisitResult:
         """Forward/backward one leaf without writing its new KV to the path stack."""
 
