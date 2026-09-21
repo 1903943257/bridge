@@ -13,10 +13,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_model, _make_plan
-from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention, _PROFILE_MODEL_SHAPE
-from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-from verl.models.mcore.tpr.segment_plan import SegmentPlan
+# Model/spec helpers must be imported after runtime has installed MindSpeed's
+# backend patches. Importing them during collection caches missing TE providers.
 
 pytestmark = pytest.mark.skipif(os.getenv("TPR_RUN_OFFLOAD") != "1", reason="Set TPR_RUN_OFFLOAD=1")
 
@@ -25,7 +23,6 @@ pytestmark = pytest.mark.skipif(os.getenv("TPR_RUN_OFFLOAD") != "1", reason="Set
 def runtime():
     import torch.distributed as dist
     import torch_npu  # noqa: F401
-    from megatron.core import parallel_state
     assert int(os.getenv("WORLD_SIZE", "1")) == 1
     torch.npu.set_device(int(os.getenv("LOCAL_RANK", "0")))
     dist.init_process_group(backend="hccl")
@@ -39,6 +36,7 @@ def runtime():
     vars(get_full_args()).pop("", None)
     repatch(dict(context_parallel_size=1, experimental_attention_variant="gated_delta_net",
                  use_naive_l2norm=True, use_flash_attn=True, deterministic_mode=False))
+    from megatron.core import parallel_state
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=1,
                                              pipeline_model_parallel_size=1, context_parallel_size=1)
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -58,10 +56,10 @@ def native_args(runtime, monkeypatch):
     # Transfers, streams, pinned buffers and saved-tensor hooks remain real.
     from mindspeed import args_utils
     from verl.models.mcore.tpr import activation_offload
-    args = SimpleNamespace(swap_attention=False, pipeline_model_parallel_size=1,
-                           eval_interval=0, curr_iteration=1, noop_layers=None,
-                           swap_modules=os.getenv("TPR_SWAP_MODULES", "self_attention,mlp"))
-    monkeypatch.setattr(args_utils, "get_full_args", lambda: args)
+    args = SimpleNamespace(**vars(args_utils.get_full_args()))
+    vars(args).update(swap_attention=False, pipeline_model_parallel_size=1,
+                      eval_interval=0, curr_iteration=1, noop_layers=None,
+                      swap_modules=os.getenv("TPR_SWAP_MODULES", "self_attention,mlp"))
     # Feed both supported launchers without requiring Megatron-LM training.
     monkeypatch.setattr(activation_offload, "_args", lambda: args)
     prefetch = activation_offload._native_prefetch()
@@ -70,6 +68,9 @@ def native_args(runtime, monkeypatch):
 
 
 def _plan(prefix=1024, suffix=1024, owned=True):
+    from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_plan
+    from verl.models.mcore.tpr.segment_plan import SegmentPlan
+
     plan = _make_plan(torch.arange(prefix) % 2048,
                       (torch.arange(suffix) + 37) % 2048,
                       (torch.arange(suffix) + 93) % 2048)
@@ -80,6 +81,8 @@ def _plan(prefix=1024, suffix=1024, owned=True):
 
 
 def _run(model, plan, *, observe=False, counts=None):
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+
     model.zero_grad(set_to_none=True)
     logs = {}
 
@@ -162,11 +165,25 @@ def test_correctness(runtime, native_args, monkeypatch, kind, owned):
         model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
         binding = bind_stage1_gdn_primitives(gdn, model)
     else:
+        from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_model
+        from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
+
         model = _make_model(runtime.device, tpr=True, max_sequence_length=2048,
                             core_attention_module=_ProfileFusedCausalAttention,
                             model_shape=dict(hidden_size=512, ffn_hidden_size=2048,
-                                             num_attention_heads=8, num_query_groups=4, kv_channels=64))
+                                             num_attention_heads=8, num_query_groups=4, kv_channels=64,
+                                             experimental_attention_variant=None, linear_attention_freq=None,
+                                             transformer_impl="local"))
         binding = nullcontext()
+    if kind == "fa":
+        assert model.config.experimental_attention_variant is None
+        assert all(getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
+                   for layer in model.decoder.layers)
+    else:
+        assert model.config.linear_attention_freq == 4
+        assert sum(getattr(layer.self_attention, "tpr_state_kind", None) == "gdn"
+                   for layer in model.decoder.layers) == 3
+    model.config.swap_modules = native_args.swap_modules
     counts = _probe(monkeypatch)
     plan = _plan(owned=owned)
     with binding:
@@ -194,12 +211,19 @@ def test_correctness(runtime, native_args, monkeypatch, kind, owned):
 def test_capacity(runtime, native_args):
     if os.getenv("TPR_OFFLOAD_PROFILE") != "1":
         pytest.skip("Set TPR_OFFLOAD_PROFILE=1; run on/off in separate processes")
+    from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_model
+    from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention, _PROFILE_MODEL_SHAPE
+
     prefix = int(os.getenv("TPR_PREFIX", "16384"))
     suffix = int(os.getenv("TPR_SUFFIX", "4096"))
     enabled = os.getenv("TPR_OFFLOAD", "0") == "1"
     torch.manual_seed(123)
     model = _make_model(runtime.device, tpr=True, max_sequence_length=prefix + suffix,
-                        core_attention_module=_ProfileFusedCausalAttention, model_shape=_PROFILE_MODEL_SHAPE)
+                        core_attention_module=_ProfileFusedCausalAttention,
+                        model_shape=dict(_PROFILE_MODEL_SHAPE, experimental_attention_variant=None,
+                                         linear_attention_freq=None, transformer_impl="local"))
+    assert model.config.experimental_attention_variant is None
+    model.config.swap_modules = native_args.swap_modules
     model.config.swap_attention = enabled
     plan = _plan(prefix, suffix)
     # No CPU gradient/logprob snapshots or telemetry wrappers inside timed runs.

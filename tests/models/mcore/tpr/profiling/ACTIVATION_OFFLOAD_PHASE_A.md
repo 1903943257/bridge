@@ -75,6 +75,15 @@ existing TPR tests. Run from that checkout with its usual package paths. Capture
 all repository revisions, torch/torch_npu/CANN versions and device type alongside
 results; this harness deliberately does not enforce old PR-before Git hashes.
 
+Run this module in a fresh pytest process as shown below. Its runtime installs
+MindSpeed before importing model/spec helpers: importing the helpers first can
+cache a GPT spec module without `TESpecProvider` on NPU. Dense FA configurations
+explicitly set `experimental_attention_variant=None`, `linear_attention_freq=None`
+and `transformer_impl="local"`, overriding the runtime's global GDN defaults;
+the hybrid configuration retains `linear_attention_freq=4`. The fixture supplies
+offload args only to the adapter/native swap accessor and does not replace the
+global MindSpeed model-construction arguments with a partial namespace.
+
 ```sh
 TPR_RUN_OFFLOAD=1 torchrun --nproc_per_node=1 --master_port=29571 \
   -m pytest -sv tests/models/mcore/tpr/profiling/test_activation_offload_phase_a_npu.py -k correctness
