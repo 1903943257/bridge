@@ -296,17 +296,26 @@ def _make_engine(model, monkeypatch, finalizations):
 @contextmanager
 def _no_cp_probe(monkeypatch):
     import mindspeed.core.ssm.gated_delta_net as gdn
-    import mindspeed.core.transformer.dot_product_attention as dpa
+    import mindspeed.core.context_parallel.dot_product_attention as dpa
 
     ring = []
-    original = dpa.ringattn_context_parallel
-
-    def traced(*args, **kwargs):
-        ring.append(True)
-        return original(*args, **kwargs)
+    # The legacy transformer.dot_product_attention imports megatron.training
+    # unconditionally. Core-only installations use context_parallel instead.
+    # Observe a legacy binding only if the runtime already loaded that module.
+    targets = [dpa]
+    legacy = sys.modules.get("mindspeed.core.transformer.dot_product_attention")
+    if legacy is not None and legacy is not dpa:
+        targets.append(legacy)
 
     with monkeypatch.context() as patch, AllToAllProbe(gdn) as a2a:
-        patch.setattr(dpa, "ringattn_context_parallel", traced)
+        for module in targets:
+            original = module.ringattn_context_parallel
+
+            def traced(*args, _original=original, **kwargs):
+                ring.append(True)
+                return _original(*args, **kwargs)
+
+            patch.setattr(module, "ringattn_context_parallel", traced)
         yield
     assert not a2a.calls and not ring, f"CP1 entered A2A/Ring: {a2a.calls}/{ring}"
 
