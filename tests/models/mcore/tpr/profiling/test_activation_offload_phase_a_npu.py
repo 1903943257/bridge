@@ -20,7 +20,34 @@ pytestmark = pytest.mark.skipif(os.getenv("TPR_RUN_OFFLOAD") != "1", reason="Set
 
 
 @pytest.fixture(scope="module")
-def runtime():
+def npu_determinism():
+    """Optional native operator-level control; keep the GDN backend unchanged."""
+    enabled = os.getenv("TPR_OFFLOAD_DETERMINISTIC", "0")
+    if enabled not in ("0", "1"):
+        raise ValueError("TPR_OFFLOAD_DETERMINISTIC must be 0 or 1")
+    print(f"TPR_OFFLOAD_DETERMINISTIC={enabled}", flush=True)
+    if enabled == "0":
+        yield
+        return
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    variables = ("HCCL_DETERMINISTIC", "CLOSE_MATMUL_K_SHIFT", "PYTHONHASHSEED")
+    environment = {name: os.environ.get(name) for name in variables}
+    try:
+        from mindspeed.functional.npu_deterministic.npu_deterministic import extend_seed_all
+        extend_seed_all(123)
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+        for name, value in environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@pytest.fixture(scope="module")
+def runtime(npu_determinism):
     import torch.distributed as dist
     import torch_npu  # noqa: F401
     assert int(os.getenv("WORLD_SIZE", "1")) == 1
@@ -181,6 +208,7 @@ def test_correctness(runtime, native_args, monkeypatch, kind, owned):
                    for layer in model.decoder.layers)
     else:
         assert model.config.linear_attention_freq == 4
+        assert not model.config.deterministic_mode, "control must retain the optimized GDN backend"
         assert sum(getattr(layer.self_attention, "tpr_state_kind", None) == "gdn"
                    for layer in model.decoder.layers) == 3
     model.config.swap_modules = native_args.swap_modules
@@ -285,6 +313,7 @@ def test_capacity(runtime, native_args):
     print("TPR_OFFLOAD_PROFILE " + json.dumps(dict(
         offload=enabled, prefix=prefix, suffix=suffix, siblings=2,
         model="synthetic-dense-0.6B", latency_seconds=(time.perf_counter() - start) / 3,
+        deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
         peak_allocated_bytes=torch.npu.max_memory_allocated(),
         peak_reserved_bytes=torch.npu.max_memory_reserved(),
         cpu_process_highwater_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,

@@ -108,6 +108,28 @@ fraction printed as 0.0% by PyTorch is rounded, not zero. Chunked CPU diagnostic
 avoid allocating full FP32 copies of the large embedding tensor. These extra
 runs and diagnostics apply only to correctness, not capacity/latency timing.
 
+If `off_repeat` already fails, first stabilize the baseline with the existing
+MindSpeed operator-level deterministic initialization in a fresh process:
+
+```sh
+HCCL_DETERMINISTIC=True CLOSE_MATMUL_K_SHIFT=1 PYTHONHASHSEED=123 \
+TPR_RUN_OFFLOAD=1 TPR_OFFLOAD_DETERMINISTIC=1 \
+torchrun --nproc_per_node=1 --master_port=29571 -m pytest -sv \
+  tests/models/mcore/tpr/profiling/test_activation_offload_phase_a_npu.py \
+  -k 'correctness and hybrid'
+```
+
+This calls MindSpeed `extend_seed_all` (including strict PyTorch deterministic
+algorithms), preserves the original tolerance, and restores its flags/environment
+after the module. Model-level `deterministic_mode` stays false: enabling that
+flag can select a different GDN implementation and would change the comparison.
+Custom Triton kernels may still be nondeterministic; this control is not a
+guarantee of a repeatable baseline. Unsupported deterministic operations fail
+explicitly. If the baseline still fails, retain the full `TPR_OFFLOAD_COMPARE`
+numeric records for baseline/on/off-after before attributing differences to
+offload. Do not interpret a baseline failure as an offload pass. Run performance
+on/off comparisons with identical deterministic settings; profiles log that flag.
+
 Test-only probes observe real native calls: Push has no transfers; each Visit and
 Pop must release positive bytes (storage size actually becomes zero, host buffer
 is pinned) and reload positive bytes. `released_bytes` is cumulative release
