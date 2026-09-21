@@ -445,9 +445,35 @@ class SegmentExecutor:
             dtype=torch.float32,
             device=logits.device,
         )
-        selected_logits = logits[0].index_select(0, query_offsets).float()
-        per_term_loss = F.cross_entropy(selected_logits, targets, reduction="none")
-        loss_sum = torch.sum(per_term_loss * weights)
+        selected_logits = logits[0].index_select(0, query_offsets)
+        compute_language_model_loss = getattr(self.model, "compute_language_model_loss", None)
+        if callable(compute_language_model_loss):
+            # Follow Megatron's native language-model CE path instead of
+            # materializing an extra FP32 logits tensor in TPR. Megatron owns
+            # the FP32-stable softmax/CE implementation and selects fused versus
+            # unfused vocab-parallel CE from the model config.
+            #
+            # LanguageModule expects logits [sequence, batch, vocab] and labels
+            # [batch, sequence]. TPR has batch=1 and may select sparse query rows.
+            per_term_loss = compute_language_model_loss(
+                targets.unsqueeze(0),
+                selected_logits.unsqueeze(1),
+            ).reshape(-1)
+        else:
+            # Algebraic unit-test doubles are intentionally allowed to omit the
+            # Megatron LanguageModule API. Production GPTModel instances expose
+            # compute_language_model_loss and never take this fallback.
+            per_term_loss = F.cross_entropy(
+                selected_logits.float(),
+                targets,
+                reduction="none",
+            )
+        if per_term_loss.numel() != len(owned_terms):
+            raise RuntimeError(
+                f"segment {segment.segment_id} native CE returned {per_term_loss.numel()} "
+                f"losses for {len(owned_terms)} owned terms"
+            )
+        loss_sum = torch.sum(per_term_loss.reshape(-1).float() * weights)
         return loss_sum, loss_sum / self.plan.total_loss_weight
 
     def _owned_loss_terms(self, segment: SegmentSpec) -> tuple[SegmentLossTerm, ...]:

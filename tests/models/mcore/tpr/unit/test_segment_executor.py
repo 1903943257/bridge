@@ -14,6 +14,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from verl.models.mcore.tpr import (
@@ -38,6 +39,18 @@ class _FakeTPRModel(nn.Module):
         self.scale = nn.Parameter(torch.tensor(0.05))
         self.rotary_pos_emb = _FakeRotaryEmbedding()
         self.fail = fail
+        self.native_loss_calls = 0
+
+    def compute_language_model_loss(self, labels, logits):
+        self.native_loss_calls += 1
+        assert logits.ndim == 3 and logits.shape[1] == 1
+        assert labels.shape == (1, logits.shape[0])
+        loss = F.cross_entropy(
+            logits[:, 0, :].float(),
+            labels[0],
+            reduction="none",
+        )
+        return loss.unsqueeze(0)
 
     def forward(self, *, input_ids, position_ids, attention_mask):
         del position_ids, attention_mask
@@ -135,12 +148,36 @@ def test_push_pop_relays_child_kv_gradients_and_empties_stack():
 
 
 def test_loss_is_normalized_once_by_plan_total_weight():
-    executor = SegmentExecutor(_FakeTPRModel(), _plan(), expected_layer_numbers=(1, 2))
+    model = _FakeTPRModel()
+    executor = SegmentExecutor(model, _plan(), expected_layer_numbers=(1, 2))
     executor.push(0)
     executor.push(1)
     result = executor.pop(1)
 
     torch.testing.assert_close(result.normalized_loss, result.loss_sum / 6.0)
+    assert model.native_loss_calls == 1
+
+
+def test_loss_delegates_sparse_weighted_terms_to_model_native_ce():
+    model = _FakeTPRModel()
+    executor = SegmentExecutor(model, _plan(), expected_layer_numbers=(1, 2))
+    segment = executor.plan.get(0)
+    context, logits = executor._forward(segment, past_key_values={}, no_grad=False)
+
+    actual_sum, actual_normalized = executor._compute_loss(segment, logits)
+    offsets = torch.tensor([0, 3], dtype=torch.long)
+    targets = torch.tensor([2, 5], dtype=torch.long)
+    expected_terms = F.cross_entropy(
+        logits[0].index_select(0, offsets).float(),
+        targets,
+        reduction="none",
+    )
+    expected_sum = expected_terms[0] * 2.0 + expected_terms[1]
+
+    assert context.new_key_values
+    assert model.native_loss_calls == 1
+    torch.testing.assert_close(actual_sum, expected_sum)
+    torch.testing.assert_close(actual_normalized, expected_sum / executor.plan.total_loss_weight)
 
 
 def test_loss_scale_hook_scales_gradients_without_scaling_reported_loss():
