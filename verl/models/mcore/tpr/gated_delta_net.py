@@ -84,9 +84,15 @@ class TPRGatedDeltaNet(GatedDeltaNet):
             from .parallel.gdn_state import forward_gdn_cp_with_state
 
             output, final_state = forward_gdn_cp_with_state(
-                self, hidden_states, initial_state=initial_state
+                self,
+                hidden_states,
+                initial_state=initial_state,
+                output_final_state=context.capture_gdn_final_state,
             )
-            context.set_new_gdn_state(self.layer_number, final_state)
+            if context.capture_gdn_final_state:
+                if final_state is None:
+                    raise RuntimeError("stateful CP GDN did not return its requested final state")
+                context.set_new_gdn_state(self.layer_number, final_state)
             return output
 
         qkvzba, input_bias = self.in_proj(hidden_states)
@@ -114,8 +120,9 @@ class TPRGatedDeltaNet(GatedDeltaNet):
             self.conv1d.bias,
             activation=self.activation,
             initial_state=conv_initial_state,
+            output_final_state=context.capture_gdn_final_state,
         )
-        if final_conv_state is None:
+        if context.capture_gdn_final_state and final_conv_state is None:
             raise RuntimeError("Stage 1 causal-conv did not return its requested final state")
 
         query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
@@ -135,17 +142,20 @@ class TPRGatedDeltaNet(GatedDeltaNet):
             g=g,
             beta=beta,
             initial_state=recurrent_initial_state,
+            output_final_state=context.capture_gdn_final_state,
         )
-        if final_recurrent_state is None:
-            raise RuntimeError("Stage 1 gated-delta rule did not return its requested final state")
-
-        context.set_new_gdn_state(
-            self.layer_number,
-            GDNLayerState(
-                conv_state=final_conv_state,
-                recurrent_state=final_recurrent_state,
-            ),
-        )
+        if context.capture_gdn_final_state:
+            if final_recurrent_state is None:
+                raise RuntimeError("Stage 1 gated-delta rule did not return its requested final state")
+            if final_conv_state is None:
+                raise RuntimeError("Stage 1 causal-conv final state disappeared before collection")
+            context.set_new_gdn_state(
+                self.layer_number,
+                GDNLayerState(
+                    conv_state=final_conv_state,
+                    recurrent_state=final_recurrent_state,
+                ),
+            )
         normalized = self._apply_gated_norm(core_output, gate)
         normalized = normalized.reshape(batch, sequence_length, -1)
         normalized = normalized.transpose(0, 1).contiguous()
@@ -208,6 +218,7 @@ def _stage1_causal_conv1d(
     *,
     activation: str | None,
     initial_state: Tensor | None,
+    output_final_state: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     """Call the exact stateful CausalConv API validated by Stage 1."""
 
@@ -221,7 +232,7 @@ def _stage1_causal_conv1d(
         bias=bias,
         initial_state=initial_state,
         activation=activation,
-        output_final_state=True,
+        output_final_state=output_final_state,
     )
 
 
@@ -233,6 +244,7 @@ def _stage1_gated_delta_rule(
     g: Tensor,
     beta: Tensor,
     initial_state: Tensor | None,
+    output_final_state: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     """Call the exact stateful GDR API validated by Stage 1."""
 
@@ -245,7 +257,7 @@ def _stage1_gated_delta_rule(
         g=g,
         beta=beta,
         initial_state=initial_state,
-        output_final_state=True,
+        output_final_state=output_final_state,
         chunk_size=64,
         head_first=False,
     )

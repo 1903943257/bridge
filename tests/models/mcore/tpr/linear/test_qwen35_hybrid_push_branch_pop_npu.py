@@ -259,6 +259,38 @@ def _boundary_tensors(gdn, kv):
     return result
 
 
+def _clone_gdn_states(states):
+    return {
+        layer: (
+            state.conv_state.detach().clone(),
+            state.recurrent_state.detach().clone(),
+        )
+        for layer, state in states.items()
+    }
+
+
+def _assert_gdn_states_bitwise_equal(expected, actual, *, label):
+    assert tuple(expected) == tuple(actual), f"{label}: GDN layer keys changed"
+    for layer, (expected_conv, expected_recurrent) in expected.items():
+        state = actual[layer]
+        assert torch.equal(state.conv_state, expected_conv), f"{label}: layer {layer} conv_state mutated"
+        assert torch.equal(state.recurrent_state, expected_recurrent), (
+            f"{label}: layer {layer} recurrent_state mutated"
+        )
+
+
+def _run_tree_direct(model, plan, executor_cls):
+    model.zero_grad(set_to_none=True)
+    executor = executor_cls(model, plan)
+    executor.push(0)
+    executor.visit_leaf(1)
+    executor.visit_leaf(2)
+    executor.pop(0)
+    executor.kv_stack.assert_empty()
+    assert not executor.gdn_states
+    return _parameter_grads(model), executor
+
+
 def _make_engine(model, monkeypatch, finalizations):
     # Match the existing FA Engine fixture: suppress only the unrelated eager
     # MindSpeed-engine re-patcher; the actual Megatron Engine method is executed.
@@ -343,7 +375,10 @@ def _run_engine(model, plan, monkeypatch):
 
         def _forward(self, segment, **kwargs):
             context, logits = super()._forward(segment, **kwargs)
-            self._assert_collected_layers(context)
+            self._assert_collected_layers(
+                context,
+                expect_gdn_states=kwargs.get("capture_gdn_final_state", True),
+            )
             self.forwards.append((segment.segment_id, kwargs["no_grad"]))
             return context, logits
 
@@ -409,8 +444,13 @@ def _connected_reference(model, plan, *, probe=None):
         tensor.retain_grad()
     for leaf_id in (1, 2):
         with probe.segment(f"S{leaf_id}") if probe else nullcontext():
-            _, logits = executor._forward(plan.get(leaf_id), past_key_values=kv,
-                                          initial_gdn_states=gdn, no_grad=False)
+            _, logits = executor._forward(
+                plan.get(leaf_id),
+                past_key_values=kv,
+                initial_gdn_states=gdn,
+                no_grad=False,
+                capture_gdn_final_state=False,
+            )
         logprobs[leaf_id] = _term_logprobs(logits, plan.get(leaf_id)).detach().cpu()
         loss = loss + executor._compute_loss(plan.get(leaf_id), logits)[1]
     loss.backward()
@@ -603,3 +643,141 @@ def test_qwen35_cp1_repeatability_without_offload(runtime, monkeypatch, path, la
                     applicable=category != "prefix_grad" or path == "tpr")), flush=True)
             del actual
     assert not failures, "CP1 offload-disabled repeatability failures:\n" + "\n".join(failures)
+
+
+
+def test_leaf_final_state_capture_repeatability_control(runtime, monkeypatch):
+    """Report whether unused leaf final-state capture changes repeatability."""
+    import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+
+    torch.manual_seed(123)
+    model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
+    plan = _plan(1024, owned=True, offload_tokens=True)
+
+    class LegacyLeafCaptureExecutor(SegmentExecutor):
+        def _forward(self, segment, **kwargs):
+            if not kwargs["no_grad"] and not self.plan.children_of(segment.segment_id):
+                kwargs["capture_gdn_final_state"] = True
+            return super()._forward(segment, **kwargs)
+
+        def _assert_collected_layers(self, context, *, expect_gdn_states=True):
+            if context.new_gdn_states:
+                expect_gdn_states = True
+            return super()._assert_collected_layers(
+                context, expect_gdn_states=expect_gdn_states
+            )
+
+    with bind_stage1_gdn_primitives(mindspeed_gdn, model), _no_cp_probe(monkeypatch):
+        legacy_ref, _ = _run_tree_direct(model, plan, LegacyLeafCaptureExecutor)
+        legacy_repeat, _ = _run_tree_direct(model, plan, LegacyLeafCaptureExecutor)
+        current_ref, _ = _run_tree_direct(model, plan, SegmentExecutor)
+        current_repeat, _ = _run_tree_direct(model, plan, SegmentExecutor)
+
+    legacy = gradient_map_diagnostics(legacy_ref, legacy_repeat).aggregate
+    current = gradient_map_diagnostics(current_ref, current_repeat).aggregate
+    print("QWEN35_LEAF_FINAL_STATE_CONTROL " + json.dumps(dict(
+        legacy_relative_l2=legacy.relative_l2,
+        legacy_cosine=legacy.cosine,
+        current_relative_l2=current.relative_l2,
+        current_cosine=current.cosine,
+        relative_l2_ratio=current.relative_l2 / max(legacy.relative_l2, 1e-30),
+        reduced=current.relative_l2 < legacy.relative_l2,
+    )), flush=True)
+    assert all(torch.isfinite(torch.tensor(value)) for value in (
+        legacy.relative_l2, legacy.cosine, current.relative_l2, current.cosine
+    ))
+
+
+def test_push_saved_state_matches_pop_recompute(runtime, monkeypatch):
+    """Push graph-free GDN state must bitwise match Pop's fresh recomputed boundary."""
+    import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+
+    torch.manual_seed(123)
+    model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
+    plan = _plan(64, owned=True)
+
+    class RecomputeProbeExecutor(SegmentExecutor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.saved = None
+            self.recomputed = None
+
+        def push(self, segment_id):
+            result = super().push(segment_id)
+            self.saved = _clone_gdn_states(self.gdn_states[segment_id].layer_states)
+            return result
+
+        def _forward(self, segment, **kwargs):
+            context, logits = super()._forward(segment, **kwargs)
+            if segment.segment_id == 0 and not kwargs["no_grad"]:
+                self.recomputed = _clone_gdn_states(context.new_gdn_states)
+            return context, logits
+
+    with bind_stage1_gdn_primitives(mindspeed_gdn, model), _no_cp_probe(monkeypatch):
+        _, executor = _run_tree_direct(model, plan, RecomputeProbeExecutor)
+
+    assert executor.saved is not None and executor.recomputed is not None
+    assert executor.saved.keys() == executor.recomputed.keys()
+    for layer, (saved_conv, saved_recurrent) in executor.saved.items():
+        recomputed_conv, recomputed_recurrent = executor.recomputed[layer]
+        torch.testing.assert_close(recomputed_conv, saved_conv, rtol=0, atol=0)
+        torch.testing.assert_close(recomputed_recurrent, saved_recurrent, rtol=0, atol=0)
+    print("QWEN35_PUSH_POP_STATE_MATCH PASS", flush=True)
+
+
+def test_saved_prefix_state_is_read_only_across_leaf_forward_backward(runtime, monkeypatch):
+    """Zero-copy GDN anchors must never mutate persistent PrefixState storage."""
+    import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+
+    torch.manual_seed(123)
+    model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
+    plan = _plan(64, owned=True)
+
+    class ReadOnlyAnchorExecutor(SegmentExecutor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.saved = None
+            self.forward_checks = 0
+
+        def push(self, segment_id):
+            result = super().push(segment_id)
+            self.saved = _clone_gdn_states(self.gdn_states[segment_id].layer_states)
+            return result
+
+        def _forward(self, segment, **kwargs):
+            is_leaf = not kwargs["no_grad"] and not self.plan.children_of(segment.segment_id)
+            before = None
+            parent = None
+            if is_leaf:
+                parent = self.gdn_states[segment.parent_id]
+                before = _clone_gdn_states(parent.layer_states)
+            context, logits = super()._forward(segment, **kwargs)
+            if is_leaf:
+                _assert_gdn_states_bitwise_equal(
+                    before,
+                    parent.layer_states,
+                    label=f"leaf={segment.segment_id}/after-forward",
+                )
+                self.forward_checks += 1
+            return context, logits
+
+    model.zero_grad(set_to_none=True)
+    executor = ReadOnlyAnchorExecutor(model, plan)
+    with bind_stage1_gdn_primitives(mindspeed_gdn, model), _no_cp_probe(monkeypatch):
+        executor.push(0)
+        assert executor.saved is not None
+        for leaf_id in (1, 2):
+            executor.visit_leaf(leaf_id)
+            _assert_gdn_states_bitwise_equal(
+                executor.saved,
+                executor.gdn_states[0].layer_states,
+                label=f"leaf={leaf_id}/after-backward",
+            )
+        assert executor.forward_checks == 2
+        executor.pop(0)
+    executor.kv_stack.assert_empty()
+    assert not executor.gdn_states
+    print("QWEN35_PREFIX_STATE_READ_ONLY PASS", flush=True)

@@ -312,8 +312,9 @@ class SegmentExecutor:
                 no_grad=False,
                 sharded_past_anchors=anchors if self.cp_enabled else None,
                 initial_gdn_states={} if gdn_anchors is None else gdn_anchors.layer_states,
+                capture_gdn_final_state=False,
             )
-            self._assert_collected_layers(context)
+            self._assert_collected_layers(context, expect_gdn_states=False)
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
             owned_loss_term_count = len(self._owned_loss_terms(segment))
 
@@ -337,7 +338,7 @@ class SegmentExecutor:
                     segment_id=segment_id,
                     prefix_length=segment.prefix_length,
                     suffix_length=segment.length,
-                    layer_count=len(context.new_key_values) + len(context.new_gdn_states),
+                    layer_count=len(context.new_key_values) + len(self.gdn_layer_numbers),
                 ),
                 backward=SegmentBackwardResult(
                     segment_id=segment_id,
@@ -359,6 +360,7 @@ class SegmentExecutor:
         no_grad: bool,
         sharded_past_anchors: ShardedPastKVAnchors | None = None,
         initial_gdn_states: Mapping[int, GDNLayerState] | None = None,
+        capture_gdn_final_state: bool = True,
     ) -> tuple[TPRAttentionContext, Tensor]:
         device = _model_device(self.model)
         shard = self._segment_shard(segment)
@@ -391,6 +393,7 @@ class SegmentExecutor:
                 if initial_gdn_states is None and self.gdn_layer_numbers and len(self.kv_stack)
                 else (initial_gdn_states or {})
             ),
+            capture_gdn_final_state=capture_gdn_final_state,
         )
         grad_context = torch.no_grad() if no_grad else torch.enable_grad()
         with grad_context:
@@ -487,9 +490,11 @@ class SegmentExecutor:
         if self._failed:
             raise RuntimeError("SegmentExecutor is failed and cannot continue")
 
-    def _assert_collected_layers(self, context: TPRAttentionContext) -> None:
+    def _assert_collected_layers(
+        self, context: TPRAttentionContext, *, expect_gdn_states: bool = True
+    ) -> None:
         context.assert_new_kv_layers(self.expected_layer_numbers)
-        context.assert_new_gdn_layers(self.gdn_layer_numbers)
+        context.assert_new_gdn_layers(self.gdn_layer_numbers if expect_gdn_states else ())
 
     def _gdn_parent_state(self) -> GDNPrefixState:
         return self.gdn_states[self.kv_stack.top().segment.segment_id]

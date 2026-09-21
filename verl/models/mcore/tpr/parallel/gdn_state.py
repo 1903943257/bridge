@@ -22,8 +22,10 @@ def gdn_cp_state_shapes(layer, batch=1):
             (batch, heads // cp, layer.key_head_dim, layer.value_head_dim))
 
 
-def forward_gdn_cp_with_state(layer, hidden_states, initial_state=None):
-    """Return ((output, bias), GDNLayerState), retaining all state gradients.
+def forward_gdn_cp_with_state(
+    layer, hidden_states, initial_state=None, *, output_final_state=True
+):
+    """Return ((output, bias), optional GDNLayerState), retaining requested state gradients.
 
     Conv state is [B,Q_local+K_local+V_local,W], not a contiguous slice of
     the full concatenated QKV channels. Recurrent state is [B,Hv_local,K,V].
@@ -77,6 +79,7 @@ def forward_gdn_cp_with_state(layer, hidden_states, initial_state=None):
     convolved, conv_state = _stage1_causal_conv1d(
         qkv, weight.squeeze(1), conv_bias, activation=layer.activation,
         initial_state=None if initial_state is None else initial_state.conv_state,
+        output_final_state=output_final_state,
     )
     query, key, value, gate, beta, alpha = layer._prepare_qkv_for_gated_delta_rule(
         convolved, gate, beta, alpha, batch, sequence,
@@ -85,10 +88,15 @@ def forward_gdn_cp_with_state(layer, hidden_states, initial_state=None):
     core, recurrent_state = _stage1_gated_delta_rule(
         query, key, value, g=g, beta=beta,
         initial_state=None if initial_state is None else initial_state.recurrent_state,
+        output_final_state=output_final_state,
     )
-    state = GDNLayerState(conv_state, recurrent_state)
-    if (tuple(conv_state.shape), tuple(recurrent_state.shape)) != shapes:
-        raise RuntimeError(f"primitive returned unexpected state shapes; expected {shapes}")
+    state = None
+    if output_final_state:
+        if conv_state is None or recurrent_state is None:
+            raise RuntimeError("stateful GDN primitives did not return their requested final states")
+        state = GDNLayerState(conv_state, recurrent_state)
+        if (tuple(conv_state.shape), tuple(recurrent_state.shape)) != shapes:
+            raise RuntimeError(f"primitive returned unexpected state shapes; expected {shapes}")
     normalized = layer._apply_gated_norm(core, gate).reshape(batch, sequence, -1).transpose(0, 1).contiguous()
     normalized = native.tensor_a2a_hp2cp(
         normalized, seq_dim=0, head_dim=-1, cp_group=layer.pg_collection.cp,

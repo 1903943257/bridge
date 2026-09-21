@@ -111,6 +111,7 @@ class TPRAttentionContext:
     suffix_rotary_pos_emb: RotaryPosEmb | None = None
     attention_backend: TPRAttentionBackend | None = None
     initial_gdn_states: Mapping[int, GDNLayerState] = field(default_factory=dict)
+    capture_gdn_final_state: bool = True
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
     _new_gdn_states: dict[int, GDNLayerState] = field(default_factory=dict, init=False, repr=False)
 
@@ -119,6 +120,11 @@ class TPRAttentionContext:
             raise ValueError(f"prefix_length must be a non-negative integer, got {self.prefix_length!r}")
         if not isinstance(self.suffix_length, int) or isinstance(self.suffix_length, bool) or self.suffix_length <= 0:
             raise ValueError(f"suffix_length must be a positive integer, got {self.suffix_length!r}")
+        if not isinstance(self.capture_gdn_final_state, bool):
+            raise TypeError(
+                "capture_gdn_final_state must be a bool, "
+                f"got {type(self.capture_gdn_final_state).__name__}"
+            )
         if self.prefix_length == 0 and self.past_key_values:
             raise ValueError("past_key_values must be empty when prefix_length is 0")
         if self.prefix_length == 0 and self.initial_gdn_states:
