@@ -2,6 +2,8 @@
 
 Status: implementation plus NPU acceptance harness. Phase A is intentionally
 **Full-Attention only**. GDN/Hybrid support is not implemented or accepted here.
+All NPU profiling/capacity acceptance uses real Qwen3-1.7B or Qwen3-4B checkpoints;
+the old synthetic ~0.6B proxy is no longer a valid experiment target.
 
 ## Scope
 
@@ -71,7 +73,9 @@ TPR_RUN_OFFLOAD=1 torchrun --nproc_per_node=1 --master_port=29571 \\
 
 There are exactly two correctness cases: FA with root-owned loss and FA without
 root-owned loss. The latter forces Pop to run from relayed dKV roots without a
-Prefix-owned loss term.
+Prefix-owned loss term. Both cases use a real checkpoint. The default target is
+`/workspace/hf_models/Qwen3-1.7B`; set `TPR_QWEN_PROFILE_SIZE=4B` for
+`/workspace/hf_models/Qwen3-4B`. `TPR_QWEN_MODEL_PATH` may override the path.
 
 Each case uses the same model/weights and runs:
 
@@ -99,6 +103,7 @@ Run off/on in separate fresh processes:
 for suffix in 4096 16384; do
   for offload in 0 1; do
     TPR_RUN_OFFLOAD=1 TPR_OFFLOAD_PROFILE=1 TPR_OFFLOAD=$offload \\
+    TPR_QWEN_PROFILE_SIZE=1.7B \\
     TPR_PREFIX=16384 TPR_SUFFIX=$suffix \\
     torchrun --nproc_per_node=1 --master_port=29572 -m pytest -sv \\
       tests/models/mcore/tpr/profiling/test_activation_offload_phase_a_npu.py \\
@@ -107,12 +112,13 @@ for suffix in 4096 16384; do
 done
 ```
 
-The capacity test uses the existing synthetic dense Full-Attention ~0.6B/32-layer
-model with two siblings, one warmup and three measured Push/Visit/Visit/Pop
-iterations. It reports synchronized mean latency, NPU peak allocated/reserved
-bytes and process CPU high-water RSS. An OOM is a failed capacity result.
+The capacity test uses the selected real Qwen3-1.7B/4B checkpoint with two
+siblings, one warmup and three measured Push/Visit/Visit/Pop iterations. It
+reports synchronized mean latency, NPU peak allocated/reserved bytes and process
+CPU high-water RSS. An OOM is a failed capacity result, not a reason to fall back
+to a smaller synthetic model.
 
-The proxy does not claim optimizer/full-training capacity. Once Phase A FA
+The profile does not claim optimizer/full-training capacity. Once Phase A FA
 correctness and capacity are closed, end-to-end FA training should be measured
 with the same native swap configuration.
 

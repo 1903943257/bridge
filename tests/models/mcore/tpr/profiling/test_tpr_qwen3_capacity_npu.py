@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in TPR-only capacity smoke for real Qwen3-0.6B at an 8K + 8K path."""
+"""Opt-in TPR-only capacity smoke for real Qwen3-1.7B/4B.
+
+Defaults: Qwen3-1.7B from /workspace/hf_models/Qwen3-1.7B and P=S=8192.
+Synthetic and Qwen3-0.6B capacity experiments are intentionally unsupported.
+"""
 
 import gc
 import math
@@ -22,14 +26,15 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from ._qwen3_profile_target import resolve_qwen3_profile_target
 from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
+from ..correctness import test_tpr_qwen3_compatibility_npu as qwen_fixture
 from ..equivalence.test_tpr_engine_reference_equivalence_npu import (
     _configure_model_runtime,
     _make_engine,
     _make_plan,
 )
 from ..correctness.test_tpr_qwen3_compatibility_npu import (
-    QWEN_VOCAB_SIZE,
     _initialize_single_rank_megatron,
     _make_qwen_model,
 )
@@ -46,25 +51,25 @@ pytestmark = pytest.mark.skipif(
     reason="Set TPR_RUN_QWEN_TPR_CAPACITY=1 for the real Qwen3 TPR capacity smoke",
 )
 
-_PREFIX_LENGTH = 8192
-_SUFFIX_LENGTH = 8192
-_SIBLING_COUNT = 2
+_PREFIX_LENGTH = int(os.getenv("TPR_PREFIX", "8192"))
+_SUFFIX_LENGTH = int(os.getenv("TPR_SUFFIX", "8192"))
+_SIBLING_COUNT = int(os.getenv("TPR_SIBLINGS", "2"))
 
 
-def _tokens(start: int, length: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(start, start + length, dtype=torch.long, device=device) % QWEN_VOCAB_SIZE
+def _tokens(start: int, length: int, vocab_size: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(start, start + length, dtype=torch.long, device=device) % vocab_size
 
 
 def _gib(num_bytes: int) -> float:
     return num_bytes / (1024**3)
 
 
-def test_qwen3_tpr_runs_8k_prefix_8k_suffix_engine_step(monkeypatch):
+def test_qwen3_tpr_capacity_engine_step(monkeypatch):
     torch.manual_seed(2026)
     device = torch.device("npu")
+    target = resolve_qwen3_profile_target()
+    monkeypatch.setattr(qwen_fixture, "QWEN_MODEL_PATH", target.path)
 
-    # Megatron must own the global memory buffer before the test-only runtime
-    # stubs are installed; otherwise model construction attempts a second init.
     _initialize_single_rank_megatron()
     _install_single_rank_runtime(monkeypatch, device)
 
@@ -74,12 +79,14 @@ def test_qwen3_tpr_runs_8k_prefix_8k_suffix_engine_step(monkeypatch):
         max_sequence_length=_PREFIX_LENGTH + _SUFFIX_LENGTH,
         core_attention_module=_ProfileFusedCausalAttention,
     )
+    parameter_count = target.assert_model_scale(model)
     _configure_model_runtime(model)
     engine = _make_engine(model, tpr_enabled=True, monkeypatch=monkeypatch)
 
-    prefix = _tokens(17, _PREFIX_LENGTH, device)
+    vocab_size = target.hf_config.vocab_size
+    prefix = _tokens(17, _PREFIX_LENGTH, vocab_size, device)
     suffixes = tuple(
-        _tokens(50000 + sibling * 20000, _SUFFIX_LENGTH, device)
+        _tokens(50000 + sibling * 20000, _SUFFIX_LENGTH, vocab_size, device)
         for sibling in range(_SIBLING_COUNT)
     )
     plan = _make_plan(prefix, *suffixes)
@@ -112,7 +119,9 @@ def test_qwen3_tpr_runs_8k_prefix_8k_suffix_engine_step(monkeypatch):
         gradient_tensor_count += 1
     assert gradient_tensor_count > 0
 
-    print("\nQwen3-0.6B TPR-only capacity smoke")
+    print(f"\n{target.label} TPR-only capacity smoke")
+    print(f"Checkpoint: {target.path}")
+    print(f"Parameters: {parameter_count / 1e9:.3f}B")
     print(f"Case: P={_PREFIX_LENGTH}, S={_SUFFIX_LENGTH}, N={_SIBLING_COUNT}")
     print(f"Loss: {loss:.9f}")
     print(f"Gradient tensors checked: {gradient_tensor_count}")

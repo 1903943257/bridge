@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in controlled fused-reference profile for the TPR Engine MVP."""
+"""Shared controlled fused-reference profiling harness for real Qwen3 experiments.
+
+The old standalone synthetic ~0.6B profile is disabled. Real-model entry points
+must inject a Qwen3-1.7B or Qwen3-4B model factory before calling this harness.
+"""
 
 import copy
 import gc
@@ -49,13 +53,10 @@ from verl.models.mcore.tpr.kv_stack import KVStack, KVStackEntry, SegmentKV
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 
+_DEFAULT_PROFILE_MODEL_FACTORY = _make_model
+
 if not is_torch_npu_available(check_device=True):
     pytest.skip("Requires an Ascend NPU", allow_module_level=True)
-
-pytestmark = pytest.mark.skipif(
-    os.getenv("TPR_RUN_PROFILE") != "1",
-    reason="Set TPR_RUN_PROFILE=1 for the non-gating NPU profile",
-)
 
 _PROFILE_CASES = (
     (16384, 512, 2),
@@ -72,21 +73,11 @@ _PROFILE_CASES = (
     (1024, 8192, 8),
 )
 
-# A roughly 0.6B synthetic dense-model proxy.  A deliberately modest vocab
-# keeps long-sequence logits from dominating the attention/scheduler profile.
-_PROFILE_MODEL_SHAPE = {
-    "num_layers": 32,
-    "hidden_size": 1280,
-    "ffn_hidden_size": 5120,
-    "num_attention_heads": 20,
-    "num_query_groups": 4,
-    "kv_channels": 64,
-    "vocab_size": 8192,
-}
-_PROFILE_NUM_LAYERS = _PROFILE_MODEL_SHAPE["num_layers"]
-_PROFILE_VOCAB_SIZE = _PROFILE_MODEL_SHAPE["vocab_size"]
-_MIN_PROFILE_PARAMETERS = 500_000_000
-_MAX_PROFILE_PARAMETERS = 700_000_000
+# Real-Qwen entry points must inject these before running the shared harness.
+# Keeping them unset prevents accidental fallback to the removed synthetic proxy.
+_PROFILE_MODEL_SHAPE = None
+_PROFILE_NUM_LAYERS = None
+_PROFILE_VOCAB_SIZE = None
 
 _WARMUP_RUNS = 3
 _MEASURE_RUNS = 10
@@ -832,14 +823,22 @@ def _profile_reference_loss_function(*, model_output, data, dp_group):
 
 
 def _assert_profile_model_scale(model):
-    parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    assert _MIN_PROFILE_PARAMETERS <= parameter_count <= _MAX_PROFILE_PARAMETERS, (
-        f"profile model must remain 0.6B-class, got {parameter_count / 1e9:.3f}B parameters"
+    raise RuntimeError(
+        "real Qwen profile entry must inject its model-scale validator"
     )
-    return parameter_count
+
+
+def _ensure_real_profile_configured():
+    if _make_model is _DEFAULT_PROFILE_MODEL_FACTORY:
+        raise RuntimeError(
+            "synthetic TPR profiling is disabled; use a Qwen3-1.7B/4B entry point"
+        )
+    if _PROFILE_NUM_LAYERS is None or _PROFILE_VOCAB_SIZE is None:
+        raise RuntimeError("real Qwen profile metadata was not injected")
 
 
 def _profile_reference(monkeypatch, prefix_length, suffix_length, sibling_count):
+    _ensure_real_profile_configured()
     device = torch.device("npu")
     full_length = prefix_length + suffix_length
     model = _make_model(
@@ -877,6 +876,7 @@ def _profile_reference(monkeypatch, prefix_length, suffix_length, sibling_count)
 
 
 def _profile_tpr(monkeypatch, prefix_length, suffix_length, sibling_count, initial_state):
+    _ensure_real_profile_configured()
     device = torch.device("npu")
     full_length = prefix_length + suffix_length
     model = _make_model(
@@ -1106,9 +1106,9 @@ def _print_case(prefix_length, suffix_length, sibling_count, reference, tpr):
     return speedup, memory_reduction
 
 
-def test_tpr_engine_profile_report(monkeypatch):
-    """Report controlled fused-kernel latency and memory without performance assertions."""
-
+def _run_tpr_engine_profile_report(monkeypatch):
+    """Run the shared profile after a real Qwen model factory is injected."""
+    _ensure_real_profile_configured()
     torch.manual_seed(2026)
     device = torch.device("npu")
     _install_single_rank_runtime(monkeypatch, device)

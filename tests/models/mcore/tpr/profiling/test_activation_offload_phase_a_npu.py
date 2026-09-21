@@ -1,4 +1,4 @@
-"""FA-only native-swap correctness and capacity gates; see adjacent Phase A guide."""
+"""FA-only native-swap gates on real Qwen3-1.7B/4B; see Phase A guide."""
 
 from dataclasses import replace
 import json
@@ -64,6 +64,29 @@ def native_args(runtime, monkeypatch):
     prefetch = activation_offload._native_prefetch()
     monkeypatch.setattr(prefetch, "get_args", lambda: args)
     return args
+
+
+def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length):
+    from ._qwen3_profile_target import resolve_qwen3_profile_target
+    from ..correctness import test_tpr_qwen3_compatibility_npu as qwen_fixture
+    from ..correctness.test_tpr_qwen3_compatibility_npu import _make_qwen_model
+    from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
+
+    target = resolve_qwen3_profile_target()
+    monkeypatch.setattr(qwen_fixture, "QWEN_MODEL_PATH", target.path)
+    model = _make_qwen_model(
+        runtime.device,
+        tpr=True,
+        max_sequence_length=max_sequence_length,
+        core_attention_module=_ProfileFusedCausalAttention,
+    )
+    parameter_count = target.assert_model_scale(model)
+    assert model.config.experimental_attention_variant is None
+    assert all(
+        getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
+        for layer in model.decoder.layers
+    )
+    return model, target, parameter_count
 
 
 def _plan(prefix=1024, suffix=1024, owned=True):
@@ -153,18 +176,11 @@ def _probe(monkeypatch):
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "no-owned"])
 def test_correctness(runtime, native_args, monkeypatch, owned):
     torch.manual_seed(123)
-    from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_model
-    from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
-
-    model = _make_model(runtime.device, tpr=True, max_sequence_length=2048,
-                        core_attention_module=_ProfileFusedCausalAttention,
-                        model_shape=dict(hidden_size=512, ffn_hidden_size=2048,
-                                         num_attention_heads=8, num_query_groups=4, kv_channels=64,
-                                         experimental_attention_variant=None, linear_attention_freq=None,
-                                         transformer_impl="local"))
-    assert model.config.experimental_attention_variant is None
-    assert all(getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
-               for layer in model.decoder.layers)
+    model, target, parameter_count = _make_real_qwen_model(
+        runtime,
+        monkeypatch,
+        max_sequence_length=2048,
+    )
     model.config.swap_modules = native_args.swap_modules
     counts = _probe(monkeypatch)
     plan = _plan(owned=owned)
@@ -188,7 +204,13 @@ def test_correctness(runtime, native_args, monkeypatch, owned):
         else:
             assert counts == before
     assert not failures, "Offload correctness failures (see TPR_OFFLOAD_COMPARE):\n" + "\n".join(failures)
-    print("TPR_OFFLOAD_CORRECTNESS " + json.dumps(dict(model="fa", owned=owned, **counts)), flush=True)
+    print("TPR_OFFLOAD_CORRECTNESS " + json.dumps(dict(
+        model=target.label,
+        checkpoint=str(target.path),
+        parameter_count=parameter_count,
+        owned=owned,
+        **counts,
+    )), flush=True)
 
 def _difference_metrics(expected, actual):
     """CPU diagnostics in bounded chunks."""
@@ -236,23 +258,19 @@ def _compare_runs(reference, actual, *, owned, stage):
     return failures
 
 
-def test_capacity(runtime, native_args):
+def test_capacity(runtime, native_args, monkeypatch):
     if os.getenv("TPR_OFFLOAD_PROFILE") != "1":
         pytest.skip("Set TPR_OFFLOAD_PROFILE=1; run on/off in separate processes")
-    from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_model
-    from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention, _PROFILE_MODEL_SHAPE
 
     prefix = int(os.getenv("TPR_PREFIX", "16384"))
     suffix = int(os.getenv("TPR_SUFFIX", "4096"))
     enabled = os.getenv("TPR_OFFLOAD", "0") == "1"
     torch.manual_seed(123)
-    model = _make_model(runtime.device, tpr=True, max_sequence_length=prefix + suffix,
-                        core_attention_module=_ProfileFusedCausalAttention,
-                        model_shape=dict(_PROFILE_MODEL_SHAPE, experimental_attention_variant=None,
-                                         linear_attention_freq=None, transformer_impl="local"))
-    assert model.config.experimental_attention_variant is None
-    assert all(getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
-               for layer in model.decoder.layers)
+    model, target, parameter_count = _make_real_qwen_model(
+        runtime,
+        monkeypatch,
+        max_sequence_length=prefix + suffix,
+    )
     model.config.swap_modules = native_args.swap_modules
     model.config.swap_attention = enabled
     plan = _plan(prefix, suffix)
@@ -266,7 +284,8 @@ def test_capacity(runtime, native_args):
     torch.npu.synchronize()
     print("TPR_OFFLOAD_PROFILE " + json.dumps(dict(
         offload=enabled, prefix=prefix, suffix=suffix, siblings=2,
-        model="synthetic-dense-0.6B", latency_seconds=(time.perf_counter() - start) / 3,
+        model=target.label, checkpoint=str(target.path), parameter_count=parameter_count,
+        latency_seconds=(time.perf_counter() - start) / 3,
         deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
         peak_allocated_bytes=torch.npu.max_memory_allocated(),
         peak_reserved_bytes=torch.npu.max_memory_reserved(),

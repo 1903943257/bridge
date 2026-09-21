@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in Qwen3-0.6B/1.7B/4B Reference versus TPR profile with CP=1/2/4.
+"""Opt-in Qwen3-1.7B/4B Reference versus TPR profile with CP=1/2/4.
 
 The Reference executes every complete ``P + S`` trajectory independently.
 TPR executes one shared Prefix followed by all Suffixes.  Model construction,
@@ -20,17 +20,17 @@ checkpoint loading, plan construction, warmup, and gradient clearing are not
 timed.  Each measured sample includes forward, loss, backward, and one final
 CP parameter-gradient synchronization (omitted for CP=1).
 
-Select TPR_QWEN_PROFILE_SIZE=0.6B, 1.7B or 4B (default: 0.6B).
+Select TPR_QWEN_PROFILE_SIZE=1.7B or 4B (default: 1.7B).
 Checkpoints default to /workspace/hf_models/Qwen3-<size>; override with
-TPR_QWEN_MODEL_PATH or the size-specific TPR_QWEN_0_6B_PATH,
-TPR_QWEN_1_7B_PATH or TPR_QWEN_4B_PATH. CP is WORLD_SIZE, set by
+TPR_QWEN_MODEL_PATH or the size-specific TPR_QWEN_1_7B_PATH /
+TPR_QWEN_4B_PATH. Synthetic and 0.6B profiles are intentionally unsupported. CP is WORLD_SIZE, set by
 torchrun --nproc_per_node=1, 2 or 4. CP=1 uses local rectangular attention;
 CP>1 uses Ring. All sizes use the same MindSpeed bootstrap and loss path.
 
 Run all cases from the verl repository root with two visible NPUs::
 
     TPR_RUN_QWEN_RING_CP_PROFILE=1 \
-    TPR_QWEN_0_6B_PATH=/workspace/hf_models/Qwen3-0.6B \
+    TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B \
     torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29551 \
         -m pytest -s -v -x \
         tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py
@@ -52,14 +52,12 @@ import sys
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
-from transformers import AutoConfig
 from megatron.core import parallel_state
 
 import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
@@ -74,8 +72,8 @@ from verl.models.mcore.tpr import (
 )
 from verl.utils.device import is_torch_npu_available
 
+from ._qwen3_profile_target import resolve_qwen3_profile_target
 from ..parallel._ring_block_probe import ring_block_probe
-from ..correctness.test_tpr_qwen3_compatibility_npu import _validate_checkpoint_files
 from ..parallel.test_tpr_qwen3_cp_equivalence_npu import (
     _make_qwen_cp_model,
 )
@@ -1375,20 +1373,10 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
             f"Ring profile requires CP={_EXPECTED_WORLD_SIZE}, got {runtime.cp_size}"
         )
 
-    size = os.getenv("TPR_QWEN_PROFILE_SIZE", "0.6B")
-    choices = {
-        "0.6B": ("TPR_QWEN_0_6B_PATH", 500_000_000, 700_000_000),
-        "1.7B": ("TPR_QWEN_1_7B_PATH", 1_500_000_000, 1_900_000_000),
-        "4B": ("TPR_QWEN_4B_PATH", 3_500_000_000, 4_500_000_000),
-    }
-    if size not in choices:
-        raise ValueError(f"Unsupported TPR_QWEN_PROFILE_SIZE={size!r}; choose {tuple(choices)}")
-    path_env, minimum, maximum = choices[size]
-    model_path = Path(os.getenv(path_env, os.getenv("TPR_QWEN_MODEL_PATH", f"/workspace/hf_models/Qwen3-{size}")))
-    _validate_checkpoint_files(model_path)
-    hf_config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
-    if hf_config.model_type != "qwen3":
-        raise ValueError(f"Expected dense Qwen3, got {hf_config.model_type!r}")
+    target = resolve_qwen3_profile_target()
+    size = target.size
+    model_path = target.path
+    hf_config = target.hf_config
     model_case = SimpleNamespace(path=model_path)
     model = _make_qwen_cp_model(runtime, model_case, hf_config)
     config = model.config
@@ -1404,8 +1392,7 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
         assert actual == expected
     assert len(model.decoder.layers) == hf_config.num_hidden_layers
     assert model.share_embeddings_and_output_weights == hf_config.tie_word_embeddings
-    parameters = sum(parameter.numel() for parameter in model.parameters())
-    assert minimum <= parameters <= maximum, f"Qwen3-{size}: unexpected parameter count {parameters}"
+    parameters = target.assert_model_scale(model)
     if runtime.rank == 0:
         print(f"Qwen3-{size}: checkpoint={model_path}, CP={runtime.cp_size}")
         print(f"Prefix FULL coalescing: {os.getenv('TPR_RING_COALESCE_PREFIX_FULL', '0') == '1'}")
