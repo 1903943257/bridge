@@ -98,6 +98,12 @@ class AdapterTest(unittest.TestCase):
         self.model.config.swap_attention = False
         self.assertFalse(self.adapter.swap_enabled(self.model))
 
+    def test_hybrid_gdn_rejected(self):
+        self.attention.tpr_state_kind = "gdn"
+        with self.assertRaisesRegex(NotImplementedError, "Full Attention only"):
+            self.adapter.validate_activation_offload(self.model, 1)
+        del self.attention.tpr_state_kind
+
     def test_cp_and_checkpoint_rejected(self):
         with self.assertRaisesRegex(NotImplementedError, "CP=1"):
             self.adapter.validate_activation_offload(self.model, 2)
@@ -124,6 +130,21 @@ class AdapterTest(unittest.TestCase):
             self.layer.handles.clear()
         self.assertEqual(self.native.prefetch_stream.synchronize.call_count, 2)
 
+    def test_external_storage_extension_seam_is_fa_only_by_default(self):
+        context = NS(
+            past_key_values={1: (Tensor(1), Tensor(2))},
+            new_key_values={1: (Tensor(3), Tensor(4))},
+        )
+        with patch.object(self.adapter, "get_tpr_attention_context", return_value=context):
+            self.assertEqual(
+                self.adapter._external_storages(),
+                {("npu:0", 1), ("npu:0", 2), ("npu:0", 3), ("npu:0", 4)},
+            )
+            with patch.object(
+                self.adapter, "_iter_extra_external_tensors", return_value=(Tensor(5),)
+            ):
+                self.assertIn(("npu:0", 5), self.adapter._external_storages())
+
     def test_exported_storage_and_aliases_stay_resident(self):
         def item(ptr):
             return NS(tensor=Tensor(ptr), storage_data_ptr=ptr, first_tensor=False, last_tensor=False)
@@ -136,7 +157,7 @@ class AdapterTest(unittest.TestCase):
         self.assertTrue(ordinary.first_tensor)
         self.native.prefetch_stream.synchronize.assert_called_once()
 
-    def test_direct_state_root_reloads_with_native_h2d(self):
+    def test_direct_kv_root_reloads_with_native_h2d(self):
         tensor = Tensor(42)
         item = NS(tensor=tensor, stat="host", layer_name="decoder.layers.0.self_attention", h2d_event=object())
         self.native.h2d.side_effect = lambda name: setattr(item, "stat", "h2d")

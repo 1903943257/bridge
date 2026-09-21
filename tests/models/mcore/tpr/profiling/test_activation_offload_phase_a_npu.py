@@ -1,6 +1,5 @@
-"""Opt-in native-swap correctness and capacity gates; see adjacent Phase A guide."""
+"""FA-only native-swap correctness and capacity gates; see adjacent Phase A guide."""
 
-from contextlib import nullcontext
 from dataclasses import replace
 import json
 import os
@@ -20,34 +19,7 @@ pytestmark = pytest.mark.skipif(os.getenv("TPR_RUN_OFFLOAD") != "1", reason="Set
 
 
 @pytest.fixture(scope="module")
-def npu_determinism():
-    """Optional native operator-level control; keep the GDN backend unchanged."""
-    enabled = os.getenv("TPR_OFFLOAD_DETERMINISTIC", "0")
-    if enabled not in ("0", "1"):
-        raise ValueError("TPR_OFFLOAD_DETERMINISTIC must be 0 or 1")
-    print(f"TPR_OFFLOAD_DETERMINISTIC={enabled}", flush=True)
-    if enabled == "0":
-        yield
-        return
-    previous = torch.are_deterministic_algorithms_enabled()
-    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    variables = ("HCCL_DETERMINISTIC", "CLOSE_MATMUL_K_SHIFT", "PYTHONHASHSEED")
-    environment = {name: os.environ.get(name) for name in variables}
-    try:
-        from mindspeed.functional.npu_deterministic.npu_deterministic import extend_seed_all
-        extend_seed_all(123)
-        yield
-    finally:
-        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
-        for name, value in environment.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-
-@pytest.fixture(scope="module")
-def runtime(npu_determinism):
+def runtime():
     import torch.distributed as dist
     import torch_npu  # noqa: F401
     assert int(os.getenv("WORLD_SIZE", "1")) == 1
@@ -61,8 +33,8 @@ def runtime(npu_determinism):
         sys.argv[:] = argv
     from mindspeed.args_utils import get_full_args
     vars(get_full_args()).pop("", None)
-    repatch(dict(context_parallel_size=1, experimental_attention_variant="gated_delta_net",
-                 use_naive_l2norm=True, use_flash_attn=True, deterministic_mode=False))
+    repatch(dict(context_parallel_size=1, experimental_attention_variant=None,
+                 use_flash_attn=True))
     from megatron.core import parallel_state
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=1,
                                              pipeline_model_parallel_size=1, context_parallel_size=1)
@@ -139,10 +111,6 @@ def _run(model, plan, *, observe=False, counts=None):
         for layer, pair in executor.kv_stack.top().gradients.items():
             for name, value in zip(("key", "value"), pair):
                 boundary[f"fa.{layer}.{name}"] = value.detach().cpu().clone()
-        for state in executor.gdn_states.values():
-            for layer, gradient in state.gradients.items():
-                for name in ("conv_state", "recurrent_state"):
-                    boundary[f"gdn.{layer}.{name}"] = getattr(gradient, name).detach().cpu().clone()
     before = None if counts is None else counts.copy()
     losses.append(executor.pop(0).normalized_loss)
     if counts is not None and model.config.swap_attention:
@@ -182,64 +150,48 @@ def _probe(monkeypatch):
     return counts
 
 
-@pytest.mark.parametrize("kind", ["fa", "hybrid"])
-@pytest.mark.parametrize("owned", [True, False])
-def test_correctness(runtime, native_args, monkeypatch, kind, owned):
+@pytest.mark.parametrize("owned", [True, False], ids=["owned", "no-owned"])
+def test_correctness(runtime, native_args, monkeypatch, owned):
     torch.manual_seed(123)
-    if kind == "hybrid":
-        from baseline._qwen35_baseline_utils import make_qwen35_model, bind_stage1_gdn_primitives
-        import mindspeed.core.ssm.gated_delta_net as gdn
-        model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
-        binding = bind_stage1_gdn_primitives(gdn, model)
-    else:
-        from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_model
-        from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
+    from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_model
+    from .test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
 
-        model = _make_model(runtime.device, tpr=True, max_sequence_length=2048,
-                            core_attention_module=_ProfileFusedCausalAttention,
-                            model_shape=dict(hidden_size=512, ffn_hidden_size=2048,
-                                             num_attention_heads=8, num_query_groups=4, kv_channels=64,
-                                             experimental_attention_variant=None, linear_attention_freq=None,
-                                             transformer_impl="local"))
-        binding = nullcontext()
-    if kind == "fa":
-        assert model.config.experimental_attention_variant is None
-        assert all(getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
-                   for layer in model.decoder.layers)
-    else:
-        assert model.config.linear_attention_freq == 4
-        assert not model.config.deterministic_mode, "control must retain the optimized GDN backend"
-        assert sum(getattr(layer.self_attention, "tpr_state_kind", None) == "gdn"
-                   for layer in model.decoder.layers) == 3
+    model = _make_model(runtime.device, tpr=True, max_sequence_length=2048,
+                        core_attention_module=_ProfileFusedCausalAttention,
+                        model_shape=dict(hidden_size=512, ffn_hidden_size=2048,
+                                         num_attention_heads=8, num_query_groups=4, kv_channels=64,
+                                         experimental_attention_variant=None, linear_attention_freq=None,
+                                         transformer_impl="local"))
+    assert model.config.experimental_attention_variant is None
+    assert all(getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
+               for layer in model.decoder.layers)
     model.config.swap_modules = native_args.swap_modules
     counts = _probe(monkeypatch)
     plan = _plan(owned=owned)
-    with binding:
-        model.config.swap_attention = False
-        reference = _run(model, plan, observe=True, counts=counts)
-        assert counts == {"released_bytes": 0, "h2d_bytes": 0}
-        failures = []
-        # Establish run-to-run noise before installing swap hooks. Complete all
-        # comparisons before failing so one embedding mismatch cannot hide the
-        # per-layer or Prefix-state results and post-offload cleanup control.
-        for stage, enabled in (("off_repeat", False), ("on_first", True),
-                               ("on_repeat", True), ("off_after", False)):
-            model.config.swap_attention = enabled
-            before = counts.copy()
-            actual = _run(model, plan, observe=True, counts=counts)
-            failures.extend(_compare_runs(reference, actual, kind=kind, owned=owned, stage=stage))
-            del actual
-            if enabled:
-                assert counts["released_bytes"] > before["released_bytes"]
-                assert counts["h2d_bytes"] > before["h2d_bytes"]
-            else:
-                assert counts == before
-        assert not failures, "Offload correctness failures (see TPR_OFFLOAD_COMPARE):\n" + "\n".join(failures)
-    print("TPR_OFFLOAD_CORRECTNESS " + json.dumps(dict(kind=kind, owned=owned, **counts)), flush=True)
-
+    model.config.swap_attention = False
+    reference = _run(model, plan, observe=True, counts=counts)
+    assert counts == {"released_bytes": 0, "h2d_bytes": 0}
+    failures = []
+    # Establish FA baseline repeatability before installing swap hooks. Complete
+    # all comparisons before failing so one tensor mismatch cannot hide the
+    # Prefix-dKV result or post-offload cleanup control.
+    for stage, enabled in (("off_repeat", False), ("on_first", True),
+                           ("on_repeat", True), ("off_after", False)):
+        model.config.swap_attention = enabled
+        before = counts.copy()
+        actual = _run(model, plan, observe=True, counts=counts)
+        failures.extend(_compare_runs(reference, actual, owned=owned, stage=stage))
+        del actual
+        if enabled:
+            assert counts["released_bytes"] > before["released_bytes"]
+            assert counts["h2d_bytes"] > before["h2d_bytes"]
+        else:
+            assert counts == before
+    assert not failures, "Offload correctness failures (see TPR_OFFLOAD_COMPARE):\n" + "\n".join(failures)
+    print("TPR_OFFLOAD_CORRECTNESS " + json.dumps(dict(model="fa", owned=owned, **counts)), flush=True)
 
 def _difference_metrics(expected, actual):
-    """CPU diagnostics in bounded chunks, including the ~254M-element embedding."""
+    """CPU diagnostics in bounded chunks."""
     expected, actual = expected.reshape(-1), actual.reshape(-1)
     max_abs = squared_error = squared_reference = 0.0
     mismatched = 0
@@ -257,7 +209,7 @@ def _difference_metrics(expected, actual):
                 mismatched=mismatched, elements=expected.numel(), finite=finite)
 
 
-def _compare_runs(reference, actual, *, kind, owned, stage):
+def _compare_runs(reference, actual, *, owned, stage):
     failures = []
     for category, expected_map, actual_map in zip(("loss", "logprob", "parameter_grad", "prefix_grad"),
                                                  reference, actual):
@@ -269,17 +221,17 @@ def _compare_runs(reference, actual, *, kind, owned, stage):
                 torch.testing.assert_close(actual_map[name], expected_map[name], rtol=2e-3, atol=2e-4)
             except AssertionError as error:
                 category_failures += 1
-                label = f"{kind}/owned={owned}/{stage}/{category}/{name}"
+                label = f"fa/owned={owned}/{stage}/{category}/{name}"
                 failures.append(label)
                 if expected_map[name].shape != actual_map[name].shape:
                     metrics = {"error": str(error)}
                 else:
                     metrics = _difference_metrics(expected_map[name], actual_map[name])
                 print("TPR_OFFLOAD_COMPARE " + json.dumps(dict(
-                    kind=kind, owned=owned, stage=stage, category=category, tensor=str(name),
+                    model="fa", owned=owned, stage=stage, category=category, tensor=str(name),
                     passed=False, **metrics)), flush=True)
         print("TPR_OFFLOAD_COMPARE " + json.dumps(dict(
-            kind=kind, owned=owned, stage=stage, category=category,
+            model="fa", owned=owned, stage=stage, category=category,
             checked=len(expected_map), failed=category_failures)), flush=True)
     return failures
 
@@ -299,6 +251,8 @@ def test_capacity(runtime, native_args):
                         model_shape=dict(_PROFILE_MODEL_SHAPE, experimental_attention_variant=None,
                                          linear_attention_freq=None, transformer_impl="local"))
     assert model.config.experimental_attention_variant is None
+    assert all(getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
+               for layer in model.decoder.layers)
     model.config.swap_modules = native_args.swap_modules
     model.config.swap_attention = enabled
     plan = _plan(prefix, suffix)

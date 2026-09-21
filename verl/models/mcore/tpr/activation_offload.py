@@ -1,4 +1,4 @@
-"""CP1 adapter for MindSpeed swap-attention (no separate transfer engine).
+"""CP1 Full-Attention adapter for MindSpeed swap-attention.
 
 One Visit/Pop is a complete forward/backward microbatch. Native SwapPrefetch
 owns selection, host allocations, streams, transfer and release. Hooks are
@@ -64,6 +64,11 @@ def validate_activation_offload(model, cp_size):
     args = _args()
     if args is None:
         raise RuntimeError("MindSpeed swap-attention requires initialized Megatron/MindSpeed args")
+    if any(getattr(module, "tpr_state_kind", None) == "gdn" for module in model.modules()):
+        raise NotImplementedError(
+            "TPR swap-attention Phase A supports Full Attention only; "
+            "GDN/Hybrid support is reserved for a later phase"
+        )
     if cp_size != 1 or getattr(config, "context_parallel_size", 1) != 1:
         raise NotImplementedError("TPR swap-attention Phase A supports CP=1 only")
     for source in (config, args):
@@ -86,17 +91,25 @@ def _storage_key(tensor):
     return (tensor.device, tensor.untyped_storage().data_ptr())
 
 
+def _iter_extra_external_tensors(context):
+    """Reserved extension seam for future non-FA Prefix state exports.
+
+    Phase A is intentionally Full-Attention only, so no additional state is
+    exported here. A later Hybrid phase can extend this seam without changing
+    the native swap lifecycle or KV protection policy.
+    """
+    return ()
+
+
 def _external_storages():
-    """Exported backward roots and reusable Prefix state must stay resident."""
+    """Exported FA KV roots and reusable Prefix KV must stay resident."""
     context = get_tpr_attention_context()
     if context is None:
         return set()
     tensors = []
     for mapping in (context.past_key_values, context.new_key_values):
         tensors.extend(t for pair in mapping.values() for t in pair)
-    for mapping in (context.initial_gdn_states, context.new_gdn_states):
-        for state in mapping.values():
-            tensors.extend((state.conv_state, state.recurrent_state))
+    tensors.extend(_iter_extra_external_tensors(context))
     return {_storage_key(t) for t in tensors}
 
 
@@ -177,7 +190,7 @@ def mindspeed_swap_attention(model, *, cp_size=1):
             return original_unpack(item)
         if getattr(item, "tpr_resident", False):
             return item.tensor
-        # Pop's direct dKV/dState roots can bypass the layer backward hook.
+        # Pop's direct dKV roots can bypass the layer backward hook.
         # Use native same-layer reload as a correctness fallback, no new policy.
         # Native duplicate handles are labelled h2d without recording their
         # own event: the last alias owns the actual transfer. Reload the layer
