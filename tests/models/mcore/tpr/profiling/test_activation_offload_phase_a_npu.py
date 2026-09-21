@@ -82,6 +82,10 @@ def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length):
         core_attention_module=_ProfileFusedCausalAttention,
     )
     parameter_count = target.assert_model_scale(model)
+    # Match the mainstream Megatron/MindSpeed training loss path used by the
+    # Ascend profiles instead of falling back to the unfused default.
+    model.config.cross_entropy_loss_fusion = True
+    model.config.cross_entropy_fusion_impl = "native"
     assert model.config.experimental_attention_variant is None
     assert all(
         getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
