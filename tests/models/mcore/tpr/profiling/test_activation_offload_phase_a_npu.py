@@ -91,14 +91,15 @@ def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length, tpr=True
         getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
         for layer in model.decoder.layers
     )
+    from verl.models.mcore.tpr.attention import TPRSelfAttention
     if tpr:
-        assert any(
-            getattr(layer.self_attention, "tpr_state_kind", None) == "fa"
+        assert all(
+            isinstance(layer.self_attention, TPRSelfAttention)
             for layer in model.decoder.layers
         )
     else:
         assert all(
-            getattr(layer.self_attention, "tpr_state_kind", None) is None
+            not isinstance(layer.self_attention, TPRSelfAttention)
             for layer in model.decoder.layers
         )
     return model, target, parameter_count
@@ -220,7 +221,7 @@ def _run(model, plan, *, observe=False, counts=None, memory_audit=None):
     executor.kv_stack.assert_empty()
     assert not executor.gdn_states
     if not observe:
-        return
+        return torch.stack(losses).sum().detach()
     grads = {name: p.grad.detach().cpu().clone() for name, p in model.named_parameters() if p.grad is not None}
     return {"loss": torch.stack(losses).sum().cpu()}, logs, grads, boundary
 
@@ -238,7 +239,7 @@ def _run_reference(model, trajectories, *, total_loss_weight, counts=None):
     from verl.models.mcore.tpr.activation_offload import mindspeed_swap_attention
 
     model.zero_grad(set_to_none=True)
-    loss_sum = model.parameters().__next__().new_zeros((), dtype=torch.float32)
+    loss_sum = next(model.parameters()).new_zeros((), dtype=torch.float32)
     for trajectory in trajectories:
         positions = torch.arange(
             trajectory.numel(), dtype=torch.long, device=trajectory.device
@@ -678,6 +679,8 @@ def test_reference_tpr_offload_matrix(runtime, native_args, monkeypatch):
         incremental_peak_allocated_bytes=max(0, peak_allocated - baseline_allocated),
         incremental_peak_reserved_bytes=max(0, peak_reserved - baseline_reserved),
         cpu_process_highwater_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        swap_probe_released_bytes=counts["released_bytes"],
+        swap_probe_h2d_bytes=counts["h2d_bytes"],
     )
     if measured_loss is not None:
         row["normalized_loss"] = float(measured_loss.detach().cpu())
