@@ -90,11 +90,23 @@ TPR_RUN_OFFLOAD=1 torchrun --nproc_per_node=1 --master_port=29571 \
 ```
 
 Four cases: dense FA and 4-layer 3-GDN/1-FA hybrid, each with/without root-owned
-loss. Compare off/on/on/off using identical weights: loss, per-term logprob,
+loss. Compare off/off/on/on/off using identical weights: loss, per-term logprob,
 parameter gradients, Prefix dKV and (hybrid) dConv/dRecurrent state. The no-owned
 case exercises Pop with only state/KV backward roots. Repeated operations exercise
 queue reuse/cleanup. The on/off tolerance is rtol=2e-3, atol=2e-4 and must not be
 relaxed merely to obtain a pass.
+
+`TPR_OFFLOAD_COMPARE` reports `off_repeat`, `on_first`, `on_repeat`, and `off_after`
+against the first offload-disabled run, for all four comparison categories. A
+numerical mismatch does not stop subsequent comparisons: every failed tensor
+reports max absolute error, relative L2, element count and finiteness, then the
+test fails at the end with the original tolerance. This distinguishes baseline
+repeat variation from differences introduced during/after offload. Hybrid uses
+BF16 and tied embedding/output weights; small embedding errors alone do not
+establish either nondeterminism or an offload correctness bug. The mismatch
+fraction printed as 0.0% by PyTorch is rounded, not zero. Chunked CPU diagnostics
+avoid allocating full FP32 copies of the large embedding tensor. These extra
+runs and diagnostics apply only to correctness, not capacity/latency timing.
 
 Test-only probes observe real native calls: Push has no transfers; each Visit and
 Pop must release positive bytes (storage size actually becomes zero, host buffer

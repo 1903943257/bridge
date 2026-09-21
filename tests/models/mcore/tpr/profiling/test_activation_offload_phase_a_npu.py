@@ -190,22 +190,70 @@ def test_correctness(runtime, native_args, monkeypatch, kind, owned):
         model.config.swap_attention = False
         reference = _run(model, plan, observe=True, counts=counts)
         assert counts == {"released_bytes": 0, "h2d_bytes": 0}
-        for enabled in (True, True, False):  # repeated native lifecycle, then non-offload regression
+        failures = []
+        # Establish run-to-run noise before installing swap hooks. Complete all
+        # comparisons before failing so one embedding mismatch cannot hide the
+        # per-layer or Prefix-state results and post-offload cleanup control.
+        for stage, enabled in (("off_repeat", False), ("on_first", True),
+                               ("on_repeat", True), ("off_after", False)):
             model.config.swap_attention = enabled
             before = counts.copy()
             actual = _run(model, plan, observe=True, counts=counts)
-            for expected_map, actual_map in zip(reference, actual):
-                assert expected_map.keys() == actual_map.keys()
-                assert expected_map
-                for name in expected_map:
-                    torch.testing.assert_close(actual_map[name], expected_map[name], rtol=2e-3, atol=2e-4,
-                                               msg=lambda message: f"{kind}/{name}: {message}")
+            failures.extend(_compare_runs(reference, actual, kind=kind, owned=owned, stage=stage))
+            del actual
             if enabled:
                 assert counts["released_bytes"] > before["released_bytes"]
                 assert counts["h2d_bytes"] > before["h2d_bytes"]
             else:
                 assert counts == before
+        assert not failures, "Offload correctness failures (see TPR_OFFLOAD_COMPARE):\n" + "\n".join(failures)
     print("TPR_OFFLOAD_CORRECTNESS " + json.dumps(dict(kind=kind, owned=owned, **counts)), flush=True)
+
+
+def _difference_metrics(expected, actual):
+    """CPU diagnostics in bounded chunks, including the ~254M-element embedding."""
+    expected, actual = expected.reshape(-1), actual.reshape(-1)
+    max_abs = squared_error = squared_reference = 0.0
+    mismatched = 0
+    finite = True
+    for offset in range(0, expected.numel(), 1024 * 1024):
+        left = expected[offset:offset + 1024 * 1024].float()
+        right = actual[offset:offset + 1024 * 1024].float()
+        diff = (right - left).abs()
+        finite = finite and bool(torch.isfinite(left).all() and torch.isfinite(right).all())
+        max_abs = max(max_abs, diff.max().item())
+        mismatched += (diff > 2e-4 + 2e-3 * left.abs()).sum().item()
+        squared_error += diff.square().sum(dtype=torch.float64).item()
+        squared_reference += left.square().sum(dtype=torch.float64).item()
+    return dict(max_abs=max_abs, relative_l2=(squared_error / max(squared_reference, 1e-30)) ** 0.5,
+                mismatched=mismatched, elements=expected.numel(), finite=finite)
+
+
+def _compare_runs(reference, actual, *, kind, owned, stage):
+    failures = []
+    for category, expected_map, actual_map in zip(("loss", "logprob", "parameter_grad", "prefix_grad"),
+                                                 reference, actual):
+        assert expected_map.keys() == actual_map.keys(), f"{stage}/{category}: tensor keys changed"
+        assert expected_map, f"{stage}/{category}: empty comparison"
+        category_failures = 0
+        for name in expected_map:
+            try:
+                torch.testing.assert_close(actual_map[name], expected_map[name], rtol=2e-3, atol=2e-4)
+            except AssertionError as error:
+                category_failures += 1
+                label = f"{kind}/owned={owned}/{stage}/{category}/{name}"
+                failures.append(label)
+                if expected_map[name].shape != actual_map[name].shape:
+                    metrics = {"error": str(error)}
+                else:
+                    metrics = _difference_metrics(expected_map[name], actual_map[name])
+                print("TPR_OFFLOAD_COMPARE " + json.dumps(dict(
+                    kind=kind, owned=owned, stage=stage, category=category, tensor=str(name),
+                    passed=False, **metrics)), flush=True)
+        print("TPR_OFFLOAD_COMPARE " + json.dumps(dict(
+            kind=kind, owned=owned, stage=stage, category=category,
+            checked=len(expected_map), failed=category_failures)), flush=True)
+    return failures
 
 
 def test_capacity(runtime, native_args):
