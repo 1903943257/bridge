@@ -142,3 +142,43 @@ Two independent extensions are deliberately left outside Phase A:
 
 Phase A offloads selected saved activations only. Detached Prefix KV, accumulated
 dKV, logits, parameters and optimizer state remain outside native activation swap.
+
+
+## Fair Reference/TPR × offload 2x2
+
+Phase A also provides a fair four-cell memory/latency matrix on real
+Qwen3-1.7B. The Reference and TPR cells use the same native fused Megatron CE,
+the same `swap_modules`, P/S/N and one process per cell. Reference offload wraps
+each ordinary full-trajectory microbatch with the same
+`mindspeed_swap_attention` adapter; TPR offload remains scoped to Visit/Pop.
+
+Run the four cells in fresh processes:
+
+```sh
+cd /workspace/uni-agent/verl
+
+for path in reference tpr; do
+  for offload in 0 1; do
+    echo "===== path=$path offload=$offload ====="
+    TPR_RUN_OFFLOAD=1 \
+    TPR_OFFLOAD_MATRIX=1 \
+    TPR_OFFLOAD_MATRIX_PATH=$path \
+    TPR_OFFLOAD=$offload \
+    TPR_QWEN_PROFILE_SIZE=1.7B \
+    TPR_PREFIX=8192 \
+    TPR_SUFFIX=8192 \
+    torchrun --nproc_per_node=1 \
+      --master_addr=127.0.0.1 \
+      --master_port=$((29620 + offload)) \
+      -m pytest -s -v \
+      tests/models/mcore/tpr/profiling/test_activation_offload_phase_a_npu.py \
+      -k reference_tpr_offload_matrix
+  done
+done
+```
+
+Each cell emits one `TPR_OFFLOAD_2X2` JSON record with baseline/peak/incremental
+allocated and reserved memory, latency, CE configuration and CPU RSS. An untimed
+transfer gate asserts zero native traffic in OFF cells and positive D2H/H2D
+traffic in ON cells. The matrix is intentionally restricted to Qwen3-1.7B until
+the comparison is accepted.

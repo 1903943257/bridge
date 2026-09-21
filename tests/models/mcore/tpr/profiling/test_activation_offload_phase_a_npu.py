@@ -67,7 +67,7 @@ def native_args(runtime, monkeypatch):
     return args
 
 
-def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length):
+def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length, tpr=True):
     from ._qwen3_profile_target import resolve_qwen3_profile_target
     from ..correctness import test_tpr_qwen3_compatibility_npu as qwen_fixture
     from ..correctness.test_tpr_qwen3_compatibility_npu import _make_qwen_model
@@ -77,7 +77,7 @@ def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length):
     monkeypatch.setattr(qwen_fixture, "QWEN_MODEL_PATH", target.path)
     model = _make_qwen_model(
         runtime.device,
-        tpr=True,
+        tpr=tpr,
         max_sequence_length=max_sequence_length,
         core_attention_module=_ProfileFusedCausalAttention,
     )
@@ -91,6 +91,16 @@ def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length):
         getattr(layer.self_attention, "tpr_state_kind", None) != "gdn"
         for layer in model.decoder.layers
     )
+    if tpr:
+        assert any(
+            getattr(layer.self_attention, "tpr_state_kind", None) == "fa"
+            for layer in model.decoder.layers
+        )
+    else:
+        assert all(
+            getattr(layer.self_attention, "tpr_state_kind", None) is None
+            for layer in model.decoder.layers
+        )
     return model, target, parameter_count
 
 
@@ -213,6 +223,60 @@ def _run(model, plan, *, observe=False, counts=None, memory_audit=None):
         return
     grads = {name: p.grad.detach().cpu().clone() for name, p in model.named_parameters() if p.grad is not None}
     return {"loss": torch.stack(losses).sum().cpu()}, logs, grads, boundary
+
+
+def _reference_trajectories(prefix, suffix, *, device):
+    prefix_tokens = torch.arange(prefix, dtype=torch.long, device=device) % 2048
+    suffixes = (
+        (torch.arange(suffix, dtype=torch.long, device=device) + 37) % 2048,
+        (torch.arange(suffix, dtype=torch.long, device=device) + 93) % 2048,
+    )
+    return tuple(torch.cat((prefix_tokens, suffix_tokens)) for suffix_tokens in suffixes)
+
+
+def _run_reference(model, trajectories, *, total_loss_weight, counts=None):
+    from verl.models.mcore.tpr.activation_offload import mindspeed_swap_attention
+
+    model.zero_grad(set_to_none=True)
+    loss_sum = model.parameters().__next__().new_zeros((), dtype=torch.float32)
+    for trajectory in trajectories:
+        positions = torch.arange(
+            trajectory.numel(), dtype=torch.long, device=trajectory.device
+        ).unsqueeze(0)
+        before = None if counts is None else counts.copy()
+        with mindspeed_swap_attention(model, cp_size=1):
+            logits = model(
+                input_ids=trajectory.unsqueeze(0),
+                position_ids=positions,
+                attention_mask=None,
+            )
+            labels = trajectory[1:].unsqueeze(0)
+            per_token_loss = model.compute_language_model_loss(
+                labels,
+                logits[0, :-1, :].unsqueeze(1),
+            ).reshape(-1)
+            normalized = per_token_loss.float().sum() / total_loss_weight
+            normalized.backward()
+            loss_sum = loss_sum + normalized.detach()
+        if counts is not None:
+            if model.config.swap_attention:
+                assert counts["released_bytes"] > before["released_bytes"], (
+                    "Reference microbatch did not release NPU storage"
+                )
+                assert counts["h2d_bytes"] > before["h2d_bytes"], (
+                    "Reference microbatch did not reload activations"
+                )
+            else:
+                assert counts == before
+    return loss_sum
+
+
+def _settle_profile_baseline(model):
+    model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.synchronize()
+    return int(torch.npu.memory_allocated()), int(torch.npu.memory_reserved())
 
 
 def _probe(monkeypatch):
@@ -510,6 +574,114 @@ def _compare_runs(reference, actual, *, owned, stage):
             model="fa", owned=owned, stage=stage, category=category,
             checked=len(expected_map), failed=category_failures)), flush=True)
     return failures
+
+
+def test_reference_tpr_offload_matrix(runtime, native_args, monkeypatch):
+    """Fair 2x2: Reference/TPR x offload on/off on real Qwen3-1.7B.
+
+    Run each cell in a fresh process. Both paths use the same model family,
+    native fused Megatron CE, swap_modules and two logical sibling trajectories.
+    """
+    if os.getenv("TPR_OFFLOAD_MATRIX") != "1":
+        pytest.skip("Set TPR_OFFLOAD_MATRIX=1 for the Reference/TPR x offload matrix")
+
+    path = os.getenv("TPR_OFFLOAD_MATRIX_PATH", "tpr").strip().lower()
+    if path not in ("reference", "tpr"):
+        raise ValueError("TPR_OFFLOAD_MATRIX_PATH must be reference or tpr")
+    enabled = os.getenv("TPR_OFFLOAD", "0") == "1"
+    prefix = int(os.getenv("TPR_PREFIX", "8192"))
+    suffix = int(os.getenv("TPR_SUFFIX", "8192"))
+
+    # This acceptance matrix is intentionally fixed to the 1.7B target for now.
+    requested_size = os.getenv("TPR_QWEN_PROFILE_SIZE", "1.7B")
+    if requested_size != "1.7B":
+        raise ValueError("Phase A 2x2 matrix currently requires TPR_QWEN_PROFILE_SIZE=1.7B")
+
+    torch.manual_seed(123)
+    model, target, parameter_count = _make_real_qwen_model(
+        runtime,
+        monkeypatch,
+        max_sequence_length=prefix + suffix,
+        tpr=path == "tpr",
+    )
+    if target.label != "Qwen3-1.7B":
+        raise RuntimeError(f"2x2 matrix expected Qwen3-1.7B, got {target.label}")
+    model.config.swap_modules = native_args.swap_modules
+    model.config.swap_attention = enabled
+
+    plan = _plan(prefix, suffix)
+    if path == "reference":
+        trajectories = _reference_trajectories(prefix, suffix, device=runtime.device)
+
+        def run():
+            return _run_reference(
+                model,
+                trajectories,
+                total_loss_weight=plan.total_loss_weight,
+            )
+    else:
+        def run():
+            return _run(model, plan)
+
+    # Untimed native-transfer gate proves that both Reference and TPR actually
+    # exercise the same MindSpeed swap implementation in the ON cells.
+    with monkeypatch.context() as probe_patch:
+        counts = _probe(probe_patch)
+        if path == "reference":
+            probe_loss = _run_reference(
+                model,
+                trajectories,
+                total_loss_weight=plan.total_loss_weight,
+                counts=counts,
+            )
+        else:
+            _run(model, plan, counts=counts)
+            probe_loss = None
+        if enabled:
+            assert counts["released_bytes"] > 0 and counts["h2d_bytes"] > 0
+        else:
+            assert counts == {"released_bytes": 0, "h2d_bytes": 0}
+
+    baseline_allocated, baseline_reserved = _settle_profile_baseline(model)
+
+    # One uninstrumented warmup, then settle again before the measured window.
+    warmup_loss = run()
+    del warmup_loss, probe_loss
+    baseline_allocated, baseline_reserved = _settle_profile_baseline(model)
+    torch.npu.reset_peak_memory_stats()
+
+    started = time.perf_counter()
+    measured_loss = None
+    for _ in range(3):
+        measured_loss = run()
+    torch.npu.synchronize()
+    peak_allocated = int(torch.npu.max_memory_allocated())
+    peak_reserved = int(torch.npu.max_memory_reserved())
+
+    row = dict(
+        path=path,
+        offload=enabled,
+        prefix=prefix,
+        suffix=suffix,
+        siblings=2,
+        model=target.label,
+        checkpoint=str(target.path),
+        parameter_count=parameter_count,
+        cross_entropy_loss_fusion=bool(model.config.cross_entropy_loss_fusion),
+        cross_entropy_fusion_impl=str(model.config.cross_entropy_fusion_impl),
+        swap_modules=str(model.config.swap_modules),
+        latency_seconds=(time.perf_counter() - started) / 3,
+        baseline_allocated_bytes=baseline_allocated,
+        baseline_reserved_bytes=baseline_reserved,
+        peak_allocated_bytes=peak_allocated,
+        peak_reserved_bytes=peak_reserved,
+        incremental_peak_allocated_bytes=max(0, peak_allocated - baseline_allocated),
+        incremental_peak_reserved_bytes=max(0, peak_reserved - baseline_reserved),
+        cpu_process_highwater_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+    )
+    if measured_loss is not None:
+        row["normalized_loss"] = float(measured_loss.detach().cpu())
+    print("TPR_OFFLOAD_2X2 " + json.dumps(row), flush=True)
 
 
 def test_capacity(runtime, native_args, monkeypatch):
