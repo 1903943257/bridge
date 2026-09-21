@@ -1,6 +1,7 @@
 """FA-only native-swap gates on real Qwen3-1.7B/4B; see Phase A guide."""
 
 from dataclasses import replace
+import gc
 import json
 import os
 import resource
@@ -102,20 +103,83 @@ def _plan(prefix=1024, suffix=1024, owned=True):
     return plan
 
 
-def _run(model, plan, *, observe=False, counts=None):
+def _run(model, plan, *, observe=False, counts=None, memory_audit=None):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
 
     model.zero_grad(set_to_none=True)
     logs = {}
 
     class ObservedExecutor(SegmentExecutor):
+        def _phase_call(self, action, segment_id, function):
+            if memory_audit is None:
+                return function()
+            previous_phase = memory_audit.phase
+            previous_executor = memory_audit.executor
+            memory_audit.phase = f"{action}.{segment_id}"
+            memory_audit.executor = self
+            memory_audit.sample(memory_audit.phase + ".enter", executor=self)
+            try:
+                result = function()
+            except Exception as error:
+                memory_audit.fail_window(memory_audit.phase, error)
+                raise
+            memory_audit.sample(memory_audit.phase + ".exit", executor=self)
+            memory_audit.phase = previous_phase
+            memory_audit.executor = previous_executor
+            return result
+
+        def push(self, segment_id):
+            return self._phase_call("push", segment_id, lambda: super(ObservedExecutor, self).push(segment_id))
+
+        def visit_leaf(self, segment_id):
+            return self._phase_call(
+                "visit_leaf", segment_id, lambda: super(ObservedExecutor, self).visit_leaf(segment_id)
+            )
+
+        def pop(self, segment_id):
+            return self._phase_call("pop", segment_id, lambda: super(ObservedExecutor, self).pop(segment_id))
+
+        def _forward(self, segment, **kwargs):
+            if memory_audit is None:
+                return super()._forward(segment, **kwargs)
+            name = memory_audit.phase + ".forward"
+            past_key_values = kwargs.get("past_key_values")
+            memory_audit.begin_window(
+                name,
+                executor=self,
+                past_key_values=past_key_values,
+            )
+            try:
+                context, logits = super()._forward(segment, **kwargs)
+            except Exception as error:
+                memory_audit.fail_window(name, error)
+                raise
+            memory_audit.end_window(
+                name,
+                executor=self,
+                context=context,
+                logits=logits,
+                past_key_values=past_key_values,
+            )
+            return context, logits
+
         def _compute_loss(self, segment, logits):
             if observe and segment.loss_terms:
                 indices = torch.tensor([t.query_offset for t in segment.loss_terms], device=logits.device)
                 targets = torch.tensor([t.target_token_id for t in segment.loss_terms], device=logits.device)
                 logs[segment.segment_id] = -F.cross_entropy(
                     logits[0].index_select(0, indices).float(), targets, reduction="none").detach().cpu()
-            return super()._compute_loss(segment, logits)
+            if memory_audit is None:
+                return super()._compute_loss(segment, logits)
+            name = memory_audit.phase + ".loss"
+            memory_audit.begin_window(name, executor=self, logits=logits)
+            try:
+                result = super()._compute_loss(segment, logits)
+            except Exception as error:
+                memory_audit.fail_window(name, error)
+                raise
+            memory_audit.end_window(name, executor=self, logits=logits)
+            return result
 
     executor = ObservedExecutor(model, plan)
     before = None if counts is None else counts.copy()
@@ -171,6 +235,192 @@ def _probe(monkeypatch):
     monkeypatch.setattr(SwapTensor, "wait_d2h_finished", released)
     monkeypatch.setattr(SwapTensor, "launch_h2d", reloaded)
     return counts
+
+
+def _iter_tensors(value):
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, torch.Tensor):
+            yield item
+        elif isinstance(item, dict) or hasattr(item, "values"):
+            pending.extend(item.values())
+        elif isinstance(item, (tuple, list)):
+            pending.extend(item)
+
+
+def _npu_storage_metrics(value):
+    logical_bytes = 0
+    storages = {}
+    tensor_count = 0
+    for tensor in _iter_tensors(value):
+        if tensor.device.type != "npu":
+            continue
+        tensor_count += 1
+        logical_bytes += tensor.numel() * tensor.element_size()
+        storage = tensor.untyped_storage()
+        pointer = int(storage.data_ptr())
+        if pointer:
+            storages[(str(tensor.device), pointer)] = int(storage.nbytes())
+    return {
+        "tensor_count": tensor_count,
+        "logical_bytes": logical_bytes,
+        "unique_storage_bytes": sum(storages.values()),
+        "_storages": storages,
+    }
+
+
+class _CapacityMemoryAudit:
+    """Phase-level NPU memory attribution for one untimed TPR iteration.
+
+    The audit deliberately lives in the test harness. It never changes TPR
+    execution semantics; it records allocator state and the payload of live
+    tensors already owned by the executor/model.
+    """
+
+    def __init__(self, model, *, swap_counts):
+        self.model = model
+        self.swap_counts = swap_counts
+        self.phase = None
+        self.executor = None
+        self._windows = {}
+
+    def _categories(self, *, executor=None, context=None, logits=None, past_key_values=None):
+        categories = {
+            "parameters": tuple(self.model.parameters()),
+            "parameter_grads": tuple(
+                parameter.grad
+                for parameter in self.model.parameters()
+                if parameter.grad is not None
+            ),
+        }
+        if executor is not None:
+            prefix_kv = []
+            prefix_dkv = []
+            for segment_id in executor.kv_stack.segment_ids:
+                entry = executor.kv_stack.get(segment_id)
+                prefix_kv.extend(
+                    tensor
+                    for pair in entry.kv.key_values.values()
+                    for tensor in pair
+                )
+                prefix_dkv.extend(
+                    tensor
+                    for pair in entry.gradients.values()
+                    for tensor in pair
+                )
+            categories["persistent_prefix_kv"] = tuple(prefix_kv)
+            categories["accumulated_prefix_dkv"] = tuple(prefix_dkv)
+        if past_key_values is not None:
+            categories["past_kv_argument"] = past_key_values
+        if context is not None:
+            categories["current_segment_kv"] = context.new_key_values
+        if logits is not None:
+            categories["logits"] = logits
+        return categories
+
+    def _emit(
+        self,
+        stage,
+        *,
+        executor=None,
+        context=None,
+        logits=None,
+        past_key_values=None,
+        sync=True,
+        window_start=None,
+        window_peak=None,
+    ):
+        if sync:
+            torch.npu.synchronize()
+        allocated = int(torch.npu.memory_allocated())
+        reserved = int(torch.npu.memory_reserved())
+        categories = self._categories(
+            executor=executor,
+            context=context,
+            logits=logits,
+            past_key_values=past_key_values,
+        )
+        category_rows = {}
+        all_storages = {}
+        for name, value in categories.items():
+            metrics = _npu_storage_metrics(value)
+            all_storages.update(metrics.pop("_storages"))
+            category_rows[name] = metrics
+        accounted = sum(all_storages.values())
+        row = {
+            "stage": stage,
+            "phase": self.phase,
+            "allocated_bytes": allocated,
+            "reserved_bytes": reserved,
+            "accounted_unique_storage_bytes": accounted,
+            "unclassified_allocated_bytes": max(0, allocated - accounted),
+            "swap_released_bytes": self.swap_counts["released_bytes"],
+            "swap_h2d_bytes": self.swap_counts["h2d_bytes"],
+            "categories": category_rows,
+        }
+        if window_start is not None and window_peak is not None:
+            row.update(
+                window_start_allocated_bytes=window_start,
+                window_peak_allocated_bytes=window_peak,
+                window_peak_increment_bytes=max(0, window_peak - window_start),
+            )
+        print("TPR_OFFLOAD_MEMORY " + json.dumps(row), flush=True)
+
+    def sample(self, stage, *, executor=None, **kwargs):
+        self._emit(stage, executor=executor, **kwargs)
+
+    def begin_window(self, name, *, executor=None, **kwargs):
+        torch.npu.synchronize()
+        start = int(torch.npu.memory_allocated())
+        torch.npu.reset_peak_memory_stats()
+        self._windows[name] = start
+        self._emit(name + ".begin", executor=executor, sync=False, **kwargs)
+
+    def end_window(self, name, *, executor=None, **kwargs):
+        torch.npu.synchronize()
+        start = self._windows.pop(name)
+        peak = int(torch.npu.max_memory_allocated())
+        self._emit(
+            name + ".end",
+            executor=executor,
+            sync=False,
+            window_start=start,
+            window_peak=peak,
+            **kwargs,
+        )
+
+    def fail_window(self, name, error):
+        print(
+            "TPR_OFFLOAD_MEMORY_FAILURE "
+            + json.dumps(
+                {
+                    "stage": name,
+                    "phase": self.phase,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            ),
+            flush=True,
+        )
+
+    def install_backward_probe(self, patch):
+        original_backward = torch.autograd.backward
+
+        def traced_backward(*args, **kwargs):
+            if self.phase is None or self.executor is None:
+                return original_backward(*args, **kwargs)
+            name = self.phase + ".backward"
+            self.begin_window(name, executor=self.executor)
+            try:
+                result = original_backward(*args, **kwargs)
+            except Exception as error:
+                self.fail_window(name, error)
+                raise
+            self.end_window(name, executor=self.executor)
+            return result
+
+        patch.setattr(torch.autograd, "backward", traced_backward)
 
 
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "no-owned"])
@@ -274,20 +524,53 @@ def test_capacity(runtime, native_args, monkeypatch):
     model.config.swap_modules = native_args.swap_modules
     model.config.swap_attention = enabled
     plan = _plan(prefix, suffix)
-    # No CPU gradient/logprob snapshots or telemetry wrappers inside timed runs.
-    _run(model, plan)
+
+    # One untimed diagnostic iteration runs before the benchmark. It emits each
+    # record immediately, so an OOM still leaves the last completed memory stage.
+    if os.getenv("TPR_OFFLOAD_MEMORY_AUDIT", "1") == "1":
+        with monkeypatch.context() as audit_patch:
+            swap_counts = _probe(audit_patch)
+            audit = _CapacityMemoryAudit(model, swap_counts=swap_counts)
+            audit.install_backward_probe(audit_patch)
+            audit.sample("model_ready")
+            _run(model, plan, counts=swap_counts, memory_audit=audit)
+            audit.sample("iteration_complete")
+        del audit
+
+    # Timed runs remain uninstrumented. Settle gradients/cache first so the
+    # reported incremental peak is relative to the resident model baseline.
+    model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.npu.empty_cache()
     torch.npu.synchronize()
+    baseline_allocated = int(torch.npu.memory_allocated())
+    baseline_reserved = int(torch.npu.memory_reserved())
+
+    _run(model, plan)  # one uninstrumented warmup
+    model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.synchronize()
+    baseline_allocated = int(torch.npu.memory_allocated())
+    baseline_reserved = int(torch.npu.memory_reserved())
     torch.npu.reset_peak_memory_stats()
+
     start = time.perf_counter()
     for _ in range(3):
         _run(model, plan)
     torch.npu.synchronize()
+    peak_allocated = int(torch.npu.max_memory_allocated())
+    peak_reserved = int(torch.npu.max_memory_reserved())
     print("TPR_OFFLOAD_PROFILE " + json.dumps(dict(
         offload=enabled, prefix=prefix, suffix=suffix, siblings=2,
         model=target.label, checkpoint=str(target.path), parameter_count=parameter_count,
         latency_seconds=(time.perf_counter() - start) / 3,
         deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
-        peak_allocated_bytes=torch.npu.max_memory_allocated(),
-        peak_reserved_bytes=torch.npu.max_memory_reserved(),
+        baseline_allocated_bytes=baseline_allocated,
+        baseline_reserved_bytes=baseline_reserved,
+        peak_allocated_bytes=peak_allocated,
+        peak_reserved_bytes=peak_reserved,
+        incremental_peak_allocated_bytes=max(0, peak_allocated - baseline_allocated),
+        incremental_peak_reserved_bytes=max(0, peak_reserved - baseline_reserved),
         cpu_process_highwater_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
     )), flush=True)

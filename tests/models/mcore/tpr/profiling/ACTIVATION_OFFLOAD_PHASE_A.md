@@ -114,9 +114,15 @@ done
 
 The capacity test uses the selected real Qwen3-1.7B/4B checkpoint with two
 siblings, one warmup and three measured Push/Visit/Visit/Pop iterations. It
-reports synchronized mean latency, NPU peak allocated/reserved bytes and process
-CPU high-water RSS. An OOM is a failed capacity result, not a reason to fall back
-to a smaller synthetic model.
+reports baseline and peak allocated/reserved bytes, incremental peak, synchronized
+mean latency and process CPU high-water RSS. Before timing it runs one diagnostic
+iteration by default (`TPR_OFFLOAD_MEMORY_AUDIT=1`) and emits
+`TPR_OFFLOAD_MEMORY` records for Push, each Leaf, Pop, model forward, loss and
+backward. The records also report live payloads for parameters, parameter grads,
+persistent Prefix KV, accumulated Prefix dKV, past-KV arguments, current-segment
+KV and logits; the remainder is reported as unclassified allocator usage.
+Set `TPR_OFFLOAD_MEMORY_AUDIT=0` only for a minimal profile. An OOM is a failed
+capacity result, not a reason to fall back to a smaller synthetic model.
 
 The profile does not claim optimizer/full-training capacity. Once Phase A FA
 correctness and capacity are closed, end-to-end FA training should be measured
