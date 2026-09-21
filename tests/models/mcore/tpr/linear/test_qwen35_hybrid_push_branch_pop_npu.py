@@ -9,10 +9,32 @@ From the server verl root (after syncing bridge's verl/ and tests/)::
 
     torchrun --master_addr=127.0.0.1 --master_port=29563 --nproc_per_node=1 \
       -m pytest -s -v tests/models/mcore/tpr/linear/test_qwen35_hybrid_push_branch_pop_npu.py
+
+Same-path CP1 repeatability (native materialized training and TPR separately)::
+
+    torchrun --master_addr=127.0.0.1 --master_port=29563 --nproc_per_node=1 \
+      -m pytest -s -v tests/models/mcore/tpr/linear/test_qwen35_hybrid_push_branch_pop_npu.py \
+      -k repeatability_without_offload
+
+Six cases cover 4 layers/P1024/S1024 with and without Prefix-owned loss and
+24 layers/P64/S64 with Prefix-owned loss, through both native and TPR paths.
+Each case performs three runs of one unchanged model, resetting gradients before
+each run. Strict rtol=2e-3/atol=2e-4 gates are separate from the original
+cross-path numerical envelopes; failures remain failures and all are reported.
+Native has no exposed Prefix boundary VJPs; those are checked on the TPR path.
+The 4-layer cases use Phase A's token construction and seed. This is a baseline
+repeatability check, not an offload-on acceptance result. CPU gradient snapshots
+are retained for two runs at a time; allow several GiB of host memory.
+
+The existing runtime validates Git revisions. If using the verified PR169
+MindSpeed-Ops checkout, set STAGE34_MINDSPEED_OPS_SHA to its full commit SHA
+(and STAGE34_MINDSPEED_OPS_ROOT if not /workspace/MindSpeed-Ops). The default
+historical revision check and other dependency checks are unchanged.
 """
 
 from collections import Counter
 from contextlib import contextmanager, nullcontext
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -48,21 +70,25 @@ def runtime():
     destroy_npu_runtime(value)
 
 
-def _plan():
+def _plan(length=64, *, owned=True, offload_tokens=False):
     from verl.models.mcore.tpr.segment_plan import SegmentLossTerm, SegmentPlan, SegmentSpec
 
-    tokens = [(torch.arange(64) * step + start) % VOCAB_SIZE
+    tokens = [(torch.arange(length) * step + start) % VOCAB_SIZE
               for step, start in ((17, 23), (19, 101), (23, 307))]
+    if offload_tokens:
+        tokens = [(torch.arange(length) + start) % 2048 for start in (0, 37, 93)]
     prefix, *suffixes = tokens
-    root_terms = tuple(SegmentLossTerm(i, int(prefix[i + 1]), weight=2.0) for i in range(63))
-    root_terms += tuple(SegmentLossTerm(63, int(s[0]), sample_id=j)
+    root_terms = tuple(SegmentLossTerm(i, int(prefix[i + 1]), weight=2.0) for i in range(length - 1))
+    root_terms += tuple(SegmentLossTerm(length - 1, int(s[0]), sample_id=j)
                         for j, s in enumerate(suffixes, 1))
+    if not owned:
+        root_terms = ()
     segments = [SegmentSpec(0, None, prefix, 0, 0, root_terms)]
     for j, suffix in enumerate(suffixes, 1):
-        terms = tuple(SegmentLossTerm(i, int(suffix[i + 1]), sample_id=j) for i in range(63))
-        segments.append(SegmentSpec(j, 0, suffix, 64, 64, terms))
+        terms = tuple(SegmentLossTerm(i, int(suffix[i + 1]), sample_id=j) for i in range(length - 1))
+        segments.append(SegmentSpec(j, 0, suffix, length, length, terms))
     plan = SegmentPlan(segments, root_id=0)
-    assert plan.total_loss_weight == 254
+    assert plan.total_loss_weight == (2 * (2 * length - 1) if owned else 2 * (length - 1))
     return plan
 
 
@@ -78,6 +104,8 @@ def _parameter_grads(model):
 
 
 def _term_logprobs(logits, segment):
+    if not segment.loss_terms:
+        return logits.new_empty((0,), dtype=torch.float32)
     indices = torch.tensor([term.query_offset for term in segment.loss_terms], device=logits.device)
     targets = torch.tensor([term.target_token_id for term in segment.loss_terms], device=logits.device)
     return -F.cross_entropy(logits[0].index_select(0, indices).float(), targets, reduction="none")
@@ -178,22 +206,23 @@ def _layer_diagnostics(label, reference, actual):
 def _native_reference(model, plan, device, *, tpr_context=False, probe=None):
     model.zero_grad(set_to_none=True)
     losses, outputs = [], {}
+    prefix_length = plan.get(0).length
     for leaf_id in (1, 2):
         tokens = torch.cat((plan.get(0).token_ids, plan.get(leaf_id).token_ids)).to(device)
-        positions = torch.arange(128, device=device).unsqueeze(0)
+        positions = torch.arange(tokens.numel(), device=device).unsqueeze(0)
         context_manager = nullcontext()
         if tpr_context:
             from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
             from verl.models.mcore.tpr.rope import build_suffix_rotary_pos_emb
 
             context = TPRAttentionContext(
-                prefix_length=0, suffix_length=128,
+                prefix_length=0, suffix_length=tokens.numel(),
                 suffix_rotary_pos_emb=build_suffix_rotary_pos_emb(
-                    model.rotary_pos_emb, prefix_length=0, suffix_length=128,
+                    model.rotary_pos_emb, prefix_length=0, suffix_length=tokens.numel(),
                 ),
             )
             context_manager = use_tpr_attention_context(context)
-        # Same full 128-token path/loss for both modes; no Push/Pop or anchors.
+        # Same full path/loss for both modes; no Push/Pop or anchors.
         with context_manager, probe.segment(f"full{leaf_id}") if probe else nullcontext():
             logits = model(tokens.unsqueeze(0), positions, attention_mask=None)
         if tpr_context:
@@ -201,18 +230,21 @@ def _native_reference(model, plan, device, *, tpr_context=False, probe=None):
             context.assert_new_kv_layers((4, 8, 12, 16, 20, 24))
             # The diagnostic never consumes or backpropagates final-state roots.
             del context, context_manager
-        assert logits.shape == (1, 128, VOCAB_SIZE)
-        loss = F.cross_entropy(logits[0, :-1].float(), tokens[1:], reduction="sum") / 254
+        assert logits.shape == (1, tokens.numel(), VOCAB_SIZE)
+        loss_start = 0 if plan.get(0).loss_terms else prefix_length
+        loss = F.cross_entropy(logits[0, loss_start:-1].float(), tokens[loss_start + 1:],
+                               reduction="sum") / plan.total_loss_weight
         outputs[leaf_id] = {
-            0: _term_logprobs(logits[:, :64], plan.get(0)).detach().cpu(),
-            leaf_id: _term_logprobs(logits[:, 64:], plan.get(leaf_id)).detach().cpu(),
+            0: _term_logprobs(logits[:, :prefix_length], plan.get(0)).detach().cpu(),
+            leaf_id: _term_logprobs(logits[:, prefix_length:], plan.get(leaf_id)).detach().cpu(),
         }
         losses.append(loss.detach().cpu())
         loss.backward()
         del logits, loss
     # Shared prefix internals have multiplicity 2; branchpoint has two targets.
     root = outputs[1][0].clone()
-    root[-1] = outputs[2][0][-1]
+    if root.numel():
+        root[-1] = outputs[2][0][-1]
     return sum(losses), {0: root, 1: outputs[1][1], 2: outputs[2][2]}, _parameter_grads(model)
 
 
@@ -341,7 +373,7 @@ def _run_engine(model, plan, monkeypatch):
     executor = instances[0]
     assert executor.forwards == [(0, True), (1, False), (2, False), (0, False)]
     assert executor.loss_calls == Counter({0: 1, 1: 1, 2: 1})
-    assert len(executor.boundary_gradients) == 18 * 2 + 6 * 2
+    assert len(executor.boundary_gradients) == model.config.num_layers * 2
     assert executor.saved_state.released
     assert not executor.gdn_states
     executor.kv_stack.assert_empty()
@@ -479,3 +511,86 @@ def test_full_qwen35_hybrid_engine_push_branch_pop(runtime, monkeypatch):
     print(f"STAGE-3.3 {status}: 24 layers (18 GDN + 6 FA), CP=1, non-packed; "
           "Engine tree request; prefix own loss once at Pop; 48 boundary gradients; "
           "A2A=0/Ring=0; all cached states released", flush=True)
+
+
+def _repeat_difference(expected, actual):
+    """Bound CPU temporary memory when reporting the tied embedding gradient."""
+    expected, actual = expected.reshape(-1), actual.reshape(-1)
+    squared_error = squared_reference = max_abs = 0.0
+    mismatched = 0
+    finite = True
+    for offset in range(0, expected.numel(), 1024 * 1024):
+        left = expected[offset:offset + 1024 * 1024].float()
+        right = actual[offset:offset + 1024 * 1024].float()
+        finite = finite and bool(torch.isfinite(left).all() and torch.isfinite(right).all())
+        diff = (right - left).abs()
+        max_abs = max(max_abs, diff.max().item())
+        mismatched += (diff > 2e-4 + 2e-3 * left.abs()).sum().item()
+        squared_error += diff.square().sum(dtype=torch.float64).item()
+        squared_reference += left.square().sum(dtype=torch.float64).item()
+    return dict(max_abs=max_abs, relative_l2=(squared_error / max(squared_reference, 1e-30)) ** 0.5,
+                mismatched=mismatched, elements=expected.numel(), finite=finite)
+
+
+@pytest.mark.parametrize("path", ["native", "tpr"])
+@pytest.mark.parametrize("layers,length,owned", [(4, 1024, True), (4, 1024, False), (24, 64, True)],
+                         ids=["l4-p1024-s1024-owned", "l4-p1024-s1024-no-owned", "l24-p64-s64-owned"])
+def test_qwen35_cp1_repeatability_without_offload(runtime, monkeypatch, path, layers, length, owned):
+    """Repeat one unchanged model/plan three times, through the same path.
+
+    Native repeats ordinary materialized P+S training; TPR repeats Engine tree
+    requests. Compare repeats within each path, never native against TPR here.
+    The 4-layer cases match Phase A's failing model shape, tokens and loss policy.
+    No swap hooks, optimizer or first-layer projection controls are installed.
+    """
+    import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
+    from verl.models.mcore.tpr.activation_offload import swap_enabled
+
+    torch.manual_seed(123)
+    model = make_qwen35_model(runtime, cp_size=1, tpr=path == "tpr", num_layers=layers)
+    model.config.swap_attention = False
+    assert not swap_enabled(model)
+    assert model.config.attention_dropout == model.config.hidden_dropout == 0
+    plan = _plan(length, owned=owned, offload_tokens=layers == 4)
+    failures = []
+    metadata = dict(path=path, layers=layers, prefix=length, suffix=length, owned=owned,
+                    offload=False, deterministic_algorithms=torch.are_deterministic_algorithms_enabled())
+    print("QWEN35_CP1_REPEAT_CONFIG " + json.dumps(metadata), flush=True)
+
+    def run():
+        assert not swap_enabled(model)
+        if path == "native":
+            loss, logprobs, grads = _native_reference(model, plan, runtime.device)
+            boundary = {}
+        else:
+            loss, logprobs, grads, boundary = _run_engine(model, plan, monkeypatch)
+        return {"loss": torch.as_tensor(loss).detach().cpu()}, logprobs, grads, boundary
+
+    with bind_stage1_gdn_primitives(mindspeed_gdn, model), _no_cp_probe(monkeypatch):
+        reference = run()
+        for repeat in (1, 2):
+            actual = run()
+            for category, expected_map, actual_map in zip(
+                ("loss", "logprob", "parameter_grad", "prefix_grad"), reference, actual
+            ):
+                assert expected_map.keys() == actual_map.keys(), f"{category}: gradient keys changed"
+                if category != "prefix_grad" or path == "tpr":
+                    assert expected_map, f"{category}: missing measurements"
+                count = 0
+                for name, expected in expected_map.items():
+                    value = actual_map[name]
+                    try:
+                        torch.testing.assert_close(value, expected, rtol=2e-3, atol=2e-4)
+                    except AssertionError as error:
+                        count += 1
+                        failures.append(f"repeat={repeat}/{category}/{name}")
+                        metrics = (_repeat_difference(expected, value) if expected.shape == value.shape
+                                   else dict(error=str(error)))
+                        print("QWEN35_CP1_REPEAT " + json.dumps(dict(
+                            metadata, repeat=repeat, category=category, tensor=str(name),
+                            passed=False, **metrics)), flush=True)
+                print("QWEN35_CP1_REPEAT " + json.dumps(dict(
+                    metadata, repeat=repeat, category=category, checked=len(expected_map), failed=count,
+                    applicable=category != "prefix_grad" or path == "tpr")), flush=True)
+            del actual
+    assert not failures, "CP1 offload-disabled repeatability failures:\n" + "\n".join(failures)
