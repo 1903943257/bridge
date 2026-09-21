@@ -7,8 +7,9 @@ scoped to that microbatch so graph-free Push never enters native swap queues.
 
 from contextlib import contextmanager
 from functools import wraps
+from importlib import import_module
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import torch
 
@@ -24,6 +25,30 @@ def _args():
         # Megatron training launcher. Do not import/repatch MindSpeed when off.
         module = sys.modules.get("mindspeed.args_utils")
         return None if module is None else module.get_full_args()
+
+
+def _native_prefetch():
+    """Import the installed native implementation with Core-only Megatron.
+
+    Older MindSpeed prefetch.py imports training.get_args at module scope even
+    though its only training dependency is that accessor. Supply it only during
+    this import; never leave a fake training package visible to other callers.
+    """
+    name = "mindspeed.core.memory.swap_attention.prefetch"
+    try:
+        return import_module(name)
+    except ModuleNotFoundError as error:
+        if error.name != "megatron.training" or "megatron.training" in sys.modules:
+            raise
+    from mindspeed.args_utils import get_full_args
+
+    training = ModuleType("megatron.training")
+    training.get_args = get_full_args
+    sys.modules["megatron.training"] = training
+    try:
+        return import_module(name)
+    finally:
+        del sys.modules["megatron.training"]
 
 
 def swap_enabled(model):
@@ -110,8 +135,8 @@ def mindspeed_swap_attention(model, *, cp_size=1):
         yield None
         return
     validate_activation_offload(model, cp_size)
-    from mindspeed.core.memory.swap_attention.prefetch import SwapPrefetch, get_layer_id
-    from mindspeed.core.memory.swap_attention import prefetch
+    prefetch = _native_prefetch()
+    SwapPrefetch, get_layer_id = prefetch.SwapPrefetch, prefetch.get_layer_id
 
     if getattr(SwapPrefetch, "swap_prefetch", None) is not None:
         raise RuntimeError("Native global swap-attention is already installed; do not install it twice for TPR")

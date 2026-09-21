@@ -53,15 +53,18 @@ def runtime():
 
 
 @pytest.fixture
-def native_args(monkeypatch):
+def native_args(runtime, monkeypatch):
     # Only supply the training namespace normally initialized by the launcher.
     # Transfers, streams, pinned buffers and saved-tensor hooks remain real.
-    import megatron.training
-    from mindspeed.core.memory.swap_attention import prefetch
+    from mindspeed import args_utils
+    from verl.models.mcore.tpr import activation_offload
     args = SimpleNamespace(swap_attention=False, pipeline_model_parallel_size=1,
                            eval_interval=0, curr_iteration=1, noop_layers=None,
                            swap_modules=os.getenv("TPR_SWAP_MODULES", "self_attention,mlp"))
-    monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+    monkeypatch.setattr(args_utils, "get_full_args", lambda: args)
+    # Feed both supported launchers without requiring Megatron-LM training.
+    monkeypatch.setattr(activation_offload, "_args", lambda: args)
+    prefetch = activation_offload._native_prefetch()
     monkeypatch.setattr(prefetch, "get_args", lambda: args)
     return args
 

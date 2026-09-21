@@ -37,6 +37,11 @@ Necessary adaptations:
 - VERL can initialize MindSpeed args without Megatron training globals: bind the
   native module's argument accessor for the operation, then restore it. Missing
   training-only eval fields default to disabled evaluation scheduling.
+- Megatron-Core-only installations do not ship `megatron.training`. For native
+  MindSpeed versions that import its `get_args` at module scope, provide that
+  accessor from MindSpeed only while importing the installed prefetch module,
+  then remove the temporary training module. Other missing dependencies still
+  raise their original errors. The NPU fixture uses MindSpeed args directly.
 - KV/GDN exports are external live references and Pop gradient roots. Exclude
   their entire storages, including aliases, before native storage release.
   Detached Prefix state and accumulated gradients are not offloaded.

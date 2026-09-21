@@ -170,6 +170,55 @@ class AdapterTest(unittest.TestCase):
             with self.adapter.mindspeed_swap_attention(self.model):
                 pass
 
+    def test_core_only_imports_real_native_prefetch_without_leaking_training(self):
+        native_dir = SOURCE.parents[5] / "MindSpeed/mindspeed/core/memory/swap_attention"
+        if not (native_dir / "prefetch.py").is_file():
+            self.skipTest("requires the adjacent MindSpeed checkout for the native import regression")
+        megatron = ModuleType("megatron")
+        megatron.__path__ = []  # Core-only installation: no training package.
+        mind_args = ModuleType("mindspeed.args_utils")
+        mind_args.get_full_args = lambda: self.args
+        torch_npu = ModuleType("torch_npu")
+        torch_npu.npu = NS(Stream=lambda **kwargs: self.native.prefetch_stream)
+        torch = sys.modules["torch"]
+        torch.npu.current_device = lambda: 0
+        package = sys.modules["mindspeed.core.memory.swap_attention"]
+        package.__path__ = [str(native_dir)]
+        with patch.dict(sys.modules, {"megatron": megatron, "mindspeed.args_utils": mind_args,
+                                      "torch_npu": torch_npu}):
+            del sys.modules["megatron.training"]
+            del sys.modules["mindspeed.core.memory.swap_attention.prefetch"]
+            prefetch = self.adapter._native_prefetch()
+            self.assertEqual(Path(prefetch.__file__).resolve(), (native_dir / "prefetch.py").resolve())
+            self.assertIs(prefetch.get_args(), self.args)
+            self.assertNotIn("megatron.training", sys.modules)
+            self.assertFalse(hasattr(megatron, "training"))
+            original_get_args = prefetch.get_args
+            with self.adapter.mindspeed_swap_attention(self.model) as native:
+                self.assertIsInstance(native, prefetch.SwapPrefetch)
+            self.assertIs(prefetch.get_args, original_get_args)
+            self.assertNotIn("megatron.training", sys.modules)
+
+    def test_native_import_does_not_hide_other_missing_dependencies(self):
+        error = ModuleNotFoundError("missing torch_npu", name="torch_npu")
+        with patch.object(self.adapter, "import_module", side_effect=error):
+            with self.assertRaises(ModuleNotFoundError) as caught:
+                self.adapter._native_prefetch()
+        self.assertIs(caught.exception, error)
+
+    def test_temporary_training_removed_when_native_retry_fails(self):
+        mind_args = ModuleType("mindspeed.args_utils")
+        mind_args.get_full_args = lambda: self.args
+        missing_training = ModuleNotFoundError("missing training", name="megatron.training")
+        missing_other = ModuleNotFoundError("missing torch_npu", name="torch_npu")
+        with patch.dict(sys.modules, {"mindspeed.args_utils": mind_args}):
+            del sys.modules["megatron.training"]
+            with patch.object(self.adapter, "import_module", side_effect=[missing_training, missing_other]):
+                with self.assertRaises(ModuleNotFoundError) as caught:
+                    self.adapter._native_prefetch()
+            self.assertIs(caught.exception, missing_other)
+            self.assertNotIn("megatron.training", sys.modules)
+
     def test_missing_targets_and_double_install_rejected(self):
         self.model.config.swap_modules = "missing"
         with self.assertRaisesRegex(RuntimeError, "matched no"):
