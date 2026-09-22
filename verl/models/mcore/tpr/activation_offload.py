@@ -109,14 +109,28 @@ def _iter_extra_external_tensors(context):
     return ()
 
 
-def _external_storages():
-    """Exported FA KV roots and reusable Prefix KV must stay resident."""
+def _external_storages(*, include_new_key_values=True):
+    """Return external FA storages that native swap must not release.
+
+    Reusable/past KV is always external state. Current/new KV is external only
+    when the caller still needs it as a direct autograd root (Pop). VisitLeaf
+    consumes current KV entirely inside its forward/backward graph, so native
+    swap may offload/reload it like any other transient activation.
+    """
     context = get_tpr_attention_context()
     if context is None:
         return set()
-    tensors = []
-    for mapping in (context.past_key_values, context.new_key_values):
-        tensors.extend(t for pair in mapping.values() for t in pair)
+    tensors = [
+        tensor
+        for pair in context.past_key_values.values()
+        for tensor in pair
+    ]
+    if include_new_key_values:
+        tensors.extend(
+            tensor
+            for pair in context.new_key_values.values()
+            for tensor in pair
+        )
     tensors.extend(_iter_extra_external_tensors(context))
     return {_storage_key(t) for t in tensors}
 
@@ -145,7 +159,14 @@ def _protect_exports(native, protected):
 
 
 @contextmanager
-def mindspeed_swap_attention(model, *, cp_size=1, cp_backend=None, persistent_kv_storages=None):
+def mindspeed_swap_attention(
+    model,
+    *,
+    cp_size=1,
+    cp_backend=None,
+    persistent_kv_storages=None,
+    protect_new_key_values=True,
+):
     """Temporarily install the native PP1 swap schedule on a constructed model.
 
     VERL bypasses megatron.training.setup_model_and_optimizer, where upstream
@@ -213,7 +234,9 @@ def mindspeed_swap_attention(model, *, cp_size=1, cp_backend=None, persistent_kv
 
     def after_layer(name):
         def hook(module, inputs, output):
-            protected.update(_external_storages())
+            protected.update(
+                _external_storages(include_new_key_values=protect_new_key_values)
+            )
             if persistent_kv_storages is not None:
                 protected.update(persistent_kv_storages())
             _protect_exports(native, protected)
@@ -269,9 +292,17 @@ def with_activation_offload(method):
                     for tensor in pair
                 }
 
+            # VisitLeaf never exports its current/new KV beyond this
+            # forward/backward graph, so native swap may release/reload it.
+            # Pop still needs recomputed new KV as explicit dKV roots after
+            # forward, therefore those storages must remain device-resident.
+            protect_new_key_values = method.__name__ == "pop"
             with mindspeed_swap_attention(
-                executor.model, cp_size=executor.cp_size,
-                cp_backend=executor.cp_backend, persistent_kv_storages=persistent_kv_storages,
+                executor.model,
+                cp_size=executor.cp_size,
+                cp_backend=executor.cp_backend,
+                persistent_kv_storages=persistent_kv_storages,
+                protect_new_key_values=protect_new_key_values,
             ):
                 return method(executor, *args, **kwargs)
         except Exception:
