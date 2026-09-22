@@ -11,7 +11,14 @@ import statistics
 from pathlib import Path
 
 
-LOG_RE = re.compile(r"cp(?P<cp>\d+)_p(?P<p>\d+)_s(?P<s>\d+)_off(?P<off>[01])\.log$")
+LOG_RE = re.compile(r"cp(?P<cp>\\d+)_p(?P<p>\\d+)_s(?P<s>\\d+)_off(?P<off>[01])\\.log$")
+OOM_RE = re.compile(
+    r"Tried to allocate (?P<request>[0-9.]+) (?P<request_unit>GiB|MiB).*?"
+    r"(?P<allocated>[0-9.]+) GiB already allocated.*?"
+    r"(?P<free>[0-9.]+) GiB free.*?"
+    r"(?P<reserved>[0-9.]+) GiB reserved",
+    re.IGNORECASE,
+)
 
 
 def _json_records(text: str, marker: str):
@@ -60,8 +67,29 @@ def parse_log(path: Path, warmup: int, repeats: int):
         row for row in max_rows
         if int(row.get("iteration", -1)) >= warmup
     ]
-    failures = list(_json_records(text, "TPR_OFFLOAD_B_FAILURE "))
-    oom = any(bool(item.get("oom")) for item in failures if isinstance(item, dict))
+    failures = [
+        item for item in _json_records(text, "TPR_OFFLOAD_B_FAILURE ")
+        if isinstance(item, dict)
+    ]
+    oom_records = [
+        item for item in failures
+        if bool(item.get("oom")) or "out of memory" in str(item.get("error", "")).lower()
+    ]
+    oom = bool(oom_records)
+    oom_record = next((item for item in oom_records if item.get("oom")), oom_records[0] if oom_records else None)
+    oom_stats = {}
+    if oom_record is not None:
+        match_oom = OOM_RE.search(str(oom_record.get("error", "")))
+        if match_oom:
+            request = float(match_oom.group("request"))
+            if match_oom.group("request_unit").lower() == "mib":
+                request /= 1024.0
+            oom_stats = {
+                "oom_request_gib": request,
+                "oom_allocated_gib": float(match_oom.group("allocated")),
+                "oom_free_gib": float(match_oom.group("free")),
+                "oom_reserved_gib": float(match_oom.group("reserved")),
+            }
 
     if oom:
         status = "OOM"
@@ -77,6 +105,8 @@ def parse_log(path: Path, warmup: int, repeats: int):
         "path": str(path),
         "status": status,
         "samples": len(measured),
+        "oom_phase": None if oom_record is None else oom_record.get("stage"),
+        **oom_stats,
         "latency_s": _median(measured, "latency_s"),
         # Memory is a capacity metric: report the worst measured iteration.
         "peak_allocated": _maximum(measured, "peak_allocated"),
@@ -108,6 +138,16 @@ def compare(off, on):
         "off_incremental_gib": None if not off else _gib(off["incremental_peak"]),
         "on_incremental_gib": None if not on else _gib(on["incremental_peak"]),
         "on_released_gib": None if not on else _gib(on["released_bytes"]),
+        "off_oom_phase": None if not off else off.get("oom_phase"),
+        "on_oom_phase": None if not on else on.get("oom_phase"),
+        "off_oom_request_gib": None if not off else off.get("oom_request_gib"),
+        "on_oom_request_gib": None if not on else on.get("oom_request_gib"),
+        "off_oom_allocated_gib": None if not off else off.get("oom_allocated_gib"),
+        "on_oom_allocated_gib": None if not on else on.get("oom_allocated_gib"),
+        "off_oom_free_gib": None if not off else off.get("oom_free_gib"),
+        "on_oom_free_gib": None if not on else on.get("oom_free_gib"),
+        "off_oom_reserved_gib": None if not off else off.get("oom_reserved_gib"),
+        "on_oom_reserved_gib": None if not on else on.get("oom_reserved_gib"),
     }
     if off and on and off["status"] == "OK" and on["status"] == "OK":
         row["latency_overhead_pct"] = _pct(
@@ -133,7 +173,8 @@ def print_markdown(rows):
         "CP", "P", "S", "OFF", "ON",
         "OFF latency ms", "ON latency ms", "Δ latency %",
         "OFF peak GiB", "ON peak GiB", "Saved GiB", "Saved %",
-        "ON released GiB",
+        "ON released GiB", "OFF OOM phase", "ON OOM phase",
+        "OFF req GiB", "ON req GiB",
     ]
     print("| " + " | ".join(headers) + " |")
     print("|" + "|".join(["---"] * len(headers)) + "|")
@@ -146,6 +187,8 @@ def print_markdown(rows):
             fmt(row["off_peak_gib"]), fmt(row["on_peak_gib"]),
             fmt(row["memory_saved_gib"]), fmt(row["memory_saved_pct"]),
             fmt(row["on_released_gib"]),
+            row["off_oom_phase"] or "-", row["on_oom_phase"] or "-",
+            fmt(row["off_oom_request_gib"]), fmt(row["on_oom_request_gib"]),
         ]
         print("| " + " | ".join(map(str, values)) + " |")
 
