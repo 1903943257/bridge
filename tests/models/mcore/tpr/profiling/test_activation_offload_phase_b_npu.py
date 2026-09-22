@@ -150,13 +150,15 @@ class _Probe:
                 monkeypatch.setattr(ring_attention, name, timed)
 
     def marker(self, event, **extra):
-        print("TPR_OFFLOAD_B_STAGE " + json.dumps(dict(
-            rank=dist.get_rank(), stage=self.stage, phase=self.phase, event=event, **extra)), flush=True)
+        # Correctness logs are intentionally minimal. Emit phase detail only
+        # for exceptions; normal progress is summarized once per stage.
+        if event == "failure":
+            print("TPR_OFFLOAD_B_FAILURE " + json.dumps(dict(
+                rank=dist.get_rank(), stage=self.stage, phase=self.phase, **extra)), flush=True)
 
     def call(self, phase, enabled, function, *, transfer_gate=True):
         self.phase = phase
         before = self.counts.copy()
-        self.marker("begin")
         try:
             result = function()
             if self.synchronize:
@@ -165,7 +167,6 @@ class _Probe:
         except Exception as error:
             self.marker("failure", error=str(error)[:500])
             raise
-        self.marker("end")
         delta = {key: value - before[key] for key, value in self.counts.items()}
         self.phases.append(dict(phase=phase, **delta))
         if not transfer_gate:
@@ -209,8 +210,8 @@ def _run(model, plan, runtime, probe, *, observe):
             return super()._compute_loss(segment, logits)
 
     executor = ObservedExecutor(model, plan, cp_group=runtime.cp_group, cp_backend="ring")
-    if observe:
-        print("TPR_OFFLOAD_B_SHARDS " + json.dumps(dict(rank=runtime.rank, segments={
+    if observe and runtime.rank == 0 and probe.stage == "off":
+        print("TPR_OFFLOAD_B_SHARDS " + json.dumps(dict(cp_size=runtime.cp_size, segments={
             str(s.segment_id): dict(logical_length=s.length,
                                     physical_local_length=executor._segment_shard(s).local_length,
                                     local_loss_terms=len(executor._owned_loss_terms(s)))
@@ -259,19 +260,24 @@ def _report(runtime, record):
 def _compare(reference, actual, baseline, *, stage, rank):
     from .test_activation_offload_phase_a_npu import _difference_metrics
     from ._offload_b_gate import parameter_gate
+
     failures = 0
+    failed_details = []
+    category_summary = {}
     for category, expected, observed in zip(
         ("loss", "logprob", "parameter_grad", "prefix_grad"), reference, actual
     ):
-        details = []
         bad = 0
         keys_ok = bool(expected) and expected.keys() == observed.keys()
         bad += int(not keys_ok)
         for name in expected.keys() & observed.keys():
             if expected[name].shape != observed[name].shape:
                 bad += 1
-                details.append(dict(tensor=str(name), passed=False, severity=float("inf"), error="shape mismatch"))
+                failed_details.append(dict(
+                    category=category, tensor=str(name), severity=float("inf"),
+                    reason="shape_mismatch"))
                 continue
+
             metrics = _difference_metrics(expected[name], observed[name])
             metrics["mismatch_fraction"] = metrics["mismatched"] / max(metrics["elements"], 1)
             limits = {}
@@ -283,25 +289,25 @@ def _compare(reference, actual, baseline, *, stage, rank):
                     passed, severity = False, float("inf")
                 if stage == "off_repeat":
                     baseline[name] = metrics.copy()
-                # Rank baseline detail by relative L2 rather than constant zero.
-                if calibration and passed:
-                    severity = metrics["relative_l2"]
             else:
-                # Exact same elementwise strict tolerance as Phase A; NaN/Inf fail.
                 passed = metrics["finite"] and metrics["mismatched"] == 0
                 severity = metrics["max_abs"] if passed else float("inf")
-            bad += int(not passed)
-            details.append(dict(tensor=str(name), passed=passed, severity=severity,
-                                **metrics, limits=limits,
-                                baseline=baseline.get(name) if category == "parameter_grad" else None))
+
+            if not passed:
+                bad += 1
+                failed_details.append(dict(
+                    category=category, tensor=str(name), severity=severity,
+                    relative_l2=metrics["relative_l2"], max_abs=metrics["max_abs"],
+                    mismatch_fraction=metrics["mismatch_fraction"], limits=limits))
+
         failures += bad
-        print("TPR_OFFLOAD_B_COMPARE " + json.dumps(dict(
-            rank=rank, stage=stage, category=category, checked=len(details), failed=bad,
-            keys_match=keys_ok, calibration=category == "parameter_grad" and stage == "off_repeat")), flush=True)
-        if category != "parameter_grad" or rank == 0:
-            worst = sorted(details, key=lambda row: (not row["passed"], row["severity"]), reverse=True)[:5]
-            print("TPR_OFFLOAD_B_WORST " + json.dumps(dict(
-                rank=rank, stage=stage, category=category, top5=worst)), flush=True)
+        category_summary[category] = bad
+
+    if rank == 0:
+        worst = sorted(failed_details, key=lambda row: row["severity"], reverse=True)[:3]
+        print("TPR_OFFLOAD_B_RESULT " + json.dumps(dict(
+            stage=stage, failures=failures, by_category=category_summary,
+            worst=worst)), flush=True)
     return failures
 
 
@@ -327,15 +333,18 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
         stage_failures = _compare(reference, actual, baseline, stage=stage, rank=runtime.rank)
         stage_failures += len(probe.errors)
         failures += stage_failures
-        probe.phase = "correctness_gate"
-        probe.marker("failure" if stage_failures else "end", failures=stage_failures)
         torch.npu.synchronize()
-        _report(runtime, dict(stage=stage, padded=padded, sparse=sparse, **probe.report()))
+        if runtime.rank == 0:
+            print("TPR_OFFLOAD_B_TRANSFER " + json.dumps(dict(
+                stage=stage, d2h_bytes=probe.counts["d2h_bytes"],
+                released_bytes=probe.counts["released_bytes"],
+                h2d_bytes=probe.counts["h2d_bytes"],
+                probe_errors=probe.errors[:3])), flush=True)
         if actual is not reference:
             del actual
     failed = torch.tensor(bool(failures), device=runtime.device, dtype=torch.int32)
     dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=runtime.cp_group)
-    assert not failed.item(), f"Offload correctness failed; local failures={failures}; see COMPARE/WORST summaries"
+    assert not failed.item(), f"Offload correctness failed; local failures={failures}; see TPR_OFFLOAD_B_RESULT"
 
 
 def test_ring_offload_capacity(runtime, native_args, monkeypatch):
