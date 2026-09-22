@@ -12,16 +12,25 @@ SMALL_TENSOR_REL_L2_FLOOR = 2e-2
 def gradient_gate(metrics, baseline):
     """Return pass/limit/severity against calibrated OFF-repeat noise.
 
-    Hard acceptance uses finite values and relative-L2 only. max_abs and
-    mismatch_fraction remain diagnostics because isolated BF16 quantization
-    outliers are not a robust correctness signal.
+    Finite tensors with zero elementwise mismatches pass immediately using the
+    original Phase-A tolerance. Otherwise acceptance falls back to calibrated
+    relative-L2. max_abs and mismatch_fraction remain diagnostics.
     """
     valid = lambda row: (
         row["finite"]
         and math.isfinite(row["relative_l2"])
         and row["relative_l2"] >= 0
     )
-    if not valid(metrics) or baseline is None or not valid(baseline):
+    if not valid(metrics):
+        return False, {}, float("inf")
+
+    # If every element already satisfies the original Phase-A elementwise
+    # tolerance, accept directly. Relative-L2 can look large for tiny/near-zero
+    # gradients even though there is no elementwise correctness violation.
+    if metrics["mismatched"] == 0:
+        return True, {"elementwise": "pass"}, 0.0
+
+    if baseline is None or not valid(baseline):
         return False, {}, float("inf")
 
     floor = (
