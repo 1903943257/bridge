@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from .context import KVPair, TPRAttentionContext, use_tpr_attention_context
 from .activation_offload import validate_activation_offload, with_activation_offload
@@ -85,6 +86,7 @@ class SegmentExecutor:
         expected_layer_numbers: tuple[int, ...] | None = None,
         kv_stack: KVStack | None = None,
         loss_scale_func: Callable[[Tensor], Tensor] | None = None,
+        loss_chunk_size: int | None = None,
         cp_group: Any | None = None,
         cp_backend: TPRCPBackend | str | None = None,
     ) -> None:
@@ -112,6 +114,13 @@ class SegmentExecutor:
         self.expected_layer_numbers = tuple(sorted(expected_layer_numbers))
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
+        if loss_chunk_size is not None and (
+            not isinstance(loss_chunk_size, int)
+            or isinstance(loss_chunk_size, bool)
+            or loss_chunk_size <= 0
+        ):
+            raise ValueError(f"loss_chunk_size must be a positive integer or None, got {loss_chunk_size!r}")
+        self.loss_chunk_size = loss_chunk_size
         self.cp_group = cp_group
         self.gdn_layer_numbers = tuple(
             sorted(module.layer_number for module in model.modules()
@@ -445,24 +454,52 @@ class SegmentExecutor:
             dtype=torch.float32,
             device=logits.device,
         )
-        selected_logits = logits[0].index_select(0, query_offsets)
         compute_language_model_loss = getattr(self.model, "compute_language_model_loss", None)
         if callable(compute_language_model_loss):
-            # Follow Megatron's native language-model CE path instead of
-            # materializing an extra FP32 logits tensor in TPR. Megatron owns
-            # the FP32-stable softmax/CE implementation and selects fused versus
-            # unfused vocab-parallel CE from the model config.
+            # Follow Megatron's native language-model CE path. For long local
+            # sequences, checkpoint sequence chunks so the large [tokens, vocab]
+            # BF16 selection and Megatron's FP32 CE workspace are materialized
+            # one chunk at a time instead of for the entire local sequence.
             #
-            # LanguageModule expects logits [sequence, batch, vocab] and labels
-            # [batch, sequence]. TPR has batch=1 and may select sparse query rows.
-            per_term_loss = compute_language_model_loss(
-                targets.unsqueeze(0),
-                selected_logits.unsqueeze(1),
-            ).reshape(-1)
+            # We deliberately chunk the token/sequence dimension, NOT vocab:
+            # each chunk still sees the complete vocabulary and therefore uses
+            # exactly the same native softmax / CE semantics and FP32 policy.
+            # index_select stays inside the checkpoint because Megatron CE may
+            # modify its logits workspace in-place; this also prevents retaining
+            # a full-size selected_logits copy until backward.
+            if self.loss_chunk_size is not None and len(owned_terms) > self.loss_chunk_size:
+                def native_loss_chunk(full_logits, offsets, labels):
+                    chunk_logits = full_logits[0].index_select(0, offsets)
+                    return compute_language_model_loss(
+                        labels.unsqueeze(0),
+                        chunk_logits.unsqueeze(1),
+                    ).reshape(-1)
+
+                loss_chunks = []
+                for start in range(0, len(owned_terms), self.loss_chunk_size):
+                    end = min(start + self.loss_chunk_size, len(owned_terms))
+                    loss_chunks.append(
+                        checkpoint(
+                            native_loss_chunk,
+                            logits,
+                            query_offsets[start:end],
+                            targets[start:end],
+                            use_reentrant=False,
+                            preserve_rng_state=False,
+                        )
+                    )
+                per_term_loss = torch.cat(loss_chunks, dim=0)
+            else:
+                selected_logits = logits[0].index_select(0, query_offsets)
+                per_term_loss = compute_language_model_loss(
+                    targets.unsqueeze(0),
+                    selected_logits.unsqueeze(1),
+                ).reshape(-1)
         else:
             # Algebraic unit-test doubles are intentionally allowed to omit the
             # Megatron LanguageModule API. Production GPTModel instances expose
             # compute_language_model_loss and never take this fallback.
+            selected_logits = logits[0].index_select(0, query_offsets)
             per_term_loss = F.cross_entropy(
                 selected_logits.float(),
                 targets,
