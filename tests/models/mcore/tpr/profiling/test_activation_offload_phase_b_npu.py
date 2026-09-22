@@ -209,7 +209,14 @@ def _run(model, plan, runtime, probe, *, observe):
                         ).cpu() if terms else torch.empty(0)
             return super()._compute_loss(segment, logits)
 
-    executor = ObservedExecutor(model, plan, cp_group=runtime.cp_group, cp_backend="ring")
+    loss_chunk_size = int(os.getenv("TPR_LOSS_CHUNK_SIZE", "1024"))
+    executor = ObservedExecutor(
+        model,
+        plan,
+        cp_group=runtime.cp_group,
+        cp_backend="ring",
+        loss_chunk_size=loss_chunk_size,
+    )
     if observe and runtime.rank == 0 and probe.stage == "off":
         print("TPR_OFFLOAD_B_SHARDS " + json.dumps(dict(cp_size=runtime.cp_size, segments={
             str(s.segment_id): dict(logical_length=s.length,
