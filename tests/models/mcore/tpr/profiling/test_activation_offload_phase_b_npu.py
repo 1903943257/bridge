@@ -259,17 +259,22 @@ def _report(runtime, record):
 
 def _compare(reference, actual, baseline, *, stage):
     from .test_activation_offload_phase_a_npu import _difference_metrics
-    from ._offload_b_gate import parameter_gate
+    from ._offload_b_gate import gradient_gate, merge_baseline
 
     failures = 0
     failed_details = []
     category_summary = {}
+    calibration = stage in ("off_repeat", "off_repeat2")
+    gradient_categories = ("parameter_grad", "prefix_grad")
+
     for category, expected, observed in zip(
         ("loss", "logprob", "parameter_grad", "prefix_grad"), reference, actual
     ):
         bad = 0
         keys_ok = bool(expected) and expected.keys() == observed.keys()
         bad += int(not keys_ok)
+        category_baseline = baseline.setdefault(category, {}) if category in gradient_categories else None
+
         for name in expected.keys() & observed.keys():
             if expected[name].shape != observed[name].shape:
                 bad += 1
@@ -281,14 +286,15 @@ def _compare(reference, actual, baseline, *, stage):
             metrics = _difference_metrics(expected[name], observed[name])
             metrics["mismatch_fraction"] = metrics["mismatched"] / max(metrics["elements"], 1)
             limits = {}
-            if category == "parameter_grad":
-                calibration = stage in ("off", "off_repeat")
-                noise = None if calibration else baseline.get(name)
-                passed, limits, severity = parameter_gate(metrics, noise)
-                if not calibration and noise is None:
-                    passed, severity = False, float("inf")
-                if stage == "off_repeat":
-                    baseline[name] = metrics.copy()
+
+            if category in gradient_categories:
+                if stage == "off":
+                    passed, severity = metrics["finite"], 0.0
+                elif calibration:
+                    passed, severity = metrics["finite"], 0.0
+                    category_baseline[name] = merge_baseline(category_baseline.get(name), metrics)
+                else:
+                    passed, limits, severity = gradient_gate(metrics, category_baseline.get(name))
             else:
                 passed = metrics["finite"] and metrics["mismatched"] == 0
                 severity = metrics["max_abs"] if passed else float("inf")
@@ -315,10 +321,10 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
     reference = None
     baseline = {}
     failures = 0
-    # Control repeat identifies nondeterminism independently of swap; final OFF
-    # checks hook/stream/buffer cleanup after repeated native lifecycles.
-    for stage, enabled in (("off", False), ("off_repeat", False), ("on", True),
-                           ("on_repeat", True), ("off_after", False)):
+    # Two OFF repeats calibrate native Ring/NPU backward noise before swap.
+    # Final OFF checks that repeated native swap lifecycles leave no regression.
+    for stage, enabled in (("off", False), ("off_repeat", False), ("off_repeat2", False),
+                           ("on", True), ("on_repeat", True), ("off_after", False)):
         model.config.swap_attention = enabled
         model.zero_grad(set_to_none=True)
         with monkeypatch.context() as patches:
@@ -345,9 +351,14 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
         dist.all_gather_object(stage_results, local_result, group=runtime.cp_group)
         if runtime.rank == 0:
             categories = ("loss", "logprob", "parameter_grad", "prefix_grad")
+            unique_worst = {}
+            for row in stage_results:
+                for item in row["worst"]:
+                    key = (item["category"], item["tensor"])
+                    if key not in unique_worst or item["severity"] > unique_worst[key]["severity"]:
+                        unique_worst[key] = item
             worst = sorted(
-                (item for row in stage_results for item in row["worst"]),
-                key=lambda row: row["severity"], reverse=True,
+                unique_worst.values(), key=lambda row: row["severity"], reverse=True
             )[:3]
             print("TPR_OFFLOAD_B_RESULT " + json.dumps(dict(
                 stage=stage,
