@@ -199,10 +199,47 @@ class AdapterTest(unittest.TestCase):
                 self.adapter._external_storages(),
                 {("npu:0", 1), ("npu:0", 2), ("npu:0", 3), ("npu:0", 4)},
             )
+            self.assertEqual(
+                self.adapter._external_storages(include_new_key_values=False),
+                {("npu:0", 1), ("npu:0", 2)},
+            )
             with patch.object(
                 self.adapter, "_iter_extra_external_tensors", return_value=(Tensor(5),)
             ):
-                self.assertIn(("npu:0", 5), self.adapter._external_storages())
+                self.assertIn(
+                    ("npu:0", 5),
+                    self.adapter._external_storages(include_new_key_values=False),
+                )
+
+    def test_visit_can_swap_new_kv_but_pop_keeps_direct_roots_resident(self):
+        context = NS(
+            past_key_values={},
+            new_key_values={1: (Tensor(3), Tensor(4))},
+        )
+        items = [
+            NS(tensor=Tensor(3), storage_data_ptr=3, first_tensor=False, last_tensor=False),
+            NS(tensor=Tensor(4), storage_data_ptr=4, first_tensor=False, last_tensor=False),
+        ]
+        with patch.object(self.adapter, "get_tpr_attention_context", return_value=context):
+            self.native.swap_tensors = list(items)
+            with self.adapter.mindspeed_swap_attention(
+                self.model, protect_new_key_values=False
+            ):
+                self.layer.forward_hook(self.layer, (), None)
+                self.assertEqual(self.native.swap_tensors, items)
+                self.assertFalse(any(getattr(item, "tpr_resident", False) for item in items))
+
+            items = [
+                NS(tensor=Tensor(3), storage_data_ptr=3, first_tensor=False, last_tensor=False),
+                NS(tensor=Tensor(4), storage_data_ptr=4, first_tensor=False, last_tensor=False),
+            ]
+            self.native.swap_tensors = list(items)
+            with self.adapter.mindspeed_swap_attention(
+                self.model, protect_new_key_values=True
+            ):
+                self.layer.forward_hook(self.layer, (), None)
+                self.assertEqual(self.native.swap_tensors, [])
+                self.assertTrue(all(item.tpr_resident for item in items))
 
     def test_exported_storage_and_aliases_stay_resident(self):
         def item(ptr):
