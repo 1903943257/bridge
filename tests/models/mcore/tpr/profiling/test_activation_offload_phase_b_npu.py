@@ -257,7 +257,7 @@ def _report(runtime, record):
         print("TPR_OFFLOAD_B_MAX " + json.dumps(dict(max_rank=maximum)), flush=True)
 
 
-def _compare(reference, actual, baseline, *, stage, rank):
+def _compare(reference, actual, baseline, *, stage):
     from .test_activation_offload_phase_a_npu import _difference_metrics
     from ._offload_b_gate import parameter_gate
 
@@ -303,12 +303,8 @@ def _compare(reference, actual, baseline, *, stage, rank):
         failures += bad
         category_summary[category] = bad
 
-    if rank == 0:
-        worst = sorted(failed_details, key=lambda row: row["severity"], reverse=True)[:3]
-        print("TPR_OFFLOAD_B_RESULT " + json.dumps(dict(
-            stage=stage, failures=failures, by_category=category_summary,
-            worst=worst)), flush=True)
-    return failures
+    worst = sorted(failed_details, key=lambda row: row["severity"], reverse=True)[:3]
+    return failures, dict(by_category=category_summary, worst=worst)
 
 
 @pytest.mark.parametrize("padded,sparse", [(False, False), (True, False), (True, True)])
@@ -330,21 +326,53 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
             actual = _run(model, plan, runtime, probe, observe=True)
         if reference is None:
             reference = actual
-        stage_failures = _compare(reference, actual, baseline, stage=stage, rank=runtime.rank)
+        stage_failures, comparison = _compare(reference, actual, baseline, stage=stage)
         stage_failures += len(probe.errors)
         failures += stage_failures
         torch.npu.synchronize()
+
+        local_result = dict(
+            rank=runtime.rank,
+            failures=stage_failures,
+            by_category=comparison["by_category"],
+            worst=comparison["worst"],
+            d2h_bytes=probe.counts["d2h_bytes"],
+            released_bytes=probe.counts["released_bytes"],
+            h2d_bytes=probe.counts["h2d_bytes"],
+            probe_errors=probe.errors[:3],
+        )
+        stage_results = [None] * runtime.cp_size
+        dist.all_gather_object(stage_results, local_result, group=runtime.cp_group)
         if runtime.rank == 0:
-            print("TPR_OFFLOAD_B_TRANSFER " + json.dumps(dict(
-                stage=stage, d2h_bytes=probe.counts["d2h_bytes"],
-                released_bytes=probe.counts["released_bytes"],
-                h2d_bytes=probe.counts["h2d_bytes"],
-                probe_errors=probe.errors[:3])), flush=True)
+            categories = ("loss", "logprob", "parameter_grad", "prefix_grad")
+            worst = sorted(
+                (item for row in stage_results for item in row["worst"]),
+                key=lambda row: row["severity"], reverse=True,
+            )[:3]
+            print("TPR_OFFLOAD_B_RESULT " + json.dumps(dict(
+                stage=stage,
+                failures_max=max(row["failures"] for row in stage_results),
+                failures_by_rank=[row["failures"] for row in stage_results],
+                by_category_max={
+                    category: max(row["by_category"][category] for row in stage_results)
+                    for category in categories
+                },
+                transfer_max={
+                    key: max(row[key] for row in stage_results)
+                    for key in ("d2h_bytes", "released_bytes", "h2d_bytes")
+                },
+                probe_errors=[error for row in stage_results for error in row["probe_errors"]][:3],
+                worst=worst,
+            )), flush=True)
         if actual is not reference:
             del actual
-    failed = torch.tensor(bool(failures), device=runtime.device, dtype=torch.int32)
-    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=runtime.cp_group)
-    assert not failed.item(), f"Offload correctness failed; local failures={failures}; see TPR_OFFLOAD_B_RESULT"
+    failure_count = torch.tensor(failures, device=runtime.device, dtype=torch.int32)
+    dist.all_reduce(failure_count, op=dist.ReduceOp.MAX, group=runtime.cp_group)
+    if runtime.rank == 0:
+        assert failure_count.item() == 0, (
+            f"Offload correctness failed; max-rank failures={failure_count.item()}; "
+            "see TPR_OFFLOAD_B_RESULT"
+        )
 
 
 def test_ring_offload_capacity(runtime, native_args, monkeypatch):
