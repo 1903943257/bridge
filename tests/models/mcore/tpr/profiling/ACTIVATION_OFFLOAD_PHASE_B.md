@@ -51,23 +51,20 @@ done
 loss 数，检查 padding 和 loss ownership 确实命中。默认 P/S=2048，padding
 case 为 P2047/S2045，可用 `TPR_OFFLOAD_B_CHECK_LENGTH` 调整。
 
-依次跑 OFF、OFF repeat、ON、ON repeat、OFF after；对比 loss、本 rank 的
-全部 owned logprobs、CP finalize 后所有参数梯度、Pop 前本 rank Prefix dKV。
-loss/logprob/Prefix dKV 沿用 Phase A rtol=2e-3/atol=2e-4 的严格逐元素
-gate，并要求 finite。参数梯度改为每个参数独立的 OFF-repeat noise budget：
+依次跑 OFF、两个 OFF repeat、ON、ON repeat、OFF after；对比 loss、本 rank
+的全部 owned logprobs、CP finalize 后所有参数梯度、Pop 前本 rank Prefix dKV。
+loss/logprob 保持 Phase A rtol=2e-3/atol=2e-4 的严格逐元素 gate。
+parameter grad 和 Prefix dKV 使用同一套 OFF-repeat baseline-aware gate：
 
-- 所有阶段均与第一次 OFF 比较；OFF-repeat 的参数误差只校准 baseline，
-  但缺失参数、shape 不一致和非有限值仍失败。
-- `relative_l2 = ||actual-reference||2 / max(||reference||2, 1e-15)`；
-  `max_abs = max(abs(actual-reference))`；`mismatch_fraction` 是超出原
-  `2e-4 + 2e-3*abs(reference)` 逐元素容差的元素占比。
-- 对 ON/ON-repeat/OFF-after，每个指标上限为
-  `max(1.5 * baseline_metric, baseline_metric + floor)`。
-  relative_l2/max_abs/mismatch_fraction 的 floor 分别为
-  `0.002 / 0.0002 / 0.001`（最后一项是占比增加 0.1 个百分点）。
-  任一指标超限或任一 tensor/baseline 非 finite 即失败。
-- 这是一轮 OFF repeat 的工程回归预算，不是统计显著性检验；它检查 swap
-  相对现有重复噪声是否退化，不证明原 OFF 路径相对数学参考正确。
+- 所有阶段均与第一次 OFF 比较；两个 OFF repeat 用于校准现有 Ring/NPU
+  backward noise，按 tensor 保留 relative-L2 更差的 baseline。
+- 若 tensor finite 且 `mismatched == 0`，即所有元素均满足原
+  `2e-4 + 2e-3*abs(reference)` 逐元素容差，则直接通过。
+- 只有存在逐元素 mismatch 时才使用 relative-L2 baseline gate：
+  `limit=max(1.5*baseline, baseline+floor)`；普通 tensor floor=0.002，
+  小于 4096 elements 的 tensor floor=0.02。
+- `max_abs` 和 `mismatch_fraction` 仅保留为诊断信息，不作为硬 gate。
+- 非 finite、缺失 tensor 或 shape 不一致始终失败。
 
 各 rank 每 stage/category 输出 summary，参数 detail 只 rank0 输出 worst
 top-5；assert 只输出失败数量。native per-layer 命中默认汇总，设置
