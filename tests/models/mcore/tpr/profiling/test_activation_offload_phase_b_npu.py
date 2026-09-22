@@ -198,15 +198,21 @@ def _run(model, plan, runtime, probe, *, observe):
         def _compute_loss(self, segment, logits):
             if observe:
                 terms = self._owned_loss_terms(segment)
-                shard = self._segment_shard(segment)
-                # Only diagnostics: production backward still calls native fused CE.
-                with torch.no_grad():
-                    offsets = torch.tensor([shard.global_to_local(t.query_offset) for t in terms],
-                                           device=logits.device, dtype=torch.long)
-                    targets = torch.tensor([t.target_token_id for t in terms], device=logits.device)
-                    if hasattr(logits, "per_term_loss"):
-                        logs[segment.segment_id] = -logits.per_term_loss.detach().float().cpu()
-                    else:
+                if hasattr(logits, "per_term_loss"):
+                    logs[segment.segment_id] = -logits.per_term_loss.detach().float().cpu()
+                elif terms:
+                    shard = self._segment_shard(segment)
+                    # Only diagnostics: production backward still calls native fused CE.
+                    with torch.no_grad():
+                        offsets = torch.tensor(
+                            [shard.global_to_local(t.query_offset) for t in terms],
+                            device=logits.device,
+                            dtype=torch.long,
+                        )
+                        targets = torch.tensor(
+                            [t.target_token_id for t in terms],
+                            device=logits.device,
+                        )
                         logs[segment.segment_id] = (-torch.nn.functional.cross_entropy(
                             logits[0].index_select(0, offsets).float(),
                             targets.long(),
