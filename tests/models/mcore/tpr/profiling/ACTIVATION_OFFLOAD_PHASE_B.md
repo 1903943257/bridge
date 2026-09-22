@@ -121,6 +121,19 @@ capacity 通过。OOM 的 rank 会输出 `TPR_OFFLOAD_B_FAILURE`，记录阶段�
 确认瓶颈须结合 NPU profiler trace；D2H/H2D transfer time、exposed wait
 目前输出 null，不为统计改造 native runtime。详细计数仅存在于测试探针。
 
+矩阵跑完后可直接汇总 OFF/ON：
+
+```bash
+python tests/models/mcore/tpr/profiling/summarize_activation_offload_phase_b.py \
+  tests/models/mcore/tpr/logs/phase_b_perf \
+  --warmup 1 --repeats 3 \
+  --csv tests/models/mcore/tpr/logs/phase_b_perf/summary.csv
+```
+
+脚本按 case 自动配对 OFF/ON，Markdown 表输出 median latency、max peak allocated、
+显存节省 GiB/%、latency overhead %、ON released GiB，并标记 OK/OOM/FAILED/
+INCOMPLETE；同时可落一份 CSV。
+
 ## 验证状态与下一步
 
 本地适配器 unit tests 通过，NPU 测试仅完成静态检查；CP2/CP4 correctness、
