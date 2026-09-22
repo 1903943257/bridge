@@ -53,7 +53,28 @@ case 为 P2047/S2045，可用 `TPR_OFFLOAD_B_CHECK_LENGTH` 调整。
 
 依次跑 OFF、OFF repeat、ON、ON repeat、OFF after；对比 loss、本 rank 的
 全部 owned logprobs、CP finalize 后所有参数梯度、Pop 前本 rank Prefix dKV。
-沿用 Phase A rtol=2e-3/atol=2e-4，不通过放宽容差掩盖 OFF repeat 的波动。
+loss/logprob/Prefix dKV 沿用 Phase A rtol=2e-3/atol=2e-4 的严格逐元素
+gate，并要求 finite。参数梯度改为每个参数独立的 OFF-repeat noise budget：
+
+- 所有阶段均与第一次 OFF 比较；OFF-repeat 的参数误差只校准 baseline，
+  但缺失参数、shape 不一致和非有限值仍失败。
+- `relative_l2 = ||actual-reference||2 / max(||reference||2, 1e-15)`；
+  `max_abs = max(abs(actual-reference))`；`mismatch_fraction` 是超出原
+  `2e-4 + 2e-3*abs(reference)` 逐元素容差的元素占比。
+- 对 ON/ON-repeat/OFF-after，每个指标上限为
+  `max(1.5 * baseline_metric, baseline_metric + floor)`。
+  relative_l2/max_abs/mismatch_fraction 的 floor 分别为
+  `0.002 / 0.0002 / 0.001`（最后一项是占比增加 0.1 个百分点）。
+  任一指标超限或任一 tensor/baseline 非 finite 即失败。
+- 这是一轮 OFF repeat 的工程回归预算，不是统计显著性检验；它检查 swap
+  相对现有重复噪声是否退化，不证明原 OFF 路径相对数学参考正确。
+
+各 rank 每 stage/category 输出 summary，参数 detail 只 rank0 输出 worst
+top-5；assert 只输出失败数量。native per-layer 命中默认汇总，设置
+`TPR_OFFLOAD_B_VERBOSE=1` 才输出全量。Push/Visit/Pop/finalize 均输出
+begin/end/failure；correctness 在每阶段结束同步 NPU，以定位异步错误，
+capacity 不加入这些额外同步。model.config.swap_modules 显式取 native args，
+确保 `TPR_SWAP_MODULES=self_attention,mlp` 生效。
 各 rank 完成通信后统一汇总失败；CPU 保留 reference gradients，会需要额外
 主机内存。Push 必须零 transfer；每次 ON Visit/Pop 必须 release/H2D > 0，
 并检查 native storage 已释放及 host buffer pinned。零命中是失败而不是通过。

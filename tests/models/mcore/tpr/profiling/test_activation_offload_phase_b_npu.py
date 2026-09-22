@@ -65,7 +65,7 @@ def native_args(runtime, monkeypatch):
     return args
 
 
-def _model(runtime, length):
+def _model(runtime, length, native_args):
     # These imports MUST follow MindSpeed bootstrap, not pytest collection.
     from ._qwen3_profile_target import resolve_qwen3_profile_target
     from ..parallel.test_tpr_qwen3_cp_equivalence_npu import _make_qwen_cp_model
@@ -77,6 +77,7 @@ def _model(runtime, length):
     model.config.cross_entropy_loss_fusion = True
     model.config.cross_entropy_fusion_impl = "native"
     model.config.swap_attention = False
+    model.config.swap_modules = native_args.swap_modules
     return model
 
 
@@ -94,10 +95,12 @@ def _plan(prefix, suffix, *, sparse=False):
 class _Probe:
     """Test-only native counters and optional events; never owns tensor storage."""
 
-    def __init__(self, monkeypatch, *, timing=False):
+    def __init__(self, monkeypatch, *, timing=False, stage="capacity", synchronize=False):
         from mindspeed.core.memory.swap_attention.prefetch import SwapTensor
         from verl.models.mcore.tpr.parallel import ring_attention
         self.phase = "setup"
+        self.stage = stage
+        self.synchronize = synchronize
         self.counts = dict(d2h_bytes=0, released_bytes=0, h2d_bytes=0)
         self.restore_peak = 0
         self.by_layer = {}
@@ -146,12 +149,27 @@ class _Probe:
 
                 monkeypatch.setattr(ring_attention, name, timed)
 
-    def call(self, phase, enabled, function):
+    def marker(self, event, **extra):
+        print("TPR_OFFLOAD_B_STAGE " + json.dumps(dict(
+            rank=dist.get_rank(), stage=self.stage, phase=self.phase, event=event, **extra)), flush=True)
+
+    def call(self, phase, enabled, function, *, transfer_gate=True):
         self.phase = phase
         before = self.counts.copy()
-        result = function()
+        self.marker("begin")
+        try:
+            result = function()
+            if self.synchronize:
+                # Correctness only: surface asynchronous errors at their phase.
+                torch.npu.synchronize()
+        except Exception as error:
+            self.marker("failure", error=str(error)[:500])
+            raise
+        self.marker("end")
         delta = {key: value - before[key] for key, value in self.counts.items()}
         self.phases.append(dict(phase=phase, **delta))
+        if not transfer_gate:
+            return result
         if phase.startswith("push") or not enabled:
             if any(delta.values()):
                 self.errors.append(f"{phase}: unexpected transfers {delta}")
@@ -163,8 +181,9 @@ class _Probe:
         times = dict(ring_comm=0.0, fa=0.0, merge=0.0)
         for category, start, end in self.events:
             times[category] += start.elapsed_time(end)
+        detail = {"native_hits_by_layer": self.by_layer} if os.getenv("TPR_OFFLOAD_B_VERBOSE") == "1" else {}
         return dict(**self.counts, restore_sample_peak_allocated=self.restore_peak,
-                    phase_transfers=self.phases, native_hits_by_layer=self.by_layer,
+                    phase_transfers=self.phases, native_hit_entries=len(self.by_layer), **detail,
                     stream_interval_ms=times if self.events else None,
                     transfer_time_ms=None, exposed_wait_ms=None)
 
@@ -209,10 +228,13 @@ def _run(model, plan, runtime, probe, *, observe):
                 boundary[f"{layer}.{name}"] = value.detach().cpu().clone()
     losses.append(probe.call("pop.0", enabled, lambda: executor.pop(0)).normalized_loss)
     executor.kv_stack.assert_empty()
-    probe.phase = "parameter_grad_finalize"
-    _finalize_cp_parameter_gradients(model, runtime)
-    loss = torch.stack(losses).sum().detach()
-    dist.all_reduce(loss, group=runtime.cp_group)
+    def finalize():
+        _finalize_cp_parameter_gradients(model, runtime)
+        loss = torch.stack(losses).sum().detach()
+        dist.all_reduce(loss, group=runtime.cp_group)
+        return loss
+
+    loss = probe.call("finalize", enabled, finalize, transfer_gate=False)
     if not observe:
         return loss
     grads = {name: p.grad.detach().cpu().clone() for name, p in model.named_parameters()}
@@ -231,17 +253,66 @@ def _report(runtime, record):
             maximum["stream_interval_ms"] = {
                 key: max(row["stream_interval_ms"][key] for row in records)
                 for key in record["stream_interval_ms"]}
-        print("TPR_OFFLOAD_B_MAX " + json.dumps(dict(max_rank=maximum, ranks=records)), flush=True)
+        print("TPR_OFFLOAD_B_MAX " + json.dumps(dict(max_rank=maximum)), flush=True)
+
+
+def _compare(reference, actual, baseline, *, stage, rank):
+    from .test_activation_offload_phase_a_npu import _difference_metrics
+    from ._offload_b_gate import parameter_gate
+    failures = 0
+    for category, expected, observed in zip(
+        ("loss", "logprob", "parameter_grad", "prefix_grad"), reference, actual
+    ):
+        details = []
+        bad = 0
+        keys_ok = bool(expected) and expected.keys() == observed.keys()
+        bad += int(not keys_ok)
+        for name in expected.keys() & observed.keys():
+            if expected[name].shape != observed[name].shape:
+                bad += 1
+                details.append(dict(tensor=str(name), passed=False, severity=float("inf"), error="shape mismatch"))
+                continue
+            metrics = _difference_metrics(expected[name], observed[name])
+            metrics["mismatch_fraction"] = metrics["mismatched"] / max(metrics["elements"], 1)
+            limits = {}
+            if category == "parameter_grad":
+                calibration = stage in ("off", "off_repeat")
+                noise = None if calibration else baseline.get(name)
+                passed, limits, severity = parameter_gate(metrics, noise)
+                if not calibration and noise is None:
+                    passed, severity = False, float("inf")
+                if stage == "off_repeat":
+                    baseline[name] = metrics.copy()
+                # Rank baseline detail by relative L2 rather than constant zero.
+                if calibration and passed:
+                    severity = metrics["relative_l2"]
+            else:
+                # Exact same elementwise strict tolerance as Phase A; NaN/Inf fail.
+                passed = metrics["finite"] and metrics["mismatched"] == 0
+                severity = metrics["max_abs"] if passed else float("inf")
+            bad += int(not passed)
+            details.append(dict(tensor=str(name), passed=passed, severity=severity,
+                                **metrics, limits=limits,
+                                baseline=baseline.get(name) if category == "parameter_grad" else None))
+        failures += bad
+        print("TPR_OFFLOAD_B_COMPARE " + json.dumps(dict(
+            rank=rank, stage=stage, category=category, checked=len(details), failed=bad,
+            keys_match=keys_ok, calibration=category == "parameter_grad" and stage == "off_repeat")), flush=True)
+        if category != "parameter_grad" or rank == 0:
+            worst = sorted(details, key=lambda row: (not row["passed"], row["severity"]), reverse=True)[:5]
+            print("TPR_OFFLOAD_B_WORST " + json.dumps(dict(
+                rank=rank, stage=stage, category=category, top5=worst)), flush=True)
+    return failures
 
 
 @pytest.mark.parametrize("padded,sparse", [(False, False), (True, False), (True, True)])
 def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, sparse):
-    from .test_activation_offload_phase_a_npu import _compare_runs
     length = int(os.getenv("TPR_OFFLOAD_B_CHECK_LENGTH", "2048"))
     plan = _plan(length - int(padded), length - 3 * int(padded), sparse=sparse)
-    model = _model(runtime, 2 * length)
+    model = _model(runtime, 2 * length, native_args)
     reference = None
-    failures = []
+    baseline = {}
+    failures = 0
     # Control repeat identifies nondeterminism independently of swap; final OFF
     # checks hook/stream/buffer cleanup after repeated native lifecycles.
     for stage, enabled in (("off", False), ("off_repeat", False), ("on", True),
@@ -249,20 +320,22 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
         model.config.swap_attention = enabled
         model.zero_grad(set_to_none=True)
         with monkeypatch.context() as patches:
-            probe = _Probe(patches)
+            probe = _Probe(patches, stage=stage, synchronize=True)
             actual = _run(model, plan, runtime, probe, observe=True)
         if reference is None:
             reference = actual
-        else:
-            failures.extend(_compare_runs(reference, actual, owned=not sparse, stage=stage))
-        failures.extend(probe.errors)
+        stage_failures = _compare(reference, actual, baseline, stage=stage, rank=runtime.rank)
+        stage_failures += len(probe.errors)
+        failures += stage_failures
+        probe.phase = "correctness_gate"
+        probe.marker("failure" if stage_failures else "end", failures=stage_failures)
         torch.npu.synchronize()
         _report(runtime, dict(stage=stage, padded=padded, sparse=sparse, **probe.report()))
         if actual is not reference:
             del actual
     failed = torch.tensor(bool(failures), device=runtime.device, dtype=torch.int32)
     dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=runtime.cp_group)
-    assert not failed.item(), f"Offload correctness failed on one or more ranks: {failures}"
+    assert not failed.item(), f"Offload correctness failed; local failures={failures}; see COMPARE/WORST summaries"
 
 
 def test_ring_offload_capacity(runtime, native_args, monkeypatch):
@@ -271,7 +344,7 @@ def test_ring_offload_capacity(runtime, native_args, monkeypatch):
     prefix, suffix = int(os.getenv("TPR_PREFIX", "16384")), int(os.getenv("TPR_SUFFIX", "16384"))
     enabled = os.getenv("TPR_OFFLOAD", "0") == "1"
     plan = _plan(prefix, suffix)
-    model = _model(runtime, prefix + suffix)
+    model = _model(runtime, prefix + suffix, native_args)
     model.config.swap_attention = enabled
     warmup = int(os.getenv("TPR_OFFLOAD_B_WARMUP", "1"))
     repeats = int(os.getenv("TPR_OFFLOAD_B_REPEATS", "3"))
@@ -286,7 +359,8 @@ def test_ring_offload_capacity(runtime, native_args, monkeypatch):
         baseline_reserved = torch.npu.memory_reserved()
         torch.npu.reset_peak_memory_stats()
         with monkeypatch.context() as patches:
-            probe = _Probe(patches, timing=os.getenv("TPR_OFFLOAD_B_TIMING") == "1")
+            probe = _Probe(patches, timing=os.getenv("TPR_OFFLOAD_B_TIMING") == "1",
+                           stage=f"capacity.{iteration}")
             start = time.perf_counter()
             try:
                 _run(model, plan, runtime, probe, observe=False)
