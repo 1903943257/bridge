@@ -204,9 +204,16 @@ def _run(model, plan, runtime, probe, *, observe):
                     offsets = torch.tensor([shard.global_to_local(t.query_offset) for t in terms],
                                            device=logits.device, dtype=torch.long)
                     targets = torch.tensor([t.target_token_id for t in terms], device=logits.device)
-                    logs[segment.segment_id] = (-torch.nn.functional.cross_entropy(
-                        logits[0].index_select(0, offsets).float(), targets.long(), reduction="none")
-                        ).cpu() if terms else torch.empty(0)
+                    if hasattr(logits, "per_term_loss"):
+                        logs[segment.segment_id] = -logits.per_term_loss.detach().float().cpu()
+                    else:
+                        logs[segment.segment_id] = (-torch.nn.functional.cross_entropy(
+                            logits[0].index_select(0, offsets).float(),
+                            targets.long(),
+                            reduction="none",
+                        )).cpu()
+                else:
+                    logs[segment.segment_id] = torch.empty(0)
             return super()._compute_loss(segment, logits)
 
     loss_chunk_size = int(os.getenv("TPR_LOSS_CHUNK_SIZE", "1024"))
