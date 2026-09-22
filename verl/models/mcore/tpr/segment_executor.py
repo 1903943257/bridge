@@ -70,6 +70,17 @@ class LeafVisitResult:
     backward: SegmentBackwardResult
 
 
+@dataclass(frozen=True, slots=True)
+class _ChunkedLanguageModelOutput:
+    """Small loss-only result returned by Megatron's native output_processor."""
+
+    per_term_loss: Tensor
+    loss_sum: Tensor
+    normalized_loss: Tensor
+    backward_anchor: Tensor
+    local_sequence_length: int
+
+
 class SegmentExecutor:
     """Execute graph-free Push and gradient-carrying Pop for a SegmentPlan.
 
@@ -412,11 +423,28 @@ class SegmentExecutor:
                 else nullcontext()
             )
             with rope_context, use_tpr_attention_context(context):
-                logits = self.model(
+                model_kwargs = dict(
                     input_ids=input_ids,
                     position_ids=position_ids,
                     attention_mask=None,
                 )
+                if not no_grad and self._can_chunk_language_model_output():
+                    # Megatron's native output_processor runs after the decoder
+                    # and before the default full-sequence output projection.
+                    # Keep the native output layer / tied weight / CE helpers,
+                    # but project only the owned token rows in sequence chunks.
+                    model_kwargs["output_processor"] = (
+                        lambda **kwargs: self._chunk_language_model_output(
+                            segment, local_sequence_length=shard.local_length, **kwargs
+                        )
+                    )
+                logits = self.model(**model_kwargs)
+        if isinstance(logits, _ChunkedLanguageModelOutput):
+            if logits.local_sequence_length != shard.local_length:
+                raise RuntimeError(
+                    "chunked language-model output local sequence length differs from shard"
+                )
+            return context, logits
         if not isinstance(logits, Tensor) or logits.ndim != 3:
             raise ValueError(f"model must return logits [batch, sequence, vocab], got {type(logits).__name__}")
         expected_shape = (1, shard.local_length)
@@ -424,7 +452,123 @@ class SegmentExecutor:
             raise ValueError(f"model logits must start with shape {expected_shape}, got {tuple(logits.shape)}")
         return context, logits
 
-    def _compute_loss(self, segment: SegmentSpec, logits: Tensor) -> tuple[Tensor, Tensor]:
+    def _can_chunk_language_model_output(self) -> bool:
+        if self.loss_chunk_size is None:
+            return False
+        if not callable(getattr(self.model, "compute_language_model_loss", None)):
+            return False
+        if not callable(getattr(self.model, "output_layer", None)):
+            return False
+        # Current Megatron GPTModel exposes output_processor explicitly. Avoid
+        # relying on a TypeError fallback, which could mask errors raised inside
+        # model.forward on older revisions.
+        import inspect
+
+        try:
+            parameters = inspect.signature(self.model.forward).parameters
+        except (TypeError, ValueError):
+            return False
+        return "output_processor" in parameters
+
+    def _chunk_language_model_output(
+        self,
+        segment: SegmentSpec,
+        *,
+        local_sequence_length: int,
+        hidden_states: Tensor,
+        output_layer,
+        output_weight,
+        compute_language_model_loss,
+        scale_logits,
+        config,
+        **unused,
+    ) -> _ChunkedLanguageModelOutput:
+        """Project token chunks to vocab logits and immediately run native CE."""
+        owned_terms = self._owned_loss_terms(segment)
+        if not owned_terms:
+            # Preserve a differentiable path through every CP rank so Ring
+            # attention backward collectives are traversed even without loss.
+            anchor = hidden_states.float().sum() * 0.0
+            empty = hidden_states.new_empty((0,), dtype=torch.float32)
+            return _ChunkedLanguageModelOutput(
+                per_term_loss=empty,
+                loss_sum=anchor,
+                normalized_loss=anchor,
+                backward_anchor=anchor,
+                local_sequence_length=local_sequence_length,
+            )
+
+        shard = self._segment_shard(segment)
+        local_offsets = tuple(shard.global_to_local(term.query_offset) for term in owned_terms)
+        if any(offset is None for offset in local_offsets):
+            raise RuntimeError(f"segment {segment.segment_id} has a loss term outside its local shard")
+        device = hidden_states.device
+        query_offsets = torch.tensor(local_offsets, dtype=torch.long, device=device)
+        targets = torch.tensor(
+            [term.target_token_id for term in owned_terms],
+            dtype=torch.long,
+            device=device,
+        )
+        max_target = max(term.target_token_id for term in owned_terms)
+        vocab_size = int(getattr(self.model, "vocab_size", 0))
+        if vocab_size and max_target >= vocab_size:
+            raise ValueError(
+                f"segment {segment.segment_id} target token {max_target} "
+                f"is outside vocabulary size {vocab_size}"
+            )
+        weights = torch.tensor(
+            [term.weight for term in owned_terms],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        def project_and_loss(full_hidden, offsets, labels):
+            selected_hidden = full_hidden.index_select(0, offsets)
+            projected = output_layer(selected_hidden, weight=output_weight)
+            chunk_logits = projected[0] if isinstance(projected, tuple) else projected
+            if getattr(config, "use_mup", False):
+                chunk_logits = scale_logits(chunk_logits)
+            return compute_language_model_loss(
+                labels.unsqueeze(0),
+                chunk_logits,
+            ).reshape(-1)
+
+        loss_chunks = []
+        chunk_size = self.loss_chunk_size
+        for start in range(0, len(owned_terms), chunk_size):
+            end = min(start + chunk_size, len(owned_terms))
+            loss_chunks.append(
+                checkpoint(
+                    project_and_loss,
+                    hidden_states,
+                    query_offsets[start:end],
+                    targets[start:end],
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            )
+        per_term_loss = torch.cat(loss_chunks, dim=0)
+        if per_term_loss.numel() != len(owned_terms):
+            raise RuntimeError(
+                f"segment {segment.segment_id} native chunked CE returned "
+                f"{per_term_loss.numel()} losses for {len(owned_terms)} owned terms"
+            )
+        loss_sum = torch.sum(per_term_loss.float() * weights)
+        return _ChunkedLanguageModelOutput(
+            per_term_loss=per_term_loss,
+            loss_sum=loss_sum,
+            normalized_loss=loss_sum / self.plan.total_loss_weight,
+            backward_anchor=loss_sum,
+            local_sequence_length=local_sequence_length,
+        )
+
+    def _compute_loss(
+        self,
+        segment: SegmentSpec,
+        logits: Tensor | _ChunkedLanguageModelOutput,
+    ) -> tuple[Tensor, Tensor]:
+        if isinstance(logits, _ChunkedLanguageModelOutput):
+            return logits.loss_sum, logits.normalized_loss
         owned_terms = self._owned_loss_terms(segment)
         if not owned_terms:
             zero = logits.new_zeros((), dtype=torch.float32)
@@ -527,11 +671,13 @@ class SegmentExecutor:
         self,
         normalized_loss: Tensor,
         *,
-        logits: Tensor,
+        logits: Tensor | _ChunkedLanguageModelOutput,
         has_owned_loss: bool,
     ) -> Tensor:
         if has_owned_loss:
             backward_loss = normalized_loss * self.cp_size
+        elif isinstance(logits, _ChunkedLanguageModelOutput):
+            backward_loss = logits.backward_anchor
         else:
             backward_loss = logits.float().sum() * 0.0
         return backward_loss if self.loss_scale_func is None else self.loss_scale_func(backward_loss)
