@@ -180,6 +180,44 @@ def test_loss_delegates_sparse_weighted_terms_to_model_native_ce():
     torch.testing.assert_close(actual_normalized, expected_sum / executor.plan.total_loss_weight)
 
 
+def test_chunked_native_loss_matches_unchunked_loss_and_gradient():
+    baseline_model = _FakeTPRModel()
+    baseline = SegmentExecutor(baseline_model, _plan(), expected_layer_numbers=(1, 2))
+    segment = baseline.plan.get(0)
+    _, baseline_logits = baseline._forward(segment, past_key_values={}, no_grad=False)
+    baseline_sum, baseline_normalized = baseline._compute_loss(segment, baseline_logits)
+    baseline_normalized.backward()
+    baseline_grad = baseline_model.scale.grad.detach().clone()
+
+    chunked_model = _FakeTPRModel()
+    chunked = SegmentExecutor(
+        chunked_model,
+        _plan(),
+        expected_layer_numbers=(1, 2),
+        loss_chunk_size=1,
+    )
+    segment = chunked.plan.get(0)
+    _, chunked_logits = chunked._forward(segment, past_key_values={}, no_grad=False)
+    chunked_sum, chunked_normalized = chunked._compute_loss(segment, chunked_logits)
+    chunked_normalized.backward()
+
+    assert baseline_model.native_loss_calls == 1
+    assert chunked_model.native_loss_calls >= 2
+    torch.testing.assert_close(chunked_sum, baseline_sum)
+    torch.testing.assert_close(chunked_normalized, baseline_normalized)
+    torch.testing.assert_close(chunked_model.scale.grad, baseline_grad)
+
+
+def test_loss_chunk_size_must_be_positive():
+    with pytest.raises(ValueError, match="loss_chunk_size"):
+        SegmentExecutor(
+            _FakeTPRModel(),
+            _plan(),
+            expected_layer_numbers=(1, 2),
+            loss_chunk_size=0,
+        )
+
+
 def test_loss_scale_hook_scales_gradients_without_scaling_reported_loss():
     baseline_model = _FakeTPRModel()
     baseline = SegmentExecutor(baseline_model, _plan(), expected_layer_numbers=(1, 2))
