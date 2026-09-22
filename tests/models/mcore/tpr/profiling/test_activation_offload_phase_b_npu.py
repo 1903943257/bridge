@@ -1,0 +1,313 @@
+"""Opt-in native swap acceptance for Ring CP2/4; see ACTIVATION_OFFLOAD_PHASE_B.md."""
+
+from dataclasses import replace
+from datetime import timedelta
+import gc
+import json
+import os
+import resource
+import sys
+import time
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+
+pytestmark = pytest.mark.skipif(os.getenv("TPR_RUN_OFFLOAD_B") != "1", reason="Set TPR_RUN_OFFLOAD_B=1")
+
+
+@pytest.fixture(scope="module")
+def runtime():
+    import torch_npu  # noqa: F401
+    size = int(os.environ["WORLD_SIZE"])
+    assert size in (2, 4)
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("hccl", timeout=timedelta(minutes=10))
+    argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = argv
+    from mindspeed.args_utils import get_full_args
+    vars(get_full_args()).pop("", None)
+    repatch(dict(context_parallel_size=size, experimental_attention_variant=None, use_flash_attn=True))
+    from megatron.core import parallel_state
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=1,
+                                            pipeline_model_parallel_size=1, context_parallel_size=size)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        yield SimpleNamespace(cp_size=size, rank=dist.get_rank(),
+                              device=torch.device("npu", torch.npu.current_device()),
+                              cp_group=parallel_state.get_context_parallel_group(),
+                              tp_group=parallel_state.get_tensor_model_parallel_group(),
+                              pp_group=parallel_state.get_pipeline_model_parallel_group())
+    finally:
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
+
+
+@pytest.fixture
+def native_args(runtime, monkeypatch):
+    from mindspeed.args_utils import get_full_args
+    from verl.models.mcore.tpr import activation_offload
+    args = SimpleNamespace(**vars(get_full_args()))
+    vars(args).update(swap_attention=False, context_parallel_size=runtime.cp_size,
+                      pipeline_model_parallel_size=1, eval_interval=0, curr_iteration=1,
+                      noop_layers=None, swap_modules=os.getenv("TPR_SWAP_MODULES", "self_attention,mlp"))
+    monkeypatch.setattr(activation_offload, "_args", lambda: args)
+    monkeypatch.setattr(activation_offload._native_prefetch(), "get_args", lambda: args)
+    # Identical math path for BOTH off/on. No merge-specific swap policy.
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "1")
+    return args
+
+
+def _model(runtime, length):
+    # These imports MUST follow MindSpeed bootstrap, not pytest collection.
+    from ._qwen3_profile_target import resolve_qwen3_profile_target
+    from ..parallel.test_tpr_qwen3_cp_equivalence_npu import _make_qwen_cp_model
+    target = resolve_qwen3_profile_target()
+    assert target.size == "1.7B"
+    target.hf_config.max_position_embeddings = max(target.hf_config.max_position_embeddings, length)
+    model = _make_qwen_cp_model(runtime, SimpleNamespace(path=target.path), target.hf_config)
+    target.assert_model_scale(model)
+    model.config.cross_entropy_loss_fusion = True
+    model.config.cross_entropy_fusion_impl = "native"
+    model.config.swap_attention = False
+    return model
+
+
+def _plan(prefix, suffix, *, sparse=False):
+    from .test_tpr_qwen3_ring_cp_profile_npu import _ProfileCase, _make_case_plans
+    from verl.models.mcore.tpr.segment_plan import SegmentPlan
+    _, plan = _make_case_plans(_ProfileCase(prefix, suffix, 2), vocab_size=2048)
+    if sparse:
+        # Only the owner of query zero has local loss; all ranks still backward.
+        plan = SegmentPlan([replace(s, loss_terms=tuple(t for t in s.loss_terms if t.query_offset == 0))
+                            for s in plan.segments.values()], root_id=0)
+    return plan
+
+
+class _Probe:
+    """Test-only native counters and optional events; never owns tensor storage."""
+
+    def __init__(self, monkeypatch, *, timing=False):
+        from mindspeed.core.memory.swap_attention.prefetch import SwapTensor
+        from verl.models.mcore.tpr.parallel import ring_attention
+        self.phase = "setup"
+        self.counts = dict(d2h_bytes=0, released_bytes=0, h2d_bytes=0)
+        self.restore_peak = 0
+        self.by_layer = {}
+        self.events = []
+        self.errors = []
+        self.phases = []
+        for method, before, after, key in (
+            ("launch_d2h", "device", "d2h", "d2h_bytes"),
+            ("wait_d2h_finished", "d2h", "host", "released_bytes"),
+            ("launch_h2d", "host", "h2d", "h2d_bytes"),
+        ):
+            original = getattr(SwapTensor, method)
+
+            def wrapper(item, *args, _original=original, _before=before, _after=after, _key=key, **kwargs):
+                previous = item.stat
+                result = _original(item, *args, **kwargs)
+                if previous == _before and item.stat == _after:
+                    size = item.storage_size * item.tensor.element_size()
+                    self.counts[_key] += size
+                    label = f"{self.phase}/{item.layer_name}/{_key}"
+                    self.by_layer[label] = self.by_layer.get(label, 0) + size
+                    if _key == "released_bytes":
+                        if item.tensor.storage().size() != 0 or not item.tensor_cpu.is_pinned():
+                            self.errors.append("native release/pinned-storage contract failed")
+                    if _key == "h2d_bytes":
+                        self.restore_peak = max(self.restore_peak, torch.npu.memory_allocated())
+                return result
+
+            monkeypatch.setattr(SwapTensor, method, wrapper)
+        if timing:
+            for name, category in (("_circulate_kv", "ring_comm"),
+                                   ("_reduce_ring_gradients_to_owner", "ring_comm"),
+                                   ("_block_attention_forward", "fa"),
+                                   ("_block_attention_backward", "fa"),
+                                   ("_merge_attention", "merge")):
+                original = getattr(ring_attention, name)
+
+                def timed(*args, _original=original, _category=category, **kwargs):
+                    start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+                    start.record()
+                    try:
+                        return _original(*args, **kwargs)
+                    finally:
+                        end.record()
+                        self.events.append((_category, start, end))
+
+                monkeypatch.setattr(ring_attention, name, timed)
+
+    def call(self, phase, enabled, function):
+        self.phase = phase
+        before = self.counts.copy()
+        result = function()
+        delta = {key: value - before[key] for key, value in self.counts.items()}
+        self.phases.append(dict(phase=phase, **delta))
+        if phase.startswith("push") or not enabled:
+            if any(delta.values()):
+                self.errors.append(f"{phase}: unexpected transfers {delta}")
+        elif delta["released_bytes"] <= 0 or delta["h2d_bytes"] <= 0:
+            self.errors.append(f"{phase}: native swap did not release/reload {delta}")
+        return result
+
+    def report(self):
+        times = dict(ring_comm=0.0, fa=0.0, merge=0.0)
+        for category, start, end in self.events:
+            times[category] += start.elapsed_time(end)
+        return dict(**self.counts, restore_sample_peak_allocated=self.restore_peak,
+                    phase_transfers=self.phases, native_hits_by_layer=self.by_layer,
+                    stream_interval_ms=times if self.events else None,
+                    transfer_time_ms=None, exposed_wait_ms=None)
+
+
+def _run(model, plan, runtime, probe, *, observe):
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from .test_tpr_qwen3_ring_cp_profile_npu import _finalize_cp_parameter_gradients
+    logs = {}
+
+    class ObservedExecutor(SegmentExecutor):
+        def _compute_loss(self, segment, logits):
+            if observe:
+                terms = self._owned_loss_terms(segment)
+                shard = self._segment_shard(segment)
+                # Only diagnostics: production backward still calls native fused CE.
+                with torch.no_grad():
+                    offsets = torch.tensor([shard.global_to_local(t.query_offset) for t in terms],
+                                           device=logits.device, dtype=torch.long)
+                    targets = torch.tensor([t.target_token_id for t in terms], device=logits.device)
+                    logs[segment.segment_id] = (-torch.nn.functional.cross_entropy(
+                        logits[0].index_select(0, offsets).float(), targets.long(), reduction="none")
+                        ).cpu() if terms else torch.empty(0)
+            return super()._compute_loss(segment, logits)
+
+    executor = ObservedExecutor(model, plan, cp_group=runtime.cp_group, cp_backend="ring")
+    if observe:
+        print("TPR_OFFLOAD_B_SHARDS " + json.dumps(dict(rank=runtime.rank, segments={
+            str(s.segment_id): dict(logical_length=s.length,
+                                    physical_local_length=executor._segment_shard(s).local_length,
+                                    local_loss_terms=len(executor._owned_loss_terms(s)))
+            for s in plan.segments.values()})), flush=True)
+    enabled = model.config.swap_attention
+    probe.call("push.0", enabled, lambda: executor.push(0))
+    losses = []
+    for child in (1, 2):
+        result = probe.call(f"visit.{child}", enabled, lambda: executor.visit_leaf(child))
+        losses.append(result.backward.normalized_loss)
+    boundary = {}
+    if observe:
+        for layer, pair in executor.kv_stack.top().gradients.items():
+            for name, value in zip(("key", "value"), pair):
+                boundary[f"{layer}.{name}"] = value.detach().cpu().clone()
+    losses.append(probe.call("pop.0", enabled, lambda: executor.pop(0)).normalized_loss)
+    executor.kv_stack.assert_empty()
+    probe.phase = "parameter_grad_finalize"
+    _finalize_cp_parameter_gradients(model, runtime)
+    loss = torch.stack(losses).sum().detach()
+    dist.all_reduce(loss, group=runtime.cp_group)
+    if not observe:
+        return loss
+    grads = {name: p.grad.detach().cpu().clone() for name, p in model.named_parameters()}
+    return {"loss": loss.cpu()}, logs, grads, boundary
+
+
+def _report(runtime, record):
+    record = dict(rank=runtime.rank, cp_size=runtime.cp_size, qkv_merge=True, **record)
+    print("TPR_OFFLOAD_B_RANK " + json.dumps(record), flush=True)
+    records = [None] * runtime.cp_size
+    dist.all_gather_object(records, record, group=runtime.cp_group)
+    if runtime.rank == 0:
+        maximum = {key: max(row[key] for row in records)
+                   for key, value in record.items() if type(value) in (int, float) and key != "rank"}
+        if record.get("stream_interval_ms") is not None:
+            maximum["stream_interval_ms"] = {
+                key: max(row["stream_interval_ms"][key] for row in records)
+                for key in record["stream_interval_ms"]}
+        print("TPR_OFFLOAD_B_MAX " + json.dumps(dict(max_rank=maximum, ranks=records)), flush=True)
+
+
+@pytest.mark.parametrize("padded,sparse", [(False, False), (True, False), (True, True)])
+def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, sparse):
+    from .test_activation_offload_phase_a_npu import _compare_runs
+    length = int(os.getenv("TPR_OFFLOAD_B_CHECK_LENGTH", "2048"))
+    plan = _plan(length - int(padded), length - 3 * int(padded), sparse=sparse)
+    model = _model(runtime, 2 * length)
+    reference = None
+    failures = []
+    # Control repeat identifies nondeterminism independently of swap; final OFF
+    # checks hook/stream/buffer cleanup after repeated native lifecycles.
+    for stage, enabled in (("off", False), ("off_repeat", False), ("on", True),
+                           ("on_repeat", True), ("off_after", False)):
+        model.config.swap_attention = enabled
+        model.zero_grad(set_to_none=True)
+        with monkeypatch.context() as patches:
+            probe = _Probe(patches)
+            actual = _run(model, plan, runtime, probe, observe=True)
+        if reference is None:
+            reference = actual
+        else:
+            failures.extend(_compare_runs(reference, actual, owned=not sparse, stage=stage))
+        failures.extend(probe.errors)
+        torch.npu.synchronize()
+        _report(runtime, dict(stage=stage, padded=padded, sparse=sparse, **probe.report()))
+        if actual is not reference:
+            del actual
+    failed = torch.tensor(bool(failures), device=runtime.device, dtype=torch.int32)
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=runtime.cp_group)
+    assert not failed.item(), f"Offload correctness failed on one or more ranks: {failures}"
+
+
+def test_ring_offload_capacity(runtime, native_args, monkeypatch):
+    if os.getenv("TPR_OFFLOAD_B_CAPACITY") != "1":
+        pytest.skip("Set TPR_OFFLOAD_B_CAPACITY=1; run each cell in a fresh torchrun")
+    prefix, suffix = int(os.getenv("TPR_PREFIX", "16384")), int(os.getenv("TPR_SUFFIX", "16384"))
+    enabled = os.getenv("TPR_OFFLOAD", "0") == "1"
+    plan = _plan(prefix, suffix)
+    model = _model(runtime, prefix + suffix)
+    model.config.swap_attention = enabled
+    warmup = int(os.getenv("TPR_OFFLOAD_B_WARMUP", "1"))
+    repeats = int(os.getenv("TPR_OFFLOAD_B_REPEATS", "3"))
+    assert warmup >= 0 and repeats > 0
+    for iteration in range(warmup + repeats):
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
+        dist.barrier(group=runtime.cp_group)
+        baseline = torch.npu.memory_allocated()
+        baseline_reserved = torch.npu.memory_reserved()
+        torch.npu.reset_peak_memory_stats()
+        with monkeypatch.context() as patches:
+            probe = _Probe(patches, timing=os.getenv("TPR_OFFLOAD_B_TIMING") == "1")
+            start = time.perf_counter()
+            try:
+                _run(model, plan, runtime, probe, observe=False)
+                torch.npu.synchronize()
+            except Exception as error:
+                # No collective after a rank-local OOM: peers may be inside HCCL.
+                print("TPR_OFFLOAD_B_FAILURE " + json.dumps(dict(
+                    rank=runtime.rank, cp_size=runtime.cp_size, prefix=prefix, suffix=suffix,
+                    offload=enabled, iteration=iteration, stage=probe.phase,
+                    oom="out of memory" in str(error).lower(), error=str(error))), flush=True)
+                raise
+            latency = time.perf_counter() - start
+            peak = torch.npu.max_memory_allocated()
+            reserved = torch.npu.max_memory_reserved()
+        _report(runtime, dict(prefix=prefix, suffix=suffix, offload=enabled, iteration=iteration,
+                              warmup=iteration < warmup, latency_s=latency,
+                              peak_allocated=peak, peak_reserved=reserved,
+                              incremental_peak=peak - baseline,
+                              incremental_reserved=reserved - baseline_reserved,
+                              cpu_process_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+                              oom_stage=None, **probe.report()))
+        failed = torch.tensor(bool(probe.errors), device=runtime.device, dtype=torch.int32)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=runtime.cp_group)
+        assert not failed.item(), f"Native transfer gate failed: {probe.errors}"

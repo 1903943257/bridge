@@ -152,7 +152,7 @@ class SegmentExecutor:
                     raise ValueError(
                         f"segment {segment.segment_id} {exc}"
                     ) from exc
-        validate_activation_offload(model, self.cp_size)
+        validate_activation_offload(model, self.cp_size, self.cp_backend)
         self._failed = False
 
     @property

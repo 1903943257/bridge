@@ -1,4 +1,4 @@
-"""CP1 Full-Attention adapter for MindSpeed swap-attention.
+"""CP1 and Ring CP2/CP4 Full-Attention adapter for MindSpeed swap-attention.
 
 One Visit/Pop is a complete forward/backward microbatch. Native SwapPrefetch
 owns selection, host allocations, streams, transfer and release. Hooks are
@@ -57,7 +57,7 @@ def swap_enabled(model):
     return bool(getattr(_args(), "swap_attention", False) if explicit is None else explicit)
 
 
-def validate_activation_offload(model, cp_size):
+def validate_activation_offload(model, cp_size, cp_backend=None):
     if not swap_enabled(model):
         return
     config = getattr(model, "config", None)
@@ -66,14 +66,22 @@ def validate_activation_offload(model, cp_size):
         raise RuntimeError("MindSpeed swap-attention requires initialized Megatron/MindSpeed args")
     if any(getattr(module, "tpr_state_kind", None) == "gdn" for module in model.modules()):
         raise NotImplementedError(
-            "TPR swap-attention Phase A supports Full Attention only; "
+            "TPR swap-attention supports Full Attention only; "
             "GDN/Hybrid support is reserved for a later phase"
         )
-    if cp_size != 1 or getattr(config, "context_parallel_size", 1) != 1:
-        raise NotImplementedError("TPR swap-attention Phase A supports CP=1 only")
+    backend_name = cp_backend if isinstance(cp_backend, str) else getattr(cp_backend, "backend_name", None)
+    if cp_size not in (1, 2, 4) or (cp_size == 1 and cp_backend is not None) or (
+        cp_size > 1 and backend_name != "ring"
+    ):
+        raise NotImplementedError("TPR swap-attention supports CP=1 or Ring CP=2/4 only")
+    if cp_backend is not None and not isinstance(cp_backend, str):
+        if getattr(cp_backend, "parallel_size", None) != cp_size:
+            raise ValueError("swap-attention backend parallel_size does not match actual CP size")
+    if getattr(config, "context_parallel_size", 1) != cp_size:
+        raise ValueError("swap-attention model context_parallel_size does not match actual CP size")
     for source in (config, args):
-        if getattr(source, "context_parallel_size", 1) != 1:
-            raise NotImplementedError("TPR swap-attention Phase A supports CP=1 only")
+        if getattr(source, "context_parallel_size", cp_size) != cp_size:
+            raise ValueError("swap-attention configured context_parallel_size does not match actual CP size")
         for name in ("tensor_model_parallel_size", "pipeline_model_parallel_size", "expert_model_parallel_size"):
             if getattr(source, name, 1) != 1:
                 raise NotImplementedError(f"TPR swap-attention requires {name}=1")
@@ -137,7 +145,7 @@ def _protect_exports(native, protected):
 
 
 @contextmanager
-def mindspeed_swap_attention(model, *, cp_size=1):
+def mindspeed_swap_attention(model, *, cp_size=1, cp_backend=None, persistent_kv_storages=None):
     """Temporarily install the native PP1 swap schedule on a constructed model.
 
     VERL bypasses megatron.training.setup_model_and_optimizer, where upstream
@@ -147,7 +155,7 @@ def mindspeed_swap_attention(model, *, cp_size=1):
     if not swap_enabled(model):
         yield None
         return
-    validate_activation_offload(model, cp_size)
+    validate_activation_offload(model, cp_size, cp_backend)
     prefetch = _native_prefetch()
     SwapPrefetch, get_layer_id = prefetch.SwapPrefetch, prefetch.get_layer_id
 
@@ -206,6 +214,8 @@ def mindspeed_swap_attention(model, *, cp_size=1):
     def after_layer(name):
         def hook(module, inputs, output):
             protected.update(_external_storages())
+            if persistent_kv_storages is not None:
+                protected.update(persistent_kv_storages())
             _protect_exports(native, protected)
             native.sync_d2h(name)
         return hook
@@ -247,7 +257,22 @@ def with_activation_offload(method):
     def run(executor, *args, **kwargs):
         executor._ensure_healthy()
         try:
-            with mindspeed_swap_attention(executor.model, cp_size=executor.cp_size):
+            def persistent_kv_storages():
+                # Read the live stack after Pop removed/released its entry.
+                # Keep only storage identities, never extra owning references.
+                # Anchors are not enumerated: native leaf/view filters apply;
+                # any alias of persistent KV inherits its storage protection.
+                return {
+                    _storage_key(tensor)
+                    for segment_id in executor.kv_stack.segment_ids
+                    for pair in executor.kv_stack.get(segment_id).kv.key_values.values()
+                    for tensor in pair
+                }
+
+            with mindspeed_swap_attention(
+                executor.model, cp_size=executor.cp_size,
+                cp_backend=executor.cp_backend, persistent_kv_storages=persistent_kv_storages,
+            ):
                 return method(executor, *args, **kwargs)
         except Exception:
             executor._failed = True

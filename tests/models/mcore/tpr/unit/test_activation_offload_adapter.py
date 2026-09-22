@@ -113,6 +113,65 @@ class AdapterTest(unittest.TestCase):
                 self.adapter.validate_activation_offload(self.model, 1)
             delattr(self.model.config, name)
 
+    def test_ring_cp_whitelist_and_topology(self):
+        for size in (2, 4):
+            self.model.config.context_parallel_size = size
+            self.args.context_parallel_size = size
+            backend = NS(backend_name="ring", parallel_size=size)
+            self.adapter.validate_activation_offload(self.model, size, backend)
+            with self.adapter.mindspeed_swap_attention(self.model, cp_size=size, cp_backend=backend):
+                pass
+            for name in (None, "allgather", "ulysses", "hybrid"):
+                with self.assertRaises(NotImplementedError):
+                    self.adapter.validate_activation_offload(self.model, size, name)
+            with self.assertRaises(ValueError):
+                self.adapter.validate_activation_offload(self.model, size, NS(backend_name="ring", parallel_size=8))
+            self.model.config.context_parallel_size = 1
+            with self.assertRaises(ValueError):
+                self.adapter.validate_activation_offload(self.model, size, backend)
+        for size in (0, 3, 8):
+            with self.assertRaises(NotImplementedError):
+                self.adapter.validate_activation_offload(self.model, size, "ring")
+
+    def test_persistent_cp_storage_is_protected_without_protecting_other_anchors(self):
+        persistent = NS(tensor=Tensor(3), storage_data_ptr=3)
+        independent_anchor = NS(tensor=Tensor(4), storage_data_ptr=4)
+        self.native.swap_tensors = [persistent, independent_anchor]
+        with self.adapter.mindspeed_swap_attention(
+            self.model, persistent_kv_storages=lambda: {("npu:0", 3)}
+        ):
+            self.layer.forward_hook(self.layer, (), None)
+            self.assertTrue(persistent.tpr_resident)
+            self.assertFalse(getattr(independent_anchor, "tpr_resident", False))
+            self.assertEqual(self.native.swap_tensors, [independent_anchor])
+            self.native.sync_d2h.assert_called_once()
+
+    def test_decorator_uses_actual_backend_and_live_stack_after_pop(self):
+        self.model.config.context_parallel_size = 2
+        self.args.context_parallel_size = 2
+        stack = NS(segment_ids=(0,), get=Mock(side_effect=AssertionError("popped KV must not be read")))
+        executor = NS(model=self.model, cp_size=2, cp_backend=NS(backend_name="ring", parallel_size=2),
+                      kv_stack=stack, _ensure_healthy=Mock(), _failed=False)
+        candidate = NS(tensor=Tensor(3), storage_data_ptr=3)
+
+        @self.adapter.with_activation_offload
+        def pop(executor):
+            executor.kv_stack.segment_ids = ()
+            self.native.swap_tensors = [candidate]
+            self.layer.forward_hook(self.layer, (), None)
+            self.assertEqual(self.native.swap_tensors, [candidate])
+            return "done"
+
+        self.assertEqual(pop(executor), "done")
+        stack.get.assert_not_called()
+        self.assertFalse(executor._failed)
+
+    def test_launcher_cp_mismatch_rejected(self):
+        self.model.config.context_parallel_size = 2
+        self.args.context_parallel_size = 4
+        with self.assertRaisesRegex(ValueError, "configured context_parallel_size"):
+            self.adapter.validate_activation_offload(self.model, 2, "ring")
+
     def test_hooks_restore_after_success_and_error(self):
         original = self.attention.forward
         for fail in (False, True):
