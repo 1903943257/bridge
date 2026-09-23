@@ -369,8 +369,32 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
     failures = 0
     # Two OFF repeats calibrate native Ring/NPU backward noise before swap.
     # Final OFF checks that repeated native swap lifecycles leave no regression.
-    for stage, enabled in (("off", False), ("off_repeat", False), ("off_repeat2", False),
-                           ("on", True), ("on_repeat", True), ("off_after", False)):
+    #
+    # Diagnostic only: TPR_OFFLOAD_B_OFF_STRESS=N replaces the ON lifecycle
+    # with N additional pure-OFF probes. Those probes are checked against the
+    # same two-repeat baseline instead of extending it, so they expose whether
+    # the calibrated gate already underestimates CP/Ring repeat noise without
+    # involving swap at all. Default behavior is unchanged.
+    off_stress = int(os.getenv("TPR_OFFLOAD_B_OFF_STRESS", "0"))
+    if off_stress < 0:
+        raise ValueError("TPR_OFFLOAD_B_OFF_STRESS must be non-negative")
+    if off_stress:
+        stages = (
+            ("off", False),
+            ("off_repeat", False),
+            ("off_repeat2", False),
+            *tuple((f"off_probe{i}", False) for i in range(1, off_stress + 1)),
+        )
+    else:
+        stages = (
+            ("off", False),
+            ("off_repeat", False),
+            ("off_repeat2", False),
+            ("on", True),
+            ("on_repeat", True),
+            ("off_after", False),
+        )
+    for stage, enabled in stages:
         model.config.swap_attention = enabled
         model.zero_grad(set_to_none=True)
         with monkeypatch.context() as patches:
