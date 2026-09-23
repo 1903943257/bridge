@@ -8,6 +8,7 @@ scoped to that microbatch so graph-free Push never enters native swap queues.
 from contextlib import contextmanager
 from functools import wraps
 from importlib import import_module
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -227,7 +228,14 @@ def mindspeed_swap_attention(
         native.h2d(item.layer_name)
         if item.stat != "h2d":
             raise RuntimeError(f"swap-attention tensor was not restored: {item.stat}")
-        torch.npu.current_stream().wait_stream(native.prefetch_stream)
+        # Diagnostic only: CP4 padded Ring occasionally shows sparse backward
+        # mismatches after restore. Force host-side completion to distinguish a
+        # cross-stream/HCCL visibility issue from ordinary BF16 Ring noise.
+        # Default behavior stays identical to native-style async prefetch.
+        if os.getenv("TPR_OFFLOAD_B_FORCE_RESTORE_SYNC", "0") == "1":
+            native.prefetch_stream.synchronize()
+        else:
+            torch.npu.current_stream().wait_stream(native.prefetch_stream)
         return original_unpack(item)
 
     native.unpack_hook = unpack
