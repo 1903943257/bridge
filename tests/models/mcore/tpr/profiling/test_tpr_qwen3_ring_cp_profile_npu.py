@@ -98,6 +98,9 @@ _ENABLE_OFFLOAD = os.getenv("TPR_QWEN_RING_CP_PROFILE_OFFLOAD", "0") == "1"
 _PROFILE_PATH = os.getenv("TPR_QWEN_RING_CP_PROFILE_PATH", "both").strip().lower()
 if _PROFILE_PATH not in ("both", "reference", "tpr"):
     raise ValueError("TPR_QWEN_RING_CP_PROFILE_PATH must be both, reference or tpr")
+_REFERENCE_RING = os.getenv("TPR_QWEN_RING_CP_REFERENCE_RING", "native").strip().lower()
+if _REFERENCE_RING not in ("native", "legacy"):
+    raise ValueError("TPR_QWEN_RING_CP_REFERENCE_RING must be native or legacy")
 _SWAP_MODULES = os.getenv("TPR_SWAP_MODULES", "self_attention,mlp")
 _LOSS_CHUNK_SIZE_RAW = int(os.getenv("TPR_LOSS_CHUNK_SIZE", "0"))
 _LOSS_CHUNK_SIZE = None if _LOSS_CHUNK_SIZE_RAW <= 0 else _LOSS_CHUNK_SIZE_RAW
@@ -447,7 +450,14 @@ def _make_case_plans(
     return reference_plans, tpr_plan
 
 
-def _run_plan(model, plan, runtime, expected_layer_numbers) -> _RunObservation:
+def _run_plan(
+    model,
+    plan,
+    runtime,
+    expected_layer_numbers,
+    *,
+    ordinary_ring: bool = False,
+) -> _RunObservation:
     executor = SegmentExecutor(
         model,
         plan,
@@ -458,7 +468,20 @@ def _run_plan(model, plan, runtime, expected_layer_numbers) -> _RunObservation:
     )
     if runtime.cp_size > 1 and (executor.cp_backend is None or executor.cp_backend.backend_name != "ring"):
         raise AssertionError("profile did not resolve the Ring CP backend")
-    result = FixedTopologyScheduler(plan, executor).run()
+
+    if ordinary_ring and runtime.cp_size > 1:
+        def whole(query, current_key, current_value, *, prefix_blocks=(), **kwargs):
+            if prefix_blocks:
+                raise AssertionError("native Reference Ring cannot execute Prefix blocks")
+            return ring_attention.ordinary_ring_cp_attention(
+                query, current_key, current_value, **kwargs
+            )
+
+        with patch.object(ring_attention, "ring_cp_attention", whole):
+            result = FixedTopologyScheduler(plan, executor).run()
+    else:
+        result = FixedTopologyScheduler(plan, executor).run()
+
     return _RunObservation(
         local_normalized_loss=result.normalized_loss,
         execution_trace=tuple(
@@ -479,11 +502,19 @@ def _finalize_cp_parameter_gradients(model, runtime) -> None:
 
 
 def _make_reference_runner(model, plans, runtime, expected_layer_numbers):
+    use_native_ring = runtime.cp_size > 1 and _REFERENCE_RING == "native"
+
     def run() -> _RunObservation:
         normalized_loss = None
         trace = []
         for plan in plans:
-            observation = _run_plan(model, plan, runtime, expected_layer_numbers)
+            observation = _run_plan(
+                model,
+                plan,
+                runtime,
+                expected_layer_numbers,
+                ordinary_ring=use_native_ring,
+            )
             normalized_loss = (
                 observation.local_normalized_loss
                 if normalized_loss is None
@@ -546,12 +577,17 @@ def _profile_runner(
     runtime,
     *,
     expected_trace: tuple[tuple[PhysicalExecutionKind, int], ...],
+    adapter_mode: str = "tpr",
 ) -> _ProfileStats:
     # Probe separately so instrumentation cannot affect the latency samples.
     layer_trace = []
     adapter_calls = 0
-    adapter_owner = ring_attention._RingTPRAttention if runtime.cp_size > 1 else local_attention
-    adapter_name = "forward" if runtime.cp_size > 1 else "rectangular_causal_attention"
+    if runtime.cp_size > 1 and adapter_mode == "native_ring":
+        adapter_owner = ring_attention
+        adapter_name = "ordinary_ring_cp_attention"
+    else:
+        adapter_owner = ring_attention._RingTPRAttention if runtime.cp_size > 1 else local_attention
+        adapter_name = "forward" if runtime.cp_size > 1 else "rectangular_causal_attention"
     original_adapter = getattr(adapter_owner, adapter_name)
 
     def counted_adapter(*args, **kwargs):
@@ -1501,6 +1537,7 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
         print(f"Loss chunk size: {_LOSS_CHUNK_SIZE}")
         print(f"Profile cases: {[case.case_id for case in _PROFILE_CASES]}")
         print(f"Profile path: {_PROFILE_PATH}")
+        print(f"Reference Ring: {_REFERENCE_RING}")
         if runtime.cp_size == 1:
             print("Local rectangular attention; Ring-only diagnostic counters are zero.")
     if next(model.parameters()).dtype != torch.bfloat16:
@@ -1554,6 +1591,11 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
                 model,
                 runtime,
                 expected_trace=reference_trace,
+                adapter_mode=(
+                    "native_ring"
+                    if runtime.cp_size > 1 and _REFERENCE_RING == "native"
+                    else "tpr"
+                ),
             )
             _release_iteration_state(model, runtime)
             _print_path_result(case, "reference", reference_stats, rank=runtime.rank)
