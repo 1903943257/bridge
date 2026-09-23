@@ -41,7 +41,9 @@ class _FakeTPRModel(nn.Module):
         self.fail = fail
         self.native_loss_calls = 0
         self.vocab_size = 8
-        self.config = type("_Config", (), {"use_mup": False})()
+        self.post_process = True
+        self.share_embeddings_and_output_weights = False
+        self.config = type("_Config", (), {"use_mup": False, "mtp_num_layers": 0})()
 
         class _OutputLayer(nn.Module):
             def forward(inner_self, hidden_states, weight=None):
@@ -64,14 +66,7 @@ class _FakeTPRModel(nn.Module):
         )
         return loss.unsqueeze(0)
 
-    def forward(
-        self,
-        *,
-        input_ids,
-        position_ids,
-        attention_mask,
-        output_processor=None,
-    ):
+    def forward(self, *, input_ids, position_ids, attention_mask):
         del position_ids, attention_mask
         if self.fail:
             raise RuntimeError("injected forward failure")
@@ -90,25 +85,8 @@ class _FakeTPRModel(nn.Module):
                 token_signal * (layer_number + 2),
             )
         hidden_states = token_signal.view(-1, 1, 1) + past_signal
-        if output_processor is not None:
-            return output_processor(
-                hidden_states=hidden_states,
-                output_layer=self.output_layer,
-                output_weight=None,
-                labels=None,
-                loss_mask=None,
-                input_ids=input_ids,
-                position_ids=None,
-                attention_mask=None,
-                decoder_input=None,
-                inference_context=None,
-                packed_seq_params=None,
-                runtime_gather_output=None,
-                context=None,
-                compute_language_model_loss=self.compute_language_model_loss,
-                scale_logits=lambda value: value,
-                config=self.config,
-            )
+        if not self.post_process:
+            return hidden_states
         projected, _ = self.output_layer(hidden_states)
         return projected.transpose(0, 1).contiguous()
 
@@ -240,8 +218,8 @@ def test_chunked_native_loss_matches_unchunked_loss_and_gradient():
     chunked_normalized.backward()
 
     assert baseline_model.native_loss_calls == 1
-    # loss_chunk_size=1 forces the native output_processor path to project
-    # and run CE once per owned token, without materializing full logits.
+    # loss_chunk_size=1 forces the legacy-compatible post_process=False path
+    # to project and run CE once per owned token, without full logits.
     assert chunked_model.native_loss_calls >= 2
     torch.testing.assert_close(chunked_sum, baseline_sum)
     torch.testing.assert_close(chunked_normalized, baseline_normalized)
