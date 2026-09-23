@@ -65,7 +65,20 @@ def native_args(runtime, monkeypatch):
     return args
 
 
+def _reset_model_seed():
+    # Each parametrized correctness case must construct the same model whether
+    # it runs alone or after earlier cases. The module-scoped runtime seeds only
+    # once; without reseeding here, later cases consume a different RNG state
+    # and standalone-vs-suite comparisons confound runtime history with weights.
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    torch.manual_seed(123)
+    if hasattr(torch, "npu"):
+        torch.npu.manual_seed_all(123)
+    model_parallel_cuda_manual_seed(123)
+
+
 def _model(runtime, length, native_args):
+    _reset_model_seed()
     # These imports MUST follow MindSpeed bootstrap, not pytest collection.
     from ._qwen3_profile_target import resolve_qwen3_profile_target
     from ..parallel.test_tpr_qwen3_cp_equivalence_npu import _make_qwen_cp_model
