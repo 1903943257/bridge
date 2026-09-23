@@ -95,6 +95,9 @@ _BREAKDOWN_WARMUP_RUNS = 1
 _BREAKDOWN_MEASURE_RUNS = 3
 _RUN_BREAKDOWN = os.getenv("TPR_QWEN_RING_CP_PROFILE_BREAKDOWN", "1") == "1"
 _ENABLE_OFFLOAD = os.getenv("TPR_QWEN_RING_CP_PROFILE_OFFLOAD", "0") == "1"
+_PROFILE_PATH = os.getenv("TPR_QWEN_RING_CP_PROFILE_PATH", "both").strip().lower()
+if _PROFILE_PATH not in ("both", "reference", "tpr"):
+    raise ValueError("TPR_QWEN_RING_CP_PROFILE_PATH must be both, reference or tpr")
 _SWAP_MODULES = os.getenv("TPR_SWAP_MODULES", "self_attention,mlp")
 _LOSS_CHUNK_SIZE_RAW = int(os.getenv("TPR_LOSS_CHUNK_SIZE", "0"))
 _LOSS_CHUNK_SIZE = None if _LOSS_CHUNK_SIZE_RAW <= 0 else _LOSS_CHUNK_SIZE_RAW
@@ -1352,6 +1355,38 @@ def _print_controlled_breakdown(name, breakdown, *, path, sibling_count):
     print(f"  wall - model graph      {breakdown.wall_median_ms - model_forward - backward:>10.3f} ms (approximate)")
 
 
+def _stats_payload(stats: _ProfileStats) -> dict:
+    return {
+        "median_ms": stats.median_ms,
+        "mean_ms": stats.mean_ms,
+        "std_ms": stats.std_ms,
+        "baseline_allocated": stats.baseline_allocated_bytes,
+        "peak_allocated": stats.peak_allocated_bytes,
+        "incremental_peak": stats.incremental_peak_bytes,
+        "peak_reserved": stats.peak_reserved_bytes,
+        "parameter_count": stats.parameter_count,
+        "adapter_probe_calls": stats.adapter_probe_calls,
+        "layer_count": stats.layer_count,
+        "physical_phase_count": stats.physical_phase_count,
+    }
+
+
+def _print_path_result(case: _ProfileCase, path: str, stats: _ProfileStats, *, rank: int) -> None:
+    if rank != 0:
+        return
+    print("TPR_REF_TPR_PATH_RESULT " + json.dumps({
+        "path": path,
+        "cp_size": _EXPECTED_WORLD_SIZE,
+        "prefix": case.prefix_length,
+        "suffix": case.suffix_length,
+        "siblings": case.trajectory_count,
+        "offload": _ENABLE_OFFLOAD,
+        "swap_modules": _SWAP_MODULES,
+        "loss_chunk_size": _LOSS_CHUNK_SIZE,
+        "stats": _stats_payload(stats),
+    }), flush=True)
+
+
 def _print_case_result(result: _ProfileResult, *, rank: int) -> None:
     if rank != 0:
         return
@@ -1465,6 +1500,7 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
         print(f"Activation offload: {_ENABLE_OFFLOAD}; swap_modules={_SWAP_MODULES}")
         print(f"Loss chunk size: {_LOSS_CHUNK_SIZE}")
         print(f"Profile cases: {[case.case_id for case in _PROFILE_CASES]}")
+        print(f"Profile path: {_PROFILE_PATH}")
         if runtime.cp_size == 1:
             print("Local rectangular attention; Ring-only diagnostic counters are zero.")
     if next(model.parameters()).dtype != torch.bfloat16:
@@ -1506,32 +1542,47 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
             (PhysicalExecutionKind.POP, 0),
         )
 
-        if runtime.rank == 0:
-            print("TPR_REF_TPR_STAGE " + json.dumps({
-                "path": "reference", "cp_size": runtime.cp_size,
-                "prefix": case.prefix_length, "suffix": case.suffix_length,
-                "siblings": case.trajectory_count,
-            }), flush=True)
-        reference_stats = _profile_runner(
-            reference_runner,
-            model,
-            runtime,
-            expected_trace=reference_trace,
-        )
-        _release_iteration_state(model, runtime)
-        if runtime.rank == 0:
-            print("TPR_REF_TPR_STAGE " + json.dumps({
-                "path": "tpr", "cp_size": runtime.cp_size,
-                "prefix": case.prefix_length, "suffix": case.suffix_length,
-                "siblings": case.trajectory_count,
-            }), flush=True)
-        tpr_stats = _profile_runner(
-            tpr_runner,
-            model,
-            runtime,
-            expected_trace=tpr_trace,
-        )
-        _release_iteration_state(model, runtime)
+        if _PROFILE_PATH in ("both", "reference"):
+            if runtime.rank == 0:
+                print("TPR_REF_TPR_STAGE " + json.dumps({
+                    "path": "reference", "cp_size": runtime.cp_size,
+                    "prefix": case.prefix_length, "suffix": case.suffix_length,
+                    "siblings": case.trajectory_count,
+                }), flush=True)
+            reference_stats = _profile_runner(
+                reference_runner,
+                model,
+                runtime,
+                expected_trace=reference_trace,
+            )
+            _release_iteration_state(model, runtime)
+            _print_path_result(case, "reference", reference_stats, rank=runtime.rank)
+        else:
+            reference_stats = None
+
+        if _PROFILE_PATH in ("both", "tpr"):
+            if runtime.rank == 0:
+                print("TPR_REF_TPR_STAGE " + json.dumps({
+                    "path": "tpr", "cp_size": runtime.cp_size,
+                    "prefix": case.prefix_length, "suffix": case.suffix_length,
+                    "siblings": case.trajectory_count,
+                }), flush=True)
+            tpr_stats = _profile_runner(
+                tpr_runner,
+                model,
+                runtime,
+                expected_trace=tpr_trace,
+            )
+            _release_iteration_state(model, runtime)
+            _print_path_result(case, "tpr", tpr_stats, rank=runtime.rank)
+        else:
+            tpr_stats = None
+
+        # Standalone path mode is the formal capacity/performance mode. Each
+        # side runs in a fresh torchrun, so an OOM on one path cannot suppress
+        # the other. Combined mode retains the historical in-process comparison.
+        if _PROFILE_PATH != "both":
+            continue
 
         reference_breakdown = None
         tpr_breakdown = None
@@ -1563,6 +1614,7 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
         results.append(result)
         _print_case_result(result, rank=runtime.rank)
 
-    final_results = tuple(results)
-    _print_breakdown_summary(final_results, rank=runtime.rank)
-    _print_summary(final_results, rank=runtime.rank)
+    if _PROFILE_PATH == "both":
+        final_results = tuple(results)
+        _print_breakdown_summary(final_results, rank=runtime.rank)
+        _print_summary(final_results, rank=runtime.rank)
