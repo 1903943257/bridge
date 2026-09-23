@@ -1010,7 +1010,7 @@ def ordinary_ring_cp_attention(
         "cp_outer_ranks": list(config.global_ranks),
         "cp_dkv_outer_ranks": list(config.global_ranks),
         "megatron_cp_in_bnsd": False,
-        "cache_policy": "full",
+        "cache_policy": None,
         "pse_type": 1,
     }
     # Native ordinary causal Ring consumes SBH, retaining GQA's smaller KV H.
