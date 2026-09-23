@@ -321,10 +321,36 @@ def _compare(reference, actual, baseline, *, stage):
 
             if not passed:
                 bad += 1
+                baseline_metrics = (
+                    category_baseline.get(name)
+                    if category in gradient_categories
+                    else None
+                )
                 failed_details.append(dict(
-                    category=category, tensor=str(name), severity=severity,
-                    relative_l2=metrics["relative_l2"], max_abs=metrics["max_abs"],
-                    mismatch_fraction=metrics["mismatch_fraction"], limits=limits))
+                    category=category,
+                    tensor=str(name),
+                    severity=severity,
+                    relative_l2=metrics["relative_l2"],
+                    max_abs=metrics["max_abs"],
+                    mismatch_fraction=metrics["mismatch_fraction"],
+                    mismatched=metrics["mismatched"],
+                    elements=metrics["elements"],
+                    limits=limits,
+                    baseline=(
+                        None
+                        if baseline_metrics is None
+                        else dict(
+                            relative_l2=baseline_metrics["relative_l2"],
+                            max_abs=baseline_metrics["max_abs"],
+                            mismatch_fraction=(
+                                baseline_metrics["mismatched"]
+                                / max(baseline_metrics["elements"], 1)
+                            ),
+                            mismatched=baseline_metrics["mismatched"],
+                            elements=baseline_metrics["elements"],
+                        )
+                    ),
+                ))
 
         failures += bad
         category_summary[category] = bad
@@ -382,6 +408,7 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
             )[:3]
             print("TPR_OFFLOAD_B_RESULT " + json.dumps(dict(
                 stage=stage,
+                force_restore_sync=os.getenv("TPR_OFFLOAD_B_FORCE_RESTORE_SYNC", "0") == "1",
                 failures_max=max(row["failures"] for row in stage_results),
                 failures_by_rank=[row["failures"] for row in stage_results],
                 by_category_max={
