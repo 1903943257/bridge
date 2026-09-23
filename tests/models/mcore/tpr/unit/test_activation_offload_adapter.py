@@ -172,6 +172,29 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "configured context_parallel_size"):
             self.adapter.validate_activation_offload(self.model, 2, "ring")
 
+    def test_class_defined_forward_is_restored_without_instance_shadow(self):
+        class ClassForwardModule(Module):
+            def __init__(self):
+                self.handles = []
+
+            def forward(self, *args, **kwargs):
+                return args, kwargs
+
+        attention = ClassForwardModule()
+        layer = Module()
+        layer.self_attention = attention
+        layer.named_children = lambda: [("self_attention", attention)]
+        model = NS(
+            config=NS(swap_attention=True),
+            modules=lambda: [layer, attention],
+            named_modules=lambda: [("decoder.layers.0", layer)],
+            parameters=lambda: [],
+        )
+        self.assertNotIn("forward", attention.__dict__)
+        with self.adapter.mindspeed_swap_attention(model):
+            self.assertIn("forward", attention.__dict__)
+        self.assertNotIn("forward", attention.__dict__)
+
     def test_hooks_restore_after_success_and_error(self):
         original = self.attention.forward
         for fail in (False, True):
