@@ -26,7 +26,7 @@ def test_native_adapter_preserves_gqa_dtype_and_autograd(monkeypatch):
         assert cp_para["cp_group"] is group
         assert cp_para["cp_inner_ranks"] == [7]
         assert cp_para["cp_outer_ranks"] == cp_para["cp_dkv_outer_ranks"] == [4, 7]
-        assert cp_para["cache_policy"] == "full"
+        assert cp_para["cache_policy"] is None
         assert cp_para["causal"] and not cp_para["megatron_cp_in_bnsd"]
         assert kwargs == {"softmax_scale": 0.0625, "dropout_p": 0.0}
         seen.append(True)
