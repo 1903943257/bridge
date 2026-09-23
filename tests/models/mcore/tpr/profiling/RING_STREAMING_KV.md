@@ -8,8 +8,8 @@ Native forward 是 send-next → 当前 FA/merge → wait → buffer swap；
 backward 使用 `is_backward=True` 反向 Ring 和滚动 dKV accumulator。
 注意 native 存在 full/half KV cache policy，不能笼统说它一定无缓存。
 本次对齐的是无缓存的 streaming 行为。
-当前 `ordinary_ring_cp_attention` 显式设置 `cache_policy="full"`；本次保留
-该 reference 配置，不能把它的 KV retention 当作无缓存 native 基准。
+`ordinary_ring_cp_attention` 现在对齐 MindSpeed 默认配置，显式设置
+`cache_policy=None`，即不启用 KV cache；Ref 容量测试因此使用 native no-cache Ring。
 
 TPR 的区别：native 无缓存路径保存 forward 最后一块 KV（source=rank+1）；
 这里按需求只保存 local KV。因此 backward 用一次反向 hop 恢复 rank+1
