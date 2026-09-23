@@ -423,22 +423,35 @@ class SegmentExecutor:
                 else nullcontext()
             )
             with rope_context, use_tpr_attention_context(context):
-                model_kwargs = dict(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    attention_mask=None,
+                use_chunked_lm_head = (
+                    not no_grad and self._can_chunk_language_model_output()
                 )
-                if not no_grad and self._can_chunk_language_model_output():
-                    # Megatron's native output_processor runs after the decoder
-                    # and before the default full-sequence output projection.
-                    # Keep the native output layer / tied weight / CE helpers,
-                    # but project only the owned token rows in sequence chunks.
-                    model_kwargs["output_processor"] = (
-                        lambda **kwargs: self._chunk_language_model_output(
-                            segment, local_sequence_length=shard.local_length, **kwargs
+                if use_chunked_lm_head:
+                    # Older Megatron revisions do not expose output_processor.
+                    # Temporarily stop the native GPTModel after the decoder,
+                    # then invoke the same native output layer / CE ourselves in
+                    # sequence chunks. Restore post_process before returning.
+                    original_post_process = self.model.post_process
+                    self.model.post_process = False
+                    try:
+                        hidden_states = self.model(
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                            attention_mask=None,
                         )
+                    finally:
+                        self.model.post_process = original_post_process
+                    logits = self._chunk_language_model_output(
+                        segment,
+                        local_sequence_length=shard.local_length,
+                        hidden_states=hidden_states,
                     )
-                logits = self.model(**model_kwargs)
+                else:
+                    logits = self.model(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        attention_mask=None,
+                    )
         if isinstance(logits, _ChunkedLanguageModelOutput):
             if logits.local_sequence_length != shard.local_length:
                 raise RuntimeError(
@@ -459,16 +472,12 @@ class SegmentExecutor:
             return False
         if not callable(getattr(self.model, "output_layer", None)):
             return False
-        # Current Megatron GPTModel exposes output_processor explicitly. Avoid
-        # relying on a TypeError fallback, which could mask errors raised inside
-        # model.forward on older revisions.
-        import inspect
-
-        try:
-            parameters = inspect.signature(self.model.forward).parameters
-        except (TypeError, ValueError):
+        if not isinstance(getattr(self.model, "post_process", None), bool):
             return False
-        return "output_processor" in parameters
+        # TPR currently supports the ordinary dense GPT LM head only.
+        if getattr(self.model.config, "mtp_num_layers", 0):
+            return False
+        return True
 
     def _chunk_language_model_output(
         self,
@@ -476,14 +485,26 @@ class SegmentExecutor:
         *,
         local_sequence_length: int,
         hidden_states: Tensor,
-        output_layer,
-        output_weight,
-        compute_language_model_loss,
-        scale_logits,
-        config,
-        **unused,
     ) -> _ChunkedLanguageModelOutput:
         """Project token chunks to vocab logits and immediately run native CE."""
+        if not isinstance(hidden_states, Tensor) or hidden_states.ndim != 3:
+            raise ValueError(
+                "post_process=False must return decoder hidden states [sequence, batch, hidden]"
+            )
+        if hidden_states.shape[0] != local_sequence_length or hidden_states.shape[1] != 1:
+            raise ValueError(
+                "decoder hidden states must have shape "
+                f"[{local_sequence_length}, 1, hidden], got {tuple(hidden_states.shape)}"
+            )
+        output_layer = self.model.output_layer
+        compute_language_model_loss = self.model.compute_language_model_loss
+        config = self.model.config
+        output_weight = (
+            self.model.shared_embedding_or_output_weight()
+            if getattr(self.model, "share_embeddings_and_output_weights", False)
+            else None
+        )
+        scale_logits = getattr(self.model, "_scale_logits", lambda value: value)
         owned_terms = self._owned_loss_terms(segment)
         if not owned_terms:
             # Preserve a differentiable path through every CP rank so Ring
