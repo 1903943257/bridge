@@ -45,6 +45,7 @@ three-sample NPU-event pass collects the latency breakdown; set
 from __future__ import annotations
 
 import gc
+import json
 import math
 import os
 import statistics
@@ -88,11 +89,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 _EXPECTED_WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
-_WARMUP_RUNS = 3
-_MEASURE_RUNS = 10
+_WARMUP_RUNS = int(os.getenv("TPR_QWEN_RING_CP_PROFILE_WARMUP", "3"))
+_MEASURE_RUNS = int(os.getenv("TPR_QWEN_RING_CP_PROFILE_REPEATS", "10"))
 _BREAKDOWN_WARMUP_RUNS = 1
 _BREAKDOWN_MEASURE_RUNS = 3
 _RUN_BREAKDOWN = os.getenv("TPR_QWEN_RING_CP_PROFILE_BREAKDOWN", "1") == "1"
+_ENABLE_OFFLOAD = os.getenv("TPR_QWEN_RING_CP_PROFILE_OFFLOAD", "0") == "1"
+_SWAP_MODULES = os.getenv("TPR_SWAP_MODULES", "self_attention,mlp")
+_LOSS_CHUNK_SIZE_RAW = int(os.getenv("TPR_LOSS_CHUNK_SIZE", "0"))
+_LOSS_CHUNK_SIZE = None if _LOSS_CHUNK_SIZE_RAW <= 0 else _LOSS_CHUNK_SIZE_RAW
 _GIB = 1024**3
 
 
@@ -119,13 +124,24 @@ def profile_runtime():
 
     from mindspeed.args_utils import get_full_args
 
-    vars(get_full_args()).pop("", None)
+    args = get_full_args()
+    vars(args).pop("", None)
     repatch(
         {
             "context_parallel_size": _EXPECTED_WORLD_SIZE,
             "context_parallel_algo": "megatron_cp_algo",
         }
     )
+    if _ENABLE_OFFLOAD:
+        vars(args).update(
+            swap_attention=False,
+            context_parallel_size=_EXPECTED_WORLD_SIZE,
+            pipeline_model_parallel_size=1,
+            eval_interval=0,
+            curr_iteration=1,
+            noop_layers=None,
+            swap_modules=_SWAP_MODULES,
+        )
 
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
@@ -258,9 +274,26 @@ class _ProfileResult:
         return self.reference.mean_ms / self.tpr.mean_ms
 
 
-_PROFILE_CASES = (
-    _ProfileCase(16384, 16384, 8),
-)
+def _parse_profile_cases() -> tuple[_ProfileCase, ...]:
+    raw = os.getenv("TPR_QWEN_RING_CP_PROFILE_CASES", "").strip()
+    if not raw:
+        return (_ProfileCase(16384, 16384, 8),)
+    cases = []
+    for item in raw.split(","):
+        parts = item.strip().split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError(
+                "TPR_QWEN_RING_CP_PROFILE_CASES entries must be P:S or P:S:N"
+            )
+        prefix, suffix = (int(parts[0]), int(parts[1]))
+        siblings = int(parts[2]) if len(parts) == 3 else 2
+        if prefix <= 0 or suffix <= 0 or siblings <= 0:
+            raise ValueError("profile P/S/N values must be positive")
+        cases.append(_ProfileCase(prefix, suffix, siblings))
+    return tuple(cases)
+
+
+_PROFILE_CASES = _parse_profile_cases()
 
 
 class _NPUEventRecorder:
@@ -418,6 +451,7 @@ def _run_plan(model, plan, runtime, expected_layer_numbers) -> _RunObservation:
         expected_layer_numbers=expected_layer_numbers,
         cp_group=runtime.cp_group if runtime.cp_size > 1 else None,
         cp_backend="ring" if runtime.cp_size > 1 else None,
+        loss_chunk_size=_LOSS_CHUNK_SIZE,
     )
     if runtime.cp_size > 1 and (executor.cp_backend is None or executor.cp_backend.backend_name != "ring"):
         raise AssertionError("profile did not resolve the Ring CP backend")
@@ -1349,6 +1383,35 @@ def _print_case_result(result: _ProfileResult, *, rank: int) -> None:
     print(f"Speedup (median): {result.median_speedup:.3f}x")
     print(f"Incremental-peak ratio: {ratio:.3f}x")
     print(f"Incremental-peak reduction: {reduction * 100:.2f}%")
+    print("TPR_REF_TPR_RESULT " + json.dumps({
+        "cp_size": _EXPECTED_WORLD_SIZE,
+        "prefix": case.prefix_length,
+        "suffix": case.suffix_length,
+        "siblings": case.trajectory_count,
+        "offload": _ENABLE_OFFLOAD,
+        "swap_modules": _SWAP_MODULES,
+        "loss_chunk_size": _LOSS_CHUNK_SIZE,
+        "reference": {
+            "median_ms": reference.median_ms,
+            "mean_ms": reference.mean_ms,
+            "std_ms": reference.std_ms,
+            "baseline_allocated": reference.baseline_allocated_bytes,
+            "peak_allocated": reference.peak_allocated_bytes,
+            "incremental_peak": reference.incremental_peak_bytes,
+            "peak_reserved": reference.peak_reserved_bytes,
+        },
+        "tpr": {
+            "median_ms": tpr.median_ms,
+            "mean_ms": tpr.mean_ms,
+            "std_ms": tpr.std_ms,
+            "baseline_allocated": tpr.baseline_allocated_bytes,
+            "peak_allocated": tpr.peak_allocated_bytes,
+            "incremental_peak": tpr.incremental_peak_bytes,
+            "peak_reserved": tpr.peak_reserved_bytes,
+        },
+        "speedup": result.median_speedup,
+        "incremental_peak_reduction_pct": reduction * 100.0,
+    }), flush=True)
 
 
 def _print_summary(results: tuple[_ProfileResult, ...], *, rank: int) -> None:
@@ -1380,6 +1443,8 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
     model_case = SimpleNamespace(path=model_path)
     model = _make_qwen_cp_model(runtime, model_case, hf_config)
     config = model.config
+    config.swap_attention = _ENABLE_OFFLOAD
+    config.swap_modules = _SWAP_MODULES
     assert config.context_parallel_size == runtime.cp_size
     for actual, expected in (
         (config.num_layers, hf_config.num_hidden_layers),
@@ -1397,6 +1462,9 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
         print(f"Qwen3-{size}: checkpoint={model_path}, CP={runtime.cp_size}")
         print(f"Prefix FULL coalescing: {os.getenv('TPR_RING_COALESCE_PREFIX_FULL', '0') == '1'}")
         print(f"Prefix Q coalescing requested: {os.getenv('TPR_RING_COALESCE_PREFIX_QUERY', '0') == '1'}")
+        print(f"Activation offload: {_ENABLE_OFFLOAD}; swap_modules={_SWAP_MODULES}")
+        print(f"Loss chunk size: {_LOSS_CHUNK_SIZE}")
+        print(f"Profile cases: {[case.case_id for case in _PROFILE_CASES]}")
         if runtime.cp_size == 1:
             print("Local rectangular attention; Ring-only diagnostic counters are zero.")
     if next(model.parameters()).dtype != torch.bfloat16:
