@@ -124,14 +124,14 @@ def profile_runtime():
 
     from mindspeed.args_utils import get_full_args
 
-    args = get_full_args()
-    vars(args).pop("", None)
+    vars(get_full_args()).pop("", None)
     repatch(
         {
             "context_parallel_size": _EXPECTED_WORLD_SIZE,
             "context_parallel_algo": "megatron_cp_algo",
         }
     )
+    args = get_full_args()
     if _ENABLE_OFFLOAD:
         vars(args).update(
             swap_attention=False,
