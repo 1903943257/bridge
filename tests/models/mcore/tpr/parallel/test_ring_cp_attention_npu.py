@@ -124,6 +124,8 @@ def _kernel_probe():
     transport = {"forward": 0, "backward": 0}
     original_circulate = ring._circulate_kv
     original_reduce = ring._reduce_ring_gradients_to_owner
+    original_storage_trace = ring._trace_ring_storage
+    storage_events = []
 
     def circulate(*args, **kwargs):
         transport["forward"] += 1
@@ -159,15 +161,23 @@ def _kernel_probe():
     ring._reduce_ring_gradients_to_owner = reduce
     ring._block_attention_forward = traced_forward
     ring._block_attention_backward = traced_backward
+    ring._trace_ring_storage = lambda **event: storage_events.append(event)
     try:
         yield calls
         assert transport["forward"] == transport["backward"]
         calls["transport"] = transport
+        calls["storage"] = storage_events
+        assert storage_events
+        for event in storage_events:
+            expected = {"forward_buffers": 2, "backward_buffers": 4}.get(event["phase"])
+            if expected is not None:
+                assert event["storage_count"] == expected
     finally:
         ring._circulate_kv = original_circulate
         ring._reduce_ring_gradients_to_owner = original_reduce
         ring._block_attention_forward = original_forward
         ring._block_attention_backward = original_backward
+        ring._trace_ring_storage = original_storage_trace
 
 
 @pytest.mark.parametrize(
@@ -266,6 +276,14 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
         )
         _assert_padding_zero(actual, current_shard)
         actual.backward(local_gradient)
+
+    saved_kv = [event for event in calls.pop("storage") if event["phase"] == "saved_local_kv"]
+    assert len(saved_kv) == 1
+    assert saved_kv[0]["tensor_count"] == 2 * (len(prefix_lengths) + 1)
+    expected_local_bytes = sum(t.untyped_storage().nbytes() for t in
+                               (*local_prefix_keys, *local_prefix_values,
+                                local_current_key, local_current_value))
+    assert saved_kv[0]["storage_bytes"] == expected_local_bytes
 
     reference_query = global_query.detach().clone().requires_grad_(True)
     reference_current_key = global_current_key.detach().clone().requires_grad_(True)

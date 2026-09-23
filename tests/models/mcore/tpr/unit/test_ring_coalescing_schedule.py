@@ -94,7 +94,7 @@ def load_dispatch():
     wanted = {"RingBlockKind", "_RingRangeSlice", "_iter_range_slices", "_prefix_full_slices",
               "classify_ring_block", "_physical_block_attention_mask", "_RingTPRAttention",
               "_can_coalesce_prefix_query", "_slice_tnd_result", "_trace_merged_query",
-              "_merged_prefix_forward", "_merged_prefix_backward"}
+              "_source_schedule"}
     nodes = [node for node in ast.parse(source.read_text()).body
              if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted]
     preamble = ast.parse("from __future__ import annotations").body
@@ -112,12 +112,16 @@ class DispatchTests(unittest.TestCase):
         events, calls = [], {"forward": 0, "backward": 0}
         query_storage = []
         communication = dict(forward=0, backward=0)
-        def circulate(k, v, cfg):
+        def circulate(k, v, cfg, consume):
             communication["forward"] += 1
-            return tuple((k, v) for _ in range(cp))
-        def reduce(contributions, cfg):
+            for step in range(cp):
+                consume((rank - step) % cp, k, v)
+        def reduce(k, v, cfg, consume):
             communication["backward"] += 1
-            return contributions[rank]
+            dk, dv = Tensor(k.shape), Tensor(v.shape)
+            for step in range(cp):
+                consume((rank + step + 1) % cp, k, v, dk, dv)
+            return dk, dv
         def forward(q, k, v, **kwargs):
             calls["forward"] += 1
             if query_enabled and enabled and prefix:
@@ -127,6 +131,7 @@ class DispatchTests(unittest.TestCase):
             calls["backward"] += 1
             return Tensor(q.shape), Tensor(k.shape), Tensor(v.shape)
         ns.update(_trace_ring_block=lambda **event: events.append(event),
+                  _observe_ring_storage=lambda *args: None,
                   _circulate_kv=circulate,
                   _block_attention_forward=forward, _block_attention_backward=backward,
                   _merge_attention=lambda previous, current, **kw: current,
@@ -144,6 +149,8 @@ class DispatchTests(unittest.TestCase):
         ctx = SimpleNamespace()
         ctx.save_for_backward = lambda *args: setattr(ctx, "saved_tensors", args)
         output = ns["_RingTPRAttention"].forward(ctx, q, *kv, config)
+        self.assertEqual(ctx.block_tensor_count, len(kv))
+        self.assertEqual(ctx.saved_tensors[1:1 + len(kv)], tuple(kv))
         if ctx.query_coalesced:
             self.assertEqual(len(ctx.saved_tensors) - 1 - ctx.block_tensor_count, 3)
             self.assertIs(ctx.saved_tensors[-3].storage, output.storage)

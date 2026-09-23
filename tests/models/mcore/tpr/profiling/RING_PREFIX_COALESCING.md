@@ -16,6 +16,12 @@ NPU memory/latency. NPU correctness and performance have NOT been run locally
 
 ## Baseline decomposition from the executor
 
+Historical baseline below describes the pre-streaming implementation. The
+current transport consumes each source immediately and saves only local KV;
+see [Ring streaming lifecycle](RING_STREAMING_KV.md). The block-count tables
+and coalescing rules remain applicable, but the old all-source retention and
+source-index execution order no longer apply.
+
 `_circulate_kv` first gathers source buffers in a source-indexed tuple. It
 retains all source buffers for backward. FA execution then iterates query
 chunk -> segment -> source rank -> KV chunk. Thus “ring_step” in the trace

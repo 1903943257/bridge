@@ -735,6 +735,9 @@ def _collect_breakdown(
         original_ring_backward = ring_attention._RingTPRAttention.backward
         original_circulate = ring_attention._circulate_kv
         original_reduce = ring_attention._reduce_ring_gradients_to_owner
+        ring_p2p, _ = ring_attention._load_mindspeed_ring_primitives()
+        original_send_recv, original_wait = ring_p2p.async_send_recv, ring_p2p.wait
+        active_transport = [None]
         original_fa_forward = ring_attention._block_attention_forward
         original_fa_backward = ring_attention._block_attention_backward
         original_merge = ring_attention._merge_attention
@@ -820,10 +823,28 @@ def _collect_breakdown(
             return in_phase("ring_backward", original_ring_backward, ctx, *args)
 
         def timed_circulate(*args, **kwargs):
-            return in_phase("comm_forward", original_circulate, *args, **kwargs)
+            active_transport[0] = "comm_forward"
+            try:
+                return original_circulate(*args, **kwargs)
+            finally:
+                active_transport[0] = None
 
         def timed_reduce(*args, **kwargs):
-            return in_phase("comm_backward", original_reduce, *args, **kwargs)
+            active_transport[0] = "comm_backward"
+            try:
+                return original_reduce(*args, **kwargs)
+            finally:
+                active_transport[0] = None
+
+        def timed_send_recv(ring, *args, **kwargs):
+            if active_transport[0] is None:
+                return original_send_recv(ring, *args, **kwargs)
+            return in_phase(active_transport[0], original_send_recv, ring, *args, **kwargs)
+
+        def timed_wait(ring):
+            if active_transport[0] is None or not ring.send_recv_ops:
+                return original_wait(ring)
+            return in_phase(active_transport[0], original_wait, ring)
 
         def timed_fa_forward(*args, **kwargs):
             return in_phase("fa_forward", original_fa_forward, *args, **kwargs)
@@ -915,6 +936,8 @@ def _collect_breakdown(
                 stack.enter_context(
                     patch.object(ring_attention, "_circulate_kv", timed_circulate)
                 )
+                stack.enter_context(patch.object(ring_p2p, "async_send_recv", timed_send_recv))
+                stack.enter_context(patch.object(ring_p2p, "wait", timed_wait))
                 stack.enter_context(
                     patch.object(
                         ring_attention,
@@ -1342,7 +1365,7 @@ def _print_attribution(
         f"{shape_aligned_reference_prefix:.1f} ms, TPR-measured={actual_tpr_prefix:.1f} ms."
     )
     print(
-        "  Ring transport calls on rank 0 (forward + backward wrappers): "
+        "  Ring transport launch/wait events on rank 0 (exposed intervals, not wire time): "
         f"Reference={reference_communication_calls}, TPR={tpr_communication_calls}."
     )
     print(

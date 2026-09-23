@@ -120,6 +120,17 @@ class _Probe:
         self.events = []
         self.errors = []
         self.phases = []
+        self.ring_storage = {}
+        if os.getenv("TPR_RING_STORAGE_AUDIT") == "1":
+            def storage_event(phase, **metrics):
+                summary = self.ring_storage.setdefault(phase, dict(calls=0))
+                summary["calls"] += 1
+                for key, value in metrics.items():
+                    summary[key] = max(summary.get(key, 0), value)
+                expected = {"forward_buffers": 2, "backward_buffers": 4}.get(phase)
+                if expected is not None and metrics["storage_count"] != expected:
+                    self.errors.append(f"{phase}: streaming buffer count changed")
+            monkeypatch.setattr(ring_attention, "_trace_ring_storage", storage_event)
         for method, before, after, key in (
             ("launch_d2h", "device", "d2h", "d2h_bytes"),
             ("wait_d2h_finished", "d2h", "host", "released_bytes"),
@@ -144,8 +155,10 @@ class _Probe:
 
             monkeypatch.setattr(SwapTensor, method, wrapper)
         if timing:
-            for name, category in (("_circulate_kv", "ring_comm"),
-                                   ("_reduce_ring_gradients_to_owner", "ring_comm"),
+            # Streaming traversal includes FA. Do not label these intervals as
+            # communication-only or sum them with the nested FA/merge events.
+            for name, category in (("_circulate_kv", "ring_stream"),
+                                   ("_reduce_ring_gradients_to_owner", "ring_stream"),
                                    ("_block_attention_forward", "fa"),
                                    ("_block_attention_backward", "fa"),
                                    ("_merge_attention", "merge")):
@@ -192,11 +205,12 @@ class _Probe:
         return result
 
     def report(self):
-        times = dict(ring_comm=0.0, fa=0.0, merge=0.0)
+        times = dict(ring_stream=0.0, fa=0.0, merge=0.0)
         for category, start, end in self.events:
             times[category] += start.elapsed_time(end)
         detail = {"native_hits_by_layer": self.by_layer} if os.getenv("TPR_OFFLOAD_B_VERBOSE") == "1" else {}
         return dict(**self.counts, restore_sample_peak_allocated=self.restore_peak,
+                    ring_storage=self.ring_storage,
                     phase_transfers=self.phases, native_hit_entries=len(self.by_layer), **detail,
                     stream_interval_ms=times if self.events else None,
                     transfer_time_ms=None, exposed_wait_ms=None)
@@ -287,6 +301,11 @@ def _report(runtime, record):
             maximum["stream_interval_ms"] = {
                 key: max(row["stream_interval_ms"][key] for row in records)
                 for key in record["stream_interval_ms"]}
+        if record.get("ring_storage"):
+            maximum["ring_storage"] = {
+                phase: {key: max(row["ring_storage"].get(phase, {}).get(key, 0) for row in records)
+                        for key in metrics}
+                for phase, metrics in record["ring_storage"].items()}
         print("TPR_OFFLOAD_B_MAX " + json.dumps(dict(max_rank=maximum)), flush=True)
 
 

@@ -320,30 +320,29 @@ def _normalize_inputs(
     return blocks, config
 
 
-def _circulate_kv(
-    key: Tensor,
-    value: Tensor,
-    config: _RingAttentionConfig,
-) -> tuple[tuple[Tensor, Tensor], ...]:
+def _circulate_kv(key, value, config, consume):
+    """Consume each source immediately; two reusable KV buffers, no KV cache.
+
+    Like native Ring, launch the next transfer before FA and wait before
+    reusing either buffer. The callback must not retain remote tensor views.
+    """
     RingP2P, _ = _load_mindspeed_ring_primitives()
     ring = RingP2P(config.global_ranks, config.cp_group)
-    by_source: list[tuple[Tensor, Tensor] | None] = [None] * config.cp_size
     current = torch.stack((key, value), dim=0).contiguous()
-    source_rank = config.cp_rank
-    for step in range(config.cp_size):
-        if step == 0:
-            by_source[source_rank] = (key, value)
-        else:
-            by_source[source_rank] = (current[0], current[1])
-        if step + 1 < config.cp_size:
-            received = torch.empty_like(current)
-            ring.async_send_recv(current, received)
-            ring.wait()
-            current = received
-            source_rank = (source_rank - 1) % config.cp_size
-    if any(block is None for block in by_source):
-        raise RuntimeError("Ring KV circulation did not visit every source rank")
-    return tuple(block for block in by_source if block is not None)
+    received = torch.empty_like(current)
+    _observe_ring_storage("forward_buffers", (current, received))
+    try:
+        for step in range(config.cp_size):
+            if step + 1 < config.cp_size:
+                ring.async_send_recv(current, received)
+            source = (config.cp_rank - step) % config.cp_size
+            consume(source, key if step == 0 else current[0],
+                    value if step == 0 else current[1])
+            if step + 1 < config.cp_size:
+                ring.wait()
+                current, received = received, current
+    finally:
+        ring.wait()
 
 
 def _iter_range_slices(
@@ -394,6 +393,17 @@ def _prefix_full_slices(tensor, shard, *, enabled):
 
 # Patched only in untimed probes; no event dictionaries on the hot path.
 _trace_ring_block = None
+_trace_ring_storage = None
+
+
+def _observe_ring_storage(phase, tensors):
+    """Opt-in metadata-only probe; never export owning tensor references."""
+    if _trace_ring_storage is None:
+        return
+    storages = {tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+                for tensor in tensors}
+    _trace_ring_storage(phase=phase, tensor_count=len(tensors),
+                        storage_count=len(storages), storage_bytes=sum(storages.values()))
 
 
 def _can_coalesce_prefix_query(query: Tensor, config: _RingAttentionConfig) -> bool:
@@ -453,38 +463,7 @@ def _trace_merged_query(config, query, key, segment_index, source_rank, phase):
     )
 
 
-def _merged_prefix_forward(query_tnd, segment_blocks, config):
-    """One FULL FA per Prefix source; Q and KV inputs are existing views."""
-    merged = None
-    for segment_index, source_blocks in enumerate(segment_blocks[:-1]):
-        for source_rank, (key, value) in enumerate(source_blocks):
-            _trace_merged_query(config, query_tnd, key, segment_index, source_rank, "forward")
-            current = _block_attention_forward(
-                query_tnd, key.squeeze(1), value.squeeze(1),
-                query_heads=config.query_heads, softmax_scale=config.softmax_scale,
-                block_kind=RingBlockKind.FULL, attention_mask=None,
-            )
-            merged = _merge_attention(merged, current, query_length=query_tnd.shape[0])
-    return merged
 
-
-def _merged_prefix_backward(query_tnd, grad_output, final_result, segment_blocks,
-                            segment_contributions, query_gradient, config):
-    """FA sums both Q chunks' dKV; add it exactly once before existing reduction."""
-    output, maximum, total = final_result
-    for segment_index, source_blocks in enumerate(segment_blocks[:-1]):
-        for source_rank, (key, value) in enumerate(source_blocks):
-            _trace_merged_query(config, query_tnd, key, segment_index, source_rank, "backward")
-            dq, dk, dv = _block_attention_backward(
-                query_tnd, key.squeeze(1), value.squeeze(1), grad_output,
-                attention_output=output, softmax_max=maximum, softmax_sum=total,
-                query_heads=config.query_heads, softmax_scale=config.softmax_scale,
-                block_kind=RingBlockKind.FULL, attention_mask=None,
-            )
-            query_gradient.add_(dq)
-            key_buffer, value_buffer = segment_contributions[segment_index][source_rank]
-            key_buffer.add_(dk.unsqueeze(1))
-            value_buffer.add_(dv.unsqueeze(1))
 
 
 def _range_validity(item: _RingRangeSlice, *, device: torch.device) -> Tensor:
@@ -759,27 +738,86 @@ def _block_attention_backward(
     return result[0], result[1], result[2]
 
 
-def _reduce_ring_gradients_to_owner(
-    contributions: Sequence[tuple[Tensor, Tensor]],
-    config: _RingAttentionConfig,
-) -> tuple[Tensor, Tensor]:
-    if len(contributions) != config.cp_size:
-        raise RuntimeError("Ring gradient contribution count does not match CP size")
+def _reduce_ring_gradients_to_owner(key, value, config, consume):
+    """Replay native reverse Ring with constant KV/dKV ping-pong storage.
+
+    Native no-cache backward starts at the last forward source (rank+1).
+    Since ctx retains LOCAL KV only, seed that source with one reverse hop.
+    Replay rank+1,...,rank-1; the last step uses local KV without a transfer.
+    dKV follows the same reverse Ring and ends at its owner after CP-1 hops.
+    """
     RingP2P, _ = _load_mindspeed_ring_primitives()
-    ring = RingP2P(config.global_ranks, config.cp_group)
-    owner_rank = (config.cp_rank - 1) % config.cp_size
-    key_grad, value_grad = contributions[owner_rank]
-    accumulated = torch.stack((key_grad, value_grad), dim=0).contiguous()
-    for step in range(config.cp_size - 1):
-        received = torch.empty_like(accumulated)
-        ring.async_send_recv(accumulated, received)
-        ring.wait()
-        owner_rank = (config.cp_rank - step - 2) % config.cp_size
-        next_key_grad, next_value_grad = contributions[owner_rank]
-        received[0].add_(next_key_grad)
-        received[1].add_(next_value_grad)
-        accumulated = received
+    kv_ring = RingP2P(config.global_ranks, config.cp_group, is_backward=True)
+    grad_ring = RingP2P(config.global_ranks, config.cp_group, is_backward=True)
+    current = torch.stack((key, value), dim=0).contiguous()
+    received = torch.empty_like(current)
+    accumulated = torch.zeros_like(current)
+    next_grad = torch.empty_like(current)
+    _observe_ring_storage("backward_buffers", (current, received, accumulated, next_grad))
+    try:
+        if config.cp_size > 1:
+            kv_ring.async_send_recv(current, received)
+            kv_ring.wait()
+            current, received = received, current
+        for step in range(config.cp_size):
+            source = (config.cp_rank + step + 1) % config.cp_size
+            if step + 2 < config.cp_size:
+                kv_ring.async_send_recv(current, received)
+            local = step + 1 == config.cp_size
+            consume(source, key if local else current[0], value if local else current[1],
+                    accumulated[0], accumulated[1])
+            if step + 2 < config.cp_size:
+                kv_ring.wait()
+                current, received = received, current
+            if not local:
+                grad_ring.async_send_recv(accumulated, next_grad)
+                grad_ring.wait()
+                accumulated, next_grad = next_grad, accumulated
+    finally:
+        kv_ring.wait()
+        grad_ring.wait()
     return accumulated[0], accumulated[1]
+
+
+def _source_schedule(query_slices, source_key, source_value, config,
+                     segment_index, source_rank, phase):
+    """Existing TPR block classification/padding, evaluated for ONE live source."""
+    is_prefix = segment_index + 1 < len(config.segment_lengths)
+    global_length = config.segment_lengths[segment_index]
+    padded_length = config.segment_padded_lengths[segment_index]
+    source_shard = make_ring_sequence_shard(
+        global_length, cp_rank=source_rank, cp_size=config.cp_size,
+        padded_length=padded_length,
+    )
+    coalesced = is_prefix and config.coalesce_prefix_full and global_length == padded_length
+    key_slices = _prefix_full_slices(source_key.squeeze(1), source_shard, enabled=coalesced)
+    value_slices = _prefix_full_slices(source_value.squeeze(1), source_shard, enabled=coalesced)
+    for query_index, query_item in enumerate(query_slices):
+        for key_item, value_item in zip(key_slices, value_slices, strict=True):
+            if (key_item.logical_range != value_item.logical_range
+                    or key_item.physical_range != value_item.physical_range
+                    or key_item.local_slice != value_item.local_slice):
+                raise RuntimeError("Ring K/V physical slices differ")
+            block_kind = classify_ring_block(
+                query_item.logical_range, key_item.logical_range, is_prefix=is_prefix,
+            )
+            if _trace_ring_block is not None:
+                _trace_ring_block(
+                    phase=phase, rank=config.cp_rank,
+                    ring_step=(config.cp_rank - source_rank) % config.cp_size,
+                    source_rank=source_rank, segment_index=segment_index,
+                    segment_type="prefix" if is_prefix else "current",
+                    query_range=query_item.logical_range,
+                    query_chunk=query_item.physical_range[0] // (config.current_shard.padded_length // (2 * config.cp_size)),
+                    kv_ranges=source_shard.global_ranges if coalesced else (key_item.logical_range,),
+                    kv_chunks=tuple(start // (padded_length // (2 * config.cp_size)) for start, _ in
+                                    (source_shard.physical_global_ranges if coalesced else (key_item.physical_range,))),
+                    block_type=block_kind.value,
+                    query_length=query_item.tensor.shape[0], kv_length=key_item.tensor.shape[0],
+                    fa_called=block_kind is not RingBlockKind.SKIP, coalesced=coalesced,
+                )
+            if block_kind is not RingBlockKind.SKIP:
+                yield query_index, query_item, key_item, value_item, block_kind
 
 
 class _RingTPRAttention(torch.autograd.Function):
@@ -791,108 +829,48 @@ class _RingTPRAttention(torch.autograd.Function):
             raise TypeError("last Ring attention argument must be _RingAttentionConfig")
         if len(local_kv) != 2 * len(config.segment_lengths):
             raise RuntimeError("Ring attention K/V argument count does not match Segment metadata")
-
-        segment_blocks = []
-        for index in range(len(config.segment_lengths)):
-            segment_blocks.append(
-                _circulate_kv(local_kv[2 * index], local_kv[2 * index + 1], config)
-            )
-
         ctx.query_coalesced = _can_coalesce_prefix_query(query, config)
         query_tnd = query.squeeze(1).contiguous()
-        prefix_result = (
-            _merged_prefix_forward(query_tnd, segment_blocks, config)
-            if ctx.query_coalesced else None
-        )
-        query_results = []
         query_slices = _iter_range_slices(query_tnd, config.current_shard)
-        for query_item in query_slices:
-            query_range = query_item.logical_range
-            query_part = query_item.tensor
-            merged = _slice_tnd_result(prefix_result, query_item.local_slice) if ctx.query_coalesced else None
-            for segment_index, source_blocks in enumerate(segment_blocks):
-                is_prefix = segment_index + 1 < len(segment_blocks)
-                if ctx.query_coalesced and is_prefix:
-                    continue
-                global_length = config.segment_lengths[segment_index]
-                padded_length = config.segment_padded_lengths[segment_index]
-                for source_rank, (source_key, source_value) in enumerate(source_blocks):
-                    source_shard = make_ring_sequence_shard(
-                        global_length,
-                        cp_rank=source_rank,
-                        cp_size=config.cp_size,
-                        padded_length=padded_length,
-                    )
-                    coalesced = is_prefix and config.coalesce_prefix_full and global_length == padded_length
-                    key_slices = _prefix_full_slices(
-                        source_key.squeeze(1), source_shard, enabled=coalesced,
-                    )
-                    value_slices = _prefix_full_slices(
-                        source_value.squeeze(1), source_shard, enabled=coalesced,
-                    )
-                    for key_item, value_item in zip(key_slices, value_slices, strict=True):
-                        if (
-                            key_item.logical_range != value_item.logical_range
-                            or key_item.physical_range != value_item.physical_range
-                            or key_item.local_slice != value_item.local_slice
-                        ):
-                            raise RuntimeError("Ring K/V physical slices differ")
-                        kv_range = key_item.logical_range
-                        block_kind = classify_ring_block(
-                            query_range,
-                            kv_range,
-                            is_prefix=is_prefix,
-                        )
-                        if _trace_ring_block is not None:
-                            _trace_ring_block(
-                                phase="forward", rank=config.cp_rank,
-                                ring_step=(config.cp_rank - source_rank) % config.cp_size,
-                                source_rank=source_rank, segment_index=segment_index,
-                                segment_type="prefix" if is_prefix else "current",
-                                query_range=query_item.logical_range,
-                                query_chunk=query_item.physical_range[0] // (config.current_shard.padded_length // (2 * config.cp_size)),
-                                kv_ranges=source_shard.global_ranges if coalesced else (key_item.logical_range,),
-                                kv_chunks=tuple(start // (padded_length // (2 * config.cp_size)) for start, _ in
-                                                (source_shard.physical_global_ranges if coalesced else (key_item.physical_range,))),
-                                block_type=block_kind.value,
-                                query_length=query_part.shape[0], kv_length=key_item.tensor.shape[0],
-                                fa_called=block_kind is not RingBlockKind.SKIP,
-                                coalesced=coalesced,
-                            )
-                        if block_kind is RingBlockKind.SKIP:
-                            continue
-                        attention_mask, _, _ = _physical_block_attention_mask(
-                            query_item,
-                            key_item,
-                            block_kind=block_kind,
-                        )
-                        current = _block_attention_forward(
-                            query_part,
-                            key_item.tensor,
-                            value_item.tensor,
-                            query_heads=config.query_heads,
-                            softmax_scale=config.softmax_scale,
-                            block_kind=block_kind,
-                            attention_mask=attention_mask,
-                        )
-                        merged = _merge_attention(
-                            merged,
-                            current,
-                            query_length=query_part.shape[0],
-                        )
-            if merged is None:
-                raise RuntimeError(f"query range {query_range} has no visible KV block")
-            # Fused backward consumes the final context in query dtype, not
-            # the FP32 accumulator. Save the same rounded context we return.
-            query_results.append(_finalize_attention_result(merged, dtype=query.dtype))
+        query_results = [None] * len(query_slices)
+        prefix_result = None
+        for segment_index in range(len(config.segment_lengths)):
+            merged_query = ctx.query_coalesced and segment_index + 1 < len(config.segment_lengths)
+            if ctx.query_coalesced and not merged_query:
+                query_results = [_slice_tnd_result(prefix_result, item.local_slice) for item in query_slices]
+                prefix_result = None
 
-        del prefix_result
-        saved_blocks = []
-        for source_blocks in segment_blocks:
-            for key, value in source_blocks:
-                saved_blocks.extend((key, value))
+            def consume(source_rank, key, value):
+                nonlocal prefix_result
+                if merged_query:
+                    _trace_merged_query(config, query_tnd, key, segment_index, source_rank, "forward")
+                    current = _block_attention_forward(
+                        query_tnd, key.squeeze(1), value.squeeze(1),
+                        query_heads=config.query_heads, softmax_scale=config.softmax_scale,
+                        block_kind=RingBlockKind.FULL, attention_mask=None,
+                    )
+                    prefix_result = _merge_attention(prefix_result, current, query_length=query_tnd.shape[0])
+                    return
+                for index, q_item, k_item, v_item, kind in _source_schedule(
+                    query_slices, key, value, config, segment_index, source_rank, "forward"
+                ):
+                    mask, _, _ = _physical_block_attention_mask(q_item, k_item, block_kind=kind)
+                    current = _block_attention_forward(
+                        q_item.tensor, k_item.tensor, v_item.tensor,
+                        query_heads=config.query_heads, softmax_scale=config.softmax_scale,
+                        block_kind=kind, attention_mask=mask,
+                    )
+                    query_results[index] = _merge_attention(
+                        query_results[index], current, query_length=q_item.physical_length,
+                    )
+
+            _circulate_kv(local_kv[2 * segment_index], local_kv[2 * segment_index + 1], config, consume)
+        if any(result is None for result in query_results):
+            raise RuntimeError("query range has no visible KV block")
+        query_results = [_finalize_attention_result(result, dtype=query.dtype) for result in query_results]
         ctx.config = config
-        ctx.block_tensor_count = len(saved_blocks)
+        ctx.block_tensor_count = len(local_kv)
+        _observe_ring_storage("saved_local_kv", local_kv)
         output = query.new_zeros((query.shape[0], config.query_heads, config.head_dim))
         for query_item, result in zip(query_slices, query_results, strict=True):
             result_output = result[0]
@@ -916,10 +894,10 @@ class _RingTPRAttention(torch.autograd.Function):
                     full.view(heads, length, full.shape[-1])[:, item.local_slice, :].copy_(
                         part.view(heads, item.physical_length, part.shape[-1])
                     )
-            ctx.save_for_backward(query, *saved_blocks, output, *full_stats)
+            ctx.save_for_backward(query, *local_kv, output, *full_stats)
         else:
             saved_results = [tensor for result in query_results for tensor in result]
-            ctx.save_for_backward(query, *saved_blocks, *saved_results)
+            ctx.save_for_backward(query, *local_kv, *saved_results)
         return output.reshape(query.shape[0], 1, config.query_heads * config.head_dim)
 
     @staticmethod
@@ -927,159 +905,69 @@ class _RingTPRAttention(torch.autograd.Function):
         config = ctx.config
         saved = ctx.saved_tensors
         query = saved[0]
-        block_tensors = saved[1 : 1 + ctx.block_tensor_count]
-        result_tensors = saved[1 + ctx.block_tensor_count :]
-        segment_blocks = []
-        tensor_offset = 0
-        for _ in config.segment_lengths:
-            source_blocks = []
-            for _ in range(config.cp_size):
-                source_blocks.append(
-                    (block_tensors[tensor_offset], block_tensors[tensor_offset + 1])
-                )
-                tensor_offset += 2
-            segment_blocks.append(tuple(source_blocks))
-        query_results = tuple(
-            tuple(result_tensors[index : index + 3])
-            for index in range(0, len(result_tensors), 3)
-        )
-
+        local_kv = saved[1:1 + ctx.block_tensor_count]
+        result_tensors = saved[1 + ctx.block_tensor_count:]
         query_tnd = query.squeeze(1).contiguous()
         grad_output_tnd = grad_output.reshape(
-            query.shape[0],
-            config.query_heads,
-            config.head_dim,
+            query.shape[0], config.query_heads, config.head_dim,
         ).contiguous()
         query_gradient = torch.zeros_like(query_tnd)
-        segment_contributions = [
-            [
-                (torch.zeros_like(key), torch.zeros_like(value))
-                for key, value in source_blocks
-            ]
-            for source_blocks in segment_blocks
-        ]
-
         query_slices = _iter_range_slices(query_tnd, config.current_shard)
         if ctx.query_coalesced:
-            final_result = tuple(result_tensors)
-            _merged_prefix_backward(
-                query_tnd, grad_output_tnd, final_result, segment_blocks,
-                segment_contributions, query_gradient, config,
-            )
-            query_results = tuple(_slice_tnd_result(final_result, item.local_slice) for item in query_slices)
+            query_results = tuple(_slice_tnd_result(result_tensors, item.local_slice) for item in query_slices)
+        else:
+            query_results = tuple(tuple(result_tensors[i:i + 3]) for i in range(0, len(result_tensors), 3))
         grad_slices = _iter_range_slices(grad_output_tnd, config.current_shard)
-        for query_item, grad_item, final_result in zip(
-            query_slices,
-            grad_slices,
-            query_results,
-            strict=True,
-        ):
-            if (
-                query_item.logical_range != grad_item.logical_range
-                or query_item.physical_range != grad_item.physical_range
-                or query_item.local_slice != grad_item.local_slice
-            ):
+        for q_item, g_item in zip(query_slices, grad_slices, strict=True):
+            if (q_item.logical_range != g_item.logical_range
+                    or q_item.physical_range != g_item.physical_range
+                    or q_item.local_slice != g_item.local_slice):
                 raise RuntimeError("Ring query/gradient physical slices differ")
-            query_range = query_item.logical_range
-            query_part = query_item.tensor
-            grad_part = grad_item.tensor
-            valid_query = None
-            if query_item.valid_length != query_item.physical_length:
-                valid_query = _range_validity(query_item, device=query.device)
-                grad_part = grad_part * valid_query[:, None, None].to(grad_part.dtype)
-            final_output, final_max, final_sum = final_result
-            for segment_index, source_blocks in enumerate(segment_blocks):
-                is_prefix = segment_index + 1 < len(segment_blocks)
-                if ctx.query_coalesced and is_prefix:
-                    continue
-                global_length = config.segment_lengths[segment_index]
-                padded_length = config.segment_padded_lengths[segment_index]
-                for source_rank, (source_key, source_value) in enumerate(source_blocks):
-                    source_shard = make_ring_sequence_shard(
-                        global_length,
-                        cp_rank=source_rank,
-                        cp_size=config.cp_size,
-                        padded_length=padded_length,
-                    )
-                    coalesced = is_prefix and config.coalesce_prefix_full and global_length == padded_length
-                    key_slices = _prefix_full_slices(
-                        source_key.squeeze(1), source_shard, enabled=coalesced,
-                    )
-                    value_slices = _prefix_full_slices(
-                        source_value.squeeze(1), source_shard, enabled=coalesced,
-                    )
-                    for key_item, value_item in zip(key_slices, value_slices, strict=True):
-                        if (
-                            key_item.logical_range != value_item.logical_range
-                            or key_item.physical_range != value_item.physical_range
-                            or key_item.local_slice != value_item.local_slice
-                        ):
-                            raise RuntimeError("Ring K/V physical slices differ")
-                        kv_range = key_item.logical_range
-                        block_kind = classify_ring_block(
-                            query_range,
-                            kv_range,
-                            is_prefix=is_prefix,
-                        )
-                        if _trace_ring_block is not None:
-                            _trace_ring_block(
-                                phase="backward", rank=config.cp_rank,
-                                ring_step=(config.cp_rank - source_rank) % config.cp_size,
-                                source_rank=source_rank, segment_index=segment_index,
-                                segment_type="prefix" if is_prefix else "current",
-                                query_range=query_item.logical_range,
-                                query_chunk=query_item.physical_range[0] // (config.current_shard.padded_length // (2 * config.cp_size)),
-                                kv_ranges=source_shard.global_ranges if coalesced else (key_item.logical_range,),
-                                kv_chunks=tuple(start // (padded_length // (2 * config.cp_size)) for start, _ in
-                                                (source_shard.physical_global_ranges if coalesced else (key_item.physical_range,))),
-                                block_type=block_kind.value,
-                                query_length=query_part.shape[0], kv_length=key_item.tensor.shape[0],
-                                fa_called=block_kind is not RingBlockKind.SKIP,
-                                coalesced=coalesced,
-                            )
-                        if block_kind is RingBlockKind.SKIP:
-                            continue
-                        attention_mask, _, valid_kv = _physical_block_attention_mask(
-                            query_item,
-                            key_item,
-                            block_kind=block_kind,
-                        )
-                        query_grad, key_grad, value_grad = _block_attention_backward(
-                            query_part,
-                            key_item.tensor,
-                            value_item.tensor,
-                            grad_part,
-                            attention_output=final_output,
-                            softmax_max=final_max,
-                            softmax_sum=final_sum,
-                            query_heads=config.query_heads,
-                            softmax_scale=config.softmax_scale,
-                            block_kind=block_kind,
-                            attention_mask=attention_mask,
-                        )
-                        if valid_query is not None:
-                            query_grad = query_grad * valid_query[:, None, None].to(
-                                query_grad.dtype
-                            )
-                        if valid_kv is not None:
-                            key_grad = key_grad * valid_kv[:, None, None].to(
-                                key_grad.dtype
-                            )
-                            value_grad = value_grad * valid_kv[:, None, None].to(
-                                value_grad.dtype
-                            )
-                        query_gradient[query_item.local_slice].add_(query_grad)
-                        key_buffer, value_buffer = segment_contributions[segment_index][source_rank]
-                        key_buffer[key_item.local_slice].add_(key_grad.unsqueeze(1))
-                        value_buffer[key_item.local_slice].add_(value_grad.unsqueeze(1))
-
         local_gradients = []
-        for contributions in segment_contributions:
-            local_key_grad, local_value_grad = _reduce_ring_gradients_to_owner(
-                contributions,
-                config,
+        for segment_index in range(len(config.segment_lengths)):
+            merged_query = ctx.query_coalesced and segment_index + 1 < len(config.segment_lengths)
+
+            def consume(source_rank, key, value, key_buffer, value_buffer):
+                if merged_query:
+                    _trace_merged_query(config, query_tnd, key, segment_index, source_rank, "backward")
+                    dq, dk, dv = _block_attention_backward(
+                        query_tnd, key.squeeze(1), value.squeeze(1), grad_output_tnd,
+                        attention_output=result_tensors[0], softmax_max=result_tensors[1],
+                        softmax_sum=result_tensors[2], query_heads=config.query_heads,
+                        softmax_scale=config.softmax_scale, block_kind=RingBlockKind.FULL,
+                        attention_mask=None,
+                    )
+                    query_gradient.add_(dq)
+                    key_buffer.add_(dk.unsqueeze(1))
+                    value_buffer.add_(dv.unsqueeze(1))
+                    return
+                for index, q_item, k_item, v_item, kind in _source_schedule(
+                    query_slices, key, value, config, segment_index, source_rank, "backward"
+                ):
+                    grad_part = grad_slices[index].tensor
+                    mask, valid_query, valid_kv = _physical_block_attention_mask(q_item, k_item, block_kind=kind)
+                    if valid_query is not None:
+                        grad_part = grad_part * valid_query[:, None, None].to(grad_part.dtype)
+                    output, maximum, total = query_results[index]
+                    dq, dk, dv = _block_attention_backward(
+                        q_item.tensor, k_item.tensor, v_item.tensor, grad_part,
+                        attention_output=output, softmax_max=maximum, softmax_sum=total,
+                        query_heads=config.query_heads, softmax_scale=config.softmax_scale,
+                        block_kind=kind, attention_mask=mask,
+                    )
+                    if valid_query is not None:
+                        dq = dq * valid_query[:, None, None].to(dq.dtype)
+                    if valid_kv is not None:
+                        dk = dk * valid_kv[:, None, None].to(dk.dtype)
+                        dv = dv * valid_kv[:, None, None].to(dv.dtype)
+                    query_gradient[q_item.local_slice].add_(dq)
+                    key_buffer[k_item.local_slice].add_(dk.unsqueeze(1))
+                    value_buffer[k_item.local_slice].add_(dv.unsqueeze(1))
+
+            gradients = _reduce_ring_gradients_to_owner(
+                local_kv[2 * segment_index], local_kv[2 * segment_index + 1], config, consume,
             )
-            local_gradients.extend((local_key_grad, local_value_grad))
+            local_gradients.extend(gradients)
         return (query_gradient.unsqueeze(1), *local_gradients, None)
 
 
