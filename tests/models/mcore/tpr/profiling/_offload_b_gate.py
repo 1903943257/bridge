@@ -9,6 +9,11 @@ SMALL_TENSOR_ELEMENTS = 4096
 SMALL_TENSOR_REL_L2_FLOOR = 2e-2
 
 
+def is_small_tensor(metrics):
+    """Return whether this gradient uses the small-tensor noise envelope."""
+    return metrics["elements"] < SMALL_TENSOR_ELEMENTS
+
+
 def gradient_gate(metrics, baseline):
     """Return pass/limit/severity against calibrated OFF-repeat noise.
 
@@ -33,11 +38,7 @@ def gradient_gate(metrics, baseline):
     if baseline is None or not valid(baseline):
         return False, {}, float("inf")
 
-    floor = (
-        SMALL_TENSOR_REL_L2_FLOOR
-        if metrics["elements"] < SMALL_TENSOR_ELEMENTS
-        else REL_L2_FLOOR
-    )
+    floor = SMALL_TENSOR_REL_L2_FLOOR if is_small_tensor(metrics) else REL_L2_FLOOR
     limit = max(
         NOISE_FACTOR * baseline["relative_l2"],
         baseline["relative_l2"] + floor,
