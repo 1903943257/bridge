@@ -400,11 +400,12 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
     reference = None
     baseline = {}
     failures = 0
-    # Two OFF repeats calibrate all gradients. CP4 additionally samples a
-    # small-tensor-only OFF envelope because streaming Ring exposed wider native
-    # BF16/NPU repeat variance in 128-element q_layernorm gradients. This is
-    # empirical calibration, not a tolerance change. Final OFF still checks
-    # that repeated native swap lifecycles leave no regression.
+    # Two OFF repeats calibrate all gradients. The CP4 padded cases additionally
+    # sample a small-tensor-only OFF envelope because 12 held-out pure-OFF probes
+    # exposed wider native BF16/NPU repeat variance in 128-element q_layernorm
+    # gradients (including a late probe11 excursion). This is empirical
+    # calibration, not a tolerance change. Final OFF still checks that repeated
+    # native swap lifecycles leave no regression.
     #
     # Diagnostic only: TPR_OFFLOAD_B_OFF_STRESS=N replaces the ON lifecycle
     # with N additional pure-OFF probes. Those probes are checked against the
@@ -416,7 +417,7 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
         raise ValueError("TPR_OFFLOAD_B_OFF_STRESS must be non-negative")
     small_calibration_repeats = int(os.getenv(
         "TPR_OFFLOAD_B_SMALL_CALIBRATION_REPEATS",
-        "6" if runtime.cp_size == 4 else "0",
+        "12" if runtime.cp_size == 4 and padded else "0",
     ))
     if small_calibration_repeats < 0:
         raise ValueError("TPR_OFFLOAD_B_SMALL_CALIBRATION_REPEATS must be non-negative")
