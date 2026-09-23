@@ -1506,6 +1506,12 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
             (PhysicalExecutionKind.POP, 0),
         )
 
+        if runtime.rank == 0:
+            print("TPR_REF_TPR_STAGE " + json.dumps({
+                "path": "reference", "cp_size": runtime.cp_size,
+                "prefix": case.prefix_length, "suffix": case.suffix_length,
+                "siblings": case.trajectory_count,
+            }), flush=True)
         reference_stats = _profile_runner(
             reference_runner,
             model,
@@ -1513,6 +1519,12 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
             expected_trace=reference_trace,
         )
         _release_iteration_state(model, runtime)
+        if runtime.rank == 0:
+            print("TPR_REF_TPR_STAGE " + json.dumps({
+                "path": "tpr", "cp_size": runtime.cp_size,
+                "prefix": case.prefix_length, "suffix": case.suffix_length,
+                "siblings": case.trajectory_count,
+            }), flush=True)
         tpr_stats = _profile_runner(
             tpr_runner,
             model,
