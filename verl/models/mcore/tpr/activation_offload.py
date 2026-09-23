@@ -258,8 +258,14 @@ def mindspeed_swap_attention(
 
     try:
         for name, module in targets:
+            # Preserve the exact attribute state, not just the currently bound
+            # callable. Most nn.Module implementations inherit forward from the
+            # class, so assigning the saved bound method on exit would leave a
+            # new instance-level "forward" attribute behind.
+            had_instance_forward = "forward" in module.__dict__
+            instance_forward = module.__dict__.get("forward")
             original = module.forward
-            forwards.append((module, original))
+            forwards.append((module, had_instance_forward, instance_forward))
             module.forward = native.hook_swap_manager_forward(original, name)
         for name, layer in layers:
             handles.append(layer.register_forward_hook(after_layer(name)))
@@ -270,8 +276,11 @@ def mindspeed_swap_attention(
         prefetch.get_args = original_get_args
         for handle in handles:
             handle.remove()
-        for module, original in forwards:
-            module.forward = original
+        for module, had_instance_forward, instance_forward in forwards:
+            if had_instance_forward:
+                module.forward = instance_forward
+            else:
+                module.__dict__.pop("forward", None)
         # Drain native transfers before dropping host/source buffer references,
         # including tensors whose branches were not traversed by autograd.
         native.prefetch_stream.synchronize()
