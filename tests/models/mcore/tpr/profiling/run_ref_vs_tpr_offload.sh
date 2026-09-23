@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Ref vs TPR profile after Phase-B activation offload acceptance.
+# Independent Ref vs TPR profile after Phase-B activation-offload acceptance.
 #
-# Both paths use the same native MindSpeed activation offload and the same
-# chunked LM head. N=2 matches the Phase-B tree: one shared Prefix, two Suffixes.
+# Reference and TPR are deliberately launched in separate fresh torchrun
+# processes. An OOM/failure on one path must never suppress the other path.
+#
+# Both paths use the same:
+#   - Qwen3-1.7B model
+#   - Ring CP
+#   - native MindSpeed activation offload
+#   - chunked LM head
+#   - warmup/repeat counts
 #
 # Matrix:
 #   CP2: P32K/S32K, P40K/S40K
 #   CP4: P64K/S64K, P96K/S64K
+# N=2 for all cases.
 
 set -u
 set -o pipefail
@@ -26,12 +34,10 @@ export TPR_LOSS_CHUNK_SIZE="${TPR_LOSS_CHUNK_SIZE:-1024}"
 export TPR_RING_COALESCE_PREFIX_FULL=1
 export TPR_RING_COALESCE_PREFIX_QUERY=1
 
-# Long-context formal samples: one warmup plus three measured samples.
 export TPR_QWEN_RING_CP_PROFILE_WARMUP="${TPR_QWEN_RING_CP_PROFILE_WARMUP:-1}"
 export TPR_QWEN_RING_CP_PROFILE_REPEATS="${TPR_QWEN_RING_CP_PROFILE_REPEATS:-3}"
 export TPR_QWEN_RING_CP_PROFILE_BREAKDOWN=0
 
-# Never carry correctness-only diagnostics into performance measurements.
 unset TPR_OFFLOAD_B_FORCE_RESTORE_SYNC
 unset TPR_OFFLOAD_B_OFF_STRESS
 unset TPR_OFFLOAD_B_TIMING
@@ -49,17 +55,20 @@ cases=(
 
 for spec in "${cases[@]}"; do
   read -r cp p s n <<< "$spec"
-  log="$LOGDIR/cp${cp}_p${p}_s${s}_n${n}.log"
 
-  echo "===== Ref vs TPR: CP=$cp P=$p S=$s N=$n ====="
-  echo "log: $log"
+  for path_name in reference tpr; do
+    log="$LOGDIR/cp${cp}_p${p}_s${s}_n${n}_${path_name}.log"
 
-  TPR_QWEN_RING_CP_PROFILE_CASES="${p}:${s}:${n}"   timeout "$timeout_value"     torchrun       --nproc_per_node="$cp"       --master_addr=127.0.0.1       --master_port="$port"       -m pytest -x -s -v       "$TEST::test_qwen3_reference_cp_vs_tpr_ring_cp_profile"       > "$log" 2>&1
+    echo "===== $path_name: CP=$cp P=$p S=$s N=$n ====="
+    echo "log: $log"
 
-  status=$?
-  echo "END CP=$cp P=$p S=$s N=$n exit=$status"
-  grep -E 'TPR_REF_TPR_(STAGE|RESULT)|Speedup \(median\)|Incremental-peak reduction|FAILED|PASSED'     "$log" | tail -n 20 || true
-  port=$((port + 1))
+    TPR_QWEN_RING_CP_PROFILE_CASES="${p}:${s}:${n}"     TPR_QWEN_RING_CP_PROFILE_PATH="$path_name"     timeout "$timeout_value"       torchrun         --nproc_per_node="$cp"         --master_addr=127.0.0.1         --master_port="$port"         -m pytest -x -s -v         "$TEST::test_qwen3_reference_cp_vs_tpr_ring_cp_profile"         > "$log" 2>&1
+
+    status=$?
+    echo "END path=$path_name CP=$cp P=$p S=$s N=$n exit=$status"
+    grep -E 'TPR_REF_TPR_(STAGE|PATH_RESULT)|FAILED|PASSED|out of memory|Memory_Allocation_Failure'       "$log" | tail -n 20 || true
+    port=$((port + 1))
+  done
 done
 
 echo
