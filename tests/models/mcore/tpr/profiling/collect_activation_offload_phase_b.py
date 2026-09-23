@@ -19,6 +19,7 @@ from pathlib import Path
 
 
 MARKER = "TPR_OFFLOAD_B_MAX "
+RANK_MARKER = "TPR_OFFLOAD_B_RANK "
 FAILURE_MARKER = "TPR_OFFLOAD_B_FAILURE "
 _SUFFIXES = (".log", ".txt", ".out")
 
@@ -64,16 +65,44 @@ def collect_file(path: Path, warmup: int, include_off: bool):
         for item in _json_records(text, MARKER)
         if isinstance(item, dict) and isinstance(item.get("max_rank"), dict)
     ]
+    rank_rows = [
+        item for item in _json_records(text, RANK_MARKER)
+        if isinstance(item, dict)
+    ]
+    offload_by_iteration = {}
+    for row in rank_rows:
+        required = ("cp_size", "prefix", "suffix", "iteration", "offload")
+        if any(key not in row for key in required):
+            continue
+        key = (
+            int(row["cp_size"]),
+            int(row["prefix"]),
+            int(row["suffix"]),
+            int(row["iteration"]),
+        )
+        value = bool(row["offload"])
+        previous = offload_by_iteration.setdefault(key, value)
+        if previous != value:
+            raise ValueError(f"inconsistent offload flag in {path}: {key}")
+
     failures = [
         item for item in _json_records(text, FAILURE_MARKER)
         if isinstance(item, dict)
     ]
     grouped = {}
     for row in max_rows:
-        required = ("cp_size", "prefix", "suffix", "offload", "iteration")
+        required = ("cp_size", "prefix", "suffix", "iteration")
         if any(key not in row for key in required):
             continue
-        offload = bool(row["offload"])
+        iteration_key = (
+            int(row["cp_size"]),
+            int(row["prefix"]),
+            int(row["suffix"]),
+            int(row["iteration"]),
+        )
+        offload = offload_by_iteration.get(iteration_key)
+        if offload is None:
+            continue
         if not include_off and not offload:
             continue
         key = (
@@ -102,7 +131,12 @@ def collect_file(path: Path, warmup: int, include_off: bool):
             or "out of memory" in str(row.get("error", "")).lower()
             for row in relevant_failures
         )
-        status = "OOM" if oom else ("OK" if measured else "NO_SAMPLES")
+        status = (
+            "OOM" if oom
+            else "FAILED" if relevant_failures
+            else "OK" if measured
+            else "NO_SAMPLES"
+        )
         result.append({
             "source": str(path),
             "cp": cp,
