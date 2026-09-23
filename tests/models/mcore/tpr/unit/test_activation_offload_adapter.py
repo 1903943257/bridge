@@ -262,6 +262,16 @@ class AdapterTest(unittest.TestCase):
         self.native.h2d.assert_called_once_with(item.layer_name)
         self.stream.wait_stream.assert_called_once_with(self.native.prefetch_stream)
 
+    def test_force_restore_sync_waits_for_prefetch_completion(self):
+        tensor = Tensor(42)
+        item = NS(tensor=tensor, stat="host", layer_name="decoder.layers.0.self_attention")
+        self.native.h2d.side_effect = lambda name: setattr(item, "stat", "h2d")
+        with patch.object(self.adapter.os, "getenv", return_value="1"):
+            with self.adapter.mindspeed_swap_attention(self.model):
+                self.assertIs(self.native.unpack_hook(item), tensor)
+        self.native.prefetch_stream.synchronize.assert_called()
+        self.stream.wait_stream.assert_not_called()
+
     def test_exported_handle_does_not_reload(self):
         tensor = Tensor(42)
         with self.adapter.mindspeed_swap_attention(self.model):
