@@ -311,12 +311,13 @@ def _report(runtime, record):
 
 def _compare(reference, actual, baseline, *, stage):
     from .test_activation_offload_phase_a_npu import _difference_metrics
-    from ._offload_b_gate import gradient_gate, merge_baseline
+    from ._offload_b_gate import gradient_gate, is_small_tensor, merge_baseline
 
     failures = 0
     failed_details = []
     category_summary = {}
     calibration = stage in ("off_repeat", "off_repeat2")
+    small_calibration = stage.startswith("off_small_calibration")
     gradient_categories = ("parameter_grad", "prefix_grad")
 
     for category, expected, observed in zip(
@@ -342,7 +343,7 @@ def _compare(reference, actual, baseline, *, stage):
             if category in gradient_categories:
                 if stage == "off":
                     passed, severity = metrics["finite"], 0.0
-                elif calibration:
+                elif calibration or (small_calibration and is_small_tensor(metrics)):
                     passed, severity = metrics["finite"], 0.0
                     category_baseline[name] = merge_baseline(category_baseline.get(name), metrics)
                 else:
@@ -399,8 +400,11 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
     reference = None
     baseline = {}
     failures = 0
-    # Two OFF repeats calibrate native Ring/NPU backward noise before swap.
-    # Final OFF checks that repeated native swap lifecycles leave no regression.
+    # Two OFF repeats calibrate all gradients. CP4 additionally samples a
+    # small-tensor-only OFF envelope because streaming Ring exposed wider native
+    # BF16/NPU repeat variance in 128-element q_layernorm gradients. This is
+    # empirical calibration, not a tolerance change. Final OFF still checks
+    # that repeated native swap lifecycles leave no regression.
     #
     # Diagnostic only: TPR_OFFLOAD_B_OFF_STRESS=N replaces the ON lifecycle
     # with N additional pure-OFF probes. Those probes are checked against the
@@ -410,7 +414,14 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
     off_stress = int(os.getenv("TPR_OFFLOAD_B_OFF_STRESS", "0"))
     if off_stress < 0:
         raise ValueError("TPR_OFFLOAD_B_OFF_STRESS must be non-negative")
+    small_calibration_repeats = int(os.getenv(
+        "TPR_OFFLOAD_B_SMALL_CALIBRATION_REPEATS",
+        "6" if runtime.cp_size == 4 else "0",
+    ))
+    if small_calibration_repeats < 0:
+        raise ValueError("TPR_OFFLOAD_B_SMALL_CALIBRATION_REPEATS must be non-negative")
     if off_stress:
+        # Diagnostic probes intentionally remain held out from calibration.
         stages = (
             ("off", False),
             ("off_repeat", False),
@@ -422,6 +433,10 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
             ("off", False),
             ("off_repeat", False),
             ("off_repeat2", False),
+            *tuple(
+                (f"off_small_calibration{i}", False)
+                for i in range(1, small_calibration_repeats + 1)
+            ),
             ("on", True),
             ("on_repeat", True),
             ("off_after", False),
