@@ -407,14 +407,20 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
     # calibration, not a tolerance change. Final OFF still checks that repeated
     # native swap lifecycles leave no regression.
     #
-    # Diagnostic only: TPR_OFFLOAD_B_OFF_STRESS=N replaces the ON lifecycle
-    # with N additional pure-OFF probes. Those probes are checked against the
-    # same two-repeat baseline instead of extending it, so they expose whether
-    # the calibrated gate already underestimates CP/Ring repeat noise without
-    # involving swap at all. Default behavior is unchanged.
+    # Diagnostic only:
+    # - TPR_OFFLOAD_B_OFF_STRESS=N replaces the ON lifecycle with held-out
+    #   pure-OFF probes. They never update the calibration baseline.
+    # - TPR_OFFLOAD_B_ON_STRESS=N keeps the normal calibration, then appends
+    #   N extra ON probes after on_repeat. They also never update the baseline.
+    # These modes distinguish native repeat noise from swap-only excursions.
     off_stress = int(os.getenv("TPR_OFFLOAD_B_OFF_STRESS", "0"))
+    on_stress = int(os.getenv("TPR_OFFLOAD_B_ON_STRESS", "0"))
     if off_stress < 0:
         raise ValueError("TPR_OFFLOAD_B_OFF_STRESS must be non-negative")
+    if on_stress < 0:
+        raise ValueError("TPR_OFFLOAD_B_ON_STRESS must be non-negative")
+    if off_stress and on_stress:
+        raise ValueError("TPR_OFFLOAD_B_OFF_STRESS and TPR_OFFLOAD_B_ON_STRESS are mutually exclusive")
     small_calibration_repeats = int(os.getenv(
         "TPR_OFFLOAD_B_SMALL_CALIBRATION_REPEATS",
         "12" if runtime.cp_size == 4 and padded else "0",
@@ -440,6 +446,7 @@ def test_ring_offload_correctness(runtime, native_args, monkeypatch, padded, spa
             ),
             ("on", True),
             ("on_repeat", True),
+            *tuple((f"on_probe{i}", True) for i in range(1, on_stress + 1)),
             ("off_after", False),
         )
     for stage, enabled in stages:
