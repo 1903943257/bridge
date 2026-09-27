@@ -555,6 +555,56 @@ def _build_parameter_noise_baseline(reference, repeats, *, case):
     return baseline
 
 
+def _extend_small_parameter_noise_baseline(
+    reference,
+    repeat,
+    baseline,
+    *,
+    case,
+    repeat_index,
+):
+    from ._offload_b_gate import is_small_tensor, merge_baseline
+
+    assert reference.keys() == repeat.keys(), (
+        f"{case}/parameter_grad small calibration keys changed on repeat {repeat_index}"
+    )
+    updated = 0
+    for name, expected in reference.items():
+        value = repeat[name]
+        if expected.shape != value.shape:
+            raise AssertionError(
+                f"{case}/parameter_grad/{name}: small calibration shape changed "
+                f"{tuple(expected.shape)} -> {tuple(value.shape)}"
+            )
+        metrics = _difference_metrics(expected, value)
+        if not metrics["finite"]:
+            raise AssertionError(
+                f"{case}/parameter_grad/{name}: non-finite small calibration repeat"
+            )
+        if not is_small_tensor(metrics):
+            continue
+        previous = baseline.get(name)
+        merged = merge_baseline(previous, metrics)
+        baseline[name] = merged
+        updated += int(previous is None or merged["relative_l2"] > previous["relative_l2"])
+
+    print(
+        "TPR_PHASE_C_SMALL_CALIBRATION "
+        + json.dumps(
+            dict(
+                case=case,
+                repeat=repeat_index,
+                checked=sum(
+                    _difference_metrics(reference[name], repeat[name])["elements"] < 4096
+                    for name in reference
+                ),
+                updated=updated,
+            )
+        ),
+        flush=True,
+    )
+
+
 def _assert_acceptance_match(reference, actual, parameter_baseline, *, case, run):
     from ._offload_b_gate import gradient_gate
 
@@ -808,12 +858,45 @@ def test_phase_c1_correctness(runtime, native_args, monkeypatch, case):
     recompute1 = _run(model, plan, policy="recompute", probe=probe)
     recompute2 = _run(model, plan, policy="recompute", probe=probe)
     recompute3 = _run(model, plan, policy="recompute", probe=probe)
+
+    assert (
+        recompute1.tensors is not None
+        and recompute2.tensors is not None
+        and recompute3.tensors is not None
+    )
+    reference = recompute1.tensors
+    parameter_baseline = _build_parameter_noise_baseline(
+        reference[2],
+        (recompute2.tensors[2], recompute3.tensors[2]),
+        case=case,
+    )
+
+    # Phase B observed a longer-tail repeat distribution for tiny gradients
+    # such as q/k LayerNorm weights. Calibrate that existing envelope with
+    # recompute-only samples; offload never contributes to its own budget.
+    small_calibration_repeats = int(
+        os.getenv("TPR_PHASE_C_SMALL_CALIBRATION_REPEATS", "12")
+    )
+    if small_calibration_repeats < 0:
+        raise ValueError(
+            "TPR_PHASE_C_SMALL_CALIBRATION_REPEATS must be non-negative"
+        )
+    for repeat_index in range(1, small_calibration_repeats + 1):
+        small_repeat = _run(model, plan, policy="recompute", probe=probe)
+        assert small_repeat.tensors is not None
+        _extend_small_parameter_noise_baseline(
+            reference[2],
+            small_repeat.tensors[2],
+            parameter_baseline,
+            case=case,
+            repeat_index=repeat_index,
+        )
+        del small_repeat
+
     offload1 = _run(model, plan, policy="offload", probe=probe)
     offload2 = _run(model, plan, policy="offload", probe=probe)
     recompute_after = _run(model, plan, policy="recompute", probe=probe)
-
     runs = {
-        "recompute1": recompute1,
         "recompute2": recompute2,
         "recompute3": recompute3,
         "offload1": offload1,
@@ -822,15 +905,8 @@ def test_phase_c1_correctness(runtime, native_args, monkeypatch, case):
     }
     assert all(result.tensors is not None for result in runs.values())
 
-    reference = recompute1.tensors
-    parameter_baseline = _build_parameter_noise_baseline(
-        reference[2],
-        (recompute2.tensors[2], recompute3.tensors[2]),
-        case=case,
-    )
-
-    # Calibration is allowed to define parameter-grad repeat noise only.
-    # All forward observables and Prefix dKV remain under the original strict gate.
+    # The two general calibration repeats must themselves satisfy the final
+    # envelope, while loss/logprob/Prefix dKV stay under the strict gate.
     for label in ("recompute2", "recompute3"):
         _assert_acceptance_match(
             reference,
@@ -840,8 +916,7 @@ def test_phase_c1_correctness(runtime, native_args, monkeypatch, case):
             run=label,
         )
 
-    # Offload never calibrates itself: both retained-graph runs are judged
-    # against a baseline derived exclusively from recompute repeats.
+    # Held-out acceptance: neither offload nor recompute_after ever calibrates.
     for label in ("offload1", "offload2", "recompute_after"):
         _assert_acceptance_match(
             reference,
@@ -866,6 +941,7 @@ def test_phase_c1_correctness(runtime, native_args, monkeypatch, case):
                 recompute_forwards=recompute1.total_model_forwards,
                 offload_forwards=offload1.total_model_forwards,
                 calibration_repeats=2,
+                small_calibration_repeats=small_calibration_repeats,
                 offload_repeats=2,
                 recompute_after=True,
                 **probe.snapshot(),

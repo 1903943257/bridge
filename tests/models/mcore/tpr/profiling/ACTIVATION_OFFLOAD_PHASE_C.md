@@ -64,10 +64,15 @@ It keeps the original `rtol=2e-3`, `atol=2e-4` strict gate for:
 - per-layer Prefix key/value dKV at every non-leaf Pop boundary.
 
 Parameter gradients use the existing Phase B per-tensor repeat-noise gate from
-`_offload_b_gate.py`. Two extra `recompute` repeats calibrate that baseline;
-two `offload` runs and a final `recompute_after` run are then judged against
-the recompute-only baseline. Offload results never contribute to calibration,
-and no Phase C-specific tolerance is introduced.
+`_offload_b_gate.py`. Two extra `recompute` repeats calibrate the general
+baseline. Because held-out CP1 runs also expose the known long-tail noise of
+small q/k-LayerNorm gradients, 12 additional recompute-only samples update the
+baseline for tensors with fewer than 4096 elements, matching the existing
+Phase B small-tensor calibration strategy. Override that count with
+`TPR_PHASE_C_SMALL_CALIBRATION_REPEATS`. Two `offload` runs and a final
+`recompute_after` run are then judged against the recompute-only baseline.
+Offload results never contribute to calibration, and no Phase C-specific
+tolerance is introduced.
 
 There are two topology cases:
 
