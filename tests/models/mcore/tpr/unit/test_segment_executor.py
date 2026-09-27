@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+import verl.models.mcore.tpr.segment_executor as segment_executor_module
 
 from verl.models.mcore.tpr import (
     SegmentExecutor,
@@ -24,7 +28,11 @@ from verl.models.mcore.tpr import (
     SegmentSpec,
     get_tpr_attention_context,
 )
-from verl.models.mcore.tpr.segment_executor import _compact_kv_cache
+from verl.models.mcore.tpr.segment_executor import (
+    _compact_graph_kv_cache,
+    _compact_kv_cache,
+    _detach_compact_kv_cache,
+)
 
 
 class _FakeRotaryEmbedding:
@@ -43,6 +51,7 @@ class _FakeTPRModel(nn.Module):
         self.vocab_size = 8
         self.post_process = True
         self.share_embeddings_and_output_weights = False
+        self.forward_calls = 0
         self.config = type("_Config", (), {"use_mup": False, "mtp_num_layers": 0})()
 
         class _OutputLayer(nn.Module):
@@ -68,6 +77,7 @@ class _FakeTPRModel(nn.Module):
 
     def forward(self, *, input_ids, position_ids, attention_mask):
         del position_ids, attention_mask
+        self.forward_calls += 1
         if self.fail:
             raise RuntimeError("injected forward failure")
         context = get_tpr_attention_context()
@@ -133,6 +143,22 @@ def test_compact_kv_cache_owns_exact_graph_free_storage():
     assert key.untyped_storage().data_ptr() != value.untyped_storage().data_ptr()
     assert key.untyped_storage().nbytes() == key.numel() * key.element_size()
     assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
+
+
+def test_compact_graph_kv_roots_share_storage_with_detached_stack_views():
+    source = torch.arange(4 * 1 * 1 * 8, dtype=torch.float32).reshape(4, 1, 1, 8)
+    source.requires_grad_(True)
+    graph = _compact_graph_kv_cache({1: (source[..., 1:3], source[..., 5:7])})
+    detached = _detach_compact_kv_cache(graph)
+
+    for graph_tensor, detached_tensor in zip(graph[1], detached[1]):
+        assert graph_tensor.requires_grad and graph_tensor.grad_fn is not None
+        assert not detached_tensor.requires_grad and detached_tensor.grad_fn is None
+        assert graph_tensor.untyped_storage().data_ptr() == detached_tensor.untyped_storage().data_ptr()
+        assert graph_tensor.untyped_storage().nbytes() == graph_tensor.numel() * graph_tensor.element_size()
+
+    sum(tensor.sum() for tensor in graph[1]).backward()
+    assert source.grad is not None and torch.count_nonzero(source.grad).item() > 0
 
 
 def test_push_pop_relays_child_kv_gradients_and_empties_stack():
@@ -347,3 +373,150 @@ def test_failed_push_does_not_write_kv_stack_and_closes_executor():
     assert executor.failed
     with pytest.raises(RuntimeError, match="failed"):
         executor.push(0)
+
+
+class _FakeRetainedSwapSession:
+    def __init__(self):
+        self.state = "new"
+        self.capture_calls = 0
+        self.resume_calls = 0
+        self.close_calls = 0
+
+    @contextmanager
+    def capture(self):
+        assert self.state == "new"
+        self.state = "capturing"
+        self.capture_calls += 1
+        try:
+            yield None
+        except BaseException:
+            self.state = "suspended"
+            self.close()
+            raise
+        self.state = "suspended"
+
+    def finish_forward(self):
+        assert self.state == "suspended"
+
+    def resume_for_backward(self):
+        assert self.state == "suspended"
+        self.state = "backward"
+        self.resume_calls += 1
+
+    def close(self):
+        if self.state == "closed":
+            return
+        self.state = "closed"
+        self.close_calls += 1
+
+
+def _run_nested_prefix_policy(monkeypatch, policy):
+    sessions = []
+    monkeypatch.setattr(segment_executor_module, "validate_activation_offload", lambda *args: None)
+    monkeypatch.setattr(
+        segment_executor_module,
+        "swap_enabled",
+        lambda model: bool(getattr(model.config, "swap_attention", False)),
+    )
+
+    def make_session(*args, **kwargs):
+        del args, kwargs
+        session = _FakeRetainedSwapSession()
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(segment_executor_module, "create_retained_swap_session", make_session)
+    model = _FakeTPRModel()
+    model.config.swap_attention = policy == "offload"
+    executor = SegmentExecutor(
+        model,
+        _plan(),
+        expected_layer_numbers=(1, 2),
+        prefix_backward_policy=policy,
+    )
+
+    executor.push(0)
+    executor.push(1)
+    forwards_after_push = model.forward_calls
+    if policy == "offload":
+        child_record = executor._prefix_graphs.top()
+        child_entry = executor.kv_stack.top()
+        for layer_number, graph_pair in child_record.graph_key_values.items():
+            for graph_tensor, stack_tensor in zip(graph_pair, child_entry.kv.key_values[layer_number]):
+                assert graph_tensor.untyped_storage().data_ptr() == stack_tensor.untyped_storage().data_ptr()
+
+    child_result = executor.pop(1)
+    forwards_after_child_pop = model.forward_calls
+    root_prefix_gradients = {
+        layer_number: (key.clone(), value.clone())
+        for layer_number, (key, value) in executor.kv_stack.get_new_kv_gradients(0).items()
+    }
+    root_result = executor.pop(0)
+    executor.kv_stack.assert_empty()
+    executor.assert_prefix_graphs_empty()
+    return {
+        "model": model,
+        "sessions": sessions,
+        "child_result": child_result,
+        "root_result": root_result,
+        "root_prefix_gradients": root_prefix_gradients,
+        "forwards_after_push": forwards_after_push,
+        "forwards_after_child_pop": forwards_after_child_pop,
+        "total_forwards": model.forward_calls,
+    }
+
+
+def test_prefix_graph_offload_matches_recompute_and_pop_has_no_forward(monkeypatch):
+    recompute = _run_nested_prefix_policy(monkeypatch, "recompute")
+    offload = _run_nested_prefix_policy(monkeypatch, "offload")
+
+    assert recompute["forwards_after_push"] == offload["forwards_after_push"] == 2
+    assert recompute["forwards_after_child_pop"] == 3
+    assert offload["forwards_after_child_pop"] == 2
+    assert recompute["total_forwards"] == 4
+    assert offload["total_forwards"] == 2
+    assert len(offload["sessions"]) == 2
+    assert all(
+        (session.capture_calls, session.resume_calls, session.close_calls, session.state)
+        == (1, 1, 1, "closed")
+        for session in offload["sessions"]
+    )
+
+    for result_name in ("child_result", "root_result"):
+        expected = recompute[result_name]
+        actual = offload[result_name]
+        torch.testing.assert_close(actual.loss_sum, expected.loss_sum)
+        torch.testing.assert_close(actual.normalized_loss, expected.normalized_loss)
+        assert actual.loss_term_count == expected.loss_term_count
+        assert actual.relayed_layer_count == expected.relayed_layer_count
+    torch.testing.assert_close(offload["model"].scale.grad, recompute["model"].scale.grad)
+    assert offload["root_prefix_gradients"].keys() == recompute["root_prefix_gradients"].keys()
+    for layer_number, expected_pair in recompute["root_prefix_gradients"].items():
+        for actual, expected in zip(offload["root_prefix_gradients"][layer_number], expected_pair):
+            torch.testing.assert_close(actual, expected)
+
+
+def test_prefix_graph_offload_fails_closed_without_native_swap(monkeypatch):
+    monkeypatch.setattr(segment_executor_module, "validate_activation_offload", lambda *args: None)
+    monkeypatch.setattr(segment_executor_module, "swap_enabled", lambda model: False)
+    model = _FakeTPRModel()
+    model.config.swap_attention = False
+
+    with pytest.raises(RuntimeError, match="requires native activation offload"):
+        SegmentExecutor(
+            model,
+            _plan(),
+            expected_layer_numbers=(1, 2),
+            prefix_backward_policy="offload",
+        )
+
+
+def test_prefix_backward_policy_rejects_unknown_value(monkeypatch):
+    monkeypatch.setattr(segment_executor_module, "validate_activation_offload", lambda *args: None)
+    with pytest.raises(ValueError, match="tpr_prefix_backward_policy"):
+        SegmentExecutor(
+            _FakeTPRModel(),
+            _plan(),
+            expected_layer_numbers=(1, 2),
+            prefix_backward_policy="retain_everything",
+        )

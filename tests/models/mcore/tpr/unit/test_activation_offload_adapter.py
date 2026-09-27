@@ -39,6 +39,19 @@ class Module:
         return handle
 
 
+class Context:
+    def __init__(self, on_enter=None):
+        self.on_enter = on_enter
+
+    def __enter__(self):
+        if self.on_enter is not None:
+            self.on_enter()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
 class AdapterTest(unittest.TestCase):
     def setUp(self):
         context = ModuleType("_offload_test.context")
@@ -47,6 +60,8 @@ class AdapterTest(unittest.TestCase):
         torch.Tensor = Tensor
         self.stream = NS(wait_stream=Mock())
         torch.npu = NS(current_stream=lambda: self.stream)
+        self.saved_hooks = Mock(side_effect=lambda pack, unpack: Context())
+        torch.autograd = NS(graph=NS(saved_tensors_hooks=self.saved_hooks))
         self.args = NS(swap_attention=False, pipeline_model_parallel_size=1)
         training = ModuleType("megatron.training")
         training.get_args = lambda: self.args
@@ -59,9 +74,11 @@ class AdapterTest(unittest.TestCase):
             slice_tensor_storage_ptr_list=[], data_ptr={}, slice_tensor_storage_ptr={},
             unpack_hook=Mock(side_effect=lambda item: item if isinstance(item, Tensor) else item.tensor),
             h2d=Mock(), sync_d2h=Mock(), prefetch_stream=NS(synchronize=Mock()),
+            pack_hook=Mock(side_effect=lambda tensor: tensor), layer_name="",
             hook_swap_manager_forward=Mock(side_effect=lambda f, name: Mock(wraps=f)),
         )
-        native_module.SwapPrefetch = Mock(return_value=self.native)
+        self.native_factory = Mock(return_value=self.native)
+        native_module.SwapPrefetch = self.native_factory
         native_module.SwapPrefetch.swap_prefetch = None
         native_module.get_layer_id = lambda name: "0"
         self.imports = patch.dict(sys.modules, {
@@ -212,6 +229,108 @@ class AdapterTest(unittest.TestCase):
             self.layer.handles.clear()
         self.assertEqual(self.native.prefetch_stream.synchronize.call_count, 2)
 
+    def test_retained_session_suspends_payload_until_matching_backward(self):
+        original = self.attention.forward
+        session = self.adapter.create_retained_swap_session(self.model)
+        payload = object()
+        with session.capture() as native:
+            self.assertIs(native, self.native)
+            self.assertEqual(session.state, "capturing")
+            self.assertIsNot(self.attention.forward, original)
+            self.native.prefetch_list.append([payload])
+
+        self.assertEqual(session.state, "suspended")
+        self.assertIs(self.attention.forward, original)
+        self.assertEqual(self.native.prefetch_list, [[payload]])
+        self.saved_hooks.assert_called_once()
+        self.assertTrue(callable(self.saved_hooks.call_args.args[0]))
+        self.assertIs(self.saved_hooks.call_args.args[1], self.native.unpack_hook)
+        retained_unpack = self.saved_hooks.call_args.args[1]
+        with self.assertRaisesRegex(RuntimeError, "resume_for_backward"):
+            retained_unpack(Tensor(9))
+        for handle in self.layer.handles:
+            handle.remove.assert_called_once()
+
+        session.finish_forward()  # Explicit use is allowed and idempotent.
+        self.assertIs(session.resume_for_backward(), self.native)
+        resident = Tensor(9)
+        self.assertIs(retained_unpack(resident), resident)
+        self.assertEqual(session.state, "backward")
+        session.close()
+        session.close()
+        self.assertTrue(session.closed)
+        self.assertEqual(self.native.prefetch_list, [])
+
+    def test_retained_capture_flushes_loss_scope_batch_before_suspend(self):
+        candidate = NS(tensor=Tensor(8), storage_data_ptr=8)
+        session = self.adapter.create_retained_swap_session(self.model)
+        with session.capture():
+            outer_pack = self.saved_hooks.call_args.args[0]
+            decoder_tensor = Tensor(6)
+            self.assertIs(outer_pack(decoder_tensor), decoder_tensor)
+            self.native.pack_hook.assert_not_called()
+            self.layer.forward_hook(self.layer, (), None)
+            loss_tensor = Tensor(7)
+            self.assertIs(outer_pack(loss_tensor), loss_tensor)
+            self.native.pack_hook.assert_called_once_with(loss_tensor)
+            # Represents a tensor saved by CE after the final layer hook.
+            self.native.swap_tensors = [candidate]
+        self.native.sync_d2h.assert_called_with("")
+        self.assertEqual(self.native.swap_tensors, [candidate])
+        session.abort()
+
+    def test_retained_capture_is_exclusive_but_suspended_payload_is_not_installed(self):
+        first = self.adapter.create_retained_swap_session(self.model)
+        second = self.adapter.create_retained_swap_session(self.model)
+        with first.capture():
+            with self.assertRaisesRegex(RuntimeError, "already installed"):
+                with second.capture():
+                    pass
+        self.assertEqual(first.state, "suspended")
+        self.assertTrue(second.closed)
+        first.close()
+
+    def test_retained_capture_error_aborts_payload_and_restores_model(self):
+        original = self.attention.forward
+        session = self.adapter.create_retained_swap_session(self.model)
+        with self.assertRaisesRegex(ValueError, "failed Push"):
+            with session.capture():
+                self.native.prefetch_list.append([object()])
+                raise ValueError("failed Push")
+        self.assertTrue(session.closed)
+        self.assertEqual(self.native.prefetch_list, [])
+        self.assertIs(self.attention.forward, original)
+
+    def test_retained_session_requires_enabled_swap_and_valid_order(self):
+        self.model.config.swap_attention = False
+        with self.assertRaisesRegex(RuntimeError, "requires native swap-attention"):
+            self.adapter.create_retained_swap_session(self.model)
+        self.model.config.swap_attention = True
+        session = self.adapter.create_retained_swap_session(self.model)
+        with self.assertRaisesRegex(RuntimeError, "Cannot resume"):
+            session.resume_for_backward()
+        with session.capture():
+            pass
+        with self.assertRaisesRegex(RuntimeError, "cannot capture"):
+            with session.capture():
+                pass
+        session.close()
+
+    def test_offload_policy_pop_uses_retained_session_not_short_manager(self):
+        executor = NS(
+            prefix_backward_policy="offload",
+            _ensure_healthy=Mock(),
+            _mark_failed=Mock(),
+        )
+
+        @self.adapter.with_activation_offload
+        def pop(executor):
+            return "retained"
+
+        self.assertEqual(pop(executor), "retained")
+        self.native_factory.assert_not_called()
+        executor._mark_failed.assert_not_called()
+
     def test_external_storage_extension_seam_is_fa_only_by_default(self):
         context = NS(
             past_key_values={1: (Tensor(1), Tensor(2))},
@@ -346,6 +465,11 @@ class AdapterTest(unittest.TestCase):
             original_get_args = prefetch.get_args
             with self.adapter.mindspeed_swap_attention(self.model) as native:
                 self.assertIsInstance(native, prefetch.SwapPrefetch)
+            retained = self.adapter.create_retained_swap_session(self.model)
+            with retained.capture() as native:
+                self.assertIsInstance(native, prefetch.SwapPrefetch)
+            retained.resume_for_backward()
+            retained.close()
             self.assertIs(prefetch.get_args, original_get_args)
             self.assertNotIn("megatron.training", sys.modules)
 

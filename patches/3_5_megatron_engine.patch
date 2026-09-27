@@ -2,12 +2,22 @@ diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
 index 059bf392..6c604a5b 100644
 --- a/verl/workers/config/engine.py
 +++ b/verl/workers/config/engine.py
+@@ -163,6 +163,8 @@ class McoreEngineConfig(EngineConfig):
+         virtual_pipeline_model_parallel_size (Optional[int]): Virtual pipeline model parallel size
+             for interleaved scheduling.
+         context_parallel_size (int): Context parallel size for long sequences.
++        tpr_prefix_backward_policy (str): Prefix backward policy. ``recompute``
++            keeps Phase B behavior; ``offload`` enables the CP1 Phase C graph lifecycle.
+         dynamic_context_parallel (bool): Whether to enable hybrid context parallelism.
+         max_seqlen_per_dp_cp_rank (Optional[int]): Maximum sequence length per DPxCP rank.
+         sequence_parallel (bool): Whether to enable sequence parallelism.
 @@ -207,6 +207,8 @@ class McoreEngineConfig(EngineConfig):
      use_mbridge: bool = True
      vanilla_mbridge: bool = False
      use_megatron_fsdp: bool = False
 +    tpr_enabled: bool = False
 +    tpr_cp_backend: Optional[str] = None
++    tpr_prefix_backward_policy: str = "recompute"
      strategy: str = "megatron"
      qat: QATEngineConfig = field(default_factory=QATEngineConfig)
  

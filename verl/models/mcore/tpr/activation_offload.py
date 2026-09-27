@@ -1,8 +1,12 @@
-"""CP1 and Ring CP2/CP4 Full-Attention adapter for MindSpeed swap-attention.
+"""Full-Attention adapter for MindSpeed swap-attention.
 
 One Visit/Pop is a complete forward/backward microbatch. Native SwapPrefetch
 owns selection, host allocations, streams, transfer and release. Hooks are
 scoped to that microbatch so graph-free Push never enters native swap queues.
+
+Phase C additionally retains one native payload per Prefix Push. Its module
+wrappers are installed only while the Push graph is captured; the native
+queues and pinned host tensors survive until the matching Pop backward.
 """
 
 from contextlib import contextmanager
@@ -15,6 +19,9 @@ from types import ModuleType, SimpleNamespace
 import torch
 
 from .context import get_tpr_attention_context
+
+
+_active_swap_installation = None
 
 
 def _args():
@@ -160,24 +167,52 @@ def _protect_exports(native, protected):
 
 
 @contextmanager
-def mindspeed_swap_attention(
+def _claim_swap_installation(owner):
+    """Serialize module/global hook installation, not suspended payloads."""
+    global _active_swap_installation
+    if _active_swap_installation is not None:
+        raise RuntimeError("Another TPR native swap-attention capture is already installed")
+    _active_swap_installation = owner
+    try:
+        yield
+    finally:
+        if _active_swap_installation is owner:
+            _active_swap_installation = None
+
+
+def _clear_native_payload(native, original_unpack):
+    """Release native queue and pinned-buffer ownership after backward/abort."""
+    native.prefetch_stream.synchronize()
+    for name in (
+        "swap_tensors",
+        "prefetch_list",
+        "prefetch_data_ptr_list",
+        "slice_tensor_storage_ptr_list",
+    ):
+        getattr(native, name).clear()
+    native.data_ptr.clear()
+    native.slice_tensor_storage_ptr.clear()
+    native.unpack_hook = original_unpack
+    if hasattr(native, "_tpr_original_unpack"):
+        del native._tpr_original_unpack
+
+
+@contextmanager
+def _installed_mindspeed_swap_attention(
     model,
     *,
-    cp_size=1,
-    cp_backend=None,
     persistent_kv_storages=None,
     protect_new_key_values=True,
+    defer_payload_cleanup=False,
+    capture_outer_saved_tensors=False,
+    unpack_allowed=None,
 ):
-    """Temporarily install the native PP1 swap schedule on a constructed model.
+    """Install native wrappers/hooks; validation and serialization are external.
 
     VERL bypasses megatron.training.setup_model_and_optimizer, where upstream
     normally installs these hooks. This adapter deliberately keeps native
     swap_modules and the native tensor-size/view/leaf filters.
     """
-    if not swap_enabled(model):
-        yield None
-        return
-    validate_activation_offload(model, cp_size, cp_backend)
     prefetch = _native_prefetch()
     SwapPrefetch, get_layer_id = prefetch.SwapPrefetch, prefetch.get_layer_id
 
@@ -213,9 +248,12 @@ def mindspeed_swap_attention(
         prefetch.get_args = original_get_args
         raise
     original_unpack = native.unpack_hook
+    native._tpr_original_unpack = original_unpack
     handles, forwards = [], []
 
     def unpack(item):
+        if unpack_allowed is not None and not unpack_allowed():
+            raise RuntimeError("Retained swap tensor unpack requires resume_for_backward()")
         if isinstance(item, torch.Tensor):
             return original_unpack(item)
         if getattr(item, "tpr_resident", False):
@@ -240,15 +278,27 @@ def mindspeed_swap_attention(
 
     native.unpack_hook = unpack
 
+    def sync_d2h(name):
+        protected.update(
+            _external_storages(include_new_key_values=protect_new_key_values)
+        )
+        if persistent_kv_storages is not None:
+            protected.update(persistent_kv_storages())
+        _protect_exports(native, protected)
+        native.sync_d2h(name)
+
+    outer_capture_enabled = False
+    last_layer_name = layers[-1][0]
+
     def after_layer(name):
         def hook(module, inputs, output):
-            protected.update(
-                _external_storages(include_new_key_values=protect_new_key_values)
-            )
-            if persistent_kv_storages is not None:
-                protected.update(persistent_kv_storages())
-            _protect_exports(native, protected)
-            native.sync_d2h(name)
+            nonlocal outer_capture_enabled
+            sync_d2h(name)
+            if capture_outer_saved_tensors and name == last_layer_name:
+                # Preserve native swap_modules selection through the decoder.
+                # The outer hook only extends capture to final norm/LM-head/CE
+                # operations after the last Transformer layer has completed.
+                outer_capture_enabled = True
         return hook
 
     def before_layer_backward(name):
@@ -256,6 +306,10 @@ def mindspeed_swap_attention(
             native.h2d(name)
         return hook
 
+    def outer_pack(tensor):
+        return native.pack_hook(tensor) if outer_capture_enabled else tensor
+
+    yielded = False
     try:
         for name, module in targets:
             # Preserve the exact attribute state, not just the currently bound
@@ -271,7 +325,17 @@ def mindspeed_swap_attention(
             handles.append(layer.register_forward_hook(after_layer(name)))
             # Same hook kind as upstream, avoiding full-backward-hook view changes.
             handles.append(layer.register_backward_hook(before_layer_backward(name)))
-        yield native
+        if capture_outer_saved_tensors:
+            with torch.autograd.graph.saved_tensors_hooks(outer_pack, native.unpack_hook):
+                yielded = True
+                yield native
+            # CE/loss nodes may save tensors after the final Transformer-layer
+            # forward hook. Flush that last native batch before suspension.
+            if native.swap_tensors:
+                sync_d2h(native.layer_name)
+        else:
+            yielded = True
+            yield native
     finally:
         prefetch.get_args = original_get_args
         for handle in handles:
@@ -281,14 +345,151 @@ def mindspeed_swap_attention(
                 module.forward = instance_forward
             else:
                 module.__dict__.pop("forward", None)
-        # Drain native transfers before dropping host/source buffer references,
-        # including tensors whose branches were not traversed by autograd.
-        native.prefetch_stream.synchronize()
-        for name in ("swap_tensors", "prefetch_list", "prefetch_data_ptr_list", "slice_tensor_storage_ptr_list"):
-            getattr(native, name).clear()
-        native.data_ptr.clear()
-        native.slice_tensor_storage_ptr.clear()
-        native.unpack_hook = original_unpack
+        # A retained Prefix session suspends here: module/global hooks are gone,
+        # but saved autograd handles still own the native queues and pinned CPU
+        # payload. Ordinary Visit/Pop scopes release that ownership immediately.
+        if defer_payload_cleanup and yielded:
+            native.prefetch_stream.synchronize()
+        else:
+            _clear_native_payload(native, original_unpack)
+
+
+@contextmanager
+def mindspeed_swap_attention(
+    model,
+    *,
+    cp_size=1,
+    cp_backend=None,
+    persistent_kv_storages=None,
+    protect_new_key_values=True,
+):
+    """Temporarily install native swap for one complete forward/backward scope."""
+    if not swap_enabled(model):
+        yield None
+        return
+    validate_activation_offload(model, cp_size, cp_backend)
+    owner = object()
+    with _claim_swap_installation(owner):
+        with _installed_mindspeed_swap_attention(
+            model,
+            persistent_kv_storages=persistent_kv_storages,
+            protect_new_key_values=protect_new_key_values,
+        ) as native:
+            yield native
+
+
+class RetainedSwapSession:
+    """One Push-owned native payload retained until its matching Pop.
+
+    ``capture`` is the only interval that mutates model forwards or registers
+    module hooks. Leaving it suspends the session while keeping native queues
+    and pinned buffers alive. ``resume_for_backward`` is an explicit lifecycle
+    check; actual restores stay native/lazy through the unpack callbacks saved
+    in the original autograd graph.
+    """
+
+    def __init__(
+        self,
+        model,
+        *,
+        cp_size=1,
+        cp_backend=None,
+        persistent_kv_storages=None,
+        protect_new_key_values=True,
+    ):
+        if not swap_enabled(model):
+            raise RuntimeError("Retained Prefix graph offload requires native swap-attention")
+        validate_activation_offload(model, cp_size, cp_backend)
+        self.model = model
+        self.cp_size = cp_size
+        self.cp_backend = cp_backend
+        self.persistent_kv_storages = persistent_kv_storages
+        self.protect_new_key_values = protect_new_key_values
+        self.native = None
+        self._original_unpack = None
+        self._state = "new"
+
+    @property
+    def state(self):
+        return self._state
+
+    @property
+    def closed(self):
+        return self._state == "closed"
+
+    @contextmanager
+    def capture(self):
+        """Capture one Push forward and suspend its native payload on exit."""
+        if self._state != "new":
+            raise RuntimeError(f"Retained swap session cannot capture from state {self._state!r}")
+        owner = object()
+        self._state = "capturing"
+        try:
+            with _claim_swap_installation(owner):
+                with _installed_mindspeed_swap_attention(
+                    self.model,
+                    persistent_kv_storages=self.persistent_kv_storages,
+                    protect_new_key_values=self.protect_new_key_values,
+                    defer_payload_cleanup=True,
+                    capture_outer_saved_tensors=True,
+                    unpack_allowed=lambda: self._state == "backward",
+                ) as native:
+                    self.native = native
+                    self._original_unpack = native._tpr_original_unpack
+                    yield native
+            self._state = "suspended"
+        except BaseException:
+            # The installed scope has already removed model wrappers/hooks here.
+            if self.native is not None:
+                self._state = "suspended"
+                self.close()
+            else:
+                self._state = "closed"
+            raise
+
+    def finish_forward(self):
+        """Wait for capture-side D2H; idempotent after ``capture`` exits."""
+        if self._state not in ("capturing", "suspended"):
+            raise RuntimeError(f"Cannot finish retained forward from state {self._state!r}")
+        if self.native is not None:
+            self.native.prefetch_stream.synchronize()
+
+    def resume_for_backward(self):
+        """Mark the matching Pop backward; native unpack restores lazily."""
+        if self._state != "suspended":
+            raise RuntimeError(f"Cannot resume retained backward from state {self._state!r}")
+        self._state = "backward"
+        return self.native
+
+    def close(self):
+        """Release native queues/pinned buffers after backward or capture abort."""
+        if self._state == "closed":
+            return
+        if self._state == "capturing":
+            raise RuntimeError("Cannot close a retained swap session while capture hooks are installed")
+        if self.native is not None:
+            _clear_native_payload(self.native, self._original_unpack)
+        self._state = "closed"
+
+    abort = close
+
+
+def create_retained_swap_session(
+    model,
+    *,
+    cp_size=1,
+    cp_backend=None,
+    persistent_kv_storages=None,
+    protect_new_key_values=True,
+):
+    """Create an unstarted Push-to-Pop native SwapPrefetch session."""
+    return RetainedSwapSession(
+        model,
+        cp_size=cp_size,
+        cp_backend=cp_backend,
+        persistent_kv_storages=persistent_kv_storages,
+        protect_new_key_values=protect_new_key_values,
+    )
 
 
 def with_activation_offload(method):
@@ -297,6 +498,15 @@ def with_activation_offload(method):
     def run(executor, *args, **kwargs):
         executor._ensure_healthy()
         try:
+            # Phase C Pop consumes the Push-owned retained session. Installing a
+            # second short-lived manager would neither capture a forward nor own
+            # the saved graph handles, and can corrupt the retained queue.
+            if (
+                method.__name__ == "pop"
+                and getattr(executor, "prefix_backward_policy", "recompute") == "offload"
+            ):
+                return method(executor, *args, **kwargs)
+
             def persistent_kv_storages():
                 # Read the live stack after Pop removed/released its entry.
                 # Keep only storage identities, never extra owning references.
@@ -323,6 +533,10 @@ def with_activation_offload(method):
             ):
                 return method(executor, *args, **kwargs)
         except Exception:
-            executor._failed = True
+            mark_failed = getattr(executor, "_mark_failed", None)
+            if callable(mark_failed):
+                mark_failed()
+            else:
+                executor._failed = True
             raise
     return run
