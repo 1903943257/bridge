@@ -594,10 +594,7 @@ def _extend_small_parameter_noise_baseline(
             dict(
                 case=case,
                 repeat=repeat_index,
-                checked=sum(
-                    _difference_metrics(reference[name], repeat[name])["elements"] < 4096
-                    for name in reference
-                ),
+                checked=sum(value.numel() < 4096 for value in reference.values()),
                 updated=updated,
             )
         ),
