@@ -14,7 +14,9 @@ from dataclasses import dataclass
 import gc
 import json
 import os
+import statistics
 import sys
+import time
 from types import SimpleNamespace
 import weakref
 
@@ -201,6 +203,7 @@ class _NativeTransferProbe:
 
         self.counts = {"d2h_bytes": 0, "h2d_bytes": 0}
         self._payload_refs = []
+        self._peak_live_pinned_payload_bytes = 0
         release = SwapTensor.wait_d2h_finished
         reload = SwapTensor.launch_h2d
 
@@ -213,6 +216,10 @@ class _NativeTransferProbe:
                 size = item.storage_size * item.tensor.element_size()
                 self.counts["d2h_bytes"] += size
                 self._payload_refs.append((size, weakref.ref(item.tensor_cpu)))
+                self._peak_live_pinned_payload_bytes = max(
+                    self._peak_live_pinned_payload_bytes,
+                    self.live_pinned_payload_bytes(),
+                )
             return result
 
         def reloaded(item, *args, **kwargs):
@@ -230,6 +237,12 @@ class _NativeTransferProbe:
 
     def live_pinned_payload_bytes(self):
         return sum(size for size, reference in self._payload_refs if reference() is not None)
+
+    def reset_peak_live_pinned_payload_bytes(self):
+        self._peak_live_pinned_payload_bytes = self.live_pinned_payload_bytes()
+
+    def peak_live_pinned_payload_bytes(self):
+        return self._peak_live_pinned_payload_bytes
 
 
 def _delta(after, before):
@@ -266,6 +279,7 @@ def _run(
     probe,
     collect=True,
     trace_pop_parameter_names: tuple[str, ...] = (),
+    emit_stage_rows=True,
 ):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
 
@@ -309,11 +323,12 @@ def _run(
             current_stage[0] = stage
             before = probe.snapshot()
             before_forwards = model_forwards[stage]
-            print(
-                "TPR_PHASE_C_STAGE "
-                + json.dumps(dict(policy=policy, stage=stage, event="begin")),
-                flush=True,
-            )
+            if emit_stage_rows:
+                print(
+                    "TPR_PHASE_C_STAGE "
+                    + json.dumps(dict(policy=policy, stage=stage, event="begin")),
+                    flush=True,
+                )
             try:
                 result = function()
                 torch.npu.synchronize()
@@ -343,7 +358,8 @@ def _run(
                 **transfers,
             )
             stage_rows.append(row)
-            print("TPR_PHASE_C_STAGE " + json.dumps(row), flush=True)
+            if emit_stage_rows:
+                print("TPR_PHASE_C_STAGE " + json.dumps(row), flush=True)
             return result
 
         def push(self, segment_id):
@@ -946,6 +962,136 @@ def test_phase_c1_correctness(runtime, native_args, monkeypatch, case):
         ),
         flush=True,
     )
+
+
+def test_phase_c1_performance(runtime, native_args, monkeypatch):
+    if os.getenv("TPR_PHASE_C_PERF") != "1":
+        pytest.skip("Set TPR_PHASE_C_PERF=1")
+
+    policy = os.getenv("TPR_PHASE_C_PERF_POLICY", "")
+    if policy not in ("recompute", "offload"):
+        raise ValueError(
+            "TPR_PHASE_C_PERF_POLICY must be 'recompute' or 'offload'"
+        )
+    prefix = int(os.getenv("TPR_PHASE_C_PERF_PREFIX", "8192"))
+    suffix = int(os.getenv("TPR_PHASE_C_PERF_SUFFIX", "1024"))
+    siblings = int(os.getenv("TPR_PHASE_C_PERF_SIBLINGS", "2"))
+    warmup = int(os.getenv("TPR_PHASE_C_PERF_WARMUP", "1"))
+    repeats = int(os.getenv("TPR_PHASE_C_PERF_REPEATS", "3"))
+    if prefix <= 0 or suffix <= 0 or siblings <= 0:
+        raise ValueError("Phase C perf lengths/siblings must be positive")
+    if warmup < 0 or repeats <= 0:
+        raise ValueError("Phase C perf requires warmup >= 0 and repeats > 0")
+
+    plan = _flat_plan(prefix, suffix, siblings=siblings)
+    torch.manual_seed(123)
+    model, target, parameter_count = _make_model(
+        runtime,
+        monkeypatch,
+        max_sequence_length=prefix + suffix,
+    )
+    model.config.swap_attention = True
+    model.config.swap_modules = native_args.swap_modules
+    probe = _NativeTransferProbe(monkeypatch)
+
+    for _ in range(warmup):
+        _run(
+            model,
+            plan,
+            policy=policy,
+            probe=probe,
+            collect=False,
+            emit_stage_rows=False,
+        )
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
+
+    samples = []
+    for iteration in range(repeats):
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
+
+        baseline_allocated = int(torch.npu.memory_allocated())
+        baseline_reserved = int(torch.npu.memory_reserved())
+        torch.npu.reset_peak_memory_stats()
+        probe.reset_peak_live_pinned_payload_bytes()
+        before_transfers = probe.snapshot()
+        proc_before = _proc_memory()
+
+        start = time.perf_counter()
+        result = _run(
+            model,
+            plan,
+            policy=policy,
+            probe=probe,
+            collect=False,
+            emit_stage_rows=False,
+        )
+        torch.npu.synchronize()
+        latency_ms = (time.perf_counter() - start) * 1000.0
+
+        transfers = _delta(probe.snapshot(), before_transfers)
+        peak_allocated = int(torch.npu.max_memory_allocated())
+        peak_reserved = int(torch.npu.max_memory_reserved())
+        proc_after = _proc_memory()
+        sample = dict(
+            iteration=iteration,
+            latency_ms=latency_ms,
+            model_forwards=result.total_model_forwards,
+            baseline_allocated_bytes=baseline_allocated,
+            baseline_reserved_bytes=baseline_reserved,
+            peak_allocated_bytes=peak_allocated,
+            incremental_peak_allocated_bytes=peak_allocated - baseline_allocated,
+            peak_reserved_bytes=peak_reserved,
+            peak_live_pinned_payload_bytes=probe.peak_live_pinned_payload_bytes(),
+            settled_live_pinned_payload_bytes=probe.live_pinned_payload_bytes(),
+            rss_before_bytes=proc_before["rss_bytes"],
+            rss_after_bytes=proc_after["rss_bytes"],
+            **transfers,
+        )
+        samples.append(sample)
+        print("TPR_PHASE_C_PERF_SAMPLE " + json.dumps(
+            dict(policy=policy, prefix=prefix, suffix=suffix, siblings=siblings, **sample)
+        ), flush=True)
+        assert sample["settled_live_pinned_payload_bytes"] == 0
+
+    latencies = [sample["latency_ms"] for sample in samples]
+    peak_allocated = [sample["peak_allocated_bytes"] for sample in samples]
+    incremental_peak = [sample["incremental_peak_allocated_bytes"] for sample in samples]
+    peak_reserved = [sample["peak_reserved_bytes"] for sample in samples]
+    peak_pinned = [sample["peak_live_pinned_payload_bytes"] for sample in samples]
+    final = dict(
+        policy=policy,
+        model=target.label,
+        checkpoint=str(target.path),
+        parameter_count=parameter_count,
+        prefix=prefix,
+        suffix=suffix,
+        siblings=siblings,
+        warmup=warmup,
+        repeats=repeats,
+        model_forwards=samples[0]["model_forwards"],
+        latency_ms_median=statistics.median(latencies),
+        latency_ms_mean=statistics.mean(latencies),
+        latency_ms_min=min(latencies),
+        latency_ms_max=max(latencies),
+        baseline_allocated_bytes_median=int(statistics.median(
+            sample["baseline_allocated_bytes"] for sample in samples
+        )),
+        peak_allocated_bytes_median=int(statistics.median(peak_allocated)),
+        peak_allocated_bytes_max=max(peak_allocated),
+        incremental_peak_allocated_bytes_median=int(statistics.median(incremental_peak)),
+        incremental_peak_allocated_bytes_max=max(incremental_peak),
+        peak_reserved_bytes_max=max(peak_reserved),
+        peak_live_pinned_payload_bytes_max=max(peak_pinned),
+        d2h_bytes_median=int(statistics.median(sample["d2h_bytes"] for sample in samples)),
+        h2d_bytes_median=int(statistics.median(sample["h2d_bytes"] for sample in samples)),
+    )
+    print("TPR_PHASE_C_PERF " + json.dumps(final), flush=True)
 
 
 def test_phase_c1_repeated_lifecycle(runtime, native_args, monkeypatch):

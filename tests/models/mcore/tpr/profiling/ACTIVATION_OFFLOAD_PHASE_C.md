@@ -155,6 +155,55 @@ contribution. Override that set with the comma-separated
 `TPR_PHASE_C_TRACE_PARAMETERS` variable. The diagnostic asserts finiteness
 only; it does not widen the C1 correctness tolerance or accept a noisy result.
 
+## Run C1 latency / peak-memory benchmark
+
+Run each policy in a fresh one-rank process so NPU allocator and pinned-buffer
+state from one policy cannot contaminate the other. The default shape is one
+P8K Prefix with two S1K sibling leaves, one warmup and three measured repeats.
+Override with `TPR_PHASE_C_PERF_PREFIX`, `TPR_PHASE_C_PERF_SUFFIX`,
+`TPR_PHASE_C_PERF_SIBLINGS`, `TPR_PHASE_C_PERF_WARMUP` and
+`TPR_PHASE_C_PERF_REPEATS`.
+
+Recompute:
+
+```
+TPR_RUN_OFFLOAD_C=1 \
+TPR_PHASE_C_PERF=1 \
+TPR_PHASE_C_PERF_POLICY=recompute \
+TPR_QWEN_PROFILE_SIZE=1.7B \
+TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B \
+TPR_SWAP_MODULES=self_attention,mlp \
+torchrun --nproc_per_node=1 \
+  --master_addr=127.0.0.1 \
+  --master_port=29568 \
+  -m pytest -x -s -v \
+  tests/models/mcore/tpr/profiling/test_activation_offload_phase_c_npu.py \
+  -k phase_c1_performance
+```
+
+Offload:
+
+```
+TPR_RUN_OFFLOAD_C=1 \
+TPR_PHASE_C_PERF=1 \
+TPR_PHASE_C_PERF_POLICY=offload \
+TPR_QWEN_PROFILE_SIZE=1.7B \
+TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B \
+TPR_SWAP_MODULES=self_attention,mlp \
+torchrun --nproc_per_node=1 \
+  --master_addr=127.0.0.1 \
+  --master_port=29569 \
+  -m pytest -x -s -v \
+  tests/models/mcore/tpr/profiling/test_activation_offload_phase_c_npu.py \
+  -k phase_c1_performance
+```
+
+Each measured iteration emits `TPR_PHASE_C_PERF_SAMPLE`; the final
+`TPR_PHASE_C_PERF` row reports median latency, baseline/peak/incremental NPU
+allocated memory, maximum reserved memory, peak live pinned saved-activation
+payload, and D2H/H2D bytes. Timing excludes model construction and warmup but
+includes the complete Push/Visit/Pop tree and parameter-gradient backward.
+
 ## Run repeated lifecycle/leak acceptance
 
 Use a fresh process so RSS and pinned-memory observations are attributable to
