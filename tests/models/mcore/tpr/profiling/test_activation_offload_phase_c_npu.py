@@ -255,17 +255,47 @@ class _RunResult:
     tensors: tuple[dict, dict, dict, dict] | None
     total_model_forwards: int
     stage_rows: tuple[dict, ...]
+    pop_parameter_contributions: dict[str, torch.Tensor] | None = None
 
 
-def _run(model, plan, *, policy, probe, collect=True):
+def _run(
+    model,
+    plan,
+    *,
+    policy,
+    probe,
+    collect=True,
+    trace_pop_parameter_names: tuple[str, ...] = (),
+):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
 
     model.zero_grad(set_to_none=True)
     logs = {}
     boundaries = {}
+    pop_parameter_contributions = {}
     stage_rows = []
     model_forwards = defaultdict(int)
     current_stage = ["outside"]
+
+    named_parameters = dict(model.named_parameters())
+    missing_trace_parameters = [
+        name for name in trace_pop_parameter_names if name not in named_parameters
+    ]
+    if missing_trace_parameters:
+        raise KeyError(
+            "unknown traced Phase C parameter(s): "
+            + ", ".join(missing_trace_parameters)
+        )
+
+    def snapshot_traced_parameter_grads():
+        snapshots = {}
+        for name in trace_pop_parameter_names:
+            parameter = named_parameters[name]
+            if parameter.grad is None:
+                snapshots[name] = torch.zeros_like(parameter.detach(), device="cpu")
+            else:
+                snapshots[name] = parameter.grad.detach().cpu().clone()
+        return snapshots
 
     def count_model_forward(module, inputs):
         model_forwards[current_stage[0]] += 1
@@ -374,7 +404,13 @@ def _run(model, plan, *, policy, probe, collect=True):
         for child in children:
             execute(child.segment_id)
         snapshot_prefix_gradients(segment_id)
+        before_pop = snapshot_traced_parameter_grads()
         losses.append(executor.pop(segment_id).normalized_loss.detach())
+        after_pop = snapshot_traced_parameter_grads()
+        for name in trace_pop_parameter_names:
+            pop_parameter_contributions[f"segment={segment_id}.{name}"] = (
+                after_pop[name] - before_pop[name]
+            )
 
     try:
         execute(plan.root_id)
@@ -400,7 +436,7 @@ def _run(model, plan, *, policy, probe, collect=True):
     )
 
     if not collect:
-        return _RunResult(None, total_forwards, tuple(stage_rows))
+        return _RunResult(None, total_forwards, tuple(stage_rows), None)
     grads = {
         name: parameter.grad.detach().cpu().clone()
         for name, parameter in model.named_parameters()
@@ -415,7 +451,12 @@ def _run(model, plan, *, policy, probe, collect=True):
         grads,
         boundaries,
     )
-    return _RunResult(tensors, total_forwards, tuple(stage_rows))
+    return _RunResult(
+        tensors,
+        total_forwards,
+        tuple(stage_rows),
+        pop_parameter_contributions,
+    )
 
 
 def _assert_stage_contract(policy, stage_rows):
@@ -506,6 +547,169 @@ def _assert_strict_match(reference, actual, *, case):
             flush=True,
         )
     assert not failures, "Phase C1 strict correctness failures: " + ", ".join(failures[:10])
+
+
+def _repeat_gradient_summary(expected, actual, *, comparison):
+    assert expected.keys() == actual.keys(), f"{comparison}: parameter gradient keys changed"
+    failed = []
+    finite = True
+    for name, reference in expected.items():
+        value = actual[name]
+        if reference.shape != value.shape:
+            failed.append((str(name), {"shape_mismatch": True}))
+            finite = False
+            continue
+        metrics = _difference_metrics(reference, value)
+        finite = finite and metrics["finite"]
+        if metrics["mismatch_fraction"] > 0:
+            failed.append((str(name), metrics))
+    worst = sorted(
+        failed,
+        key=lambda item: item[1].get("relative_l2", float("inf")),
+        reverse=True,
+    )[:5]
+    summary = dict(
+        comparison=comparison,
+        checked=len(expected),
+        failed_strict=len(failed),
+        finite=finite,
+        worst=worst,
+    )
+    print("TPR_PHASE_C_GRAD_REPEAT " + json.dumps(summary), flush=True)
+    return summary
+
+
+def _pop_contribution_summary(expected, actual, *, comparison):
+    assert expected is not None and actual is not None
+    assert expected.keys() == actual.keys(), f"{comparison}: Pop contribution keys changed"
+    failed = []
+    finite = True
+    for name, reference in expected.items():
+        value = actual[name]
+        metrics = _difference_metrics(reference, value)
+        finite = finite and metrics["finite"]
+        if metrics["mismatch_fraction"] > 0:
+            failed.append((name, metrics))
+    worst = sorted(
+        failed,
+        key=lambda item: item[1]["relative_l2"],
+        reverse=True,
+    )[:5]
+    summary = dict(
+        comparison=comparison,
+        checked=len(expected),
+        failed_strict=len(failed),
+        finite=finite,
+        worst=worst,
+    )
+    print("TPR_PHASE_C_PREFIX_PARAM " + json.dumps(summary), flush=True)
+    return summary
+
+
+def test_phase_c1_parameter_gradient_repeat_diagnostics(
+    runtime,
+    native_args,
+    monkeypatch,
+):
+    if os.getenv("TPR_PHASE_C_GRAD_DIAGNOSTIC") != "1":
+        pytest.skip("Set TPR_PHASE_C_GRAD_DIAGNOSTIC=1")
+
+    prefix = int(os.getenv("TPR_PHASE_C_PREFIX", "1024"))
+    suffix = int(os.getenv("TPR_PHASE_C_SUFFIX", "1024"))
+    plan = _flat_plan(prefix, suffix)
+    trace_default = (
+        "decoder.layers.0.input_layernorm.weight,"
+        "decoder.layers.0.self_attention.q_layernorm.weight,"
+        "decoder.layers.0.self_attention.linear_qkv.weight,"
+        "decoder.layers.0.mlp.linear_fc1.weight"
+    )
+    trace_names = tuple(
+        name.strip()
+        for name in os.getenv(
+            "TPR_PHASE_C_TRACE_PARAMETERS",
+            trace_default,
+        ).split(",")
+        if name.strip()
+    )
+
+    torch.manual_seed(123)
+    model, target, parameter_count = _make_model(
+        runtime,
+        monkeypatch,
+        max_sequence_length=prefix + suffix,
+    )
+    model.config.swap_attention = True
+    model.config.swap_modules = native_args.swap_modules
+    probe = _NativeTransferProbe(monkeypatch)
+
+    runs = {}
+    for label, policy in (
+        ("recompute1", "recompute"),
+        ("recompute2", "recompute"),
+        ("offload1", "offload"),
+        ("offload2", "offload"),
+    ):
+        runs[label] = _run(
+            model,
+            plan,
+            policy=policy,
+            probe=probe,
+            trace_pop_parameter_names=trace_names,
+        )
+        assert runs[label].tensors is not None
+
+    parameter_summaries = [
+        _repeat_gradient_summary(
+            runs["recompute1"].tensors[2],
+            runs["recompute2"].tensors[2],
+            comparison="recompute1_vs_recompute2",
+        ),
+        _repeat_gradient_summary(
+            runs["offload1"].tensors[2],
+            runs["offload2"].tensors[2],
+            comparison="offload1_vs_offload2",
+        ),
+        _repeat_gradient_summary(
+            runs["recompute1"].tensors[2],
+            runs["offload1"].tensors[2],
+            comparison="recompute1_vs_offload1",
+        ),
+        _repeat_gradient_summary(
+            runs["recompute2"].tensors[2],
+            runs["offload2"].tensors[2],
+            comparison="recompute2_vs_offload2",
+        ),
+    ]
+    contribution_summaries = [
+        _pop_contribution_summary(
+            runs["recompute1"].pop_parameter_contributions,
+            runs["offload1"].pop_parameter_contributions,
+            comparison="prefix_recompute1_vs_offload1",
+        ),
+        _pop_contribution_summary(
+            runs["recompute2"].pop_parameter_contributions,
+            runs["offload2"].pop_parameter_contributions,
+            comparison="prefix_recompute2_vs_offload2",
+        ),
+    ]
+
+    assert all(row["finite"] for row in parameter_summaries + contribution_summaries)
+    print(
+        "TPR_PHASE_C_GRAD_DIAGNOSTIC "
+        + json.dumps(
+            dict(
+                model=target.label,
+                checkpoint=str(target.path),
+                parameter_count=parameter_count,
+                prefix=prefix,
+                suffix=suffix,
+                traced_parameters=trace_names,
+                parameter_summaries=parameter_summaries,
+                contribution_summaries=contribution_summaries,
+            )
+        ),
+        flush=True,
+    )
 
 
 @pytest.mark.parametrize("case", ["flat", "nested"])

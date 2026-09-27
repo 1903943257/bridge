@@ -115,6 +115,34 @@ torchrun --standalone --nproc_per_node=1 \
 The default correctness shape is P1K/S1K.  Override it without editing the
 test using `TPR_PHASE_C_PREFIX` and `TPR_PHASE_C_SUFFIX`.
 
+## Run parameter-gradient repeat diagnostics
+
+If strict correctness reaches the retained Pop backward but only parameter
+gradients differ, keep the production implementation unchanged and characterize
+repeat noise first:
+
+```
+TPR_RUN_OFFLOAD_C=1 \
+TPR_PHASE_C_GRAD_DIAGNOSTIC=1 \
+TPR_QWEN_PROFILE_SIZE=1.7B \
+TPR_QWEN_MODEL_PATH=/workspace/hf_models/Qwen3-1.7B \
+TPR_SWAP_MODULES=self_attention,mlp \
+torchrun --nproc_per_node=1 \
+  --master_addr=127.0.0.1 \
+  --master_port=29564 \
+  -m pytest -x -s -v \
+  tests/models/mcore/tpr/profiling/test_activation_offload_phase_c_npu.py \
+  -k parameter_gradient_repeat_diagnostics
+```
+
+This runs `recompute1/recompute2/offload1/offload2` on identical weights and
+prints `TPR_PHASE_C_GRAD_REPEAT` for repeat-vs-repeat and cross-policy
+comparisons. It also traces a small representative set of parameters around
+Pop and prints `TPR_PHASE_C_PREFIX_PARAM` for the isolated Prefix-backward
+contribution. Override that set with the comma-separated
+`TPR_PHASE_C_TRACE_PARAMETERS` variable. The diagnostic asserts finiteness
+only; it does not widen the C1 correctness tolerance or accept a noisy result.
+
 ## Run repeated lifecycle/leak acceptance
 
 Use a fresh process so RSS and pinned-memory observations are attributable to
