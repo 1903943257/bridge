@@ -261,7 +261,7 @@ class AdapterTest(unittest.TestCase):
         self.assertTrue(session.closed)
         self.assertEqual(self.native.prefetch_list, [])
 
-    def test_retained_capture_flushes_loss_scope_batch_before_suspend(self):
+    def test_retained_capture_flushes_loss_scope_as_post_decoder_layer(self):
         candidate = NS(tensor=Tensor(8), storage_data_ptr=8)
         session = self.adapter.create_retained_swap_session(self.model)
         with session.capture():
@@ -273,9 +273,13 @@ class AdapterTest(unittest.TestCase):
             loss_tensor = Tensor(7)
             self.assertIs(outer_pack(loss_tensor), loss_tensor)
             self.native.pack_hook.assert_called_once_with(loss_tensor)
+            self.assertEqual(self.native.layer_name, "tpr.outer.1")
             # Represents a tensor saved by CE after the final layer hook.
             self.native.swap_tensors = [candidate]
-        self.native.sync_d2h.assert_called_with("")
+        self.assertEqual(
+            [call.args[0] for call in self.native.sync_d2h.call_args_list],
+            ["decoder.layers.0", "tpr.outer.1"],
+        )
         self.assertEqual(self.native.swap_tensors, [candidate])
         session.abort()
 

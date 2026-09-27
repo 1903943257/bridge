@@ -289,6 +289,8 @@ def _installed_mindspeed_swap_attention(
 
     outer_capture_enabled = False
     last_layer_name = layers[-1][0]
+    outer_layer_id = max(int(layer_id) for layer_id in layer_ids) + 1
+    outer_layer_name = f"tpr.outer.{outer_layer_id}"
 
     def after_layer(name):
         def hook(module, inputs, output):
@@ -307,7 +309,14 @@ def _installed_mindspeed_swap_attention(
         return hook
 
     def outer_pack(tensor):
-        return native.pack_hook(tensor) if outer_capture_enabled else tensor
+        if not outer_capture_enabled:
+            return tensor
+        # Native SwapPrefetch groups work by monotonically increasing layer id.
+        # Treat final-norm/LM-head/CE saved tensors as one synthetic layer after
+        # the decoder instead of reusing the last Transformer layer id, which
+        # would otherwise start a second native microbatch queue.
+        native.layer_name = outer_layer_name
+        return native.pack_hook(tensor)
 
     yielded = False
     try:
@@ -330,9 +339,10 @@ def _installed_mindspeed_swap_attention(
                 yielded = True
                 yield native
             # CE/loss nodes may save tensors after the final Transformer-layer
-            # forward hook. Flush that last native batch before suspension.
+            # forward hook. Flush them as a synthetic post-decoder layer so the
+            # retained session stays in the same native microbatch queue.
             if native.swap_tensors:
-                sync_d2h(native.layer_name)
+                sync_d2h(outer_layer_name)
         else:
             yielded = True
             yield native
