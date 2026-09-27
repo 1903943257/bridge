@@ -57,12 +57,17 @@ is not injected into Megatron's `TransformerConfig`.
 
 `test_activation_offload_phase_c_npu.py` builds the real configured Qwen3
 checkpoint and runs the same weights and plan with `recompute` and `offload`.
-It strictly compares the following with `rtol=2e-3`, `atol=2e-4`:
+It keeps the original `rtol=2e-3`, `atol=2e-4` strict gate for:
 
 - summed normalized loss;
 - every owned per-term logprob;
-- every materialized model parameter gradient;
 - per-layer Prefix key/value dKV at every non-leaf Pop boundary.
+
+Parameter gradients use the existing Phase B per-tensor repeat-noise gate from
+`_offload_b_gate.py`. Two extra `recompute` repeats calibrate that baseline;
+two `offload` runs and a final `recompute_after` run are then judged against
+the recompute-only baseline. Offload results never contribute to calibration,
+and no Phase C-specific tolerance is introduced.
 
 There are two topology cases:
 
@@ -106,7 +111,9 @@ TPR_RUN_OFFLOAD_C=1 \
 TPR_QWEN_PROFILE_SIZE=1.7B \
 TPR_QWEN_MODEL_PATH=/workspace/hf_models/Qwen3-1.7B \
 TPR_SWAP_MODULES=self_attention,mlp \
-torchrun --standalone --nproc_per_node=1 \
+torchrun --nproc_per_node=1 \
+  --master_addr=127.0.0.1 \
+  --master_port=29566 \
   -m pytest -x -s -v \
   tests/models/mcore/tpr/profiling/test_activation_offload_phase_c_npu.py \
   -k correctness

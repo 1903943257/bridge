@@ -502,35 +502,109 @@ def _difference_metrics(expected, actual):
         max_abs=max_abs,
         relative_l2=(squared_error / max(squared_reference, 1e-30)) ** 0.5,
         mismatch_fraction=mismatched / max(expected.numel(), 1),
+        mismatched=mismatched,
+        elements=expected.numel(),
         finite=finite,
     )
 
 
-def _assert_strict_match(reference, actual, *, case):
+def _build_parameter_noise_baseline(reference, repeats, *, case):
+    from ._offload_b_gate import merge_baseline
+
+    baseline = {}
+    for repeat_index, repeat in enumerate(repeats, start=1):
+        assert reference.keys() == repeat.keys(), (
+            f"{case}/parameter_grad calibration keys changed on repeat {repeat_index}"
+        )
+        for name, expected in reference.items():
+            value = repeat[name]
+            if expected.shape != value.shape:
+                raise AssertionError(
+                    f"{case}/parameter_grad/{name}: calibration shape changed "
+                    f"{tuple(expected.shape)} -> {tuple(value.shape)}"
+                )
+            metrics = _difference_metrics(expected, value)
+            if not metrics["finite"]:
+                raise AssertionError(
+                    f"{case}/parameter_grad/{name}: non-finite calibration repeat"
+                )
+            baseline[name] = merge_baseline(baseline.get(name), metrics)
+
+    worst = sorted(
+        (
+            (str(name), metrics)
+            for name, metrics in baseline.items()
+            if metrics["mismatched"] > 0
+        ),
+        key=lambda item: item[1]["relative_l2"],
+        reverse=True,
+    )[:5]
+    print(
+        "TPR_PHASE_C_CALIBRATION "
+        + json.dumps(
+            dict(
+                case=case,
+                repeats=len(repeats),
+                checked=len(reference),
+                noisy=sum(metrics["mismatched"] > 0 for metrics in baseline.values()),
+                worst=worst,
+            )
+        ),
+        flush=True,
+    )
+    return baseline
+
+
+def _assert_acceptance_match(reference, actual, parameter_baseline, *, case, run):
+    from ._offload_b_gate import gradient_gate
+
     failures = []
     for category, expected_map, actual_map in zip(
         ("loss", "logprob", "parameter_grad", "prefix_grad"),
         reference,
         actual,
     ):
-        assert expected_map.keys() == actual_map.keys(), f"{case}/{category}: tensor keys changed"
-        assert expected_map, f"{case}/{category}: empty comparison"
+        assert expected_map.keys() == actual_map.keys(), (
+            f"{case}/{run}/{category}: tensor keys changed"
+        )
+        assert expected_map, f"{case}/{run}/{category}: empty comparison"
         failed = []
         for name, expected in expected_map.items():
             value = actual_map[name]
-            try:
-                torch.testing.assert_close(value, expected, rtol=2e-3, atol=2e-4)
-            except AssertionError:
-                metrics = (
-                    {"shape_expected": tuple(expected.shape), "shape_actual": tuple(value.shape)}
-                    if expected.shape != value.shape
-                    else _difference_metrics(expected, value)
-                )
+            if expected.shape != value.shape:
+                metrics = {
+                    "shape_expected": tuple(expected.shape),
+                    "shape_actual": tuple(value.shape),
+                }
                 failed.append((str(name), metrics))
-                failures.append(f"{case}/{category}/{name}")
+                failures.append(f"{case}/{run}/{category}/{name}")
+                continue
+
+            metrics = _difference_metrics(expected, value)
+            if category == "parameter_grad":
+                passed, limits, severity = gradient_gate(
+                    metrics,
+                    parameter_baseline.get(name),
+                )
+                if not passed:
+                    detail = dict(
+                        **metrics,
+                        limits=limits,
+                        severity=severity,
+                        baseline=parameter_baseline.get(name),
+                    )
+                    failed.append((str(name), detail))
+                    failures.append(f"{case}/{run}/{category}/{name}")
+            else:
+                try:
+                    torch.testing.assert_close(value, expected, rtol=2e-3, atol=2e-4)
+                except AssertionError:
+                    failed.append((str(name), metrics))
+                    failures.append(f"{case}/{run}/{category}/{name}")
+
         worst = sorted(
             failed,
-            key=lambda item: item[1].get("relative_l2", float("inf")),
+            key=lambda item: item[1].get("severity", item[1].get("relative_l2", float("inf"))),
             reverse=True,
         )[:5]
         print(
@@ -538,7 +612,9 @@ def _assert_strict_match(reference, actual, *, case):
             + json.dumps(
                 dict(
                     case=case,
+                    run=run,
                     category=category,
+                    gate=("baseline_aware" if category == "parameter_grad" else "strict"),
                     checked=len(expected_map),
                     failed=len(failed),
                     worst=worst,
@@ -546,7 +622,7 @@ def _assert_strict_match(reference, actual, *, case):
             ),
             flush=True,
         )
-    assert not failures, "Phase C1 strict correctness failures: " + ", ".join(failures[:10])
+    assert not failures, "Phase C1 acceptance failures: " + ", ".join(failures[:10])
 
 
 def _repeat_gradient_summary(expected, actual, *, comparison):
@@ -729,15 +805,56 @@ def test_phase_c1_correctness(runtime, native_args, monkeypatch, case):
     model.config.swap_modules = native_args.swap_modules
     probe = _NativeTransferProbe(monkeypatch)
 
-    reference = _run(model, plan, policy="recompute", probe=probe)
-    actual = _run(model, plan, policy="offload", probe=probe)
-    assert reference.tensors is not None and actual.tensors is not None
-    _assert_strict_match(reference.tensors, actual.tensors, case=case)
+    recompute1 = _run(model, plan, policy="recompute", probe=probe)
+    recompute2 = _run(model, plan, policy="recompute", probe=probe)
+    recompute3 = _run(model, plan, policy="recompute", probe=probe)
+    offload1 = _run(model, plan, policy="offload", probe=probe)
+    offload2 = _run(model, plan, policy="offload", probe=probe)
+    recompute_after = _run(model, plan, policy="recompute", probe=probe)
+
+    runs = {
+        "recompute1": recompute1,
+        "recompute2": recompute2,
+        "recompute3": recompute3,
+        "offload1": offload1,
+        "offload2": offload2,
+        "recompute_after": recompute_after,
+    }
+    assert all(result.tensors is not None for result in runs.values())
+
+    reference = recompute1.tensors
+    parameter_baseline = _build_parameter_noise_baseline(
+        reference[2],
+        (recompute2.tensors[2], recompute3.tensors[2]),
+        case=case,
+    )
+
+    # Calibration is allowed to define parameter-grad repeat noise only.
+    # All forward observables and Prefix dKV remain under the original strict gate.
+    for label in ("recompute2", "recompute3"):
+        _assert_acceptance_match(
+            reference,
+            runs[label].tensors,
+            parameter_baseline,
+            case=case,
+            run=label,
+        )
+
+    # Offload never calibrates itself: both retained-graph runs are judged
+    # against a baseline derived exclusively from recompute repeats.
+    for label in ("offload1", "offload2", "recompute_after"):
+        _assert_acceptance_match(
+            reference,
+            runs[label].tensors,
+            parameter_baseline,
+            case=case,
+            run=label,
+        )
 
     if case == "flat":
         sibling_count = len(plan.children_of(plan.root_id))
-        assert reference.total_model_forwards == sibling_count + 2
-        assert actual.total_model_forwards == sibling_count + 1
+        assert recompute1.total_model_forwards == sibling_count + 2
+        assert offload1.total_model_forwards == sibling_count + 1
     print(
         "TPR_PHASE_C_CORRECTNESS "
         + json.dumps(
@@ -746,8 +863,11 @@ def test_phase_c1_correctness(runtime, native_args, monkeypatch, case):
                 model=target.label,
                 checkpoint=str(target.path),
                 parameter_count=parameter_count,
-                recompute_forwards=reference.total_model_forwards,
-                offload_forwards=actual.total_model_forwards,
+                recompute_forwards=recompute1.total_model_forwards,
+                offload_forwards=offload1.total_model_forwards,
+                calibration_repeats=2,
+                offload_repeats=2,
+                recompute_after=True,
                 **probe.snapshot(),
             )
         ),
