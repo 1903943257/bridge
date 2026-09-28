@@ -274,8 +274,13 @@ class SegmentExecutor:
             gdn_state = self.gdn_states.pop(segment_id) if self.gdn_layer_numbers else None
             relayed_gdn_gradients = {} if gdn_state is None else gdn_state.consume_gradients()
             del entry
+            # The popped segment's cached KV is dead before recompute: its
+            # relayed gradients and metadata were copied above, while the
+            # replay consumes only the remaining ancestor path as past KV.
+            # Release it for CP=1 as well as CP>1 so cached current KV does not
+            # overlap with the graph-connected KV recreated by this forward.
+            popped_entry.kv.release()
             if self.cp_enabled:
-                popped_entry.kv.release()
                 anchors = build_sharded_past_anchors(self.kv_stack)
                 past_key_values = {}
             else:
