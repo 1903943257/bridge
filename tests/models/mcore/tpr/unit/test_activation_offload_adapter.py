@@ -37,7 +37,7 @@ class Tensor:
             self.pointer + 100000,
             numel=self._numel,
             storage_size=self._numel,
-            grad_fn=object(),
+            grad_fn=None,
         )
 
 
@@ -102,6 +102,10 @@ class AdapterTest(unittest.TestCase):
             unpack_hook=Mock(side_effect=lambda item: item if isinstance(item, Tensor) else item.tensor),
             h2d=Mock(), sync_d2h=Mock(), prefetch_stream=NS(synchronize=Mock()),
             pack_hook=Mock(side_effect=lambda tensor: tensor), layer_name="",
+            no_swap_tensor=Mock(
+                side_effect=lambda tensor: tensor.grad_fn is None
+                or tensor.storage().size() != tensor.numel()
+            ),
             hook_swap_manager_forward=Mock(side_effect=lambda f, name: Mock(wraps=f)),
         )
         self.native_factory = Mock(return_value=self.native)
@@ -310,11 +314,23 @@ class AdapterTest(unittest.TestCase):
                 storage_size=2 * 1024 * 1024,
                 grad_fn=object(),
             )
+            forced_checks = []
+            original_side_effect = original_pack.side_effect
+
+            def observe_forced_compact(tensor):
+                if tensor is not view and tensor.storage().size() == tensor.numel():
+                    forced_checks.append(self.native.no_swap_tensor(tensor))
+                return original_side_effect(tensor)
+
+            original_pack.side_effect = observe_forced_compact
             packed_view = self.native.pack_hook(view)
             compact = original_pack.call_args.args[0]
             self.assertIsNot(compact, view)
             self.assertEqual(compact.storage().size(), compact.numel())
+            self.assertIsNone(compact.grad_fn)
+            self.assertEqual(forced_checks[-1], False)
             self.assertIs(packed_view, compact)
+            original_pack.side_effect = original_side_effect
 
             self.layer.forward_hook(self.layer, (), None)
             loss_tensor = Tensor(9)
