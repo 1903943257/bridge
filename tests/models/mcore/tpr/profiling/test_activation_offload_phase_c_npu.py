@@ -280,6 +280,7 @@ def _run(
     collect=True,
     trace_pop_parameter_names: tuple[str, ...] = (),
     emit_stage_rows=True,
+    profile_stage_memory=False,
 ):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
 
@@ -323,6 +324,17 @@ def _run(
             current_stage[0] = stage
             before = probe.snapshot()
             before_forwards = model_forwards[stage]
+            memory = {}
+            if profile_stage_memory:
+                torch.npu.synchronize()
+                memory.update(
+                    allocated_before_bytes=int(torch.npu.memory_allocated()),
+                    reserved_before_bytes=int(torch.npu.memory_reserved()),
+                    live_pinned_before_bytes=probe.live_pinned_payload_bytes(),
+                )
+                torch.npu.reset_peak_memory_stats()
+                probe.reset_peak_live_pinned_payload_bytes()
+            stage_start = time.perf_counter()
             if emit_stage_rows:
                 print(
                     "TPR_PHASE_C_STAGE "
@@ -349,12 +361,36 @@ def _run(
                 raise
             finally:
                 current_stage[0] = previous
+            stage_latency_ms = (time.perf_counter() - stage_start) * 1000.0
             transfers = _delta(probe.snapshot(), before)
+            if profile_stage_memory:
+                memory.update(
+                    allocated_after_bytes=int(torch.npu.memory_allocated()),
+                    reserved_after_bytes=int(torch.npu.memory_reserved()),
+                    peak_allocated_bytes=int(torch.npu.max_memory_allocated()),
+                    peak_reserved_bytes=int(torch.npu.max_memory_reserved()),
+                    peak_live_pinned_payload_bytes=probe.peak_live_pinned_payload_bytes(),
+                    live_pinned_after_bytes=probe.live_pinned_payload_bytes(),
+                )
+                memory["allocated_delta_bytes"] = (
+                    memory["allocated_after_bytes"] - memory["allocated_before_bytes"]
+                )
+                memory["reserved_delta_bytes"] = (
+                    memory["reserved_after_bytes"] - memory["reserved_before_bytes"]
+                )
+                memory["stage_incremental_peak_allocated_bytes"] = (
+                    memory["peak_allocated_bytes"] - memory["allocated_before_bytes"]
+                )
+                memory["stage_incremental_peak_reserved_bytes"] = (
+                    memory["peak_reserved_bytes"] - memory["reserved_before_bytes"]
+                )
             row = dict(
                 policy=policy,
                 stage=stage,
                 event="end",
+                latency_ms=stage_latency_ms,
                 model_forwards=model_forwards[stage] - before_forwards,
+                **memory,
                 **transfers,
             )
             stage_rows.append(row)
@@ -1030,13 +1066,32 @@ def test_phase_c1_performance(runtime, native_args, monkeypatch):
             probe=probe,
             collect=False,
             emit_stage_rows=False,
+            profile_stage_memory=True,
         )
         torch.npu.synchronize()
         latency_ms = (time.perf_counter() - start) * 1000.0
 
+        for row in result.stage_rows:
+            print(
+                "TPR_PHASE_C_PERF_STAGE "
+                + json.dumps(
+                    dict(
+                        iteration=iteration,
+                        prefix=prefix,
+                        suffix=suffix,
+                        siblings=siblings,
+                        **row,
+                    )
+                ),
+                flush=True,
+            )
+
         transfers = _delta(probe.snapshot(), before_transfers)
-        peak_allocated = int(torch.npu.max_memory_allocated())
-        peak_reserved = int(torch.npu.max_memory_reserved())
+        peak_allocated = max(row["peak_allocated_bytes"] for row in result.stage_rows)
+        peak_reserved = max(row["peak_reserved_bytes"] for row in result.stage_rows)
+        peak_pinned_payload = max(
+            row["peak_live_pinned_payload_bytes"] for row in result.stage_rows
+        )
         proc_after = _proc_memory()
         sample = dict(
             iteration=iteration,
@@ -1047,7 +1102,7 @@ def test_phase_c1_performance(runtime, native_args, monkeypatch):
             peak_allocated_bytes=peak_allocated,
             incremental_peak_allocated_bytes=peak_allocated - baseline_allocated,
             peak_reserved_bytes=peak_reserved,
-            peak_live_pinned_payload_bytes=probe.peak_live_pinned_payload_bytes(),
+            peak_live_pinned_payload_bytes=peak_pinned_payload,
             settled_live_pinned_payload_bytes=probe.live_pinned_payload_bytes(),
             rss_before_bytes=proc_before["rss_bytes"],
             rss_after_bytes=proc_after["rss_bytes"],

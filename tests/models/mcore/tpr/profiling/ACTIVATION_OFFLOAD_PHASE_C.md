@@ -198,11 +198,20 @@ torchrun --nproc_per_node=1 \
   -k phase_c1_performance
 ```
 
-Each measured iteration emits `TPR_PHASE_C_PERF_SAMPLE`; the final
-`TPR_PHASE_C_PERF` row reports median latency, baseline/peak/incremental NPU
-allocated memory, maximum reserved memory, peak live pinned saved-activation
-payload, and D2H/H2D bytes. Timing excludes model construction and warmup but
-includes the complete Push/Visit/Pop tree and parameter-gradient backward.
+Each measured iteration emits one `TPR_PHASE_C_PERF_STAGE` row per
+Push/Visit/Pop stage. These rows report stage latency, NPU allocated/reserved
+bytes before and after the stage, the stage-local allocated/reserved peaks,
+their deltas from the stage start, live/peak pinned saved-activation payload,
+and D2H/H2D bytes. Peak-memory stats are reset between stages without freeing
+allocator state, so the overall run peaks are reconstructed as the maximum of
+the stage-local peaks.
+
+The per-iteration `TPR_PHASE_C_PERF_SAMPLE` and final `TPR_PHASE_C_PERF`
+rows retain the whole-tree summary: median latency, baseline/peak/incremental
+NPU allocated memory, maximum reserved memory, peak live pinned
+saved-activation payload, and D2H/H2D bytes. Timing excludes model construction
+and warmup but includes the complete Push/Visit/Pop tree and
+parameter-gradient backward.
 
 ## Run repeated lifecycle/leak acceptance
 
