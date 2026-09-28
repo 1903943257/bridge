@@ -198,6 +198,15 @@ torchrun --nproc_per_node=1 \
   -k phase_c1_performance
 ```
 
+Each offload Push in the performance test also emits
+`TPR_PHASE_C_OWNERSHIP`. This is a diagnostic ownership audit of the
+suspended retained Prefix graph. It reports unique NPU storage bytes for the
+graph-connected KV roots, detached KVStack aliases, parent anchors, native
+`tpr_resident` swap handles, their storage overlap, the live native host-only
+swap queue, and the remaining Push allocation growth not explained by those
+known long-lived categories. The audit keeps only weak references to resident
+tensors so it does not extend their lifetime.
+
 Each measured iteration emits one `TPR_PHASE_C_PERF_STAGE` row per
 Push/Visit/Pop stage. These rows report stage latency, NPU allocated/reserved
 bytes before and after the stage, the stage-local allocated/reserved peaks,

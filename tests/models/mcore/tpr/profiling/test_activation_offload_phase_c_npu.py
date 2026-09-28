@@ -204,8 +204,34 @@ class _NativeTransferProbe:
         self.counts = {"d2h_bytes": 0, "h2d_bytes": 0}
         self._payload_refs = []
         self._peak_live_pinned_payload_bytes = 0
+        self._resident_refs = []
         release = SwapTensor.wait_d2h_finished
         reload = SwapTensor.launch_h2d
+
+        from verl.models.mcore.tpr import activation_offload
+
+        protect_exports = activation_offload._protect_exports
+
+        def audited_protect_exports(native, protected):
+            candidates = tuple(native.swap_tensors)
+            result = protect_exports(native, protected)
+            for item in candidates:
+                if not getattr(item, "tpr_resident", False):
+                    continue
+                tensor = item.tensor
+                key = (str(tensor.device), int(tensor.untyped_storage().data_ptr()))
+                size = int(tensor.untyped_storage().nbytes())
+                self._resident_refs.append(
+                    (
+                        key,
+                        size,
+                        str(getattr(item, "layer_name", "unknown")),
+                        weakref.ref(tensor),
+                    )
+                )
+            return result
+
+        monkeypatch.setattr(activation_offload, "_protect_exports", audited_protect_exports)
 
         def released(item, *args, **kwargs):
             before = item.stat
@@ -243,6 +269,80 @@ class _NativeTransferProbe:
 
     def peak_live_pinned_payload_bytes(self):
         return self._peak_live_pinned_payload_bytes
+
+    def live_resident_storage_inventory(self):
+        inventory = {}
+        for key, size, layer_name, reference in self._resident_refs:
+            if reference() is None:
+                continue
+            current = inventory.get(key)
+            if current is None or size > current["bytes"]:
+                inventory[key] = {"bytes": size, "layers": {layer_name}}
+            else:
+                current["layers"].add(layer_name)
+        return inventory
+
+
+def _storage_inventory(tensors):
+    inventory = {}
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        storage = tensor.untyped_storage()
+        key = (str(tensor.device), int(storage.data_ptr()))
+        size = int(storage.nbytes())
+        current = inventory.get(key)
+        if current is None or size > current:
+            inventory[key] = size
+    return inventory
+
+
+def _pair_tensors(key_values):
+    return tuple(tensor for pair in key_values.values() for tensor in pair)
+
+
+def _inventory_bytes(inventory):
+    return sum(
+        value["bytes"] if isinstance(value, dict) else value
+        for value in inventory.values()
+    )
+
+
+def _inventory_overlap_bytes(left, right):
+    overlap = set(left).intersection(right)
+    return sum(
+        min(
+            left[key]["bytes"] if isinstance(left[key], dict) else left[key],
+            right[key]["bytes"] if isinstance(right[key], dict) else right[key],
+        )
+        for key in overlap
+    )
+
+
+def _native_host_queue_summary(native):
+    unique = {}
+    by_status = defaultdict(lambda: {"items": 0, "unique_bytes": 0})
+    by_layer = defaultdict(lambda: {"items": 0, "unique_bytes": 0})
+    for item in tuple(getattr(native, "swap_tensors", ())):
+        ptr = int(getattr(item, "storage_data_ptr", 0))
+        size = int(getattr(item, "storage_size", 0)) * int(item.tensor.element_size())
+        stat = str(getattr(item, "stat", "unknown"))
+        layer = str(getattr(item, "layer_name", "unknown"))
+        by_status[stat]["items"] += 1
+        by_layer[layer]["items"] += 1
+        previous = unique.get(ptr)
+        if previous is None or size > previous["bytes"]:
+            unique[ptr] = {"bytes": size, "stat": stat, "layer": layer}
+    for value in unique.values():
+        by_status[value["stat"]]["unique_bytes"] += value["bytes"]
+        by_layer[value["layer"]]["unique_bytes"] += value["bytes"]
+    return {
+        "items": len(tuple(getattr(native, "swap_tensors", ()))),
+        "unique_storages": len(unique),
+        "unique_bytes": sum(value["bytes"] for value in unique.values()),
+        "by_status": dict(sorted(by_status.items())),
+        "by_layer": dict(sorted(by_layer.items())),
+    }
 
 
 def _delta(after, before):
@@ -399,9 +499,72 @@ def _run(
             return result
 
         def push(self, segment_id):
-            return self._stage_call(
+            result = self._stage_call(
                 "push", segment_id, lambda: super(ObservedExecutor, self).push(segment_id)
             )
+            if profile_stage_memory and policy == "offload":
+                stage_memory = stage_rows[-1]
+                record = self._prefix_graphs.top()
+                entry = self.kv_stack.get(segment_id)
+                graph_kv = _storage_inventory(_pair_tensors(record.graph_key_values))
+                stack_kv = _storage_inventory(_pair_tensors(entry.kv.key_values))
+                parent_key_values = getattr(record.parent_anchors, "key_values", {})
+                parent_anchors = _storage_inventory(_pair_tensors(parent_key_values))
+                resident = probe.live_resident_storage_inventory()
+                native = record.native_session.native
+                host_queue = _native_host_queue_summary(native)
+
+                known_live_keys = (
+                    set(graph_kv)
+                    | set(stack_kv)
+                    | set(parent_anchors)
+                    | set(resident)
+                )
+                known_live_bytes = 0
+                for key in known_live_keys:
+                    sizes = []
+                    for inventory in (graph_kv, stack_kv, parent_anchors):
+                        if key in inventory:
+                            sizes.append(inventory[key])
+                    if key in resident:
+                        sizes.append(resident[key]["bytes"])
+                    known_live_bytes += max(sizes)
+
+                resident_by_layer = defaultdict(lambda: {"storages": 0, "unique_bytes": 0})
+                for value in resident.values():
+                    for layer in value["layers"]:
+                        resident_by_layer[layer]["storages"] += 1
+                        resident_by_layer[layer]["unique_bytes"] += value["bytes"]
+
+                growth = (
+                    stage_memory["allocated_after_bytes"]
+                    - stage_memory["allocated_before_bytes"]
+                )
+                audit = dict(
+                    policy=policy,
+                    segment_id=segment_id,
+                    allocated_before_bytes=stage_memory["allocated_before_bytes"],
+                    allocated_after_bytes=stage_memory["allocated_after_bytes"],
+                    allocated_growth_bytes=growth,
+                    graph_kv_unique_storages=len(graph_kv),
+                    graph_kv_unique_bytes=_inventory_bytes(graph_kv),
+                    kvstack_unique_storages=len(stack_kv),
+                    kvstack_unique_bytes=_inventory_bytes(stack_kv),
+                    graph_kv_kvstack_overlap_bytes=_inventory_overlap_bytes(graph_kv, stack_kv),
+                    parent_anchor_unique_storages=len(parent_anchors),
+                    parent_anchor_unique_bytes=_inventory_bytes(parent_anchors),
+                    native_resident_unique_storages=len(resident),
+                    native_resident_unique_bytes=_inventory_bytes(resident),
+                    native_resident_by_layer=dict(sorted(resident_by_layer.items())),
+                    graph_kv_resident_overlap_bytes=_inventory_overlap_bytes(graph_kv, resident),
+                    kvstack_resident_overlap_bytes=_inventory_overlap_bytes(stack_kv, resident),
+                    known_live_union_bytes=known_live_bytes,
+                    unattributed_growth_bytes=growth - known_live_bytes,
+                    native_host_queue=host_queue,
+                    live_pinned_payload_bytes=probe.live_pinned_payload_bytes(),
+                )
+                print("TPR_PHASE_C_OWNERSHIP " + json.dumps(audit), flush=True)
+            return result
 
         def visit_leaf(self, segment_id):
             return self._stage_call(
