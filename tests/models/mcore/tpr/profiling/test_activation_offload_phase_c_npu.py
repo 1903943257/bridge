@@ -319,6 +319,119 @@ def _inventory_overlap_bytes(left, right):
     )
 
 
+def _live_npu_storage_audit(model, *, categories, limit=50):
+    """Best-effort Python-visible live NPU storage inventory for diagnostics."""
+
+    parameter_names = defaultdict(list)
+    for name, parameter in model.named_parameters():
+        storage = parameter.untyped_storage()
+        key = (str(parameter.device), int(storage.data_ptr()))
+        parameter_names[key].append(name)
+
+    storages = {}
+    for obj in gc.get_objects():
+        if not isinstance(obj, torch.Tensor):
+            continue
+        try:
+            if obj.device.type != "npu":
+                continue
+            storage = obj.untyped_storage()
+            key = (str(obj.device), int(storage.data_ptr()))
+            storage_bytes = int(storage.nbytes())
+            shape = tuple(int(dimension) for dimension in obj.shape)
+            grad_fn = None if obj.grad_fn is None else type(obj.grad_fn).__name__
+            row = storages.get(key)
+            if row is None:
+                row = dict(
+                    key=key,
+                    bytes=storage_bytes,
+                    tensor_views=0,
+                    shapes=set(),
+                    dtypes=set(),
+                    grad_fns=set(),
+                    requires_grad=False,
+                    is_leaf=False,
+                )
+                storages[key] = row
+            row["bytes"] = max(row["bytes"], storage_bytes)
+            row["tensor_views"] += 1
+            if len(row["shapes"]) < 6:
+                row["shapes"].add(shape)
+            row["dtypes"].add(str(obj.dtype))
+            if grad_fn is not None:
+                row["grad_fns"].add(grad_fn)
+            row["requires_grad"] = row["requires_grad"] or bool(obj.requires_grad)
+            row["is_leaf"] = row["is_leaf"] or bool(obj.is_leaf)
+        except (RuntimeError, TypeError, AttributeError):
+            # Diagnostic only: skip exotic/freed tensor wrappers.
+            continue
+
+    category_by_key = {}
+    for category, inventory in categories.items():
+        for key in inventory:
+            category_by_key.setdefault(key, []).append(category)
+    for key in parameter_names:
+        category_by_key.setdefault(key, []).append("parameter")
+
+    by_category = defaultdict(lambda: {"storages": 0, "bytes": 0})
+    by_grad_fn = defaultdict(lambda: {"storages": 0, "bytes": 0})
+    by_shape = defaultdict(lambda: {"storages": 0, "bytes": 0})
+    unknown_rows = []
+    for key, row in storages.items():
+        labels = tuple(sorted(category_by_key.get(key, ("unknown",))))
+        primary = "+".join(labels)
+        by_category[primary]["storages"] += 1
+        by_category[primary]["bytes"] += row["bytes"]
+        if labels != ("unknown",):
+            continue
+        grad_key = ",".join(sorted(row["grad_fns"])) or "None"
+        shape_key = ",".join(str(shape) for shape in sorted(row["shapes"])) or "()"
+        by_grad_fn[grad_key]["storages"] += 1
+        by_grad_fn[grad_key]["bytes"] += row["bytes"]
+        by_shape[shape_key]["storages"] += 1
+        by_shape[shape_key]["bytes"] += row["bytes"]
+        unknown_rows.append(
+            dict(
+                storage_ptr=key[1],
+                storage_bytes=row["bytes"],
+                tensor_views=row["tensor_views"],
+                shapes=[list(shape) for shape in sorted(row["shapes"])],
+                dtypes=sorted(row["dtypes"]),
+                requires_grad=row["requires_grad"],
+                is_leaf=row["is_leaf"],
+                grad_fns=sorted(row["grad_fns"]),
+            )
+        )
+
+    unknown_rows.sort(key=lambda item: item["storage_bytes"], reverse=True)
+    grad_groups = sorted(
+        (
+            dict(grad_fn=name, **value)
+            for name, value in by_grad_fn.items()
+        ),
+        key=lambda item: item["bytes"],
+        reverse=True,
+    )
+    shape_groups = sorted(
+        (
+            dict(shape=name, **value)
+            for name, value in by_shape.items()
+        ),
+        key=lambda item: item["bytes"],
+        reverse=True,
+    )
+    return dict(
+        python_visible_unique_storages=len(storages),
+        python_visible_unique_bytes=sum(row["bytes"] for row in storages.values()),
+        by_category=dict(sorted(by_category.items())),
+        unknown_unique_storages=len(unknown_rows),
+        unknown_unique_bytes=sum(row["storage_bytes"] for row in unknown_rows),
+        unknown_by_grad_fn=grad_groups[:20],
+        unknown_by_shape=shape_groups[:20],
+        largest_unknown_storages=unknown_rows[:limit],
+    )
+
+
 def _native_host_queue_summary(native):
     unique = {}
     by_status = defaultdict(lambda: {"items": 0, "unique_bytes": 0})
@@ -564,6 +677,27 @@ def _run(
                     live_pinned_payload_bytes=probe.live_pinned_payload_bytes(),
                 )
                 print("TPR_PHASE_C_OWNERSHIP " + json.dumps(audit), flush=True)
+
+                live_storage = _live_npu_storage_audit(
+                    model,
+                    categories=dict(
+                        graph_kv=graph_kv,
+                        kvstack=stack_kv,
+                        parent_anchors=parent_anchors,
+                        native_resident=resident,
+                    ),
+                    limit=int(os.getenv("TPR_PHASE_C_LIVE_STORAGE_TOPK", "50")),
+                )
+                print(
+                    "TPR_PHASE_C_LIVE_STORAGE " + json.dumps(
+                        dict(
+                            policy=policy,
+                            segment_id=segment_id,
+                            **live_storage,
+                        )
+                    ),
+                    flush=True,
+                )
             return result
 
         def visit_leaf(self, segment_id):
