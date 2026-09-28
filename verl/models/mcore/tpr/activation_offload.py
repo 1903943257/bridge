@@ -205,6 +205,8 @@ def _installed_mindspeed_swap_attention(
     protect_new_key_values=True,
     defer_payload_cleanup=False,
     capture_outer_saved_tensors=False,
+    capture_decoder_saved_tensors=False,
+    compact_saved_views=False,
     unpack_allowed=None,
 ):
     """Install native wrappers/hooks; validation and serialization are external.
@@ -247,9 +249,36 @@ def _installed_mindspeed_swap_attention(
     except Exception:
         prefetch.get_args = original_get_args
         raise
+    original_pack = native.pack_hook
     original_unpack = native.unpack_hook
     native._tpr_original_unpack = original_unpack
     handles, forwards = [], []
+
+    def pack(tensor):
+        if not compact_saved_views:
+            return original_pack(tensor)
+        try:
+            # Native SwapPrefetch intentionally skips slice/view tensors because
+            # resize_(0) on shared backing storage would invalidate sibling
+            # aliases. Retained Prefix graphs keep those skipped views alive
+            # across all sibling Visits. Give saved-tensor offload an independent
+            # compact copy instead, so native can release only that copy while
+            # preserving ordinary SwapPrefetch scheduling and restore semantics.
+            storage_size = tensor.storage().size()
+            if (
+                tensor.grad_fn is not None
+                and storage_size
+                and storage_size != tensor.numel()
+                and tensor.numel() * tensor.element_size() * 2 >= 1024 * 1024
+            ):
+                tensor = tensor.clone(memory_format=torch.contiguous_format)
+        except (AttributeError, RuntimeError, TypeError):
+            # Keep native filtering authoritative for unusual tensor wrappers.
+            pass
+        return original_pack(tensor)
+
+    if compact_saved_views:
+        native.pack_hook = pack
 
     def unpack(item):
         if unpack_allowed is not None and not unpack_allowed():
@@ -287,19 +316,27 @@ def _installed_mindspeed_swap_attention(
         _protect_exports(native, protected)
         native.sync_d2h(name)
 
+    decoder_capture_enabled = False
     outer_capture_enabled = False
     last_layer_name = layers[-1][0]
     outer_layer_id = max(int(layer_id) for layer_id in layer_ids) + 1
     outer_layer_name = f"tpr.outer.{outer_layer_id}"
 
+    def before_layer(name):
+        def hook(module, inputs):
+            nonlocal decoder_capture_enabled
+            decoder_capture_enabled = True
+            native.layer_name = name
+        return hook
+
     def after_layer(name):
         def hook(module, inputs, output):
-            nonlocal outer_capture_enabled
+            nonlocal decoder_capture_enabled, outer_capture_enabled
             sync_d2h(name)
+            decoder_capture_enabled = False
             if capture_outer_saved_tensors and name == last_layer_name:
-                # Preserve native swap_modules selection through the decoder.
-                # The outer hook only extends capture to final norm/LM-head/CE
-                # operations after the last Transformer layer has completed.
+                # Continue the same native queue through final norm/LM-head/CE,
+                # but use a synthetic layer id after the decoder.
                 outer_capture_enabled = True
         return hook
 
@@ -309,6 +346,11 @@ def _installed_mindspeed_swap_attention(
         return hook
 
     def outer_pack(tensor):
+        if capture_decoder_saved_tensors and decoder_capture_enabled:
+            # Child swap_modules install nested saved-tensor hooks, so this
+            # catches only layer-level work outside those children (norms,
+            # residual paths, etc.) without double-packing child activations.
+            return native.pack_hook(tensor)
         if not outer_capture_enabled:
             return tensor
         # Native SwapPrefetch groups work by monotonically increasing layer id.
@@ -331,6 +373,8 @@ def _installed_mindspeed_swap_attention(
             forwards.append((module, had_instance_forward, instance_forward))
             module.forward = native.hook_swap_manager_forward(original, name)
         for name, layer in layers:
+            if capture_decoder_saved_tensors:
+                handles.append(layer.register_forward_pre_hook(before_layer(name)))
             handles.append(layer.register_forward_hook(after_layer(name)))
             # Same hook kind as upstream, avoiding full-backward-hook view changes.
             handles.append(layer.register_backward_hook(before_layer_backward(name)))
@@ -355,6 +399,7 @@ def _installed_mindspeed_swap_attention(
                 module.forward = instance_forward
             else:
                 module.__dict__.pop("forward", None)
+        native.pack_hook = original_pack
         # A retained Prefix session suspends here: module/global hooks are gone,
         # but saved autograd handles still own the native queues and pinned CPU
         # payload. Ordinary Visit/Pop scopes release that ownership immediately.
@@ -442,6 +487,8 @@ class RetainedSwapSession:
                     protect_new_key_values=self.protect_new_key_values,
                     defer_payload_cleanup=True,
                     capture_outer_saved_tensors=True,
+                    capture_decoder_saved_tensors=True,
+                    compact_saved_views=True,
                     unpack_allowed=lambda: self._state == "backward",
                 ) as native:
                     self.native = native

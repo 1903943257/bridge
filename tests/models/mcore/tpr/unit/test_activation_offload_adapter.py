@@ -14,17 +14,43 @@ SOURCE = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/activation
 class Tensor:
     device = "npu:0"
 
-    def __init__(self, pointer):
+    def __init__(self, pointer, *, numel=1, storage_size=None, grad_fn=None):
         self.pointer = pointer
+        self._numel = numel
+        self._storage_size = numel if storage_size is None else storage_size
+        self.grad_fn = grad_fn
 
     def untyped_storage(self):
         return NS(data_ptr=lambda: self.pointer)
+
+    def storage(self):
+        return NS(size=lambda: self._storage_size)
+
+    def numel(self):
+        return self._numel
+
+    def element_size(self):
+        return 2
+
+    def clone(self, memory_format=None):
+        return Tensor(
+            self.pointer + 100000,
+            numel=self._numel,
+            storage_size=self._numel,
+            grad_fn=object(),
+        )
 
 
 class Module:
     def __init__(self):
         self.forward = Mock()
         self.handles = []
+
+    def register_forward_pre_hook(self, hook):
+        self.forward_pre_hook = hook
+        handle = NS(remove=Mock())
+        self.handles.append(handle)
+        return handle
 
     def register_forward_hook(self, hook):
         self.forward_hook = hook
@@ -58,6 +84,7 @@ class AdapterTest(unittest.TestCase):
         context.get_tpr_attention_context = lambda: None
         torch = ModuleType("torch")
         torch.Tensor = Tensor
+        torch.contiguous_format = object()
         self.stream = NS(wait_stream=Mock())
         torch.npu = NS(current_stream=lambda: self.stream)
         self.saved_hooks = Mock(side_effect=lambda pack, unpack: Context())
@@ -261,18 +288,32 @@ class AdapterTest(unittest.TestCase):
         self.assertTrue(session.closed)
         self.assertEqual(self.native.prefetch_list, [])
 
-    def test_retained_capture_flushes_loss_scope_as_post_decoder_layer(self):
+    def test_retained_capture_flushes_decoder_and_loss_scope(self):
         candidate = NS(tensor=Tensor(8), storage_data_ptr=8)
+        original_pack = self.native.pack_hook
         session = self.adapter.create_retained_swap_session(self.model)
         with session.capture():
             outer_pack = self.saved_hooks.call_args.args[0]
-            decoder_tensor = Tensor(6)
+            before_decoder = Tensor(6)
+            self.assertIs(outer_pack(before_decoder), before_decoder)
+            original_pack.assert_not_called()
+
+            self.layer.forward_pre_hook(self.layer, ())
+            decoder_tensor = Tensor(7)
             self.assertIs(outer_pack(decoder_tensor), decoder_tensor)
-            self.native.pack_hook.assert_not_called()
+            original_pack.assert_called_once_with(decoder_tensor)
+
+            view = Tensor(10, numel=4, storage_size=8, grad_fn=object())
+            packed_view = self.native.pack_hook(view)
+            compact = original_pack.call_args.args[0]
+            self.assertIsNot(compact, view)
+            self.assertEqual(compact.storage().size(), compact.numel())
+            self.assertIs(packed_view, compact)
+
             self.layer.forward_hook(self.layer, (), None)
-            loss_tensor = Tensor(7)
+            loss_tensor = Tensor(9)
             self.assertIs(outer_pack(loss_tensor), loss_tensor)
-            self.native.pack_hook.assert_called_once_with(loss_tensor)
+            self.assertEqual(original_pack.call_args.args[0], loss_tensor)
             self.assertEqual(self.native.layer_name, "tpr.outer.1")
             # Represents a tensor saved by CE after the final layer hook.
             self.native.swap_tensors = [candidate]
@@ -280,6 +321,7 @@ class AdapterTest(unittest.TestCase):
             [call.args[0] for call in self.native.sync_d2h.call_args_list],
             ["decoder.layers.0", "tpr.outer.1"],
         )
+        self.assertIs(self.native.pack_hook, original_pack)
         self.assertEqual(self.native.swap_tensors, [candidate])
         session.abort()
 
