@@ -303,7 +303,13 @@ class AdapterTest(unittest.TestCase):
             self.assertIs(outer_pack(decoder_tensor), decoder_tensor)
             original_pack.assert_called_once_with(decoder_tensor)
 
-            view = Tensor(10, numel=4, storage_size=8, grad_fn=object())
+            # Retained compacting preserves native's 1 MiB minimum-swap threshold.
+            view = Tensor(
+                10,
+                numel=1024 * 1024,
+                storage_size=2 * 1024 * 1024,
+                grad_fn=object(),
+            )
             packed_view = self.native.pack_hook(view)
             compact = original_pack.call_args.args[0]
             self.assertIsNot(compact, view)
