@@ -250,9 +250,19 @@ def _installed_mindspeed_swap_attention(
         prefetch.get_args = original_get_args
         raise
     original_pack = native.pack_hook
+    original_no_swap_tensor = native.no_swap_tensor
     original_unpack = native.unpack_hook
     native._tpr_original_unpack = original_unpack
     handles, forwards = [], []
+    force_swap_storages = set()
+
+    def no_swap_tensor(tensor):
+        if _storage_key(tensor) in force_swap_storages:
+            return False
+        return original_no_swap_tensor(tensor)
+
+    if compact_saved_views:
+        native.no_swap_tensor = no_swap_tensor
 
     def pack(tensor):
         if not compact_saved_views:
@@ -272,6 +282,12 @@ def _installed_mindspeed_swap_attention(
                 and tensor.numel() * tensor.element_size() * 2 >= 1024 * 1024
             ):
                 tensor = tensor.clone(memory_format=torch.contiguous_format)
+                storage_key = _storage_key(tensor)
+                force_swap_storages.add(storage_key)
+                try:
+                    return original_pack(tensor)
+                finally:
+                    force_swap_storages.discard(storage_key)
         except (AttributeError, RuntimeError, TypeError):
             # Keep native filtering authoritative for unusual tensor wrappers.
             pass
@@ -400,6 +416,7 @@ def _installed_mindspeed_swap_attention(
             else:
                 module.__dict__.pop("forward", None)
         native.pack_hook = original_pack
+        native.no_swap_tensor = original_no_swap_tensor
         # A retained Prefix session suspends here: module/global hooks are gone,
         # but saved autograd handles still own the native queues and pinned CPU
         # payload. Ordinary Visit/Pop scopes release that ownership immediately.
