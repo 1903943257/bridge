@@ -436,7 +436,14 @@ def _run(
                     ).cpu()
             return super()._compute_loss(segment, logits)
 
-    executor = ObservedExecutor(model, plan, prefix_backward_policy=policy)
+    loss_chunk_size_env = os.getenv("TPR_PHASE_C_LOSS_CHUNK_SIZE")
+    loss_chunk_size = None if loss_chunk_size_env in (None, "") else int(loss_chunk_size_env)
+    executor = ObservedExecutor(
+        model,
+        plan,
+        prefix_backward_policy=policy,
+        loss_chunk_size=loss_chunk_size,
+    )
     losses = []
 
     def snapshot_prefix_gradients(segment_id):
@@ -1121,6 +1128,11 @@ def test_phase_c1_performance(runtime, native_args, monkeypatch):
     peak_pinned = [sample["peak_live_pinned_payload_bytes"] for sample in samples]
     final = dict(
         policy=policy,
+        loss_chunk_size=(
+            None
+            if os.getenv("TPR_PHASE_C_LOSS_CHUNK_SIZE") in (None, "")
+            else int(os.getenv("TPR_PHASE_C_LOSS_CHUNK_SIZE"))
+        ),
         model=target.label,
         checkpoint=str(target.path),
         parameter_count=parameter_count,
