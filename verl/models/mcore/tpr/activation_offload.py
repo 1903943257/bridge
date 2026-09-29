@@ -512,14 +512,20 @@ class RetainedSwapSession:
         self._state = "capturing"
         try:
             with _claim_swap_installation(owner):
+                (
+                    _tier,
+                    compact_saved_views,
+                    capture_decoder_saved_tensors,
+                    capture_outer_saved_tensors,
+                ) = _phase_c_offload_flags()
                 with _installed_mindspeed_swap_attention(
                     self.model,
                     persistent_kv_storages=self.persistent_kv_storages,
                     protect_new_key_values=self.protect_new_key_values,
                     defer_payload_cleanup=True,
-                    capture_outer_saved_tensors=True,
-                    capture_decoder_saved_tensors=True,
-                    compact_saved_views=True,
+                    capture_outer_saved_tensors=capture_outer_saved_tensors,
+                    capture_decoder_saved_tensors=capture_decoder_saved_tensors,
+                    compact_saved_views=compact_saved_views,
                     unpack_allowed=lambda: self._state == "backward",
                 ) as native:
                     self.native = native
@@ -580,6 +586,20 @@ def create_retained_swap_session(
     )
 
 
+def _phase_c_offload_flags():
+    """Return retained/recompute Prefix offload selection for Phase C experiments."""
+    tier = os.getenv("TPR_PHASE_C_OFFLOAD_TIER", "aggressive").strip().lower()
+    if tier == "light":
+        return tier, False, False, False
+    if tier == "balanced":
+        return tier, False, True, True
+    if tier == "aggressive":
+        return tier, True, True, True
+    raise ValueError(
+        "TPR_PHASE_C_OFFLOAD_TIER must be one of: light, balanced, aggressive"
+    )
+
+
 def with_activation_offload(method):
     """Scope native hooks to a full differentiable Visit or recomputing Pop."""
     @wraps(method)
@@ -612,20 +632,35 @@ def with_activation_offload(method):
             # Pop still needs recomputed new KV as explicit dKV roots after
             # forward, therefore those storages must remain device-resident.
             protect_new_key_values = method.__name__ == "pop"
-            aggressive_recompute_pop = (
+            phase_c_recompute_pop = (
                 method.__name__ == "pop"
                 and getattr(executor, "prefix_backward_policy", "recompute") == "recompute"
-                and os.getenv("TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS", "0") == "1"
             )
+            if phase_c_recompute_pop and "TPR_PHASE_C_OFFLOAD_TIER" in os.environ:
+                (
+                    _tier,
+                    compact_saved_views,
+                    capture_decoder_saved_tensors,
+                    capture_outer_saved_tensors,
+                ) = _phase_c_offload_flags()
+            else:
+                legacy_aggressive = (
+                    phase_c_recompute_pop
+                    and os.getenv("TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS", "0") == "1"
+                )
+                compact_saved_views = legacy_aggressive
+                capture_decoder_saved_tensors = legacy_aggressive
+                capture_outer_saved_tensors = legacy_aggressive
+
             with mindspeed_swap_attention(
                 executor.model,
                 cp_size=executor.cp_size,
                 cp_backend=executor.cp_backend,
                 persistent_kv_storages=persistent_kv_storages,
                 protect_new_key_values=protect_new_key_values,
-                compact_saved_views=aggressive_recompute_pop,
-                capture_decoder_saved_tensors=aggressive_recompute_pop,
-                capture_outer_saved_tensors=aggressive_recompute_pop,
+                compact_saved_views=compact_saved_views,
+                capture_decoder_saved_tensors=capture_decoder_saved_tensors,
+                capture_outer_saved_tensors=capture_outer_saved_tensors,
             ):
                 return method(executor, *args, **kwargs)
         except Exception:
