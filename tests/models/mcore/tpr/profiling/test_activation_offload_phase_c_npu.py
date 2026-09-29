@@ -615,7 +615,11 @@ def _run(
             result = self._stage_call(
                 "push", segment_id, lambda: super(ObservedExecutor, self).push(segment_id)
             )
-            if profile_stage_memory and policy == "offload":
+            if (
+                profile_stage_memory
+                and policy == "offload"
+                and os.getenv("TPR_PHASE_C_OWNERSHIP_AUDIT", "0") == "1"
+            ):
                 stage_memory = stage_rows[-1]
                 record = self._prefix_graphs.top()
                 entry = self.kv_stack.get(segment_id)
