@@ -525,6 +525,41 @@ class AdapterTest(unittest.TestCase):
         self.assertTrue(ordinary.first_tensor)
         self.native.prefetch_stream.synchronize.assert_called_once()
 
+    def test_pending_outer_d2h_flushes_before_recompute_unpack(self):
+        tensor = Tensor(42)
+        item = NS(
+            tensor=tensor,
+            storage_data_ptr=42,
+            stat="d2h",
+            layer_name="tpr.outer.1",
+            first_tensor=False,
+            last_tensor=False,
+        )
+        self.native.swap_tensors = [item]
+        order = []
+
+        def finish_d2h(name):
+            order.append(("d2h", name))
+            item.stat = "host"
+
+        def launch_h2d(name):
+            order.append(("h2d", name))
+            item.stat = "h2d"
+
+        self.native.sync_d2h.side_effect = finish_d2h
+        self.native.h2d.side_effect = launch_h2d
+
+        with self.adapter.mindspeed_swap_attention(
+            self.model,
+            capture_outer_saved_tensors=True,
+        ):
+            self.assertIs(self.native.unpack_hook(item), tensor)
+
+        self.assertEqual(
+            order[:2],
+            [("d2h", item.layer_name), ("h2d", item.layer_name)],
+        )
+
     def test_direct_kv_root_reloads_with_native_h2d(self):
         tensor = Tensor(42)
         item = NS(tensor=tensor, stat="host", layer_name="decoder.layers.0.self_attention", h2d_event=object())
