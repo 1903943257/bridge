@@ -435,6 +435,8 @@ def mindspeed_swap_attention(
     persistent_kv_storages=None,
     protect_new_key_values=True,
     compact_saved_views=False,
+    capture_decoder_saved_tensors=False,
+    capture_outer_saved_tensors=False,
 ):
     """Temporarily install native swap for one complete forward/backward scope."""
     if not swap_enabled(model):
@@ -448,6 +450,8 @@ def mindspeed_swap_attention(
             persistent_kv_storages=persistent_kv_storages,
             protect_new_key_values=protect_new_key_values,
             compact_saved_views=compact_saved_views,
+            capture_decoder_saved_tensors=capture_decoder_saved_tensors,
+            capture_outer_saved_tensors=capture_outer_saved_tensors,
         ) as native:
             yield native
 
@@ -600,7 +604,7 @@ def with_activation_offload(method):
             # Pop still needs recomputed new KV as explicit dKV roots after
             # forward, therefore those storages must remain device-resident.
             protect_new_key_values = method.__name__ == "pop"
-            compact_saved_views = (
+            aggressive_recompute_pop = (
                 method.__name__ == "pop"
                 and getattr(executor, "prefix_backward_policy", "recompute") == "recompute"
                 and os.getenv("TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS", "0") == "1"
@@ -611,7 +615,9 @@ def with_activation_offload(method):
                 cp_backend=executor.cp_backend,
                 persistent_kv_storages=persistent_kv_storages,
                 protect_new_key_values=protect_new_key_values,
-                compact_saved_views=compact_saved_views,
+                compact_saved_views=aggressive_recompute_pop,
+                capture_decoder_saved_tensors=aggressive_recompute_pop,
+                capture_outer_saved_tensors=aggressive_recompute_pop,
             ):
                 return method(executor, *args, **kwargs)
         except Exception:
