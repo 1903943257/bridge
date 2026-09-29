@@ -303,6 +303,14 @@ def _installed_mindspeed_swap_attention(
             return original_unpack(item)
         if getattr(item, "tpr_resident", False):
             return item.tensor
+        # Recompute Pop performs forward and backward inside one native
+        # swap scope. Synthetic post-decoder tensors can therefore be unpacked
+        # before the context-manager exit flushes their pending D2H queue.
+        # Finish only that pending native layer here; retained Prefix sessions
+        # have already flushed at the end of Push and never take this branch.
+        if item.stat == "d2h" and any(candidate is item for candidate in native.swap_tensors):
+            sync_d2h(item.layer_name)
+
         # Pop's direct dKV roots can bypass the layer backward hook.
         # Use native same-layer reload as a correctness fallback, no new policy.
         # Native duplicate handles are labelled h2d without recording their
