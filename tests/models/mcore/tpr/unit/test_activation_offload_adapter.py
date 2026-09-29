@@ -408,12 +408,16 @@ class AdapterTest(unittest.TestCase):
             with patch.dict(self.adapter.os.environ, {"TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS": "1"}):
                 self.assertEqual(pop(executor), "recomputed")
             self.assertTrue(calls[-1]["compact_saved_views"])
+            self.assertTrue(calls[-1]["capture_decoder_saved_tensors"])
+            self.assertTrue(calls[-1]["capture_outer_saved_tensors"])
 
             calls.clear()
             with patch.dict(self.adapter.os.environ, {}, clear=False):
                 self.adapter.os.environ.pop("TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS", None)
                 self.assertEqual(pop(executor), "recomputed")
             self.assertFalse(calls[-1]["compact_saved_views"])
+            self.assertFalse(calls[-1]["capture_decoder_saved_tensors"])
+            self.assertFalse(calls[-1]["capture_outer_saved_tensors"])
 
     def test_visit_does_not_enable_recompute_aggressive_saved_views(self):
         executor = NS(
@@ -439,6 +443,8 @@ class AdapterTest(unittest.TestCase):
             with patch.dict(self.adapter.os.environ, {"TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS": "1"}):
                 self.assertEqual(visit_leaf(executor), "visited")
         self.assertFalse(calls[-1]["compact_saved_views"])
+        self.assertFalse(calls[-1]["capture_decoder_saved_tensors"])
+        self.assertFalse(calls[-1]["capture_outer_saved_tensors"])
 
     def test_offload_policy_pop_uses_retained_session_not_short_manager(self):
         executor = NS(
