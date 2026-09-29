@@ -384,7 +384,7 @@ class AdapterTest(unittest.TestCase):
                 pass
         session.close()
 
-    def test_recompute_pop_can_enable_aggressive_saved_view_offload(self):
+    def test_recompute_pop_uses_phase_c_offload_tier(self):
         executor = NS(
             prefix_backward_policy="recompute",
             model=self.model,
@@ -404,20 +404,27 @@ class AdapterTest(unittest.TestCase):
         def pop(executor):
             return "recomputed"
 
+        expected = {
+            "light": (False, False, False),
+            "balanced": (False, True, True),
+            "aggressive": (True, True, True),
+        }
         with patch.object(self.adapter, "mindspeed_swap_attention", side_effect=manager):
-            with patch.dict(self.adapter.os.environ, {"TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS": "1"}):
-                self.assertEqual(pop(executor), "recomputed")
-            self.assertTrue(calls[-1]["compact_saved_views"])
-            self.assertTrue(calls[-1]["capture_decoder_saved_tensors"])
-            self.assertTrue(calls[-1]["capture_outer_saved_tensors"])
-
-            calls.clear()
-            with patch.dict(self.adapter.os.environ, {}, clear=False):
-                self.adapter.os.environ.pop("TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS", None)
-                self.assertEqual(pop(executor), "recomputed")
-            self.assertFalse(calls[-1]["compact_saved_views"])
-            self.assertFalse(calls[-1]["capture_decoder_saved_tensors"])
-            self.assertFalse(calls[-1]["capture_outer_saved_tensors"])
+            for tier, flags in expected.items():
+                calls.clear()
+                with patch.dict(
+                    self.adapter.os.environ,
+                    {"TPR_PHASE_C_OFFLOAD_TIER": tier},
+                ):
+                    self.assertEqual(pop(executor), "recomputed")
+                self.assertEqual(
+                    (
+                        calls[-1]["compact_saved_views"],
+                        calls[-1]["capture_decoder_saved_tensors"],
+                        calls[-1]["capture_outer_saved_tensors"],
+                    ),
+                    flags,
+                )
 
     def test_visit_does_not_enable_recompute_aggressive_saved_views(self):
         executor = NS(
