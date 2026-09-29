@@ -1379,20 +1379,21 @@ def test_phase_c1_performance(runtime, native_args, monkeypatch):
         torch.npu.synchronize()
         latency_ms = (time.perf_counter() - start) * 1000.0
 
-        for row in result.stage_rows:
-            print(
-                "TPR_PHASE_C_PERF_STAGE "
-                + json.dumps(
-                    dict(
-                        iteration=iteration,
-                        prefix=prefix,
-                        suffix=suffix,
-                        siblings=siblings,
-                        **row,
-                    )
-                ),
-                flush=True,
-            )
+        if os.getenv("TPR_PHASE_C_PERF_VERBOSE", "0") == "1":
+            for row in result.stage_rows:
+                print(
+                    "TPR_PHASE_C_PERF_STAGE "
+                    + json.dumps(
+                        dict(
+                            iteration=iteration,
+                            prefix=prefix,
+                            suffix=suffix,
+                            siblings=siblings,
+                            **row,
+                        )
+                    ),
+                    flush=True,
+                )
 
         transfers = _delta(probe.snapshot(), before_transfers)
         peak_allocated = max(row["peak_allocated_bytes"] for row in result.stage_rows)
@@ -1417,9 +1418,10 @@ def test_phase_c1_performance(runtime, native_args, monkeypatch):
             **transfers,
         )
         samples.append(sample)
-        print("TPR_PHASE_C_PERF_SAMPLE " + json.dumps(
-            dict(policy=policy, prefix=prefix, suffix=suffix, siblings=siblings, **sample)
-        ), flush=True)
+        if os.getenv("TPR_PHASE_C_PERF_VERBOSE", "0") == "1":
+            print("TPR_PHASE_C_PERF_SAMPLE " + json.dumps(
+                dict(policy=policy, prefix=prefix, suffix=suffix, siblings=siblings, **sample)
+            ), flush=True)
         assert sample["settled_live_pinned_payload_bytes"] == 0
 
     latencies = [sample["latency_ms"] for sample in samples]
@@ -1429,6 +1431,7 @@ def test_phase_c1_performance(runtime, native_args, monkeypatch):
     peak_pinned = [sample["peak_live_pinned_payload_bytes"] for sample in samples]
     final = dict(
         policy=policy,
+        offload_tier=os.getenv("TPR_PHASE_C_OFFLOAD_TIER", "aggressive"),
         loss_chunk_size=(
             None
             if os.getenv("TPR_PHASE_C_LOSS_CHUNK_SIZE") in (None, "")
