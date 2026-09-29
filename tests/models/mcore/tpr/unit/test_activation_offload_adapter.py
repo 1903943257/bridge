@@ -384,6 +384,62 @@ class AdapterTest(unittest.TestCase):
                 pass
         session.close()
 
+    def test_recompute_pop_can_enable_aggressive_saved_view_offload(self):
+        executor = NS(
+            prefix_backward_policy="recompute",
+            model=self.model,
+            cp_size=1,
+            cp_backend=None,
+            kv_stack=NS(segment_ids=()),
+            _ensure_healthy=Mock(),
+            _mark_failed=Mock(),
+        )
+        calls = []
+
+        def manager(*args, **kwargs):
+            calls.append(kwargs)
+            return Context()
+
+        @self.adapter.with_activation_offload
+        def pop(executor):
+            return "recomputed"
+
+        with patch.object(self.adapter, "mindspeed_swap_attention", side_effect=manager):
+            with patch.dict(self.adapter.os.environ, {"TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS": "1"}):
+                self.assertEqual(pop(executor), "recomputed")
+            self.assertTrue(calls[-1]["compact_saved_views"])
+
+            calls.clear()
+            with patch.dict(self.adapter.os.environ, {}, clear=False):
+                self.adapter.os.environ.pop("TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS", None)
+                self.assertEqual(pop(executor), "recomputed")
+            self.assertFalse(calls[-1]["compact_saved_views"])
+
+    def test_visit_does_not_enable_recompute_aggressive_saved_views(self):
+        executor = NS(
+            prefix_backward_policy="recompute",
+            model=self.model,
+            cp_size=1,
+            cp_backend=None,
+            kv_stack=NS(segment_ids=()),
+            _ensure_healthy=Mock(),
+            _mark_failed=Mock(),
+        )
+        calls = []
+
+        def manager(*args, **kwargs):
+            calls.append(kwargs)
+            return Context()
+
+        @self.adapter.with_activation_offload
+        def visit_leaf(executor):
+            return "visited"
+
+        with patch.object(self.adapter, "mindspeed_swap_attention", side_effect=manager):
+            with patch.dict(self.adapter.os.environ, {"TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS": "1"}):
+                self.assertEqual(visit_leaf(executor), "visited")
+        self.assertFalse(calls[-1]["compact_saved_views"])
+
     def test_offload_policy_pop_uses_retained_session_not_short_manager(self):
         executor = NS(
             prefix_backward_policy="offload",
