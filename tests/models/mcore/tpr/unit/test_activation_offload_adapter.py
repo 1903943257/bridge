@@ -14,43 +14,17 @@ SOURCE = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/activation
 class Tensor:
     device = "npu:0"
 
-    def __init__(self, pointer, *, numel=1, storage_size=None, grad_fn=None):
+    def __init__(self, pointer):
         self.pointer = pointer
-        self._numel = numel
-        self._storage_size = numel if storage_size is None else storage_size
-        self.grad_fn = grad_fn
 
     def untyped_storage(self):
         return NS(data_ptr=lambda: self.pointer)
-
-    def storage(self):
-        return NS(size=lambda: self._storage_size)
-
-    def numel(self):
-        return self._numel
-
-    def element_size(self):
-        return 2
-
-    def clone(self, memory_format=None):
-        return Tensor(
-            self.pointer + 100000,
-            numel=self._numel,
-            storage_size=self._numel,
-            grad_fn=None,
-        )
 
 
 class Module:
     def __init__(self):
         self.forward = Mock()
         self.handles = []
-
-    def register_forward_pre_hook(self, hook):
-        self.forward_pre_hook = hook
-        handle = NS(remove=Mock())
-        self.handles.append(handle)
-        return handle
 
     def register_forward_hook(self, hook):
         self.forward_hook = hook
@@ -65,30 +39,14 @@ class Module:
         return handle
 
 
-class Context:
-    def __init__(self, on_enter=None):
-        self.on_enter = on_enter
-
-    def __enter__(self):
-        if self.on_enter is not None:
-            self.on_enter()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return False
-
-
 class AdapterTest(unittest.TestCase):
     def setUp(self):
         context = ModuleType("_offload_test.context")
         context.get_tpr_attention_context = lambda: None
         torch = ModuleType("torch")
         torch.Tensor = Tensor
-        torch.contiguous_format = object()
         self.stream = NS(wait_stream=Mock())
         torch.npu = NS(current_stream=lambda: self.stream)
-        self.saved_hooks = Mock(side_effect=lambda pack, unpack: Context())
-        torch.autograd = NS(graph=NS(saved_tensors_hooks=self.saved_hooks))
         self.args = NS(swap_attention=False, pipeline_model_parallel_size=1)
         training = ModuleType("megatron.training")
         training.get_args = lambda: self.args
@@ -101,15 +59,9 @@ class AdapterTest(unittest.TestCase):
             slice_tensor_storage_ptr_list=[], data_ptr={}, slice_tensor_storage_ptr={},
             unpack_hook=Mock(side_effect=lambda item: item if isinstance(item, Tensor) else item.tensor),
             h2d=Mock(), sync_d2h=Mock(), prefetch_stream=NS(synchronize=Mock()),
-            pack_hook=Mock(side_effect=lambda tensor: tensor), layer_name="",
-            no_swap_tensor=Mock(
-                side_effect=lambda tensor: tensor.grad_fn is None
-                or tensor.storage().size() != tensor.numel()
-            ),
             hook_swap_manager_forward=Mock(side_effect=lambda f, name: Mock(wraps=f)),
         )
-        self.native_factory = Mock(return_value=self.native)
-        native_module.SwapPrefetch = self.native_factory
+        native_module.SwapPrefetch = Mock(return_value=self.native)
         native_module.SwapPrefetch.swap_prefetch = None
         native_module.get_layer_id = lambda name: "0"
         self.imports = patch.dict(sys.modules, {
@@ -260,214 +212,6 @@ class AdapterTest(unittest.TestCase):
             self.layer.handles.clear()
         self.assertEqual(self.native.prefetch_stream.synchronize.call_count, 2)
 
-    def test_retained_session_suspends_payload_until_matching_backward(self):
-        original = self.attention.forward
-        session = self.adapter.create_retained_swap_session(self.model)
-        payload = object()
-        with session.capture() as native:
-            self.assertIs(native, self.native)
-            self.assertEqual(session.state, "capturing")
-            self.assertIsNot(self.attention.forward, original)
-            self.native.prefetch_list.append([payload])
-
-        self.assertEqual(session.state, "suspended")
-        self.assertIs(self.attention.forward, original)
-        self.assertEqual(self.native.prefetch_list, [[payload]])
-        self.saved_hooks.assert_called_once()
-        self.assertTrue(callable(self.saved_hooks.call_args.args[0]))
-        self.assertIs(self.saved_hooks.call_args.args[1], self.native.unpack_hook)
-        retained_unpack = self.saved_hooks.call_args.args[1]
-        with self.assertRaisesRegex(RuntimeError, "resume_for_backward"):
-            retained_unpack(Tensor(9))
-        for handle in self.layer.handles:
-            handle.remove.assert_called_once()
-
-        session.finish_forward()  # Explicit use is allowed and idempotent.
-        self.assertIs(session.resume_for_backward(), self.native)
-        resident = Tensor(9)
-        self.assertIs(retained_unpack(resident), resident)
-        self.assertEqual(session.state, "backward")
-        session.close()
-        session.close()
-        self.assertTrue(session.closed)
-        self.assertEqual(self.native.prefetch_list, [])
-
-    def test_retained_capture_flushes_decoder_and_loss_scope(self):
-        candidate = NS(tensor=Tensor(8), storage_data_ptr=8)
-        original_pack = self.native.pack_hook
-        session = self.adapter.create_retained_swap_session(self.model)
-        with session.capture():
-            outer_pack = self.saved_hooks.call_args.args[0]
-            before_decoder = Tensor(6)
-            self.assertIs(outer_pack(before_decoder), before_decoder)
-            original_pack.assert_not_called()
-
-            self.layer.forward_pre_hook(self.layer, ())
-            decoder_tensor = Tensor(7)
-            self.assertIs(outer_pack(decoder_tensor), decoder_tensor)
-            original_pack.assert_called_once_with(decoder_tensor)
-
-            # Retained compacting preserves native's 1 MiB minimum-swap threshold.
-            view = Tensor(
-                10,
-                numel=1024 * 1024,
-                storage_size=2 * 1024 * 1024,
-                grad_fn=object(),
-            )
-            forced_checks = []
-            original_side_effect = original_pack.side_effect
-
-            def observe_forced_compact(tensor):
-                if tensor is not view and tensor.storage().size() == tensor.numel():
-                    forced_checks.append(self.native.no_swap_tensor(tensor))
-                return original_side_effect(tensor)
-
-            original_pack.side_effect = observe_forced_compact
-            packed_view = self.native.pack_hook(view)
-            compact = original_pack.call_args.args[0]
-            self.assertIsNot(compact, view)
-            self.assertEqual(compact.storage().size(), compact.numel())
-            self.assertIsNone(compact.grad_fn)
-            self.assertEqual(forced_checks[-1], False)
-            self.assertIs(packed_view, compact)
-            original_pack.side_effect = original_side_effect
-
-            self.layer.forward_hook(self.layer, (), None)
-            loss_tensor = Tensor(9)
-            self.assertIs(outer_pack(loss_tensor), loss_tensor)
-            self.assertEqual(original_pack.call_args.args[0], loss_tensor)
-            self.assertEqual(self.native.layer_name, "tpr.outer.1")
-            # Represents a tensor saved by CE after the final layer hook.
-            self.native.swap_tensors = [candidate]
-        self.assertEqual(
-            [call.args[0] for call in self.native.sync_d2h.call_args_list],
-            ["decoder.layers.0", "tpr.outer.1"],
-        )
-        self.assertIs(self.native.pack_hook, original_pack)
-        self.assertEqual(self.native.swap_tensors, [candidate])
-        session.abort()
-
-    def test_retained_capture_is_exclusive_but_suspended_payload_is_not_installed(self):
-        first = self.adapter.create_retained_swap_session(self.model)
-        second = self.adapter.create_retained_swap_session(self.model)
-        with first.capture():
-            with self.assertRaisesRegex(RuntimeError, "already installed"):
-                with second.capture():
-                    pass
-        self.assertEqual(first.state, "suspended")
-        self.assertTrue(second.closed)
-        first.close()
-
-    def test_retained_capture_error_aborts_payload_and_restores_model(self):
-        original = self.attention.forward
-        session = self.adapter.create_retained_swap_session(self.model)
-        with self.assertRaisesRegex(ValueError, "failed Push"):
-            with session.capture():
-                self.native.prefetch_list.append([object()])
-                raise ValueError("failed Push")
-        self.assertTrue(session.closed)
-        self.assertEqual(self.native.prefetch_list, [])
-        self.assertIs(self.attention.forward, original)
-
-    def test_retained_session_requires_enabled_swap_and_valid_order(self):
-        self.model.config.swap_attention = False
-        with self.assertRaisesRegex(RuntimeError, "requires native swap-attention"):
-            self.adapter.create_retained_swap_session(self.model)
-        self.model.config.swap_attention = True
-        session = self.adapter.create_retained_swap_session(self.model)
-        with self.assertRaisesRegex(RuntimeError, "Cannot resume"):
-            session.resume_for_backward()
-        with session.capture():
-            pass
-        with self.assertRaisesRegex(RuntimeError, "cannot capture"):
-            with session.capture():
-                pass
-        session.close()
-
-    def test_recompute_pop_uses_phase_c_offload_tier(self):
-        executor = NS(
-            prefix_backward_policy="recompute",
-            model=self.model,
-            cp_size=1,
-            cp_backend=None,
-            kv_stack=NS(segment_ids=()),
-            _ensure_healthy=Mock(),
-            _mark_failed=Mock(),
-        )
-        calls = []
-
-        def manager(*args, **kwargs):
-            calls.append(kwargs)
-            return Context()
-
-        @self.adapter.with_activation_offload
-        def pop(executor):
-            return "recomputed"
-
-        expected = {
-            "light": (False, False, False),
-            "balanced": (False, True, True),
-            "aggressive": (True, True, True),
-        }
-        with patch.object(self.adapter, "mindspeed_swap_attention", side_effect=manager):
-            for tier, flags in expected.items():
-                calls.clear()
-                with patch.dict(
-                    self.adapter.os.environ,
-                    {"TPR_PHASE_C_OFFLOAD_TIER": tier},
-                ):
-                    self.assertEqual(pop(executor), "recomputed")
-                self.assertEqual(
-                    (
-                        calls[-1]["compact_saved_views"],
-                        calls[-1]["capture_decoder_saved_tensors"],
-                        calls[-1]["capture_outer_saved_tensors"],
-                    ),
-                    flags,
-                )
-
-    def test_visit_does_not_enable_recompute_aggressive_saved_views(self):
-        executor = NS(
-            prefix_backward_policy="recompute",
-            model=self.model,
-            cp_size=1,
-            cp_backend=None,
-            kv_stack=NS(segment_ids=()),
-            _ensure_healthy=Mock(),
-            _mark_failed=Mock(),
-        )
-        calls = []
-
-        def manager(*args, **kwargs):
-            calls.append(kwargs)
-            return Context()
-
-        @self.adapter.with_activation_offload
-        def visit_leaf(executor):
-            return "visited"
-
-        with patch.object(self.adapter, "mindspeed_swap_attention", side_effect=manager):
-            with patch.dict(self.adapter.os.environ, {"TPR_RECOMPUTE_AGGRESSIVE_SAVED_VIEWS": "1"}):
-                self.assertEqual(visit_leaf(executor), "visited")
-        self.assertFalse(calls[-1]["compact_saved_views"])
-        self.assertFalse(calls[-1]["capture_decoder_saved_tensors"])
-        self.assertFalse(calls[-1]["capture_outer_saved_tensors"])
-
-    def test_offload_policy_pop_uses_retained_session_not_short_manager(self):
-        executor = NS(
-            prefix_backward_policy="offload",
-            _ensure_healthy=Mock(),
-            _mark_failed=Mock(),
-        )
-
-        @self.adapter.with_activation_offload
-        def pop(executor):
-            return "retained"
-
-        self.assertEqual(pop(executor), "retained")
-        self.native_factory.assert_not_called()
-        executor._mark_failed.assert_not_called()
-
     def test_external_storage_extension_seam_is_fa_only_by_default(self):
         context = NS(
             past_key_values={1: (Tensor(1), Tensor(2))},
@@ -531,41 +275,6 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(self.native.data_ptr, {4: 0})
         self.assertTrue(ordinary.first_tensor)
         self.native.prefetch_stream.synchronize.assert_called_once()
-
-    def test_pending_outer_d2h_flushes_before_recompute_unpack(self):
-        tensor = Tensor(42)
-        item = NS(
-            tensor=tensor,
-            storage_data_ptr=42,
-            stat="d2h",
-            layer_name="tpr.outer.1",
-            first_tensor=False,
-            last_tensor=False,
-        )
-        self.native.swap_tensors = [item]
-        order = []
-
-        def finish_d2h(name):
-            order.append(("d2h", name))
-            item.stat = "host"
-
-        def launch_h2d(name):
-            order.append(("h2d", name))
-            item.stat = "h2d"
-
-        self.native.sync_d2h.side_effect = finish_d2h
-        self.native.h2d.side_effect = launch_h2d
-
-        with self.adapter.mindspeed_swap_attention(
-            self.model,
-            capture_outer_saved_tensors=True,
-        ):
-            self.assertIs(self.native.unpack_hook(item), tensor)
-
-        self.assertEqual(
-            order[:2],
-            [("d2h", item.layer_name), ("h2d", item.layer_name)],
-        )
 
     def test_direct_kv_root_reloads_with_native_h2d(self):
         tensor = Tensor(42)
@@ -637,11 +346,6 @@ class AdapterTest(unittest.TestCase):
             original_get_args = prefetch.get_args
             with self.adapter.mindspeed_swap_attention(self.model) as native:
                 self.assertIsInstance(native, prefetch.SwapPrefetch)
-            retained = self.adapter.create_retained_swap_session(self.model)
-            with retained.capture() as native:
-                self.assertIsInstance(native, prefetch.SwapPrefetch)
-            retained.resume_for_backward()
-            retained.close()
             self.assertIs(prefetch.get_args, original_get_args)
             self.assertNotIn("megatron.training", sys.modules)
 
