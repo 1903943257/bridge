@@ -27,12 +27,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from .context import KVPair, TPRAttentionContext, use_tpr_attention_context
-from .activation_offload import (
-    create_retained_swap_session,
-    swap_enabled,
-    validate_activation_offload,
-    with_activation_offload,
-)
+from .activation_offload import validate_activation_offload, with_activation_offload
 from .kv_stack import KVStack
 from .parallel.backend import TPRCPBackend, resolve_tpr_cp_backend
 from .parallel.execution_context import (
@@ -42,7 +37,6 @@ from .parallel.execution_context import (
     resolve_cp_group,
 )
 from .prefix_state import GDNLayerState, GDNPrefixAnchors, GDNPrefixState
-from .prefix_graph import PrefixGraphStore
 from .rope import (
     build_sharded_rotary_pos_emb,
     disable_bound_context_parallel_sharding,
@@ -87,17 +81,8 @@ class _ChunkedLanguageModelOutput:
     local_sequence_length: int
 
 
-@dataclass(frozen=True, slots=True)
-class _RetainedPrefixLoss:
-    """Detached reporting values owned by one retained Prefix graph."""
-
-    loss_sum: Tensor
-    normalized_loss: Tensor
-    loss_term_count: int
-
-
 class SegmentExecutor:
-    """Execute one SegmentPlan with recomputed or retained Prefix graphs.
+    """Execute graph-free Push and gradient-carrying Pop for a SegmentPlan.
 
     The executor deliberately does not choose traversal order, synchronize
     gradients, or step an optimizer. Those responsibilities belong to the
@@ -115,7 +100,6 @@ class SegmentExecutor:
         loss_chunk_size: int | None = None,
         cp_group: Any | None = None,
         cp_backend: TPRCPBackend | str | None = None,
-        prefix_backward_policy: str | None = None,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError(f"model must be torch.nn.Module, got {type(model).__name__}")
@@ -189,25 +173,6 @@ class SegmentExecutor:
                         f"segment {segment.segment_id} {exc}"
                     ) from exc
         validate_activation_offload(model, self.cp_size, self.cp_backend)
-        self.prefix_backward_policy = _resolve_prefix_backward_policy(
-            model,
-            prefix_backward_policy,
-        )
-        if self.prefix_backward_policy == "offload":
-            if self.cp_size != 1 or self.cp_backend is not None:
-                raise NotImplementedError(
-                    "TPR Prefix graph offload Phase C1 supports Full Attention CP=1 only"
-                )
-            if self.gdn_layer_numbers:
-                raise NotImplementedError(
-                    "TPR Prefix graph offload Phase C1 does not support GDN/Hybrid models"
-                )
-            if not swap_enabled(model):
-                raise RuntimeError(
-                    "tpr_prefix_backward_policy='offload' requires native activation offload "
-                    "(swap_attention=True)"
-                )
-        self._prefix_graphs = PrefixGraphStore()
         self._failed = False
 
     @property
@@ -219,12 +184,10 @@ class SegmentExecutor:
         return self.cp_group is not None
 
     def push(self, segment_id: SegmentId) -> SegmentForwardResult:
-        """Push one Prefix using recompute or a retained/offloaded graph."""
+        """Save graph-free FA KV and GDN final states; do not compute owned loss."""
 
         self._ensure_healthy()
         try:
-            if self.prefix_backward_policy == "offload":
-                return self._push_with_retained_graph(segment_id)
             segment = self.plan.get(segment_id)
             context, logits = self._forward(
                 segment,
@@ -248,7 +211,7 @@ class SegmentExecutor:
                 layer_count=layer_count,
             )
         except Exception:
-            self._mark_failed()
+            self._failed = True
             raise
 
     @with_activation_offload
@@ -257,8 +220,6 @@ class SegmentExecutor:
 
         self._ensure_healthy()
         try:
-            if self.prefix_backward_policy == "offload":
-                return self._pop_retained_graph(segment_id)
             entry = self.kv_stack.top()
             if entry.segment.segment_id != segment_id:
                 raise RuntimeError(f"cannot pop segment {segment_id}: stack top is {entry.segment.segment_id}")
@@ -338,7 +299,7 @@ class SegmentExecutor:
                 relayed_layer_count=len(relayed_gradients) + len(relayed_gdn_gradients),
             )
         except Exception:
-            self._mark_failed()
+            self._failed = True
             raise
 
     @with_activation_offload
@@ -413,156 +374,8 @@ class SegmentExecutor:
                 ),
             )
         except Exception:
-            self._mark_failed()
+            self._failed = True
             raise
-
-    def _persistent_kv_storages(self) -> set[tuple[torch.device, int]]:
-        """Return identities only; retained sessions must not own extra KV refs."""
-
-        return {
-            (tensor.device, tensor.untyped_storage().data_ptr())
-            for active_segment_id in self.kv_stack.segment_ids
-            for pair in self.kv_stack.get(active_segment_id).kv.key_values.values()
-            for tensor in pair
-        }
-
-    def _push_with_retained_graph(self, segment_id: SegmentId) -> SegmentForwardResult:
-        """Capture a Prefix graph once and suspend its native swap payload."""
-
-        segment = self.plan.get(segment_id)
-        parent_signature = self.kv_stack.segment_ids
-        parent_anchors = self.kv_stack.build_past_anchors()
-        session = create_retained_swap_session(
-            self.model,
-            cp_size=self.cp_size,
-            cp_backend=self.cp_backend,
-            persistent_kv_storages=self._persistent_kv_storages,
-            protect_new_key_values=True,
-        )
-        stack_entry_pushed = False
-        session_transferred = False
-        try:
-            # The scope intentionally includes loss construction. Saved tensors
-            # created by the LM head/native CE must belong to this same retained
-            # session, not remain resident until Pop.
-            with session.capture():
-                context, logits = self._forward(
-                    segment,
-                    past_key_values=parent_anchors.key_values,
-                    no_grad=False,
-                )
-                self._assert_collected_layers(context)
-                loss_sum, normalized_loss = self._compute_loss(segment, logits)
-                owned_loss_term_count = len(self._owned_loss_terms(segment))
-                backward_loss = None
-                if owned_loss_term_count:
-                    backward_loss = self._prepare_backward_loss(
-                        normalized_loss,
-                        logits=logits,
-                        has_owned_loss=True,
-                    )
-                    if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
-                        raise TypeError("loss_scale_func must return a scalar tensor")
-                graph_key_values = _compact_graph_kv_cache(context.new_key_values)
-                layer_count = len(graph_key_values)
-                detached_loss = _RetainedPrefixLoss(
-                    loss_sum=loss_sum.detach(),
-                    normalized_loss=normalized_loss.detach(),
-                    loss_term_count=owned_loss_term_count,
-                )
-                del context, logits
-
-            session.finish_forward()
-            cached_key_values = _detach_compact_kv_cache(graph_key_values)
-            self.kv_stack.push(
-                segment,
-                cached_key_values,
-                shard=self._segment_shard(segment),
-            )
-            stack_entry_pushed = True
-            self._prefix_graphs.push(
-                segment_id=segment_id,
-                parent_stack_signature=parent_signature,
-                backward_loss_root=backward_loss,
-                graph_key_values=graph_key_values,
-                parent_anchors=parent_anchors,
-                detached_loss=detached_loss,
-                native_session=session,
-            )
-            session_transferred = True
-            return SegmentForwardResult(
-                segment_id=segment_id,
-                prefix_length=segment.prefix_length,
-                suffix_length=segment.length,
-                layer_count=layer_count,
-            )
-        except BaseException:
-            if stack_entry_pushed and self.kv_stack.segment_ids[-1:] == (segment_id,):
-                self.kv_stack.pop(segment_id).kv.release()
-            if not session_transferred:
-                session.close()
-            raise
-
-    def _pop_retained_graph(self, segment_id: SegmentId) -> SegmentBackwardResult:
-        """Backward the original Push graph without executing Prefix forward."""
-
-        entry = self.kv_stack.top()
-        if entry.segment.segment_id != segment_id:
-            raise RuntimeError(f"cannot pop segment {segment_id}: stack top is {entry.segment.segment_id}")
-        if self._prefix_graphs.top().segment_id != segment_id:
-            raise RuntimeError(
-                f"cannot pop segment {segment_id}: Prefix graph store top is "
-                f"{self._prefix_graphs.top().segment_id}"
-            )
-
-        relayed_gradients = dict(entry.gradients)
-        if relayed_gradients and tuple(relayed_gradients) != self.expected_layer_numbers:
-            raise RuntimeError(
-                f"segment {segment_id} relayed KV gradient layers must be "
-                f"{self.expected_layer_numbers}, got {tuple(relayed_gradients)}"
-            )
-        popped_entry = self.kv_stack.pop(segment_id)
-        try:
-            with self._prefix_graphs.consume(
-                segment_id=segment_id,
-                parent_stack_signature=self.kv_stack.segment_ids,
-            ) as record:
-                record.native_session.resume_for_backward()
-                roots: list[Tensor] = []
-                root_gradients: list[Tensor | None] = []
-                if record.backward_loss_root is not None:
-                    roots.append(record.backward_loss_root)
-                    root_gradients.append(None)
-                graph_key_values = record.graph_key_values
-                if tuple(graph_key_values) != self.expected_layer_numbers:
-                    raise RuntimeError(
-                        f"segment {segment_id} retained KV graph layers must be "
-                        f"{self.expected_layer_numbers}, got {tuple(graph_key_values)}"
-                    )
-                for layer_number in self.expected_layer_numbers:
-                    if layer_number not in relayed_gradients:
-                        continue
-                    new_key, new_value = graph_key_values[layer_number]
-                    key_grad, value_grad = relayed_gradients[layer_number]
-                    roots.extend((new_key, new_value))
-                    root_gradients.extend((key_grad, value_grad))
-
-                if roots:
-                    torch.autograd.backward(roots, grad_tensors=root_gradients)
-                    self._accumulate_past_anchor_gradients(record.parent_anchors)
-
-                detached_loss = record.detached_loss
-                if not isinstance(detached_loss, _RetainedPrefixLoss):
-                    raise TypeError("retained Prefix loss metadata is corrupt")
-                return SegmentBackwardResult(
-                    segment_id=segment_id,
-                    loss_sum=detached_loss.loss_sum,
-                    normalized_loss=detached_loss.normalized_loss,
-                    loss_term_count=detached_loss.loss_term_count,
-                    relayed_layer_count=len(relayed_gradients),
-                )
-        finally:
-            popped_entry.kv.release()
 
     def _forward(
         self,
@@ -912,20 +725,6 @@ class SegmentExecutor:
         if self._failed:
             raise RuntimeError("SegmentExecutor is failed and cannot continue")
 
-    def _mark_failed(self) -> None:
-        """Fail closed and release every suspended Prefix offload payload."""
-
-        self._failed = True
-        self._prefix_graphs.close_all()
-
-    def abort(self) -> None:
-        """Abort this executor and release retained graph/native-session state."""
-
-        self._mark_failed()
-
-    def assert_prefix_graphs_empty(self) -> None:
-        self._prefix_graphs.assert_empty()
-
     def _assert_collected_layers(
         self, context: TPRAttentionContext, *, expect_gdn_states: bool = True
     ) -> None:
@@ -952,50 +751,6 @@ def _compact_kv_cache(key_values: Mapping[int, KVPair]) -> dict[int, KVPair]:
         )
         for layer_number, (key, value) in key_values.items()
     }
-
-
-def _compact_graph_kv_cache(key_values: Mapping[int, KVPair]) -> dict[int, KVPair]:
-    """Create exact-storage KV roots while preserving their autograd edges."""
-
-    compact: dict[int, KVPair] = {}
-    for layer_number, (key, value) in key_values.items():
-        if not key.requires_grad or key.grad_fn is None:
-            raise RuntimeError(f"layer {layer_number} retained key is not graph-connected")
-        if not value.requires_grad or value.grad_fn is None:
-            raise RuntimeError(f"layer {layer_number} retained value is not graph-connected")
-        compact[layer_number] = (
-            key.clone(memory_format=torch.contiguous_format),
-            value.clone(memory_format=torch.contiguous_format),
-        )
-    return dict(sorted(compact.items()))
-
-
-def _detach_compact_kv_cache(key_values: Mapping[int, KVPair]) -> dict[int, KVPair]:
-    """Expose graph-free KVStack views sharing the retained roots' storage."""
-
-    return {
-        layer_number: (key.detach(), value.detach())
-        for layer_number, (key, value) in key_values.items()
-    }
-
-
-def _resolve_prefix_backward_policy(model: nn.Module, explicit: str | None) -> str:
-    policy = (
-        getattr(getattr(model, "config", None), "tpr_prefix_backward_policy", "recompute")
-        if explicit is None
-        else explicit
-    )
-    if not isinstance(policy, str):
-        raise TypeError(
-            "tpr_prefix_backward_policy must be 'recompute' or 'offload', "
-            f"got {type(policy).__name__}"
-        )
-    if policy not in ("recompute", "offload"):
-        raise ValueError(
-            "tpr_prefix_backward_policy must be 'recompute' or 'offload', "
-            f"got {policy!r}"
-        )
-    return policy
 
 
 def _model_device(model: nn.Module) -> torch.device:
