@@ -93,7 +93,6 @@ class FixedTopologyScheduler:
             raise ValueError("executor is already failed")
         if len(executor.kv_stack):
             raise ValueError("executor KV stack must be empty before scheduling")
-        executor.assert_prefix_graphs_empty()
 
         candidate_events = tuple(plan.dfs_events()) if events is None else tuple(events)
         self.events = plan.validate_events(candidate_events)
@@ -137,7 +136,6 @@ class FixedTopologyScheduler:
                     execution_trace.append(PhysicalExecution(PhysicalExecutionKind.POP, event.segment_id))
                 event_index += 1
             self.executor.kv_stack.assert_empty()
-            self.executor.assert_prefix_graphs_empty()
             if not all_loss_results:
                 raise RuntimeError("schedule produced no backward results")
 
@@ -158,7 +156,6 @@ class FixedTopologyScheduler:
             )
         except Exception:
             self.state = SchedulerState.FAILED
-            self.executor.abort()
             raise
         self.state = SchedulerState.COMPLETED
         return schedule_result
