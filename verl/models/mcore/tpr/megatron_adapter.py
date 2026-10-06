@@ -110,11 +110,6 @@ def run_tpr_forward_backward(
         loss_scale_func=getattr(config, "grad_scale_func", None),
         cp_group=cp_runtime.group,
         cp_backend=cp_runtime.backend,
-        prefix_backward_policy=getattr(
-            engine.engine_config,
-            "tpr_prefix_backward_policy",
-            "recompute",
-        ),
     )
     scheduler = FixedTopologyScheduler(request.plan, executor, events=request.events)
 
