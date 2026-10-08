@@ -262,6 +262,105 @@ def _probe_first_layer_mlp_shape(model, full_trace, cropped_trace, cutoff, *, ba
             )
 
 
+
+def _replay_fc2_at_fixed_physical_shape(
+    model, full_trace, cropped_trace, cutoff, *, backend
+):
+    """Test a *causal intervention*: same real FC2 inputs, fixed physical M.
+
+    MLP's FC2 maps each token independently; padding extra rows to the
+    full-context physical GEMM size cannot change the true unpadded result.
+    A restored bitwise match under padding points to GEMM tiling/accumulation
+    rather than FC2 weights, gate, attention, or incorrect logical positions.
+
+    No training or production path is changed by this diagnostic.
+    """
+    layer = 1
+    x_full = full_trace[(layer, "fc2_in")]
+    x_cut = cropped_trace[(layer, "fc2_in")]
+    if not torch.equal(x_full[:cutoff], x_cut):
+        raise AssertionError("FC2 replay expects byte-identical real inputs")
+
+    fc2 = model.decoder.layers[0].mlp.linear_fc2
+    parameter = next(fc2.parameters())
+    device, dtype = parameter.device, parameter.dtype
+
+    def apply(x):
+        y = fc2(x.to(device=device, dtype=dtype))
+        if isinstance(y, tuple):
+            y = y[0]
+        if not isinstance(y, torch.Tensor):
+            raise TypeError(f"FC2 returned non-tensor {type(y)!r}")
+        return y.detach().float().cpu()
+
+    # Replaying both shapes rules out stale hook snapshots or hidden module
+    # state as the cause of the observed mismatch.
+    with torch.no_grad():
+        y_full_replayed = apply(x_full)
+        y_cut_replayed = apply(x_cut)
+        pad = torch.zeros_like(x_full[cutoff:])
+        y_padded = apply(torch.cat((x_cut, pad), dim=0))[:cutoff]
+
+    y_full = full_trace[(layer, "fc2_out")]
+    y_cut = cropped_trace[(layer, "fc2_out")]
+    if y_full_replayed.shape != y_full.shape:
+        raise AssertionError("FC2 replay changed physical output shape")
+
+    def summarize(name, a, b):
+        difference = (a - b).abs()
+        max_abs = difference.max().item()
+        different = int(
+            difference.reshape(cutoff, -1).ne(0).any(dim=1).sum()
+        )
+        print(
+            f"FC2 SHAPE REPLAY backend={backend} cutoff={cutoff} "
+            f"comparison={name} max_abs={max_abs:.9g} "
+            f"changed_tokens={different}/{cutoff}"
+        )
+        return max_abs
+
+    summarize("full_replay_vs_original", y_full_replayed[:cutoff], y_full[:cutoff])
+    summarize("short_replay_vs_original", y_cut_replayed, y_cut)
+    original_drift = summarize("short_vs_full", y_cut, y_full[:cutoff])
+    padding_drift = summarize("pad_to_128_vs_full", y_padded, y_full[:cutoff])
+    if padding_drift == 0:
+        print(
+            f"FC2 PADDING RESULT backend={backend} cutoff={cutoff}: "
+            "BITWISE_MATCH; padding the FC2 physical GEMM to 128 eliminated "
+            "the measured shape-dependent FC2 forward difference."
+        )
+    else:
+        print(
+            f"FC2 PADDING RESULT backend={backend} cutoff={cutoff}: "
+            f"RESIDUAL max_abs={padding_drift:.9g} "
+            f"vs_unpadded={original_drift:.9g}; padding alone did not "
+            "fully restore full-context FC2 arithmetic."
+        )
+
+    # Ground the independent high-precision reference in the actual layer
+    # weights and real FC2 input, not a synthetic tensor or new model.
+    from torch.nn import functional as F
+
+    weight_fp32 = fc2.weight.detach().float().cpu()
+    bias = getattr(fc2, "bias", None)
+    bias_fp32 = None if bias is None else bias.detach().float().cpu()
+    for pos in (2, 6, 69):
+        if pos >= cutoff:
+            continue
+        x = x_full[pos].reshape(1, -1)
+        oracle_fp32 = F.linear(x, weight_fp32, bias_fp32).reshape(-1)
+        full = y_full[pos].reshape(-1)
+        short = y_cut[pos].reshape(-1)
+        padded = y_padded[pos].reshape(-1)
+        print(
+            f"FC2 FP32 ORACLE backend={backend} cutoff={cutoff} token={pos} "
+            f"full_vs_fp32_max={float((full-oracle_fp32).abs().max()):.9g} "
+            f"short_vs_fp32_max={float((short-oracle_fp32).abs().max()):.9g} "
+            f"padded_vs_fp32_max={float((padded-oracle_fp32).abs().max()):.9g}"
+        )
+
+
+
 def _fp32_attention_from_same_real_qkv(trace, scales, layer):
     """Independent, non-CANN CPU FP32 attention with causal/GQA semantics."""
     q = trace[(layer, "core_q")]
@@ -407,6 +506,10 @@ def test_real_qwen3_1_7b_first_shape_divergence():
                 _probe_first_layer_mlp_shape(
                     model, full_trace, crop_trace, cutoff, backend=backend
                 )
+                if os.environ.get("TPR_QWEN17_ROOTCAUSE_FC2_REPLAY", "1") == "1":
+                    _replay_fc2_at_fixed_physical_shape(
+                        model, full_trace, crop_trace, cutoff, backend=backend
+                    )
                 _print_fp32_core_oracle(
                     crop_trace, crop_scales, backend, cutoff, layers=(1, 2)
                 )
