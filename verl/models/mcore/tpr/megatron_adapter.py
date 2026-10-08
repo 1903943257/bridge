@@ -300,8 +300,27 @@ def run_tpr_forward_backward_batch(
             segment_loss_term_counts=counts,
         )
         result = FixedTopologyScheduler(tree_plan.segment_plan, executor).run()
-        for _segment_id, metrics in executor.segment_loss_metrics:
+        from verl.utils.metric import AggregationType, Metric
+
+        for segment_id, metrics in executor.segment_loss_metrics:
+            token_weight = counts[segment_id] / forest.logical_loss_tokens
             for name, value in metrics.items():
+                if isinstance(value, Metric) and value.aggregation is AggregationType.MEAN:
+                    # PPO reports e.g. clipfrac and approx-KL as per-segment
+                    # token means. A simple mean across physical segments
+                    # would be biased by their extremely unequal lengths.
+                    # Convert to additive weighted contributions, preserving
+                    # the original logical token-mean reporting semantics.
+                    value = Metric(
+                        aggregation=AggregationType.SUM,
+                        value=value.aggregate() * token_weight,
+                    )
+                elif isinstance(value, Metric) and value.aggregation not in (
+                    AggregationType.SUM, AggregationType.MEAN
+                ):
+                    raise NotImplementedError(
+                        f"TPR PPO metric {name} requires unsupported {value.aggregation}"
+                    )
                 metric_lists.setdefault(name, []).append(value)
         return result
 
