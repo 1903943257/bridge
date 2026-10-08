@@ -679,6 +679,64 @@ def _native_truncation_controls(model, batch, original_logprobs, full_trace, own
 
 
 
+
+def _tpr_single_segment_cutoff_controls(model, batch, original_logprobs, owners):
+    """TPR node starting at 0 ending at real radix cutoff; no KV splitting.
+
+    Compare logprob to *full-length Native*. Together with the native-only
+    cutoff control this cleanly separates context-length effects from
+    rectangular suffix query/KV concatenation.
+    """
+    from verl.models.mcore.tpr.attention import TPRSelfAttention
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.models.mcore.tpr.segment_plan import SegmentLossTerm, SegmentPlan, SegmentSpec
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    row = 0
+    tokens = batch["input_ids"][row].detach().cpu().long()
+    if tokens.numel() > 256:
+        print("TPR SINGLE-CUTOFF CONTROL skipped for full real TQ (OOM guard)")
+        return
+    layers = tuple(sorted(
+        attention.layer_number for attention in model.modules()
+        if isinstance(attention, TPRSelfAttention)
+    ))
+    for absolute, owner in sorted(owners.items()):
+        cutoff = owner.position_end
+        if cutoff >= tokens.numel() or absolute + 1 >= tokens.numel():
+            continue
+        shortened = tokens[:cutoff]
+        segment = SegmentSpec(
+            segment_id=0,
+            parent_id=None,
+            token_ids=shortened,
+            position_start=0,
+            prefix_length=0,
+            loss_terms=(SegmentLossTerm(0, int(shortened[1])),),
+        )
+        plan = SegmentPlan((segment,), root_id=0)
+        executor = SegmentExecutor(
+            model, plan, expected_layer_numbers=layers
+        )
+        with torch.no_grad():
+            _ctx, logits = executor._forward(
+                segment, past_key_values={}, no_grad=True
+            )
+            label = tokens[absolute + 1].to(logits.device).reshape(1)
+            lp = vocab_parallel_log_probs_from_logits(
+                logits[0, absolute: absolute + 1], label
+            ).detach().float().cpu().item()
+        response_offset = absolute + 1 - len(batch["prompts"][row])
+        baseline = float(original_logprobs[row][response_offset])
+        print(
+            "TPR SINGLE-CUTOFF LOGPROB "
+            f"query_abs={absolute} cutoff={cutoff} full={tokens.numel()} "
+            f"full_native_lp={baseline:.8f} single_tpr_lp={lp:.8f} "
+            f"delta={lp - baseline:.8f} abs_diff={abs(lp - baseline):.8f}"
+        )
+
+
+
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -870,6 +928,13 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     )
     if bool(bad.any()):
         _probe_tpr_model_native_forward(tpr, batch, old_probs)
+        if trace_owners is not None and os.getenv("TPR_QWEN17_PPO_NATIVE_CUTOFF", "1") == "1":
+            try:
+                _tpr_single_segment_cutoff_controls(
+                    tpr, batch, old_probs, trace_owners
+                )
+            except Exception as exc:
+                print(f"TPR SINGLE-CUTOFF DIAG unavailable: {type(exc).__name__}: {exc}")
         worst_i = (diag_actual - diag_expected).abs().argmax().item()
         worst_row = diag_keys[worst_i][0]
         try:
