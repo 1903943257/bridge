@@ -737,6 +737,161 @@ def _tpr_single_segment_cutoff_controls(model, batch, original_logprobs, owners)
 
 
 
+
+def _native_cutoff_oracle_per_segment(model, batch, *, max_length=256):
+    """Evaluate actual logical PPO targets with Native at each real Segment end.
+
+    This uses the unchanged Qwen3-1.7B checkpoint and recorded SWE tokens.
+    For each physical Segment owning one or more logical response tokens:
+      1. Run Native on the exact real prefix up to Segment.position_end.
+      2. Score every logical (query, target) owned by that Segment.
+      3. Return a (sample_row, response_offset) -> native cutoff logprob map.
+
+    This is intentionally a numerical diagnostic, NOT a new training objective
+    or a substitute for Native-full PPO. It is disabled for long sequences to
+    prevent duplicating the already observed single-NPU OOM.
+    """
+    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    keys = tu.get_non_tensor_data(batch, key="tpr_trajectory_keys", default=None)
+    if keys is None:
+        raise AssertionError("Native cutoff oracle requires real TQ keys")
+    forest = build_tree_execution_plans(tuple(keys), batch)
+    max_input_len = max(int(row.numel()) for row in _rows(batch, "input_ids"))
+    if max_input_len > max_length:
+        print(
+            f"NATIVE SEGMENT CUTOFF ORACLE skipped: real row length "
+            f"{max_input_len} exceeds OOM guard {max_length}"
+        )
+        return None, None
+    device = next(model.parameters()).device
+    scores = {}
+    details = {}
+    count = 0
+    with torch.no_grad():
+        for tree in forest.trees:
+            refs_by_segment = {}
+            for ref in tree.objective_refs:
+                refs_by_segment.setdefault(ref.segment_id, []).append(ref)
+            for segment_id, refs in refs_by_segment.items():
+                segment = tree.segment_plan.get(segment_id)
+                representative_row = refs[0].sample_row
+                cutoff = segment.position_end
+                prefix = batch["input_ids"][representative_row][:cutoff].detach().cpu()
+                for ref in refs:
+                    row_prefix = batch["input_ids"][ref.sample_row][:cutoff].detach().cpu()
+                    if not torch.equal(prefix, row_prefix):
+                        raise AssertionError(
+                            f"physical segment {segment_id} claims an invalid "
+                            f"shared prefix for row {ref.sample_row}"
+                        )
+                prefix = prefix.to(device=device, dtype=torch.long)
+                logits = model(
+                    input_ids=prefix.unsqueeze(0),
+                    position_ids=torch.arange(cutoff, device=device).unsqueeze(0),
+                    attention_mask=None,
+                )
+                query_positions = torch.tensor(
+                    [segment.position_start + ref.query_offset for ref in refs],
+                    device=device,
+                    dtype=torch.long,
+                )
+                targets = torch.tensor(
+                    [ref.target_token_id for ref in refs],
+                    device=device,
+                    dtype=torch.long,
+                )
+                # The native logits at cutoff-1 may predict DIFFERENT child
+                # tokens on different logical rows. Use each ref's actual
+                # target instead of blindly shifting the representative row.
+                lp = vocab_parallel_log_probs_from_logits(
+                    logits[0].index_select(0, query_positions), targets
+                ).detach().float().cpu().tolist()
+                for ref, value in zip(refs, lp, strict=True):
+                    key = (ref.sample_row, ref.response_offset)
+                    if key in scores:
+                        raise AssertionError(f"duplicate logical PPO token: {key}")
+                    scores[key] = float(value)
+                    details[key] = (
+                        tree.tree.key,
+                        segment_id,
+                        segment.position_start,
+                        cutoff,
+                    )
+                del logits
+                count += 1
+    print(
+        f"NATIVE SEGMENT CUTOFF ORACLE: evaluated {count} physical segments, "
+        f"{len(scores)} logical PPO targets on real Qwen3-1.7B"
+    )
+    return scores, details
+
+
+def _print_cutoff_oracle_comparison(batch, captured, full_native, cutoff_native, details):
+    """Separate full-vs-truncated native drift from Forest-vs-truncated drift."""
+    if cutoff_native is None:
+        return
+    keys = sorted(captured)
+    assert set(cutoff_native) == set(captured), (
+        "Native cutoff oracle did not score every real TQ logical token"
+    )
+    full = torch.tensor(
+        [float(full_native[row][offset]) for row, offset in keys],
+        dtype=torch.float32,
+    )
+    cutoff = torch.tensor([cutoff_native[key] for key in keys], dtype=torch.float32)
+    tpr = torch.tensor([captured[key] for key in keys], dtype=torch.float32)
+    full_delta = (cutoff - full).abs()
+    forest_delta = (tpr - cutoff).abs()
+
+    def report(title, errors, reference):
+        thresholds = 0.2 + 0.02 * reference.abs()
+        bad = errors > thresholds
+        print(
+            f"{title}: n={len(errors)} failures={int(bad.sum())} "
+            f"max_abs={errors.max().item():.8f} "
+            f"mean_abs={errors.mean().item():.8f} "
+            f"rms={errors.square().mean().sqrt().item():.8f} "
+            f"rel_l2={float(torch.linalg.vector_norm(errors) / torch.linalg.vector_norm(reference).clamp_min(1e-12)):.8f}"
+        )
+        return bad
+
+    full_bad = report(
+        "NATIVE FULL vs NATIVE PER-SEGMENT CUTOFF", full_delta, full
+    )
+    forest_bad = report(
+        "TPR FOREST vs NATIVE PER-SEGMENT CUTOFF", forest_delta, cutoff
+    )
+    for tree_id, segment_id, start, end in sorted(set(details.values())):
+        which = [
+            i for i, key in enumerate(keys)
+            if details[key] == (tree_id, segment_id, start, end)
+        ]
+        fd, td = full_delta[which], forest_delta[which]
+        print(
+            f"  CUTOFF SEGMENT {segment_id}[{start}:{end}] "
+            f"logical_refs={len(which)} "
+            f"native_full_to_cutoff_max={fd.max().item():.8f} "
+            f"forest_to_cutoff_max={td.max().item():.8f}"
+        )
+    for i in torch.argsort(forest_delta, descending=True)[:12].tolist():
+        row, offset = keys[i]
+        _, segment_id, start, end = details[keys[i]]
+        print(
+            f"  CUTOFF TOP row={row} response={offset} "
+            f"segment={segment_id}[{start}:{end}] "
+            f"native_full={full[i].item():.8f} "
+            f"native_cutoff={cutoff[i].item():.8f} "
+            f"tpr_forest={tpr[i].item():.8f} "
+            f"forest_minus_cutoff={tpr[i].item() - cutoff[i].item():.8f}"
+        )
+    return {
+        "native_full_vs_cutoff_failures": int(full_bad.sum()),
+        "forest_vs_cutoff_failures": int(forest_bad.sum()),
+    }
+
+
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -864,6 +1019,12 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
                 ref, batch, old_probs, native_trace, trace_owners
             )
 
+    cutoff_oracle, cutoff_details = None, None
+    if os.getenv("TPR_QWEN17_PPO_SEGMENT_ORACLE", "1") == "1":
+        cutoff_oracle, cutoff_details = _native_cutoff_oracle_per_segment(
+            ref, batch
+        )
+
     del ref
     gc.collect()
     torch.npu.empty_cache()
@@ -925,6 +1086,9 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     tpr_lp = torch.tensor([captured[key] for key in sorted(expected_keys)])
     diag_keys, diag_expected, diag_actual, bad, outside_clip = _logprob_diagnostics(
         batch, captured, old_probs
+    )
+    _print_cutoff_oracle_comparison(
+        batch, captured, old_probs, cutoff_oracle, cutoff_details
     )
     if bool(bad.any()):
         _probe_tpr_model_native_forward(tpr, batch, old_probs)
