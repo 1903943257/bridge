@@ -109,6 +109,17 @@ def test_qwen_output_gate_uses_mcore_gate_and_preserves_gradient(monkeypatch):
         return query, key, value, gate
 
     monkeypatch.setattr(attention, "get_query_key_value_tensors", project)
+    # Megatron wraps _apply_output_gate with @jit_fuser. That wrapper may
+    # invoke torch.compile/Inductor even for CPU-only orchestration tests,
+    # which is unrelated to TPR's Attention context or gate gradients.
+    # Exercise the exact eager gate math here; keep the NPU fused gate path
+    # unchanged in production.
+    def eager_output_gate(self, x, output_gate):
+        x_dtype = x.dtype
+        gate_reshaped = output_gate.contiguous().view(*x.shape)
+        return (x * torch.sigmoid(gate_reshaped.float())).to(x_dtype)
+
+    monkeypatch.setattr(_StubTPRSelfAttention, "_apply_output_gate", eager_output_gate)
     monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", lambda tensor, *a, **kw: tensor)
     monkeypatch.setattr(
         tpr_attention, "rectangular_causal_attention",
