@@ -1,9 +1,8 @@
 """Phase-5 real-checkpoint numerical gate: Qwen3-1.7B + real SWE TQ tokens.
 
 NO synthetic model. The original 8 recorded trajectories are loaded from the
-TQ dump. Long records are cropped to a REAL prompt suffix and REAL generated
-response prefix to make a single-NPU correctness gate affordable. This is not
-the full-length performance experiment.
+TQ dump. The default fixture keeps ALL 8 real unpadded trajectories, including
+multi-level branches. Shortened windows are explicit debug-only mode.
 
 When the TQ dump has no actor advantages, deterministic *probe coefficients*
 are used ONLY for a numerical gradient equivalence gate (never reported as RL
@@ -62,74 +61,126 @@ def _rows(batch, field):
     return list(value) if isinstance(value, (list, tuple)) else list(value.unbind())
 
 
-def _load_real_tq_probe(*, prompt_length: int, response_length: int):
+def _as_jagged(rows):
+    """Keep *all* unpadded real tokens from every variable-length TQ row."""
+    return torch.nested.as_nested_tensor(
+        [row.detach().cpu().contiguous() for row in rows], layout=torch.jagged
+    )
+
+
+def _load_real_tq_probe(
+    *, prompt_length: int | None = None, response_length: int | None = None
+):
+    """Full 8-row real TQ by default; optional opt-in cropped-real-data smoke.
+
+    Cropped mode is enabled ONLY when both lengths are explicitly specified.
+    In full mode the original token sequence, prompt boundary, response mask,
+    and compressed trie are preserved exactly.
+    """
     path = Path(os.environ.get("TPR_REAL_TQ_BATCH", str(_DEFAULT_TQ)))
     if not path.is_file():
         pytest.fail(f"real TQ dump is required (no synthetic fallback): {path}")
+    if (prompt_length is None) != (response_length is None):
+        pytest.fail("Set BOTH TPR_QWEN17_PPO_PROMPT and _RESPONSE, or neither")
+    if prompt_length is not None and (prompt_length <= 0 or response_length <= 0):
+        pytest.fail("Explicit cropped-real-data window lengths must be positive")
 
     dump = torch.load(path, map_location="cpu", weights_only=False)
     original = dump["tensordict"]
     original_keys = tuple(dump["keys"])
     full_rows = _rows(original, "input_ids")
     prompt_rows = _rows(original, "prompts")
+    response_rows = _rows(original, "responses")
     response_masks = _rows(original, "response_mask")
     if len(full_rows) != 8 or len(original_keys) != 8:
-        pytest.fail(f"expected the recorded 8 SWE trajectories, found {len(full_rows)}")
+        pytest.fail(f"expected recorded 8 SWE trajectories; found {len(full_rows)}")
 
-    ids, mask, real_advantages = [], [], []
+    token_rows, prompt_out, response_out, masks, advantage_rows = [], [], [], [], []
     source_advantages = _rows(original, "advantages") if "advantages" in original else None
-    for row, (full, prompt, response_mask) in enumerate(
-        zip(full_rows, prompt_rows, response_masks, strict=True)
-    ):
-        p = prompt.numel()
-        if p < prompt_length or full.numel() < p + response_length:
-            pytest.fail(f"TQ row {row} is too short for the requested REAL token window")
-        segment = torch.cat((
-            full[p-prompt_length:p],
-            full[p:p+response_length],
-        )).long().contiguous()
-        ids.append(segment)
-        mask.append(response_mask[:response_length].bool())
-        if source_advantages is not None:
-            real_advantages.append(source_advantages[row][:response_length].float())
-
-    if not any(bool(x.any()) for x in mask):
-        pytest.fail("no supervised real response tokens in cropped TQ fixture")
-
     if source_advantages is None:
-        # Probe-only nonzero coefficients; actual rollout advantages require
-        # capture at actor train_mini_batch, which the TQ dump may predate.
-        advantages = torch.stack([
-            torch.tensor(
-                [(-1.0 if (i + row) % 2 else 1.0) for i in range(response_length)],
-                dtype=torch.float32,
-            ) for row in range(8)
-        ])
-        print("PHASE5 ADVANTAGES: numerical probe coefficients, NOT RL actor-update advantages")
-    else:
-        advantages = torch.stack(real_advantages)
-        if not bool((advantages * torch.stack(mask)).abs().sum()):
-            pytest.fail("actual advantages are all zero; this cannot validate PPO gradients")
+        print("PHASE5: TQ has no actor advantages. Using diagnostic nonzero "
+              "coefficients ONLY for the native-vs-TPR mathematical gradient gate.")
 
-    sequences = torch.stack(ids)
-    masks = torch.stack(mask)
+    for row, (full, prompt, resp, mask) in enumerate(zip(
+        full_rows, prompt_rows, response_rows, response_masks, strict=True
+    )):
+        if not torch.equal(full[:prompt.numel()], prompt):
+            pytest.fail(f"real TQ row {row} has an inconsistent prompt boundary")
+        if not torch.equal(full[prompt.numel():], resp):
+            pytest.fail(f"real TQ row {row} has an inconsistent response suffix")
+        if mask.numel() != resp.numel():
+            pytest.fail(f"real TQ row {row} response/mask lengths disagree")
+
+        if prompt_length is None:
+            p, r = prompt.clone().long(), resp.clone().long()
+            selected_mask = mask.clone().bool()
+        else:
+            if prompt.numel() < prompt_length or resp.numel() < response_length:
+                pytest.fail(f"TQ row {row} too short for cropped REAL token window")
+            p, r = prompt[-prompt_length:].clone().long(), resp[:response_length].clone().long()
+            selected_mask = mask[:response_length].clone().bool()
+
+        token_rows.append(torch.cat((p, r)))
+        prompt_out.append(p)
+        response_out.append(r)
+        masks.append(selected_mask)
+
+        if source_advantages is None:
+            # These are NOT rollout advantages. They ensure nonzero, signed
+            # gradients in a mathematical equivalence test on REAL inputs.
+            arange = torch.arange(len(r), dtype=torch.long)
+            a = torch.where((arange + row) % 2 == 0, 1.0, -1.0).float()
+        else:
+            a = source_advantages[row][:len(r)].float().clone()
+            if a.numel() != len(r):
+                pytest.fail(f"TQ row {row} advantage length does not match response")
+        advantage_rows.append(a)
+
+    count = sum(int(mask.sum()) for mask in masks)
+    if count == 0:
+        pytest.fail("no supervised response tokens in real TQ fixture")
+
+    # A real actor-update dump should supply a loss_mask, whose response
+    # portion must agree with this vanilla token-mean PPO test.
+    if "loss_mask" in original and prompt_length is None:
+        for row, (original_loss_mask, mask, full) in enumerate(zip(
+            _rows(original, "loss_mask"), masks, token_rows, strict=True
+        )):
+            if original_loss_mask.numel() == full.numel():
+                original_loss_mask = original_loss_mask[-mask.numel():]
+            if not torch.equal(original_loss_mask.bool(), mask.bool()):
+                pytest.fail(
+                    f"real TQ row {row}: loss_mask does not match response_mask; "
+                    "cannot safely reuse a PPO token-mean denominator"
+                )
+
     batch = TensorDict({
-        "input_ids": sequences,
-        "prompts": sequences[:, :prompt_length].clone(),
-        "responses": sequences[:, prompt_length:].clone(),
-        "attention_mask": torch.ones_like(sequences, dtype=torch.long),
-        "response_mask": masks,
-        "loss_mask": masks.clone(),
-        "advantages": advantages,
-        "old_log_probs": torch.zeros((8, response_length)),
+        "input_ids": _as_jagged(token_rows),
+        "prompts": _as_jagged(prompt_out),
+        "responses": _as_jagged(response_out),
+        "attention_mask": _as_jagged([
+            torch.ones_like(row) for row in token_rows
+        ]),
+        "response_mask": _as_jagged(masks),
+        "loss_mask": _as_jagged([mask.clone() for mask in masks]),
+        "advantages": _as_jagged(advantage_rows),
+        "old_log_probs": _as_jagged([
+            torch.zeros_like(mask, dtype=torch.float32) for mask in masks
+        ]),
         "temperature": torch.ones(8, dtype=torch.float32),
     }, batch_size=[8])
     tu.assign_non_tensor(
         batch,
         tpr_trajectory_keys=original_keys,
-        batch_num_tokens=int(masks.sum().item()),
+        batch_num_tokens=count,
         global_batch_size=8,
         dp_size=1,
+    )
+    mode = "FULL_REAL_TQ" if prompt_length is None else "CROPPED_REAL_TQ_DEBUG"
+    print(
+        f"PHASE5 DATA MODE={mode}; rows=8; logical_tokens="
+        f"{sum(len(row) for row in token_rows)}; supervised_tokens={count}; "
+        f"lengths={[len(row) for row in token_rows]}"
     )
     return batch
 
@@ -203,8 +254,12 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
     from verl.workers.utils.losses import ppo_loss
 
-    prompt_len = int(os.getenv("TPR_QWEN17_PPO_PROMPT", "64"))
-    response_len = int(os.getenv("TPR_QWEN17_PPO_RESPONSE", "64"))
+    # Default is the UNMODIFIED TQ forest. Both env vars are opt-in CROPPED
+    # smoke controls only, and must be absent to validate all real tokens.
+    raw_p = os.getenv("TPR_QWEN17_PPO_PROMPT")
+    raw_r = os.getenv("TPR_QWEN17_PPO_RESPONSE")
+    prompt_len = int(raw_p) if raw_p is not None else None
+    response_len = int(raw_r) if raw_r is not None else None
     batch = _load_real_tq_probe(prompt_length=prompt_len, response_length=response_len)
     device = torch.device("npu")
     _initialize_single_rank_megatron()
@@ -220,10 +275,10 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         for row in range(8):
             _, response_lp = _native_response_logprobs(
                 ref, batch["input_ids"][row].to(device),
-                prompt_length=prompt_len, temperature=1.0
+                prompt_length=len(batch["prompts"][row]), temperature=1.0
             )
             old_probs.append(response_lp.detach().float().cpu())
-    batch["old_log_probs"] = torch.stack(old_probs)
+    batch["old_log_probs"] = _as_jagged(old_probs)
     tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
 
     loss_fn = partial(ppo_loss, config=_VanillaPPOConfig())
@@ -232,12 +287,12 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     for row in range(8):
         token_row = batch["input_ids"][row].to(device)
         lp, _ = _native_response_logprobs(
-            ref, token_row, prompt_length=prompt_len, temperature=1.0
+            ref, token_row, prompt_length=len(batch["prompts"][row]), temperature=1.0
         )
         # Rebuild a one-row native VERL loss view, rather than slicing the
         # full TQ metadata (whose NonTensorData keys may not be row-indexable).
         mini = TensorDict({
-            key: batch[key][row:row+1].to(device)
+            key: batch[key][row].unsqueeze(0).to(device)
             for key in (
                 "prompts", "responses", "attention_mask", "response_mask",
                 "old_log_probs", "advantages",
