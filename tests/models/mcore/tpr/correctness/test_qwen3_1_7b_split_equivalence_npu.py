@@ -161,12 +161,25 @@ def test_real_qwen_first_attention_full_vs_external_kv():
     _stats("ATTN_PREFIX_HIDDEN_GRAD", prefix_hidden.grad, full_in_grad[:p])
     assert prefix_hidden.grad is not None and suffix_hidden.grad is not None
     assert all(k.grad is not None and v.grad is not None for k, v in past.values())
+    assert all(
+        torch.isfinite(k.grad).all() and torch.isfinite(v.grad).all()
+        for k, v in past.values()
+    ), "non-finite gradients in cached prefix K/V"
+    assert all(
+        k.grad.float().norm() > 0 and v.grad.float().norm() > 0
+        for k, v in past.values()
+    ), "no gradient relayed to cached prefix K/V"
     assert set(full_params) == {
         n for n, param in attention.named_parameters() if param.requires_grad and param.grad is not None
     }
+    split_params = dict(attention.named_parameters())
     for name, expected in full_params.items():
         if name.startswith(("linear_qkv", "linear_proj", "q_layernorm", "k_layernorm")):
-            _stats("ATTN_PARAM_" + name, dict(attention.named_parameters())[name].grad, expected)
+            actual = split_params[name].grad
+            _stats("ATTN_PARAM_" + name, actual, expected)
+            torch.testing.assert_close(
+                actual.detach().float().cpu(), expected, atol=1e-2, rtol=1e-2
+            )
 
     # Preserve the original foundational Attention gate; do not weaken it
     # simply because this uses pretrained (rather than tiny random) weights.
