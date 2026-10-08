@@ -189,12 +189,19 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     pre_core = {}
     projection = {}
     qkv_linear = {}
+    qkv_output_grads = {}
 
     def capture_qkv_linear(_module, args, output):
         mode = modes["value"]
         if mode in ("full", "prefix", "suffix"):
             tensor = output[0] if isinstance(output, tuple) else output
             qkv_linear[mode] = (args[0].detach().clone(), tensor.detach().clone())
+            if tensor.requires_grad:
+                tensor.register_hook(
+                    lambda grad, name=mode: qkv_output_grads.__setitem__(
+                        name, grad.detach().clone()
+                    )
+                )
 
     attention.linear_qkv.register_forward_hook(capture_qkv_linear)
 
@@ -438,6 +445,88 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         flush=True
     )
     suffix_out.backward(upstream)
+
+    # Backward decomposition is the last distinct equivalence question:
+    #   (1) Are gradients delivered TO the QKV GEMM identical?
+    #   (2) If yes, do full vs split dW GEMM reductions/accumulations differ?
+    # The fixed-M Prefix intervention changes the physical GEMM dW path
+    # too, but does not force the two dW contributions to be accumulated
+    # in the same operation as Full.
+    assert set(qkv_output_grads) == {"full", "prefix", "suffix"}, (
+        f"missing QKV output gradient hooks: {set(qkv_output_grads)}"
+    )
+    full_dy = qkv_output_grads["full"]
+    prefix_dy = qkv_output_grads["prefix"]
+    suffix_dy = qkv_output_grads["suffix"]
+    assert full_dy.shape[0] == p+s
+    assert prefix_dy.shape[0] in (p, p+s)
+    assert suffix_dy.shape[0] == s
+    _stats("ATTN_QKV_DY_PREFIX_FULL_VS_SPLIT", prefix_dy[:p], full_dy[:p])
+    _stats("ATTN_QKV_DY_SUFFIX_FULL_VS_SPLIT", suffix_dy, full_dy[p:])
+    if prefix_dy.shape[0] == p+s:
+        zero_tail = torch.count_nonzero(prefix_dy[p:]).item()
+        print(
+            f"QWEN SPLIT ATTN_QKV_PADDED_DY_TAIL nonzero={zero_tail} "
+            f"total={prefix_dy[p:].numel()}",
+            flush=True,
+        )
+        assert zero_tail == 0, "padded Prefix QKV output got nonzero gradient"
+
+    # Report every relevant failed coordinate before deciding whether an
+    # apparent per-element gate failure is materially significant. Use a
+    # handful of precise FP64 scalar dot-products, *not* an expensive
+    # full [out,in] FP64 matmul, as an independent mathematical dW oracle.
+    wname = "linear_qkv.weight"
+    ref_wgrad = full_params[wname]
+    got_wgrad = dict(attention.named_parameters())[wname].grad.detach().float().cpu()
+    wdelta = (got_wgrad - ref_wgrad).abs()
+    tolerance = 1e-2 + 1e-2 * ref_wgrad.abs()
+    mismatch = wdelta > tolerance
+    print(
+        "QWEN SPLIT ATTN_QKV_DW_GATE "
+        f"dtype={dict(attention.named_parameters())[wname].grad.dtype} "
+        f"shape={tuple(ref_wgrad.shape)} "
+        f"fail_count={int(mismatch.sum())}/{mismatch.numel()} "
+        f"max_abs={float(wdelta.max()):.8g} "
+        f"rel_l2={float(torch.linalg.vector_norm(got_wgrad-ref_wgrad) / torch.linalg.vector_norm(ref_wgrad).clamp_min(1e-12)):.8g}",
+        flush=True,
+    )
+    x_full = qkv_linear["full"][0]
+    x_prefix = qkv_linear["prefix"][0]
+    x_suffix = qkv_linear["suffix"][0]
+    assert (
+        full_dy.ndim == prefix_dy.ndim == suffix_dy.ndim == 3
+        and tuple(x_full.shape) == (p+s, 1, ref_wgrad.shape[1])
+        and x_prefix.shape[0] == prefix_dy.shape[0]
+        and tuple(x_suffix.shape) == (s, 1, ref_wgrad.shape[1])
+        and full_dy.shape[-1] == ref_wgrad.shape[0]
+    ), "QKV linear layout changed; sampled dW oracle must be updated"
+    for flat_index in torch.topk(wdelta.flatten(), k=min(5, wdelta.numel())).indices.tolist():
+        oi, ii = divmod(flat_index, ref_wgrad.shape[1])
+        f64_full = (
+            full_dy[:, 0, oi].double().cpu() * x_full[:, 0, ii].double().cpu()
+        ).sum()
+        f64_split = (
+            prefix_dy[:, 0, oi].double().cpu() * x_prefix[:, 0, ii].double().cpu()
+        ).sum() + (
+            suffix_dy[:, 0, oi].double().cpu() * x_suffix[:, 0, ii].double().cpu()
+        ).sum()
+        print(
+            f"QWEN SPLIT ATTN_QKV_DW_FP64 out={oi} in={ii} "
+            f"native_grad={float(ref_wgrad[oi, ii]):.8g} "
+            f"split_grad={float(got_wgrad[oi, ii]):.8g} "
+            f"oracle_full={float(f64_full):.8g} "
+            f"oracle_split={float(f64_split):.8g} "
+            f"oracle_delta={float(f64_split-f64_full):.8g}",
+            flush=True,
+        )
+    pgrad = dict(attention.named_parameters())[wname]
+    print(
+        f"QWEN SPLIT ATTN_QKV_GRAD_BUFFER "
+        f"param_dtype={pgrad.dtype} param_grad_dtype={pgrad.grad.dtype} "
+        f"has_main_grad={getattr(pgrad, 'main_grad', None) is not None}",
+        flush=True,
+    )
 
     _stats("ATTN_OUTPUT", suffix_out, full_output)
     _stats("ATTN_SUFFIX_HIDDEN_GRAD", suffix_hidden.grad, full_in_grad[p:])
