@@ -124,6 +124,41 @@ When the cropped real-TQ numerical check fails, do **not** loosen
 - PPO scalar loss and sampled parameter gradient relative-L2 and cosine
   are reported even if the logprob gate fails.
 
+### Interpretation warning: this 'Native' baseline is a controlled CANN reference
+
+The Phase-5 correctness fixture uses **real Qwen3-1.7B checkpoint weights**
+and a Megatron `GPTModel` with `tpr=False`, but it is **not** a production
+VERL/MindSpeed reference as currently configured. The helper
+`test_tpr_qwen3_compatibility_npu._make_qwen_model` calls
+`_replace_core_attention(spec)`, which replaces the model's native
+`core_attention` with `_ProfileFusedCausalAttention`. The latter wraps the
+TPR `rectangular_causal_attention` helper (including for square causal
+attention). Thus 'Native full/cutoff' in these diagnostics means:
+
+```text
+real Qwen3 checkpoint + Megatron GPTModel + controlled CANN attention
+    full: input_ids[0:128], position_ids[0:128], S=128
+    cutoff: input_ids[0:segment_end], position_ids[0:segment_end]
+```
+
+No TPR tree, prefix cache, or rectangular external-KV merge is used in
+that full/cutoff comparison. Its observed causal shape sensitivity is
+**real for the controlled CANN fixture**, but it is not proof that the
+unmodified Megatron/MindSpeed attention backend has the same discrepancy.
+Similarly, CORE SHAPE ORACLE compares the **same** CANN helper at
+square and rectangular query lengths using post-RoPE Q/K/V captured
+from one forward. Zero difference demonstrates agreement for the measured
+tensor inputs and lengths; it does **not** independently validate the CANN
+kernel's outputs against mathematical attention.
+
+A properly independent follow-up requires:
+1. A reference with unmodified production attention module spec, matched
+   checkpoint/config, and explicit confirmation of the active backend; and
+2. FP32 attention math on captured identical post-RoPE Q/K/V and a
+   correctly aligned causal mask as an independent small-shape kernel oracle.
+Only then can we distinguish backend-specific numerical drift from
+issues elsewhere in TPR.
+
 ### Identical-QKV square versus rectangular Attention experiment
 
 Enable `TPR_QWEN17_PPO_CORE_ORACLE=1` (the short-real-TQ
