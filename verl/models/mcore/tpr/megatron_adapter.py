@@ -332,12 +332,24 @@ def run_tpr_forward_backward_batch(
     result = runner.run(forest)
     if not bool(torch.isfinite(result.normalized_loss).item()):
         raise FloatingPointError("non-finite TPR PPO mini-batch loss")
+    if objective.capture_log_probs:
+        # Explicitly opt-in through tpr_capture_log_probs for numerical gates.
+        # Never materialize all per-token logprobs on the host during training.
+        engine._tpr_captured_log_probs = dict(objective.debug_new_log_probs)
 
+    logical_input_tokens = sum(int(row.numel()) for row in data["input_ids"].unbind())
+    unique_tree_tokens = sum(
+        segment.length for tree in forest.trees
+        for segment in tree.segment_plan.segments.values()
+    )
     loss = float(result.normalized_loss.item())
     metric_lists.update({
         "tpr/forest_trees": [result.tree_count],
         "tpr/physical_segments": [result.segment_count],
         "tpr/logical_loss_tokens": [result.logical_loss_tokens],
+        "tpr/logical_input_tokens": [logical_input_tokens],
+        "tpr/unique_tree_tokens": [unique_tree_tokens],
+        "tpr/topology_token_reuse_ratio": [logical_input_tokens / unique_tree_tokens],
     })
     # VERL postprocess expects list-valued micro-batch metrics and a list of
     # loss contributions. The sum of all physical segment objectives is the
