@@ -233,9 +233,20 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         lp, _ = _native_response_logprobs(
             ref, token_row, prompt_length=prompt_len, temperature=1.0
         )
-        mini = batch[row:row+1].to(device)
-        # Use VERL native loss_function, with the original entire mini-batch
-        # denominator attached even though native model calls are row-wise.
+        # Rebuild a one-row native VERL loss view, rather than slicing the
+        # full TQ metadata (whose NonTensorData keys may not be row-indexable).
+        mini = TensorDict({
+            key: batch[key][row:row+1].to(device)
+            for key in (
+                "prompts", "responses", "attention_mask", "response_mask",
+                "old_log_probs", "advantages",
+            )
+        }, batch_size=[1])
+        tu.assign_non_tensor(
+            mini, batch_num_tokens=int(batch["response_mask"].sum()),
+            global_batch_size=8, dp_size=1,
+        )
+        # Native PPO uses the ORIGINAL global denominator for each row.
         mini_model_output = {"log_probs": lp}
         row_loss, _ = loss_fn(model_output=mini_model_output, data=mini, dp_group=None)
         row_loss.backward()
