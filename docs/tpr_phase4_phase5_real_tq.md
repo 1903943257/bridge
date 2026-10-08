@@ -73,38 +73,56 @@ python -m pytest -s -q \
 If the dump lives elsewhere, set `TPR_REAL_TQ_BATCH` to its absolute path.
 These tests require the real dump and skip if absent; no synthetic substitution.
 
-## Real Qwen3-1.7B Phase-5 numerical test
+## Real Qwen3-1.7B Phase-5 numerical gate
+
+Use the **complete 8 recorded variable-length trajectories by default**.
+No synthetic GPT proxy. Do **not** set `TPR_QWEN17_PPO_PROMPT` or
+`TPR_QWEN17_PPO_RESPONSE` for the whole-TQ correctness test.
 
 ```bash
+cd /workspace/uni-agent/verl
 export TPR_RUN_QWEN17_PPO=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
 export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
 export TPR_REAL_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
-export TPR_QWEN17_PPO_PROMPT=64
-export TPR_QWEN17_PPO_RESPONSE=64
+unset TPR_QWEN17_PPO_PROMPT TPR_QWEN17_PPO_RESPONSE
 
-python -m pytest -s -q \
+python -m pytest -x -vv -s --tb=long \\
   tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_ppo_npu.py
 ```
 
-The test loads real Qwen3-1.7B weights and checks the actual model parameter
-count. It uses authentic token IDs from the TQ trajectories and compares
-native row-wise forward/PPO backward with the patched Engine's TPR forest.
-To keep the first numerical test affordable on one NPU, it retains the final
-64 real prompt tokens and the first 64 real response tokens per row. This
-is a **cropped real-data test**, not an exact full-length trajectory run.
+This may exceed single-NPU memory because a native row can span more
+than 40k tokens and the checkpoint vocabulary is 151,936. Memory failure
+is a real capacity finding, **not** Phase-5 numerical correctness PASS.
 
-`old_log_probs` in the first numerical gate are recomputed with the **actual
-frozen checkpoint**. If the TQ dump lacks `advantages` (it usually predates
-actor update), the test uses deterministic nonzero probe coefficients to
-expose wrong gradients. **Those are not actual RL advantages** and the test
-must not be described as end-to-end RL correctness.
+For a *separate*, explicitly labeled cropped-real-data diagnostic:
 
-For the final production gate, capture `mini_batch_td` at
-`TrainingWorker.train_mini_batch`, including actual `old_log_probs`,
-`advantages`, `response_mask`, `loss_mask`, `temperature`, and stable
-trajectory identities. Then validate the unmodified actor update loss,
-gradients, optimizer step and weight sync. Keep both TQ and actor-update
-captures as distinct fixtures.
+```bash
+export TPR_QWEN17_PPO_PROMPT=64
+export TPR_QWEN17_PPO_RESPONSE=64
+python -m pytest -x -vv -s --tb=long \\
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_ppo_npu.py
+```
+
+Both windows are copied from recorded TQ samples, but cropping changes
+causal context and tree topology and does **not** verify the full TQ.
+
+Qwen3-1.7B normally has 40,960 maximum positions; the recorded TQ
+contains a 41,029-token trajectory. The shared real-Qwen test fixture now
+honors requested test length (RoPE extrapolation with unchanged theta),
+and Phase5 reports actual maximum length.
+
+`old_log_probs` in the diagnostic are recomputed with the frozen real
+checkpoint. If the TQ dump lacks `advantages` (before actor update),
+deterministic signed coefficients are used **solely** for probing the
+mathematical gradient equivalence. They are *not* true rollout advantages.
+To validate production PPO, capture `mini_batch_td` at actor update with
+actual `old_log_probs`, `advantages`, `response_mask`, `loss_mask`,
+temperature and stable trajectory identity.
+
+The Phase5 test also sanitizes an empty-named field from MindSpeed's
+`get_full_args()`, as is already done in the real-Qwen Ring profile.
+If a dataclass error remains, save the **full** `--tb=long` traceback.
 
 ## Not yet validated
 
