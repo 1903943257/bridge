@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from functools import partial
 from typing import Any
 
 import torch
@@ -84,7 +83,8 @@ class SegmentPPOObjectiveAdapter:
         self.log_prob_fn = log_prob_fn or _native_log_probs
         self.entropy_fn = entropy_fn or _native_entropy
         self.calculate_entropy = (
-            bool(getattr(cfg, "entropy_coeff", 0)) if calculate_entropy is None else calculate_entropy
+            bool(_metadata(batch, "calculate_entropy", default=False))
+            if calculate_entropy is None else bool(calculate_entropy)
         )
         self.dp_group = dp_group
 
@@ -145,7 +145,7 @@ class SegmentPPOObjectiveAdapter:
         targets = torch.tensor([key[1] for key in keys], device=logits.device, dtype=torch.long)
         temps = torch.tensor([key[2] for key in keys], device=logits.device, dtype=torch.float32)
         selected_logits = logits[0].index_select(0, positions)
-        scaled_logits = selected_logits.float() / temps[:, None]
+        scaled_logits = selected_logits / temps.to(selected_logits.dtype)[:, None]
         unique_log_probs = self.log_prob_fn(scaled_logits, targets)
         if unique_log_probs.ndim != 1 or unique_log_probs.numel() != len(keys):
             raise ValueError("log_prob_fn must return one scalar per unique query/target/temperature")
