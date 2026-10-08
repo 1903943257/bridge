@@ -41,3 +41,15 @@ index 207f4458..0c3b8bda 100644
 +
          self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
          tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
+@@ -808,4 +808,12 @@ class MegatronEngine(BaseEngine):
+                 )
+             tu.assign_non_tensor(data, routed_num_tokens=routed_num_tokens.item())
+ 
++        # TPR PPO uses the intact local mini-batch, not native micro-batches.
++        # Execute after global DP token metadata, before any microbatch split.
++        if self.engine_config.tpr_enabled and not forward_only:
++            from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
++
++            return run_tpr_forward_backward_batch(self, data, loss_function, forward_only=forward_only)
++
+         # BSHD path only: pad every micro-batch to the mini-batch's global max seq_len so the
