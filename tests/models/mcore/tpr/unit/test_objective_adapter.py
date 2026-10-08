@@ -144,3 +144,27 @@ def test_unsupported_sequence_objectives_fail_before_forward():
     cfg.policy_loss = {"loss_mode": "gspo"}
     with pytest.raises(NotImplementedError, match="vanilla"):
         SegmentPPOObjectiveAdapter(_batch(), partial(ppo_loss, config=cfg))
+
+
+def test_same_query_can_predict_different_branch_targets():
+    logits = torch.randn(1, 2, 5, requires_grad=True)
+    seen = []
+
+    def logprob_fn(selected_logits, labels):
+        seen.append((selected_logits.shape[0], labels.tolist()))
+        return _cpu_log_probs(selected_logits, labels)
+
+    # Two possible child-first tokens use the SAME parent-last query.
+    refs = (
+        SegmentObjectiveRef(0, 0, 1, 0, 0),
+        SegmentObjectiveRef(0, 1, 2, 0, 1),
+        SegmentObjectiveRef(0, 0, 3, 1, 0),
+    )
+    adapter = SegmentPPOObjectiveAdapter(
+        _batch(), partial(ppo_loss, config=_ActorConfig()), log_prob_fn=logprob_fn
+    )
+    loss, _ = adapter.compute_loss(_segment(), logits, refs)
+    assert seen == [(3, [1, 2, 3])]
+    loss.backward()
+    assert logits.grad is not None
+    assert bool(torch.isfinite(logits.grad).all())
