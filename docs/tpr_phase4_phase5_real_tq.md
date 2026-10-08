@@ -107,6 +107,26 @@ python -m pytest -x -vv -s --tb=long \\
 Both windows are copied from recorded TQ samples, but cropping changes
 causal context and tree topology and does **not** verify the full TQ.
 
+When the cropped real-TQ numerical check fails, do **not** loosen
+`rtol=0.02, atol=0.2` automatically. The Phase5 test now prints:
+
+- `NATIVE REPEATABILITY`: same Native weights/tokens, no-grad versus backward-enabled
+  forward; estimates the numerical baseline noise floor.
+- `TPR LOGPROB DIAG`: per-real-row and root/nonroot mismatch counts, followed
+  by the worst 20 logical tokens with absolute query coordinates, segment
+  span, Native logprob, TPR logprob, and exact tolerance.
+- `TPR MODEL NATIVE-FORWARD`: *same TPR checkpoint* in non-tree
+  SelfAttention mode versus Native reference. This isolates checkpoint,
+  model-spec, or ordinary-forward differences.
+- `WHOLE-SEGMENT TPR`: same TPR model and attention kernel with an
+  unsplit single physical segment for the worst mismatched real row; compare
+  its error with the Forest error to diagnose decomposition/shape effects.
+- PPO scalar loss and sampled parameter gradient relative-L2 and cosine
+  are reported even if the logprob gate fails.
+
+The numerical gate remains strict; none of these diagnostics changes
+acceptance thresholds or marks mismatches as passing.
+
 Qwen3-1.7B normally has 40,960 maximum positions; the recorded TQ
 contains a 41,029-token trajectory. The shared real-Qwen test fixture now
 honors requested test length (RoPE extrapolation with unchanged theta),
