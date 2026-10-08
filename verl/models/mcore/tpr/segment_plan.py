@@ -219,7 +219,7 @@ class SegmentPlan:
         if self.topology_only:
             # PPO owns its objective/denominator outside the topology. Do not
             # invent a fake CE normalizer for purely structural segment plans.
-            if inferred_weight != 0 or self.total_loss_weight is not None:
+            if any(segment.loss_terms for segment in normalized.values()) or self.total_loss_weight is not None:
                 raise ValueError("topology_only plans must not carry CE loss terms or total_loss_weight")
             total_loss_weight = None
         else:
