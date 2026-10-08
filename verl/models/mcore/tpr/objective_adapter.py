@@ -87,6 +87,10 @@ class SegmentPPOObjectiveAdapter:
             if calculate_entropy is None else bool(calculate_entropy)
         )
         self.dp_group = dp_group
+        # Optional numerical probe only; disabled for ordinary training to
+        # avoid device synchronization and host-side token materialization.
+        self.capture_log_probs = bool(_metadata(batch, "tpr_capture_log_probs", default=False))
+        self.debug_new_log_probs: dict[tuple[int, int], float] = {}
 
     def bind_tree(self, tree_plan: TreeExecutionPlan):
         """Bind an executable tree to SegmentExecutor's loss hook.
@@ -175,6 +179,12 @@ class SegmentPPOObjectiveAdapter:
             raise ValueError("log_prob_fn must return one scalar per unique query/target/temperature")
         gather = torch.tensor(gather_ids, device=logits.device, dtype=torch.long)
         log_probs = unique_log_probs.index_select(0, gather)
+        if self.capture_log_probs:
+            for ref, value in zip(refs, log_probs.detach().float().cpu().tolist(), strict=True):
+                key = (ref.sample_row, ref.response_offset)
+                if key in self.debug_new_log_probs:
+                    raise ValueError(f"duplicate new_log_prob probe for logical token {key}")
+                self.debug_new_log_probs[key] = value
 
         entropy = None
         if self.calculate_entropy:
