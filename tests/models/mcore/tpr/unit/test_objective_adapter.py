@@ -168,3 +168,39 @@ def test_same_query_can_predict_different_branch_targets():
     loss.backward()
     assert logits.grad is not None
     assert bool(torch.isfinite(logits.grad).all())
+
+
+
+def test_bind_tree_exposes_loss_hook_and_ref_counts():
+    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+
+    topology_batch = {
+        "input_ids": [torch.tensor([0, 1, 2]), torch.tensor([0, 1, 3])],
+        "response_mask": [
+            torch.tensor([1, 1], dtype=torch.bool),
+            torch.tensor([1, 1], dtype=torch.bool),
+        ],
+    }
+    forest = build_tree_execution_plans(["uid_s_0", "uid_s_1"], topology_batch)
+    tree_plan = forest.trees[0]
+    adapter = SegmentPPOObjectiveAdapter(
+        _batch(),
+        partial(ppo_loss, config=_ActorConfig()),
+        log_prob_fn=_cpu_log_probs,
+    )
+    callback, counts = adapter.bind_tree(tree_plan)
+    assert callable(callback)
+    assert sum(counts.values()) == forest.logical_loss_tokens == 4
+    assert counts.keys() == tree_plan.segment_plan.segments.keys()
+
+    losses = []
+    for segment in tree_plan.segment_plan.segments.values():
+        if not counts[segment.segment_id]:
+            continue
+        logits = torch.randn(1, segment.length, 5, requires_grad=True)
+        loss, metrics = callback(segment, logits)
+        assert loss.requires_grad
+        assert "actor/pg_loss" in metrics
+        losses.append(loss)
+    assert losses
+    torch.stack(losses).sum().backward()
