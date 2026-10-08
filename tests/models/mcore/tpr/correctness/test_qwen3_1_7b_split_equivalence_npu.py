@@ -520,6 +520,43 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
             f"oracle_delta={float(f64_split-f64_full):.8g}",
             flush=True,
         )
+    # Largest absolute dW differences are not necessarily the 34
+    # elements failing atol=rtol=1e-2: a 0.5 BF16 difference at |dW|=72
+    # is still within the 0.73 elementwise tolerance. Inspect ACTUAL
+    # failed coordinates and their independent FP64 scalar references.
+    if bool(mismatch.any()):
+        ratio = torch.where(
+            mismatch,
+            wdelta / tolerance.clamp_min(1e-12),
+            torch.zeros_like(wdelta),
+        )
+        for flat_index in torch.topk(
+            ratio.flatten(), k=min(5, int(mismatch.sum()))
+        ).indices.tolist():
+            oi, ii = divmod(flat_index, ref_wgrad.shape[1])
+            full_exact = (
+                full_dy[:, 0, oi].double().cpu()
+                * x_full[:, 0, ii].double().cpu()
+            ).sum()
+            split_exact = (
+                prefix_dy[:, 0, oi].double().cpu()
+                * x_prefix[:, 0, ii].double().cpu()
+            ).sum() + (
+                suffix_dy[:, 0, oi].double().cpu()
+                * x_suffix[:, 0, ii].double().cpu()
+            ).sum()
+            print(
+                f"QWEN SPLIT ATTN_QKV_DW_GATE_VIOLATION "
+                f"out={oi} in={ii} "
+                f"native_grad={float(ref_wgrad[oi, ii]):.8g} "
+                f"split_grad={float(got_wgrad[oi, ii]):.8g} "
+                f"abs_diff={float(wdelta[oi, ii]):.8g} "
+                f"allowed={float(tolerance[oi, ii]):.8g} "
+                f"oracle_full={float(full_exact):.8g} "
+                f"oracle_split={float(split_exact):.8g} "
+                f"oracle_delta={float(split_exact-full_exact):.8g}",
+                flush=True,
+            )
     pgrad = dict(attention.named_parameters())[wname]
     print(
         f"QWEN SPLIT ATTN_QKV_GRAD_BUFFER "
