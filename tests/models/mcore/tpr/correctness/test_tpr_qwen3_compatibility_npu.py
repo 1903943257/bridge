@@ -236,8 +236,11 @@ def _make_qwen_model(
     del model_shape
     if not isinstance(max_sequence_length, int) or max_sequence_length <= 0:
         raise ValueError("max_sequence_length must be a positive integer")
-    if core_attention_module not in (None, _ProfileFusedCausalAttention):
-        raise ValueError("real Qwen fixture only supports the controlled fused core attention")
+    if core_attention_module not in (None, _ProfileFusedCausalAttention, "native"):
+        raise ValueError(
+            "real Qwen fixture core_attention_module must be None, "
+            "_ProfileFusedCausalAttention or 'native'"
+        )
     _validate_checkpoint_files(QWEN_MODEL_PATH)
     _initialize_single_rank_megatron()
 
@@ -261,7 +264,12 @@ def _make_qwen_model(
         use_transformer_engine=False,
         pp_rank=0,
     )
-    spec = _replace_core_attention(spec)
+    # Explicit independent reference for shape/root-cause tests: preserve
+    # get_gpt_decoder_block_spec's upstream core attention unmodified.
+    # The existing default stays the controlled CANN adapter for all current
+    # correctness/profile tests; 'native' is opt-in only.
+    if core_attention_module != "native":
+        spec = _replace_core_attention(spec)
     if tpr:
         spec = replace_self_attention_with_tpr(spec)
 
