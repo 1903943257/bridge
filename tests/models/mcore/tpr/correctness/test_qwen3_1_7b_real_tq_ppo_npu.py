@@ -243,6 +243,11 @@ def _compare_grads(reference, actual):
 
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
+    # Sanitize before importing Qwen fixtures: some MindSpeed revisions
+    # construct dataclasses during their module import/bootstrap.
+    from mindspeed.args_utils import get_full_args
+    vars(get_full_args()).pop("", None)
+
     from ..profiling._qwen3_profile_target import resolve_qwen3_profile_target
     from . import test_tpr_qwen3_compatibility_npu as qwen_fixture
     from verl.workers.utils.losses import ppo_loss
@@ -259,9 +264,6 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     # profile: some versions accidentally include an empty key in full args;
     # turning that key into a dataclass field raises
     # TypeError: Field names must be valid identifiers: ''.
-    from mindspeed.args_utils import get_full_args
-    vars(get_full_args()).pop("", None)
-
     # Delay Engine import until after the args are sanitized; importing it
     # triggers the MindSpeed compatibility/transformer patch stack.
     from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
