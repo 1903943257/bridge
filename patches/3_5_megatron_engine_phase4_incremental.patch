@@ -1,0 +1,15 @@
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -808,4 +808,11 @@ class MegatronEngine(BaseEngine):
+                 )
+             tu.assign_non_tensor(data, routed_num_tokens=routed_num_tokens.item())
+ 
++        # Phase-4 TPR PPO: retain the intact logical mini-batch for forest
++        # construction, after global normalization and before native splitting.
++        if self.engine_config.tpr_enabled and not forward_only:
++            from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
++
++            return run_tpr_forward_backward_batch(self, data, loss_function, forward_only=forward_only)
++
+         # BSHD path only: pad every micro-batch to the mini-batch's global max seq_len so the
