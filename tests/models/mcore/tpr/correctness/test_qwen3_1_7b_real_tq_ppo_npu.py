@@ -471,11 +471,21 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
 
     loss_fn = partial(ppo_loss, config=_VanillaPPOConfig())
     native_loss = torch.zeros((), device=device, dtype=torch.float32)
+    native_repeat_abs = []
     ref.zero_grad(set_to_none=True)
     for row in range(8):
         token_row = batch["input_ids"][row].to(device)
         lp, _ = _native_response_logprobs(
             ref, token_row, prompt_length=len(batch["prompts"][row]), temperature=1.0
+        )
+        # Compare repeated Native forward of the very same checkpoint, real
+        # row and attention shape. Native nonrepeatability is a separate noise
+        # floor and must not be attributed to prefix reuse.
+        row_start = len(batch["prompts"][row]) - 1
+        row_new = lp[row_start:-1].detach().float().cpu()
+        row_mask = batch["response_mask"][row].bool().cpu()
+        native_repeat_abs.append(
+            (row_new[row_mask] - old_probs[row][row_mask]).abs()
         )
         # Rebuild a one-row native VERL loss view, rather than slicing the
         # full TQ metadata (whose NonTensorData keys may not be row-indexable).
@@ -495,6 +505,12 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         row_loss, _ = loss_fn(model_output=mini_model_output, data=mini, dp_group=None)
         row_loss.backward()
         native_loss += row_loss.detach().float()
+    repeat_differences = torch.cat(native_repeat_abs)
+    print(
+        "NATIVE REPEATABILITY (same model, same row, no-grad vs grad-enabled): "
+        f"max_abs={repeat_differences.max().item():.6g} "
+        f"mean_abs={repeat_differences.mean().item():.6g}"
+    )
     native_grads = _selected_gradient_snapshot(ref)
 
     del ref
