@@ -200,7 +200,7 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         _initialize_single_rank_megatron,
         _make_qwen_model,
     )
-    from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+    from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
     from verl.workers.utils.losses import ppo_loss
 
     prompt_len = int(os.getenv("TPR_QWEN17_PPO_PROMPT", "64"))
@@ -253,21 +253,25 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     tpr.config.finalize_model_grads_func = lambda *args, **kwargs: None
     tpr.config.calculate_per_token_loss = False
     tpr.zero_grad(set_to_none=True)
-    engine = SimpleNamespace(
-        module=[tpr],
-        engine_config=SimpleNamespace(
-            tpr_enabled=True, tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1, context_parallel_size=1,
-            expert_model_parallel_size=1, virtual_pipeline_model_parallel_size=None,
-            use_fused_kernels=False,
-        ),
-        model_config=SimpleNamespace(mtp=SimpleNamespace(enable=False)),
-        enable_routing_replay=False,
-        get_data_parallel_size=lambda: 1,
-        get_data_parallel_group=lambda: None,
+    # Test the ACTUAL patched Engine entry, not just direct adapter invocation.
+    # This confirms global batch normalization happens before Tree building.
+    engine = MegatronEngineWithLMHead.__new__(MegatronEngineWithLMHead)
+    engine.module = [tpr]
+    engine.engine_config = SimpleNamespace(
+        tpr_enabled=True, tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1, context_parallel_size=1,
+        expert_model_parallel_size=1, virtual_pipeline_model_parallel_size=None,
+        use_fused_kernels=False, dynamic_context_parallel=False,
     )
-    output = run_tpr_forward_backward_batch(
-        engine, batch, partial(ppo_loss, config=_VanillaPPOConfig())
+    engine.model_config = SimpleNamespace(mtp=SimpleNamespace(enable=False))
+    engine.tf_config = tpr.config
+    engine.enable_routing_replay = False
+    engine.get_data_parallel_size = lambda: 1
+    engine.get_data_parallel_group = lambda: None
+
+    output = engine.forward_backward_batch(
+        batch, loss_function=partial(ppo_loss, config=_VanillaPPOConfig()),
+        forward_only=False,
     )
     tpr_grads = _selected_gradient_snapshot(tpr)
     actual_loss = float(sum(output["loss"]))
