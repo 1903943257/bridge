@@ -157,6 +157,7 @@ class SegmentPlan:
     segments: Mapping[SegmentId, SegmentSpec] | Sequence[SegmentSpec]
     root_id: SegmentId
     total_loss_weight: float | None = None
+    topology_only: bool = False
     _children: Mapping[SegmentId, tuple[SegmentId, ...]] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -215,18 +216,27 @@ class SegmentPlan:
             raise ValueError(f"segments are not reachable from root: {sorted(set(normalized) - visited)}")
 
         inferred_weight = sum(term.weight for segment in normalized.values() for term in segment.loss_terms)
-        total_loss_weight = inferred_weight if self.total_loss_weight is None else self.total_loss_weight
-        if (
-            not isinstance(total_loss_weight, (int, float))
-            or isinstance(total_loss_weight, bool)
-            or not math.isfinite(total_loss_weight)
-            or total_loss_weight <= 0
-        ):
-            raise ValueError(f"total_loss_weight must be finite and positive, got {total_loss_weight!r}")
+        if self.topology_only:
+            # PPO owns its objective/denominator outside the topology. Do not
+            # invent a fake CE normalizer for purely structural segment plans.
+            if inferred_weight != 0 or self.total_loss_weight is not None:
+                raise ValueError("topology_only plans must not carry CE loss terms or total_loss_weight")
+            total_loss_weight = None
+        else:
+            total_loss_weight = inferred_weight if self.total_loss_weight is None else self.total_loss_weight
+            if (
+                not isinstance(total_loss_weight, (int, float))
+                or isinstance(total_loss_weight, bool)
+                or not math.isfinite(total_loss_weight)
+                or total_loss_weight <= 0
+            ):
+                raise ValueError(f"total_loss_weight must be finite and positive, got {total_loss_weight!r}")
 
         object.__setattr__(self, "segments", MappingProxyType(normalized))
         object.__setattr__(self, "_children", MappingProxyType({key: tuple(value) for key, value in children.items()}))
-        object.__setattr__(self, "total_loss_weight", float(total_loss_weight))
+        object.__setattr__(
+            self, "total_loss_weight", None if total_loss_weight is None else float(total_loss_weight)
+        )
 
     def get(self, segment_id: SegmentId) -> SegmentSpec:
         try:
