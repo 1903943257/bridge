@@ -44,9 +44,17 @@ cd /workspace/uni-agent/verl
 git apply --check /path/to/bridge/patches/3_5_megatron_engine.patch
 ```
 
-If the old CE patch was already applied, `git apply` of the whole updated patch
-will likely fail: add only the new PPO dispatch hunk after global token
-metadata. Do not reinstall the earlier changes. Verify:
+If the old CE patch was already applied, **do not reapply the whole patch**.
+Use the focused incremental hunk instead, after checking compatibility:
+
+```bash
+git apply --check /path/to/bridge/patches/3_5_megatron_engine_phase4_incremental.patch
+git apply /path/to/bridge/patches/3_5_megatron_engine_phase4_incremental.patch
+```
+
+If either check fails because your native file differs in the area around
+`routed_num_tokens`, patch that location manually; don't discard local
+modifications or force the patch. Verify:
 
 ```bash
 grep -n 'run_tpr_forward_backward_batch' \
