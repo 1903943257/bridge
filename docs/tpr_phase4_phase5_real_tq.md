@@ -124,6 +124,44 @@ When the cropped real-TQ numerical check fails, do **not** loosen
 - PPO scalar loss and sampled parameter gradient relative-L2 and cosine
   are reported even if the logprob gate fails.
 
+### Root/branch BF16 numerical diagnosis
+
+For the Qwen3-1.7B cropped-real-TQ case, current evidence includes:
+
+- Same checkpoint Native / TPR module in **context-free** mode: logprob max diff zero.
+- One **unsplit** TPR segment of length 128: logprob max diff zero.
+- 70-token root and smaller rectangular queries: layer 1 matches at
+  selected queries, layer 2 begins to differ by BF16-size units, later
+  layers amplify the difference.
+- A 0.425 logprob drop can move the PPO ratio to approximately 0.65,
+  changing clipping. Therefore matching PPO gradients cannot be achieved
+  merely by making the loss aggregation or gradient relay correct.
+
+**Causal truncation control (opt-in diagnostic enabled by default with
+layer tracing):**
+
+```bash
+export TPR_QWEN17_PPO_TRACE_LAYERS=1
+export TPR_QWEN17_PPO_NATIVE_CUTOFF=1
+```
+
+The NPU test compares at the exact *real* row-0 token positions:
+
+1. Native full 128-token forward (the canonical reference);
+2. Native forward truncated to the real segment's `position_end`
+   (e.g. 70 for query 69 and 94 for query 76);
+3. TPR single, **unsplit** segment with exactly the same cutoff length;
+4. TPR Forest's segmented Prefix-KV execution.
+
+Look for `NATIVE TRUNCATION LOGPROB` and
+`TPR SINGLE-CUTOFF LOGPROB` alongside the already reported Forest
+per-token error. If Native itself changes substantially with causal
+sequence length, the underlying BF16 kernel shape sensitivity must be
+quantified before attributing the drift to a tree-specific bug. If Native
+is invariant at that cutoff but Forest differs, investigate rectangular
+FA, post-RoPE K/V and ancestor-prefix state. This probe changes **no**
+model arithmetic, inference defaults, or pass/fail tolerance.
+
 When the 64+64 TQ crop gives repeated mismatches in nonroot Segment 1
 (e.g. real absolute query 76) while whole-segment TPR is bit-identical,
 the next gate is **attention-layer-local**. Set
