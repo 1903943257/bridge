@@ -98,8 +98,8 @@ def _load_real_tq_probe(
     token_rows, prompt_out, response_out, masks, advantage_rows = [], [], [], [], []
     source_advantages = _rows(original, "advantages") if "advantages" in original else None
     if source_advantages is None:
-        print("PHASE5: TQ has no actor advantages. Using diagnostic nonzero "
-              "coefficients ONLY for the native-vs-TPR mathematical gradient gate.")
+        print("PHASE5: TQ has no actor advantages. Using diagnostic signed "
+              "(+1.0/-0.5) coefficients ONLY for native-vs-TPR gradient equivalence.")
 
     for row, (full, prompt, resp, mask) in enumerate(zip(
         full_rows, prompt_rows, response_rows, response_masks, strict=True
@@ -129,7 +129,10 @@ def _load_real_tq_probe(
             # These are NOT rollout advantages. They ensure nonzero, signed
             # gradients in a mathematical equivalence test on REAL inputs.
             arange = torch.arange(len(r), dtype=torch.long)
-            a = torch.where((arange + row) % 2 == 0, 1.0, -1.0).float()
+            # Keep both advantage signs without an exactly cancelling
+            # zero native objective. A near-zero scalar hides meaningful
+            # relative-loss drift and makes PPO clipping harder to interpret.
+            a = torch.where((arange + row) % 2 == 0, 1.0, -0.5).float()
         else:
             a = source_advantages[row][:len(r)].float().clone()
             if a.numel() != len(r):
