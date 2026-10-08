@@ -9,7 +9,6 @@ the *parent* segment when t is the first token of a child.
 from __future__ import annotations
 
 from bisect import bisect_right
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -146,9 +145,8 @@ def build_tree_execution_plans(
                     prefix_length=ref.start,
                 )
             )
-        # Compatibility seam: legacy SegmentPlan requires a positive CE
-        # denominator. It is deliberately NOT the PPO/global denominator.
-        plan = SegmentPlan(segments, root_id=tree.root_id, total_loss_weight=1.0)
+        # Physical topology is independent of CE or PPO objective metadata.
+        plan = SegmentPlan(segments, root_id=tree.root_id, topology_only=True)
         refs: list[SegmentObjectiveRef] = []
         terminal_to_path = {}
 
