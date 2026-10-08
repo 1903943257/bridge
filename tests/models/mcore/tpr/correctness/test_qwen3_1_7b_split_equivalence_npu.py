@@ -234,10 +234,13 @@ def test_real_qwen_full_gpt_vs_single_split():
 
     for layer in model.decoder.layers[:2]:
         i = layer.self_attention.layer_number
+        add_capture(i, layer.self_attention, "attn_in")
+        add_capture(i, layer.self_attention.linear_qkv, "qkv_out")
         add_capture(i, layer.self_attention, "attn_out")
         add_capture(i, layer.mlp.linear_fc1, "fc1_out")
         add_capture(i, layer.mlp.linear_fc2, "fc2_in")
         add_capture(i, layer.mlp.linear_fc2, "fc2_out")
+        add_capture(i, layer.mlp, "mlp_out")
 
     try:
         with torch.no_grad():
@@ -270,7 +273,10 @@ def test_real_qwen_full_gpt_vs_single_split():
 
         first = None
         for layer in layers[:2]:
-            for stage in ("attn_out", "fc1_out", "fc2_in", "fc2_out"):
+            for stage in (
+                "attn_in", "qkv_out", "attn_out",
+                "fc1_out", "fc2_in", "fc2_out", "mlp_out",
+            ):
                 a, b = captured[("split", layer, stage)], captured[("full", layer, stage)]
                 rel, mx = _stats(f"GPT_LAYER{layer:02d}_{stage}", a, b)
                 if first is None and mx != 0:
