@@ -99,6 +99,50 @@ def _stats(name, observed, expected):
     return rel, max_abs
 
 
+def _core_fp32_sparse_row_checks(full_core, rect_tail, *, prefix_length: int):
+    """Three independent FP32 causal rows on the *same* real post-RoPE QKV.
+
+    This discriminates an actual masking/indexing error from BF16 kernel
+    reduction differences without materializing O(L^2) attention scores.
+    """
+    import math
+
+    q = full_core["q"].detach().float().cpu()
+    k = full_core["k"].detach().float().cpu()
+    v = full_core["v"].detach().float().cpu()
+    square = full_core["core"].detach().float().cpu()
+    rect = rect_tail.detach().float().cpu()
+    assert q.ndim == k.ndim == v.ndim == 4
+    qheads, kvheads = q.shape[2], k.shape[2]
+    assert q.shape[1] == k.shape[1] == 1 and qheads % kvheads == 0
+    scale = full_core["scale"]
+    if scale is None:
+        scale = 1.0 / math.sqrt(q.shape[3])
+    group_size = qheads // kvheads
+    # K and V are shared inside each GQA group, exactly as in Megatron.
+    rows = tuple(sorted({0, max(0, rect.shape[0] // 2), rect.shape[0] - 1}))
+    for local in rows:
+        absolute = prefix_length + local
+        qr = q[absolute, 0]  # [Hq, D]
+        kr = k[:absolute+1, 0].permute(1, 0, 2)
+        vr = v[:absolute+1, 0].permute(1, 0, 2)
+        kr = kr.repeat_interleave(group_size, dim=0)
+        vr = vr.repeat_interleave(group_size, dim=0)
+        # The valid mask for absolute query position i is keys 0..i.
+        scores = torch.einsum("hd,hkd->hk", qr, kr) * float(scale)
+        probs = torch.softmax(scores, dim=-1)
+        oracle = torch.einsum("hk,hkd->hd", probs, vr).reshape(-1)
+        sq_out = square[absolute, 0]
+        rc_out = rect[local, 0]
+        print(
+            f"QWEN SPLIT ATTN_FP32_ROW local={local} abs={absolute} "
+            f"square_max_abs={float((sq_out-oracle).abs().max()):.8g} "
+            f"rect_max_abs={float((rc_out-oracle).abs().max()):.8g} "
+            f"square_rect_max_abs={float((sq_out-rc_out).abs().max()):.8g}",
+            flush=True,
+        )
+
+
 def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     """Actual Qwen layer-1 weights + real-token LN activations, P+S up to 16K."""
     from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
@@ -267,6 +311,7 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         )
     _stats("ATTN_SAME_QKV_SQUARE_VS_RECT", controlled_rect_tail, full_core["core"][-s:])
     _stats("ATTN_SAME_QKV_RECT_VS_SPLIT_CORE", suffix_core["core"], controlled_rect_tail)
+    _core_fp32_sparse_row_checks(full_core, controlled_rect_tail, prefix_length=p)
     print(
         "QWEN SPLIT CORE DIAG: q_same="
         f"{torch.equal(suffix_core['q'],full_core['q'][-s:])} "
