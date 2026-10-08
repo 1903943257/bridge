@@ -1,0 +1,286 @@
+"""Isolate full-vs-cutoff shape drift on real SWE TQ and Qwen3-1.7B.
+
+The previously named "Native" Phase-5 reference deliberately replaces core
+attention with our controlled CANN wrapper. This test compares that controlled
+reference against an explicitly UNMODIFIED Megatron core-attention spec, and
+uses an independent CPU FP32 causal-attention oracle on the Q/K/V captured from
+each forward.
+
+It does not create synthetic models or token sequences, does not change TPR
+production code, and does not lower PPO correctness thresholds.
+
+Run:
+    TPR_RUN_QWEN17_ROOTCAUSE=1 TPR_QWEN_1_7B_PATH=... \\
+      python -m pytest -s -q --tb=short \\
+      tests/models/mcore/tpr/correctness/test_qwen3_1_7b_shape_rootcause_npu.py
+"""
+
+from __future__ import annotations
+
+import gc
+import os
+
+import pytest
+import torch
+
+from verl.utils.device import is_torch_npu_available
+
+if not is_torch_npu_available(check_device=True):
+    pytest.skip("Requires a real Ascend NPU", allow_module_level=True)
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("TPR_RUN_QWEN17_ROOTCAUSE") != "1",
+    reason="Set TPR_RUN_QWEN17_ROOTCAUSE=1 for real checkpoint shape diagnosis",
+)
+
+# Always compare the same physical inputs, not two independently sampled rows.
+_STAGES = (
+    "attn_in",
+    "qkv_out",
+    "core_q",
+    "core_k",
+    "core_v",
+    "core_out",
+    "proj_in",
+    "proj_out",
+    "attn_out",
+    "mlp_in",
+    "mlp_out",
+)
+
+
+def _capture_model_stages(model):
+    """Collect complete per-layer sequence tensors, including ALL prefix K/V."""
+    captures = {}
+    handles = []
+    core_scales = {}
+
+    def hook_for(layer_number, stage, *, which="out", index=0):
+        def callback(module, args, output):
+            value = args[index] if which == "arg" else output
+            if isinstance(value, tuple):
+                value = value[0]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"unexpected tensor at layer={layer_number} stage={stage}: {type(value)}"
+                )
+            captures[(layer_number, stage)] = value.detach().float().cpu().contiguous()
+            if stage == "core_out":
+                core_scales[layer_number] = getattr(module, "softmax_scale", None)
+        return callback
+
+    for layer in model.decoder.layers:
+        layer_number = layer.self_attention.layer_number
+        attn = layer.self_attention
+        handles.extend((
+            attn.register_forward_hook(hook_for(layer_number, "attn_in", which="arg")),
+            attn.linear_qkv.register_forward_hook(hook_for(layer_number, "qkv_out")),
+            attn.core_attention.register_forward_hook(
+                hook_for(layer_number, "core_q", which="arg", index=0)
+            ),
+            attn.core_attention.register_forward_hook(
+                hook_for(layer_number, "core_k", which="arg", index=1)
+            ),
+            attn.core_attention.register_forward_hook(
+                hook_for(layer_number, "core_v", which="arg", index=2)
+            ),
+            attn.core_attention.register_forward_hook(hook_for(layer_number, "core_out")),
+            attn.linear_proj.register_forward_hook(
+                hook_for(layer_number, "proj_in", which="arg")
+            ),
+            attn.linear_proj.register_forward_hook(hook_for(layer_number, "proj_out")),
+            attn.register_forward_hook(hook_for(layer_number, "attn_out")),
+            layer.mlp.register_forward_hook(hook_for(layer_number, "mlp_in", which="arg")),
+            layer.mlp.register_forward_hook(hook_for(layer_number, "mlp_out")),
+        ))
+    return captures, core_scales, handles
+
+
+def _run_recorded_prefix(model, tokens, *, cutoff):
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    ids = tokens[:cutoff].to(next(model.parameters()).device, dtype=torch.long)
+    traces, scales, handles = _capture_model_stages(model)
+    try:
+        with torch.no_grad():
+            logits = model(
+                input_ids=ids.unsqueeze(0),
+                position_ids=torch.arange(cutoff, device=ids.device)[None, :],
+                attention_mask=None,
+            )
+            if tuple(logits.shape[:2]) != (1, cutoff):
+                raise AssertionError(f"unexpected GPT logits: {tuple(logits.shape)}")
+            values = {}
+            for query_abs in (69, 76, 99, 114, 126):
+                if query_abs < cutoff and query_abs + 1 < len(tokens):
+                    label = tokens[query_abs + 1].to(ids.device).reshape(1)
+                    value = vocab_parallel_log_probs_from_logits(
+                        logits[0, query_abs:query_abs + 1], label
+                    )
+                    values[query_abs] = float(value.detach().float().cpu()[0])
+        return traces, scales, values
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _first_tensor_divergence(full_trace, cropped_trace, cutoff, backend):
+    first = None
+    print(f"FIRST-DIVERGENCE SCAN backend={backend} full=128 cutoff={cutoff}")
+    for layer in range(1, 29):
+        for stage in _STAGES:
+            key = (layer, stage)
+            if key not in full_trace or key not in cropped_trace:
+                raise AssertionError(f"missing Qwen trace {key} for {backend}")
+            a = full_trace[key][:cutoff]
+            b = cropped_trace[key]
+            if a.shape != b.shape:
+                raise AssertionError(
+                    f"trace shape mismatch at {key}: {tuple(a.shape)} vs {tuple(b.shape)}"
+                )
+            errors = (a - b).abs()
+            max_abs = errors.max().item()
+            if max_abs == 0:
+                continue
+            differs = errors.reshape(cutoff, -1).ne(0).any(dim=1)
+            first_token = int(torch.nonzero(differs)[0, 0])
+            entry = (layer, stage, first_token, max_abs)
+            if first is None:
+                first = entry
+                print(
+                    f"FIRST DIVERGENCE backend={backend} cutoff={cutoff} "
+                    f"layer={layer:02d} stage={stage} "
+                    f"first_token={first_token} max_abs={max_abs:.8g}"
+                )
+            if layer <= 3:
+                print(
+                    f"  DRIFT layer={layer:02d} stage={stage} "
+                    f"first_token={first_token} max_abs={max_abs:.8g} "
+                    f"changed_tokens={int(differs.sum())}/{cutoff}"
+                )
+    if first is None:
+        print(f"FIRST DIVERGENCE backend={backend} cutoff={cutoff}: NONE (all stages equal)")
+    return first
+
+
+def _fp32_attention_from_same_real_qkv(trace, scales, layer):
+    """Independent, non-CANN CPU FP32 attention with causal/GQA semantics."""
+    q = trace[(layer, "core_q")]
+    k = trace[(layer, "core_k")]
+    v = trace[(layer, "core_v")]
+    # Native Megatron layout [sequence, batch, heads, head_dim].
+    assert q.ndim == k.ndim == v.ndim == 4
+    q_len, batch, n_heads, head_dim = q.shape
+    kv_len, _, n_kv_heads, _ = k.shape
+    assert batch == 1 and n_heads % n_kv_heads == 0
+    q = q.permute(1, 2, 0, 3)
+    k = k.permute(1, 2, 0, 3).repeat_interleave(n_heads // n_kv_heads, dim=1)
+    v = v.permute(1, 2, 0, 3).repeat_interleave(n_heads // n_kv_heads, dim=1)
+    scale = scales.get(layer)
+    if scale is None:
+        scale = head_dim ** -0.5
+    attn_scores = torch.matmul(q, k.transpose(-1, -2)) * float(scale)
+    query_positions = torch.arange(kv_len - q_len, kv_len)
+    key_positions = torch.arange(kv_len)
+    masked = key_positions[None, :] > query_positions[:, None]
+    attn_scores = attn_scores.masked_fill(masked[None, None, :, :], float("-inf"))
+    probs = torch.softmax(attn_scores, dim=-1)
+    output = torch.matmul(probs, v)
+    return output.permute(2, 0, 1, 3).reshape(q_len, batch, n_heads * head_dim)
+
+
+def _print_fp32_core_oracle(trace, scales, backend, cutoff, *, layers=(1, 2, 3, 4)):
+    for layer in layers:
+        oracle = _fp32_attention_from_same_real_qkv(trace, scales, layer)
+        physical = trace[(layer, "core_out")]
+        if oracle.shape != physical.shape:
+            raise AssertionError(
+                f"FP32 oracle/core shape mismatch: {tuple(oracle.shape)} vs {tuple(physical.shape)}"
+            )
+        delta = (physical - oracle).abs()
+        rel = float(torch.linalg.vector_norm(physical - oracle)
+                    / torch.linalg.vector_norm(oracle).clamp_min(1e-12))
+        print(
+            f"FP32 CORE ORACLE backend={backend} S={cutoff} layer={layer:02d} "
+            f"max_abs={delta.max().item():.8g} rel_l2={rel:.8g}"
+        )
+
+
+def test_real_qwen3_1_7b_first_shape_divergence():
+    # This is a focused, real-TQ test, not a replacement for the Phase-5 PPO
+    # correctness gate. Its default 64+64 crop is deliberately explicit.
+    from mindspeed.args_utils import get_full_args
+    vars(get_full_args()).pop("", None)
+
+    from ..profiling._qwen3_profile_target import resolve_qwen3_profile_target
+    from . import test_tpr_qwen3_compatibility_npu as qwen_fixture
+    from .test_qwen3_1_7b_real_tq_ppo_npu import _load_real_tq_probe
+
+    target = resolve_qwen3_profile_target()
+    if target.size != "1.7B":
+        pytest.fail(f"expected Qwen3-1.7B, got {target.label}")
+    qwen_fixture.QWEN_MODEL_PATH = target.path
+
+    p = int(os.environ.get("TPR_QWEN17_PPO_PROMPT", "64"))
+    r = int(os.environ.get("TPR_QWEN17_PPO_RESPONSE", "64"))
+    if (p, r) != (64, 64):
+        pytest.fail("Focused real-TQ diagnostic currently fixes P=64, R=64")
+    batch = _load_real_tq_probe(prompt_length=p, response_length=r)
+    tokens = batch["input_ids"][0].detach().cpu().long()
+    assert tokens.numel() == 128
+    qwen_fixture._initialize_single_rank_megatron()
+    print(f"ROOTCAUSE REAL CHECKPOINT: {target.path}")
+    print("ROOTCAUSE TOKENS: recorded TQ row=0; cropped_real_window=64+64")
+
+    for backend in ("controlled_cann", "unmodified_megatron"):
+        import torch_npu  # noqa: F401
+
+        if backend == "unmodified_megatron":
+            mode = "native"
+        else:
+            mode = None
+
+        model = qwen_fixture._make_qwen_model(
+            torch.device("npu"), tpr=False,
+            max_sequence_length=128, core_attention_module=mode,
+        )
+        print(
+            f"ROOTCAUSE BACKEND={backend} "
+            f"core_attention={type(model.decoder.layers[0].self_attention.core_attention).__module__}."
+            f"{type(model.decoder.layers[0].self_attention.core_attention).__name__}"
+        )
+        if backend == "unmodified_megatron":
+            assert not isinstance(
+                model.decoder.layers[0].self_attention.core_attention,
+                qwen_fixture._ProfileFusedCausalAttention
+            ), "Unmodified reference accidentally still uses TPR CANN adapter"
+        try:
+            full_trace, full_scales, full_lp = _run_recorded_prefix(
+                model, tokens, cutoff=128
+            )
+            _print_fp32_core_oracle(
+                full_trace, full_scales, backend, 128
+            )
+            for cutoff in (70, 94, 102):
+                crop_trace, crop_scales, crop_lp = _run_recorded_prefix(
+                    model, tokens, cutoff=cutoff
+                )
+                for query_abs in sorted(set(full_lp).intersection(crop_lp)):
+                    print(
+                        f"SHAPE LOGPROB backend={backend} cutoff={cutoff} "
+                        f"query_abs={query_abs} full={full_lp[query_abs]:.8f} "
+                        f"cutoff_value={crop_lp[query_abs]:.8f} "
+                        f"delta={crop_lp[query_abs] - full_lp[query_abs]:.8f}"
+                    )
+                _first_tensor_divergence(
+                    full_trace, crop_trace, cutoff, backend
+                )
+                _print_fp32_core_oracle(
+                    crop_trace, crop_scales, backend, cutoff, layers=(1, 2)
+                )
+                del crop_trace
+        finally:
+            del model
+            gc.collect()
+            torch.npu.empty_cache()
+    print("ROOTCAUSE DIAGNOSTIC COMPLETE (not a PPO correctness PASS)")
