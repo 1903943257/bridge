@@ -300,6 +300,8 @@ def run_tpr_forward_backward_batch(
             segment_loss_term_counts=counts,
         )
         result = FixedTopologyScheduler(tree_plan.segment_plan, executor).run()
+        if not bool(torch.isfinite(result.normalized_loss).item()):
+            raise FloatingPointError("non-finite TPR PPO tree loss; gradients will not be finalized")
         from verl.utils.metric import AggregationType, Metric
 
         for segment_id, metrics in executor.segment_loss_metrics:
