@@ -241,6 +241,122 @@ def _compare_grads(reference, actual):
     assert relative_l2 < .08 and cosine > .997
 
 
+
+def _logprob_diagnostics(batch, captured, reference_lp):
+    """Inspect exact real-token ownership without modifying acceptance criteria."""
+    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+
+    keys = tu.get_non_tensor_data(batch, "tpr_trajectory_keys", default=None)
+    if keys is None:
+        raise AssertionError("Real TQ diagnostic requires original trajectory keys")
+    forest = build_tree_execution_plans(tuple(keys), batch)
+    owner = {}
+    for tree in forest.trees:
+        for ref in tree.objective_refs:
+            segment = tree.segment_plan.get(ref.segment_id)
+            key = (ref.sample_row, ref.response_offset)
+            if key in owner:
+                raise AssertionError(f"Duplicate real logical token in Forest: {key}")
+            owner[key] = {
+                "tree": tree.tree.key,
+                "segment_id": ref.segment_id,
+                "segment_start": segment.position_start,
+                "segment_end": segment.position_end,
+                "query_abs": segment.position_start + ref.query_offset,
+                "target_id": ref.target_token_id,
+                "root": ref.segment_id == tree.segment_plan.root_id,
+            }
+
+    all_keys = sorted(owner)
+    assert set(captured) == set(owner), "Captured TPR tokens != real trajectory objective refs"
+    expected = torch.tensor([float(reference_lp[row][offset]) for row, offset in all_keys])
+    actual = torch.tensor([captured[key] for key in all_keys])
+    diff = (actual - expected).abs()
+    threshold = .2 + .02 * expected.abs()
+    bad = diff > threshold
+    relative_l2 = torch.linalg.vector_norm(actual - expected) / (
+        torch.linalg.vector_norm(expected).clamp_min(1e-12)
+    )
+    rms = torch.sqrt(torch.mean(diff.square()))
+    print(
+        "TPR LOGPROB DIAG:"
+        f" total={len(all_keys)} bad={int(bad.sum())} "
+        f"max_abs={diff.max().item():.6g} mean_abs={diff.mean().item():.6g} "
+        f"rms={rms.item():.6g} rel_l2={relative_l2.item():.6g}"
+    )
+    for row in range(len(batch["input_ids"])):
+        indices = [i for i, (r, _) in enumerate(all_keys) if r == row]
+        d = diff[indices]
+        print(
+            f"  row={row} tokens={len(indices)} "
+            f"mismatch={int(bad[indices].sum())} max_abs={d.max().item():.6g}"
+        )
+    for root in (True, False):
+        indices = [i for i, key in enumerate(all_keys) if owner[key]["root"] == root]
+        if indices:
+            print(
+                f"  owner={'root' if root else 'nonroot'} "
+                f"tokens={len(indices)} mismatches={int(bad[indices].sum())} "
+                f"max_abs={diff[indices].max().item():.6g}"
+            )
+    for i in torch.argsort(diff, descending=True)[:min(20, len(all_keys))].tolist():
+        row, offset = all_keys[i]
+        info = owner[(row, offset)]
+        print(
+            f"  token row={row} response={offset} query_abs={info['query_abs']} "
+            f"target={info['target_id']} tree={info['tree']} "
+            f"segment={info['segment_id']}[{info['segment_start']}:{info['segment_end']}] "
+            f"native={expected[i].item():.6g} tpr={actual[i].item():.6g} "
+            f"abs_diff={diff[i].item():.6g} "
+            f"threshold={threshold[i].item():.6g}"
+            + (" FAIL" if bad[i] else " within_tol")
+        )
+    return all_keys, expected, actual, bad
+
+
+def _probe_tpr_model_native_forward(model, batch, reference_lp, *, max_length=256):
+    """If small enough, separate model/checkpoint drift from forest shape drift.
+
+    Same real checkpoint, same TPR model, but its context-free native
+    SelfAttention.forward, not the Push/Visit/Pop path. Diagnostic only,
+    never a substitute for the strict Forest gate.
+    """
+    longest = max(len(row) for row in _rows(batch, "input_ids"))
+    if longest > max_length:
+        print(
+            f"TPR NATIVE PATH PROBE skipped: longest={longest} > {max_length}; "
+            "avoid full-context OOM"
+        )
+        return
+    differences = []
+    with torch.no_grad():
+        for row in range(len(batch["input_ids"])):
+            ids = batch["input_ids"][row].to(next(model.parameters()).device)
+            _, lp = _native_response_logprobs(
+                model, ids, prompt_length=len(batch["prompts"][row]), temperature=1.0
+            )
+            mask = batch["response_mask"][row].to(bool).cpu()
+            expected = reference_lp[row][mask].float().cpu()
+            current = lp.detach().float().cpu()[mask]
+            differences.append((current - expected).abs())
+    diffs = torch.cat(differences)
+    print(
+        "TPR MODEL NATIVE-FORWARD vs REFERENCE MODEL NATIVE-FORWARD: "
+        f"max_abs={diffs.max().item():.6g} "
+        f"mean_abs={diffs.mean().item():.6g}"
+    )
+    if diffs.max().item() > 0.2:
+        print(
+            "DIAG: model/checkpoint/forward-path mismatch may exist even "
+            "WITHOUT Tree execution; inspect spec, weights and reproducibility."
+        )
+    else:
+        print(
+            "DIAG: model native paths agree within 0.2; remaining difference "
+            "is concentrated in TPR segmented execution or kernel shapes."
+        )
+
+
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -372,16 +488,35 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         [float(old_probs[row][offset]) for row, offset in sorted(expected_keys)]
     )
     tpr_lp = torch.tensor([captured[key] for key in sorted(expected_keys)])
-    torch.testing.assert_close(tpr_lp, baseline_lp, rtol=2e-2, atol=2e-1)
-    print(f"Qwen3-1.7B real TQ new_log_probs: {len(expected_keys)} logical tokens aligned")
+    _, _, _, bad = _logprob_diagnostics(batch, captured, old_probs)
+    if bool(bad.any()):
+        _probe_tpr_model_native_forward(tpr, batch, old_probs)
+    else:
+        print(f"Qwen3-1.7B real TQ new_log_probs: {len(expected_keys)} logical tokens aligned")
+    check_failures = []
+    try:
+        torch.testing.assert_close(tpr_lp, baseline_lp, rtol=2e-2, atol=2e-1)
+    except AssertionError as exc:
+        check_failures.append(f"logprob mismatch: {str(exc).splitlines()[0]}")
     actual_loss = float(sum(output["loss"]))
     expected_loss = float(native_loss.item())
     print(f"Qwen3-1.7B real TQ PPO native_loss={expected_loss:.8f}, tpr_loss={actual_loss:.8f}")
-    torch.testing.assert_close(
-        torch.tensor(actual_loss), torch.tensor(expected_loss),
-        rtol=2e-2, atol=1e-3,
-    )
-    _compare_grads(native_grads, tpr_grads)
+    try:
+        torch.testing.assert_close(
+            torch.tensor(actual_loss), torch.tensor(expected_loss),
+            rtol=2e-2, atol=1e-3,
+        )
+    except AssertionError as exc:
+        check_failures.append(f"PPO loss mismatch: {str(exc).splitlines()[0]}")
+    try:
+        _compare_grads(native_grads, tpr_grads)
+    except AssertionError as exc:
+        check_failures.append(f"parameter gradient mismatch: {str(exc).splitlines()[0]}")
     assert output["metrics"]["tpr/forest_trees"] == [1]
     assert output["metrics"]["tpr/logical_loss_tokens"] == [int(batch["response_mask"].sum())]
+    if check_failures:
+        pytest.fail(
+            "Qwen3-1.7B real TQ PPO numerical gate FAILED:\n  "
+            + "\n  ".join(check_failures)
+        )
     print("QWEN3-1.7B REAL TQ PPO NUMERICAL GATE: PASS")
