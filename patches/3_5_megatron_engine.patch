@@ -41,7 +41,7 @@ index 207f4458..0c3b8bda 100644
 +
          self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
          tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
-@@ -808,4 +808,12 @@ class MegatronEngine(BaseEngine):
+@@ -808,4 +821,11 @@ class MegatronEngine(BaseEngine):
                  )
              tu.assign_non_tensor(data, routed_num_tokens=routed_num_tokens.item())
  
