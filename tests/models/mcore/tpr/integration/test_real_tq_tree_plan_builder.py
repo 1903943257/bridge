@@ -62,5 +62,16 @@ def test_real_tq_objective_refs_exactly_cover_response_mask():
     print(f"trees: {len(forest.trees)}")
     print(f"segments: {forest.segment_count}")
     print(f"logical PPO response tokens: {forest.logical_loss_tokens}")
+    # Native Megatron's denominator uses loss_mask; vanilla PPO uses
+    # response_mask. Surface mismatches before turning on e2e training.
+    if "loss_mask" in batch:
+        loss_mask_tokens = sum(
+            int(row.to(torch.bool).sum().item()) for row in _rows(batch["loss_mask"])
+        )
+        print(f"loss_mask tokens (Megatron denominator): {loss_mask_tokens}")
+        print(f"response_mask tokens (PPO objective): {forest.logical_loss_tokens}")
+        if loss_mask_tokens != forest.logical_loss_tokens:
+            print("WARNING: loss_mask and response_mask token counts differ; "
+                  "inspect global PPO normalization before e2e training")
     print(f"objective refs at segment boundaries: {cross_segment}")
     print("REAL TQ OBJECTIVE PLAN CHECK: PASS")
