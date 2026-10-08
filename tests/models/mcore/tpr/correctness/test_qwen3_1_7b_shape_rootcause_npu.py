@@ -368,15 +368,31 @@ def test_real_qwen3_1_7b_first_shape_divergence():
                 qwen_fixture._ProfileFusedCausalAttention
             ), "Unmodified reference accidentally still uses TPR CANN adapter"
         try:
+            print(
+                f"ROOTCAUSE RUN backend={backend} cutoff=128 START",
+                flush=True,
+            )
             full_trace, full_scales, full_lp = _run_recorded_prefix(
                 model, tokens, cutoff=128
+            )
+            print(
+                f"ROOTCAUSE RUN backend={backend} cutoff=128 DONE",
+                flush=True,
             )
             _print_fp32_core_oracle(
                 full_trace, full_scales, backend, 128
             )
             for cutoff in (70, 94, 102):
+                print(
+                    f"ROOTCAUSE RUN backend={backend} cutoff={cutoff} START",
+                    flush=True,
+                )
                 crop_trace, crop_scales, crop_lp = _run_recorded_prefix(
                     model, tokens, cutoff=cutoff
+                )
+                print(
+                    f"ROOTCAUSE RUN backend={backend} cutoff={cutoff} DONE",
+                    flush=True,
                 )
                 for query_abs in sorted(set(full_lp).intersection(crop_lp)):
                     print(
