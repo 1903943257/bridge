@@ -124,6 +124,29 @@ When the cropped real-TQ numerical check fails, do **not** loosen
 - PPO scalar loss and sampled parameter gradient relative-L2 and cosine
   are reported even if the logprob gate fails.
 
+### Identical-QKV square versus rectangular Attention experiment
+
+Enable `TPR_QWEN17_PPO_CORE_ORACLE=1` (the short-real-TQ
+diagnostic default). It captures **post-RoPE Q, K and V** at selected
+layers (1, 2, 3, 4, 14, 28) from the **same real Qwen3-1.7B Native
+128-token forward**, then calls the production
+`rectangular_causal_attention` without replacing any inputs:
+
+* Square: the Native model's `128×128` causal core output.
+* Rectangular: the last `58×128`, `34×128` and `14×128`
+  queries against **the same 128 K/V tokens** (segment starts 70, 94, 114).
+
+These are full-sequence-ending segments, so CANN's bottom-right causal
+alignment is valid without an explicit mask. Compare `CORE SHAPE ORACLE`
+per-layer metrics and `CORE TOKEN` metrics. If they differ, there is
+direct evidence that the square-vs-rectangular kernel geometry changes
+the result even with identical projected Q/K/V. If they agree, the
+observed full-model Forest drift must arise from a difference **before**
+the isolated core call (e.g. prefix activations or QKV GEMM shape) or
+from multi-step effects; this does not by itself prove all TPR kernels
+correct. This is a short real-token diagnostic, not a synthetic test
+or a change to the numerical acceptance threshold.
+
 ### Native physical-segment cutoff oracle (Phase-5 accuracy)
 
 The 64+64 real-TQ experiment confirmed two positions at which the Native
