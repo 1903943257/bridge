@@ -45,6 +45,10 @@ _STAGES = (
     "proj_out",
     "attn_out",
     "mlp_in",
+    "fc1_in",
+    "fc1_out",
+    "fc2_in",
+    "fc2_out",
     "mlp_out",
 )
 
@@ -91,6 +95,18 @@ def _capture_model_stages(model):
             attn.linear_proj.register_forward_hook(hook_for(layer_number, "proj_out")),
             attn.register_forward_hook(hook_for(layer_number, "attn_out")),
             layer.mlp.register_forward_hook(hook_for(layer_number, "mlp_in", which="arg")),
+            layer.mlp.linear_fc1.register_forward_hook(
+                hook_for(layer_number, "fc1_in", which="arg")
+            ),
+            layer.mlp.linear_fc1.register_forward_hook(
+                hook_for(layer_number, "fc1_out")
+            ),
+            layer.mlp.linear_fc2.register_forward_hook(
+                hook_for(layer_number, "fc2_in", which="arg")
+            ),
+            layer.mlp.linear_fc2.register_forward_hook(
+                hook_for(layer_number, "fc2_out")
+            ),
             layer.mlp.register_forward_hook(hook_for(layer_number, "mlp_out")),
         ))
     return captures, core_scales, handles
@@ -161,6 +177,89 @@ def _first_tensor_divergence(full_trace, cropped_trace, cutoff, backend):
     if first is None:
         print(f"FIRST DIVERGENCE backend={backend} cutoff={cutoff}: NONE (all stages equal)")
     return first
+
+
+def _probe_first_layer_mlp_shape(model, full_trace, cropped_trace, cutoff, *, backend):
+    """Identify FC1/Gate/FC2 shape-dependence on exactly equal real inputs.
+
+    The first MLP is the first observed difference in the controlled CANN
+    reference. We enforce equality at its entrance before attributing any
+    difference to a particular GEMM or gate operation. No artificial tokens,
+    no model replacement and no threshold changes.
+    """
+    layer = 1
+    for stage in ("mlp_in", "fc1_in", "fc1_out", "fc2_in", "fc2_out", "mlp_out"):
+        a = full_trace[(layer, stage)][:cutoff]
+        b = cropped_trace[(layer, stage)]
+        errors = (a - b).abs()
+        max_error = float(errors.max())
+        changed = int(errors.reshape(cutoff, -1).ne(0).any(dim=1).sum())
+        print(
+            f"MLP ROOTCAUSE backend={backend} cutoff={cutoff} layer=01 "
+            f"stage={stage} max_abs={max_error:.9g} "
+            f"changed_tokens={changed}/{cutoff}"
+        )
+
+    same_input = torch.equal(
+        full_trace[(layer, "fc1_in")][:cutoff],
+        cropped_trace[(layer, "fc1_in")],
+    )
+    fc1_equal = torch.equal(
+        full_trace[(layer, "fc1_out")][:cutoff],
+        cropped_trace[(layer, "fc1_out")],
+    )
+    gate_equal = torch.equal(
+        full_trace[(layer, "fc2_in")][:cutoff],
+        cropped_trace[(layer, "fc2_in")],
+    )
+    fc2_equal = torch.equal(
+        full_trace[(layer, "fc2_out")][:cutoff],
+        cropped_trace[(layer, "fc2_out")],
+    )
+    if not same_input:
+        print(
+            f"MLP ROOTCAUSE RESULT backend={backend} cutoff={cutoff}: "
+            "FC1 input already differs; investigate preceding layer computation."
+        )
+        return
+
+    if not fc1_equal:
+        source = "FC1 GEMM (identical FC1 inputs, sequence-length-dependent output)"
+    elif not gate_equal:
+        source = "gate/activation (identical FC1 output)"
+    elif not fc2_equal:
+        source = "FC2 GEMM (identical FC2 inputs, sequence-length-dependent output)"
+    else:
+        source = "none inside MLP (check residual/add/fusion after MLP)"
+
+    print(
+        f"MLP ROOTCAUSE RESULT backend={backend} cutoff={cutoff}: "
+        f"first_internal_source={source}"
+    )
+
+    # Independent CPU FP32 GEMM on *real* layer-1 FC1 inputs/weights,
+    # restricted to 3 representative real tokens to avoid huge CPU work.
+    if not fc1_equal:
+        from torch.nn import functional as F
+
+        sample_positions = [p for p in (2, 6, 69) if p < cutoff]
+        fc1 = model.decoder.layers[0].mlp.linear_fc1
+        w = fc1.weight.detach().float().cpu()
+        bias = getattr(fc1, "bias", None)
+        if bias is not None:
+            bias = bias.detach().float().cpu()
+        for pos in sample_positions:
+            real_input = full_trace[(layer, "fc1_in")][pos].reshape(1, -1)
+            oracle = F.linear(real_input, w, bias).reshape(-1)
+            a = full_trace[(layer, "fc1_out")][pos].reshape(-1)
+            b = cropped_trace[(layer, "fc1_out")][pos].reshape(-1)
+            print(
+                f"MLP FP32 FC1 ORACLE backend={backend} cutoff={cutoff} "
+                f"token={pos} input_equal=True "
+                f"full_vs_fp32_max={float((a - oracle).abs().max()):.9g} "
+                f"cutoff_vs_fp32_max={float((b - oracle).abs().max()):.9g} "
+                f"full_vs_cutoff_max={float((a - b).abs().max()):.9g}"
+            )
 
 
 def _fp32_attention_from_same_real_qkv(trace, scales, layer):
@@ -288,6 +387,9 @@ def test_real_qwen3_1_7b_first_shape_divergence():
                     )
                 _first_tensor_divergence(
                     full_trace, crop_trace, cutoff, backend
+                )
+                _probe_first_layer_mlp_shape(
+                    model, full_trace, crop_trace, cutoff, backend=backend
                 )
                 _print_fp32_core_oracle(
                     crop_trace, crop_scales, backend, cutoff, layers=(1, 2)
