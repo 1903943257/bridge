@@ -247,6 +247,45 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     del full_out, full_hidden
     attention.zero_grad(set_to_none=True)
 
+    # Optional *test-only* causal intervention, run only on this standalone
+    # first Attention module: use the exact same physical M=P+S for the
+    # Prefix QKV GEMM as the Full path. This holds the QKV weight and all
+    # real-token inputs constant, and does not modify TPR core or any model
+    # code. Compare with the default run to test whether prefix QKV M
+    # sensitivity causes the downstream core/projection divergence.
+    if os.environ.get("TPR_QWEN17_SPLIT_PREFIX_QKV_FIXED_M", "0") == "1":
+        original_qkv_forward = attention.linear_qkv.forward
+
+        def fixed_m_prefix_qkv_forward(hidden_states, *args, **kwargs):
+            if modes["value"] != "prefix":
+                return original_qkv_forward(hidden_states, *args, **kwargs)
+            if hidden_states.shape[0] != p:
+                raise AssertionError(
+                    f"unexpected Prefix QKV physical M {hidden_states.shape[0]} vs {p}"
+                )
+            physically_padded = torch.cat(
+                (
+                    hidden_states,
+                    hidden_states.new_zeros((s, *hidden_states.shape[1:])),
+                ),
+                dim=0,
+            )
+            result = original_qkv_forward(physically_padded, *args, **kwargs)
+            if isinstance(result, tuple):
+                return (result[0][:p], *result[1:])
+            if not isinstance(result, torch.Tensor):
+                raise TypeError(f"unexpected QKV result: {type(result)!r}")
+            return result[:p]
+
+        monkeypatch.setattr(
+            attention.linear_qkv, "forward", fixed_m_prefix_qkv_forward
+        )
+        print(
+            f"QWEN SPLIT DIAGNOSTIC ONLY: Prefix QKV physical M={p+s} "
+            f"instead of M={p}; all other model modules unchanged",
+            flush=True,
+        )
+
     prefix_hidden = attention_input[:p].clone().requires_grad_(True)
     suffix_hidden = attention_input[p:].clone().requires_grad_(True)
     prefix_ctx = TPRAttentionContext(
@@ -337,6 +376,33 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         )
     _stats("ATTN_SAME_QKV_SQUARE_VS_RECT", controlled_rect_tail, full_core["core"][-s:])
     _stats("ATTN_SAME_QKV_RECT_VS_SPLIT_CORE", suffix_core["core"], controlled_rect_tail)
+
+    # Independent no-grad intervention: swap ONLY the cache (Full's genuine
+    # post-RoPE K/V) while keeping the real Split suffix Q and its S-shaped
+    # CANN Attention launch unchanged. Quantifies the causal contribution
+    # from the Prefix QKV path, rather than blaming the rectangular mask.
+    with torch.no_grad():
+        core_using_full_kv = original_cann(
+            suffix_core["q"],
+            full_core["k"], full_core["v"],
+            softmax_scale=suffix_core["scale"], dropout_p=0.0,
+        )
+    _stats(
+        "ATTN_INJECT_FULL_KV_CORE_VS_FULL",
+        core_using_full_kv, full_core["core"][-s:],
+    )
+    _stats(
+        "ATTN_INJECT_FULL_KV_CORE_VS_SPLIT",
+        core_using_full_kv, suffix_core["core"],
+    )
+    with torch.no_grad():
+        out_using_full_kv = attention.linear_proj(core_using_full_kv)
+        if isinstance(out_using_full_kv, tuple):
+            out_using_full_kv = out_using_full_kv[0]
+    _stats(
+        "ATTN_INJECT_FULL_KV_PROJ_VS_FULL",
+        out_using_full_kv, projection["full"][1][-s:],
+    )
 
     # One more causal intervention: apply the real output projection to
     # EXACTLY the full reference core's suffix tensor, but in a standalone
