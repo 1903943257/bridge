@@ -390,13 +390,25 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         n for n, param in attention.named_parameters() if param.requires_grad and param.grad is not None
     }
     split_params = dict(attention.named_parameters())
+    param_tolerance_failures = []
     for name, expected in full_params.items():
         if name.startswith(("linear_qkv", "linear_proj", "q_layernorm", "k_layernorm")):
             actual = split_params[name].grad
             _stats("ATTN_PARAM_" + name, actual, expected)
-            torch.testing.assert_close(
-                actual.detach().float().cpu(), expected, atol=1e-2, rtol=1e-2
-            )
+            try:
+                torch.testing.assert_close(
+                    actual.detach().float().cpu(), expected, atol=1e-2, rtol=1e-2
+                )
+            except AssertionError as exc:
+                # Preserve the strict original gate, but do not stop after
+                # the FIRST QKV parameter: see Q/K normalization and every
+                # projection before reporting an aggregate failure.
+                param_tolerance_failures.append((name, str(exc).splitlines()[0]))
+    print(
+        f"QWEN SPLIT ATTN_PARAM_GATE bad_count={len(param_tolerance_failures)} "
+        f"bad={param_tolerance_failures}",
+        flush=True,
+    )
 
     # Preserve the original foundational Attention gate; do not weaken it
     # simply because this uses pretrained (rather than tiny random) weights.
@@ -409,6 +421,11 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     torch.testing.assert_close(
         prefix_hidden.grad.detach().float().cpu(), full_in_grad[:p], atol=1e-2, rtol=1e-2
     )
+    if param_tolerance_failures:
+        raise AssertionError(
+            f"real Qwen Attention parameter-gradient tolerance failed: "
+            f"{param_tolerance_failures}"
+        )
     print("QWEN SPLIT REAL ATTENTION EQUIVALENCE: PASS", flush=True)
 
 
