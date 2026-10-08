@@ -110,5 +110,6 @@ def test_reject_missing_prev_query_and_misaligned_loss_masks():
 def test_tree_plans_are_topology_only_and_preserve_old_ce_contract():
     batch = _batch()
     forest = build_tree_execution_plans(_keys(), batch)
-    assert all(executable.segment_plan.total_loss_weight == 1.0 for executable in forest.trees)
-    # Legacy CE plans remain valid; no change to existing SegmentLossTerm API.
+    assert all(executable.segment_plan.topology_only for executable in forest.trees)
+    assert all(executable.segment_plan.total_loss_weight is None for executable in forest.trees)
+    # Legacy CE plans remain strict: topology-only is explicit and opt-in.
