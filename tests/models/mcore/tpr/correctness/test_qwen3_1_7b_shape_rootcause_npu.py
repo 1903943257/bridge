@@ -444,7 +444,19 @@ def test_real_qwen3_1_7b_first_shape_divergence():
     print(f"ROOTCAUSE REAL CHECKPOINT: {target.path}")
     print("ROOTCAUSE TOKENS: recorded TQ row=0; cropped_real_window=64+64")
 
-    for backend in ("controlled_cann", "unmodified_megatron"):
+    # Default to the backend known to execute so that an unsupported
+    # unmodified Megatron/NPU path never hides the proven FC2 failure.
+    # To test the independent original backend, opt in explicitly in a
+    # separate invocation with --tb=long; do not quietly substitute kernels.
+    backend_choice = os.environ.get(
+        "TPR_QWEN17_ROOTCAUSE_BACKEND", "controlled_cann"
+    )
+    if backend_choice not in ("controlled_cann", "unmodified_megatron"):
+        pytest.fail(
+            "TPR_QWEN17_ROOTCAUSE_BACKEND must be 'controlled_cann' "
+            "or 'unmodified_megatron'"
+        )
+    for backend in (backend_choice,):
         import torch_npu  # noqa: F401
 
         if backend == "unmodified_megatron":
@@ -514,6 +526,17 @@ def test_real_qwen3_1_7b_first_shape_divergence():
                     crop_trace, crop_scales, backend, cutoff, layers=(1, 2)
                 )
                 del crop_trace
+        except Exception as exc:
+            import traceback
+            print(
+                f"ROOTCAUSE BACKEND FAILURE backend={backend} "
+                f"type={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            traceback.print_exc()
+            # A failed unmodified reference is not evidence that the
+            # production native backend is numerically equivalent to TPR.
+            raise
         finally:
             del model
             gc.collect()
