@@ -457,6 +457,48 @@ def _attention_trace_hooks(model, *, monitored_positions, owner_segments=None):
                 )
 
         handles.append(attention.register_forward_hook(capture))
+
+        # Q/K/V GEMM and attention-core output are distinct possible sources
+        # of bf16 shape sensitivity. Instrument the two native Megatron
+        # projection modules (no changes to their forward implementation).
+        def capture_projection(module, args, output, layer_number=layer_number, stage=None):
+            ctx = get_tpr_attention_context()
+            if not args or not isinstance(args[0], torch.Tensor):
+                return
+            x = args[0]
+            y = output[0] if isinstance(output, tuple) else output
+            if not isinstance(y, torch.Tensor) or x.ndim != 3 or y.ndim != 3:
+                return
+            for absolute in monitored_positions:
+                if owner_segments is None:
+                    if ctx is not None:
+                        continue
+                    local = absolute
+                else:
+                    if ctx is None or absolute not in owner_segments:
+                        continue
+                    owner = owner_segments[absolute]
+                    if ctx.prefix_length != owner.position_start or ctx.suffix_length != owner.length:
+                        continue
+                    local = absolute - ctx.prefix_length
+                if not 0 <= local < x.shape[0] or local >= y.shape[0]:
+                    continue
+                traces[(layer_number, absolute, stage)] = (
+                    x[local].detach().float().cpu().clone(),
+                    y[local].detach().float().cpu().clone(),
+                )
+
+        from functools import partial as _partial
+        handles.append(
+            attention.linear_qkv.register_forward_hook(
+                _partial(capture_projection, stage="qkv")
+            )
+        )
+        handles.append(
+            attention.linear_proj.register_forward_hook(
+                _partial(capture_projection, stage="proj")
+            )
+        )
     return traces, handles
 
 
@@ -485,10 +527,29 @@ def _print_attention_layer_drift(reference, segmented, positions):
             out_rel, out_max = metric(native_out, tpr_out)
             # Report every layer: a small first-layer BF16 discrepancy can
             # amplify greatly through a 28-layer real checkpoint.
+            extra = []
+            for stage, input_name, output_name in (
+                ("qkv", "qkv_gemm_input", "qkv_gemm_output"),
+                ("proj", "core_attention_output", "o_proj_output"),
+            ):
+                subkey = (layer, absolute, stage)
+                if subkey not in reference or subkey not in segmented:
+                    continue
+                n_x, n_y = reference[subkey]
+                t_x, t_y = segmented[subkey]
+                sub_in_rel, sub_in_max = metric(n_x, t_x)
+                sub_out_rel, sub_out_max = metric(n_y, t_y)
+                extra.append(
+                    f"{input_name}_rel={sub_in_rel:.6g} "
+                    f"{input_name}_max={sub_in_max:.6g} "
+                    f"{output_name}_rel={sub_out_rel:.6g} "
+                    f"{output_name}_max={sub_out_max:.6g}"
+                )
             print(
                 f"  layer={layer:02d} "
                 f"attention_input_rel_l2={in_rel:.6g} max_abs={in_max:.6g} "
-                f"attention_output_rel_l2={out_rel:.6g} max_abs={out_max:.6g}"
+                f"attention_output_rel_l2={out_rel:.6g} max_abs={out_max:.6g} "
+                + " | ".join(extra)
             )
             if first is None and (in_max > 0 or out_max > 0):
                 first = (layer, in_max, out_max)
