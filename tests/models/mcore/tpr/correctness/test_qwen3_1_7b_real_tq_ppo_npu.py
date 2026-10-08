@@ -357,6 +357,60 @@ def _probe_tpr_model_native_forward(model, batch, reference_lp, *, max_length=25
         )
 
 
+
+def _probe_whole_segment_tpr_forward(model, batch, reference_lp, *, row: int):
+    """Same TPRSelfAttention/kernel, but one physical node; isolate split effects.
+
+    Run only for the worst row of the cropped real-TQ smoke. Single-segment
+    TPR uses identical token IDs and absolute position IDs as native.
+    """
+    from verl.models.mcore.tpr.attention import TPRSelfAttention
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.models.mcore.tpr.segment_plan import (
+        SegmentLossTerm,
+        SegmentPlan,
+        SegmentSpec,
+    )
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    tokens = batch["input_ids"][row].detach().cpu().long()
+    if tokens.numel() > 256:
+        print(f"ONE-SEGMENT TPR probe skipped: row={row} length={tokens.numel()}")
+        return
+    segment = SegmentSpec(
+        segment_id=0, parent_id=None, token_ids=tokens,
+        position_start=0, prefix_length=0,
+        # Only to satisfy the legacy CE constructor; _forward never uses CE.
+        loss_terms=(SegmentLossTerm(0, int(tokens[1])),),
+    )
+    plan = SegmentPlan((segment,), root_id=0)
+    layers = tuple(sorted(
+        layer.layer_number for layer in model.modules()
+        if isinstance(layer, TPRSelfAttention)
+    ))
+    executor = SegmentExecutor(model, plan, expected_layer_numbers=layers)
+    with torch.no_grad():
+        _, logits = executor._forward(
+            segment, past_key_values={}, no_grad=True
+        )
+        prompt_len = len(batch["prompts"][row])
+        targets = tokens[prompt_len:].to(logits.device)
+        query_logits = logits[0, prompt_len-1 : -1, :]
+        assert len(query_logits) == len(targets)
+        current = vocab_parallel_log_probs_from_logits(
+            query_logits, targets
+        ).detach().float().cpu()
+    mask = batch["response_mask"][row].bool().cpu()
+    difference = (current[mask] - reference_lp[row].float().cpu()[mask]).abs()
+    print(
+        f"WHOLE-SEGMENT TPR vs Native, row={row}: "
+        f"max_abs={difference.max().item():.6g} "
+        f"mean_abs={difference.mean().item():.6g}. "
+        "Compare with Forest drift on the same row to separate shape "
+        "sensitivity from segment/KV errors."
+    )
+
+
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -488,9 +542,21 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         [float(old_probs[row][offset]) for row, offset in sorted(expected_keys)]
     )
     tpr_lp = torch.tensor([captured[key] for key in sorted(expected_keys)])
-    _, _, _, bad = _logprob_diagnostics(batch, captured, old_probs)
+    diag_keys, diag_expected, diag_actual, bad = _logprob_diagnostics(
+        batch, captured, old_probs
+    )
     if bool(bad.any()):
         _probe_tpr_model_native_forward(tpr, batch, old_probs)
+        worst_i = (diag_actual - diag_expected).abs().argmax().item()
+        worst_row = diag_keys[worst_i][0]
+        try:
+            _probe_whole_segment_tpr_forward(
+                tpr, batch, old_probs, row=worst_row
+            )
+        except Exception as exc:
+            # Diagnostic-only probe must not obscure the original numerical
+            # gate failure; the NPU stack may reject probe-only forward calls.
+            print(f"ONE-SEGMENT TPR DIAG unavailable: {type(exc).__name__}: {exc}")
     else:
         print(f"Qwen3-1.7B real TQ new_log_probs: {len(expected_keys)} logical tokens aligned")
     check_failures = []
