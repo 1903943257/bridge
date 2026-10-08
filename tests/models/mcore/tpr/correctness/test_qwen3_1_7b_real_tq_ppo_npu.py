@@ -411,6 +411,116 @@ def _probe_whole_segment_tpr_forward(model, batch, reference_lp, *, row: int):
     )
 
 
+
+def _attention_trace_hooks(model, *, monitored_positions, owner_segments=None):
+    """Capture real Qwen layer attention inputs/outputs at selected absolute tokens.
+
+    Native: full sequence at absolute index. TPR: match the exact owning
+    physical segment's absolute start and length; reject sibling collisions.
+    This is a diagnostic-only hook, not a forward modification.
+    """
+    from verl.models.mcore.tpr.context import get_tpr_attention_context
+
+    traces = {}
+    handles = []
+    for layer in model.decoder.layers:
+        attention = layer.self_attention
+        layer_number = attention.layer_number
+
+        def capture(module, args, output, layer_number=layer_number):
+            ctx = get_tpr_attention_context()
+            hidden = args[0]
+            projected = output[0] if isinstance(output, tuple) else output
+            if not isinstance(projected, torch.Tensor):
+                return
+            for absolute in monitored_positions:
+                if owner_segments is None:
+                    if ctx is not None:
+                        continue
+                    local = absolute
+                else:
+                    if ctx is None or absolute not in owner_segments:
+                        continue
+                    segment = owner_segments[absolute]
+                    if (ctx.prefix_length != segment.position_start or
+                            ctx.suffix_length != segment.length):
+                        continue
+                    local = absolute - ctx.prefix_length
+                if not 0 <= local < hidden.shape[0] or local >= projected.shape[0]:
+                    continue
+                traces[(layer_number, absolute)] = (
+                    hidden[local].detach().float().cpu().clone(),
+                    projected[local].detach().float().cpu().clone(),
+                )
+
+        handles.append(attention.register_forward_hook(capture))
+    return traces, handles
+
+
+def _print_attention_layer_drift(reference, segmented, positions):
+    """Output relative L2 by layer, focusing on *first* deviation."""
+    for absolute in positions:
+        print(f"ATTENTION LAYER TRACE: query_abs={absolute}")
+        previous = None
+        first = None
+        matched = 0
+        for layer in sorted({k[0] for k in reference}):
+            key = (layer, absolute)
+            if key not in reference or key not in segmented:
+                continue
+            matched += 1
+            (native_in, native_out) = reference[key]
+            (tpr_in, tpr_out) = segmented[key]
+            def metric(a, b):
+                d = (a - b).float()
+                return (
+                    float(torch.linalg.vector_norm(d) /
+                          torch.linalg.vector_norm(a).clamp_min(1e-12)),
+                    float(d.abs().max()),
+                )
+            in_rel, in_max = metric(native_in, tpr_in)
+            out_rel, out_max = metric(native_out, tpr_out)
+            # Report every layer: a small first-layer BF16 discrepancy can
+            # amplify greatly through a 28-layer real checkpoint.
+            print(
+                f"  layer={layer:02d} "
+                f"attention_input_rel_l2={in_rel:.6g} max_abs={in_max:.6g} "
+                f"attention_output_rel_l2={out_rel:.6g} max_abs={out_max:.6g}"
+            )
+            if first is None and (in_max > 0 or out_max > 0):
+                first = (layer, in_max, out_max)
+            previous = (layer, in_max, out_max)
+        print(
+            f"ATTENTION TRACE SUMMARY query_abs={absolute}: "
+            f"matched_layers={matched} first_deviation={first} last={previous}"
+        )
+        if not matched:
+            print(
+                "ATTENTION TRACE unavailable for this position: "
+                "check original real-TQ tree ownership and hook scope."
+            )
+
+
+def _get_trace_owner_segments(batch, *, row=0, response_offsets=(6, 13)):
+    """Exact row-path mapping, never assume branch IDs based on one run log."""
+    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    keys = tu.get_non_tensor_data(batch, key="tpr_trajectory_keys", default=None)
+    forest = build_tree_execution_plans(tuple(keys), batch)
+    offsets = set(response_offsets)
+    segments = {}
+    for tree in forest.trees:
+        for ref in tree.objective_refs:
+            if ref.sample_row == row and ref.response_offset in offsets:
+                segment = tree.segment_plan.get(ref.segment_id)
+                absolute = segment.position_start + ref.query_offset
+                segments[absolute] = segment
+    if len(segments) != len(offsets):
+        raise AssertionError(
+            f"layer trace requires unique real query owners for {sorted(offsets)}"
+        )
+    return segments
+
+
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -513,6 +623,27 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     )
     native_grads = _selected_gradient_snapshot(ref)
 
+    # No synthetic model or token fixtures. Trace the exact original row-0
+    # query positions for early/root and shared nonroot response tokens.
+    trace_owners = None
+    native_trace = {}
+    if os.getenv("TPR_QWEN17_PPO_TRACE_LAYERS", "1") == "1":
+        trace_owners = _get_trace_owner_segments(batch)
+        trace_positions = tuple(sorted(trace_owners))
+        print(f"REAL QWEN TRACE POSITIONS: {trace_positions}")
+        native_trace, native_hooks = _attention_trace_hooks(
+            ref, monitored_positions=trace_positions
+        )
+        try:
+            with torch.no_grad():
+                _native_response_logprobs(
+                    ref, batch["input_ids"][0].to(device),
+                    prompt_length=len(batch["prompts"][0]), temperature=1.0
+                )
+        finally:
+            for handle in native_hooks:
+                handle.remove()
+
     del ref
     gc.collect()
     torch.npu.empty_cache()
@@ -541,10 +672,24 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     engine.get_data_parallel_size = lambda: 1
     engine.get_data_parallel_group = lambda: None
 
-    output = engine.forward_backward_batch(
-        batch, loss_function=partial(ppo_loss, config=_VanillaPPOConfig()),
-        forward_only=False,
-    )
+    tpr_trace, tpr_hooks = ({}, [])
+    if trace_owners is not None:
+        tpr_trace, tpr_hooks = _attention_trace_hooks(
+            tpr, monitored_positions=tuple(sorted(trace_owners)),
+            owner_segments=trace_owners,
+        )
+    try:
+        output = engine.forward_backward_batch(
+            batch, loss_function=partial(ppo_loss, config=_VanillaPPOConfig()),
+            forward_only=False,
+        )
+    finally:
+        for handle in tpr_hooks:
+            handle.remove()
+    if trace_owners is not None:
+        _print_attention_layer_drift(
+            native_trace, tpr_trace, tuple(sorted(trace_owners))
+        )
     tpr_grads = _selected_gradient_snapshot(tpr)
     captured = getattr(engine, "_tpr_captured_log_probs", None)
     assert captured is not None, "TPR logical new-logprob capture was not enabled"
