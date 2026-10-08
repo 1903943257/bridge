@@ -112,17 +112,31 @@ def _capture_model_stages(model):
     return captures, core_scales, handles
 
 
-def _run_recorded_prefix(model, tokens, *, cutoff):
+def _run_recorded_prefix(model, tokens, *, cutoff, explicit_native_mask=False):
     from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
 
     ids = tokens[:cutoff].to(next(model.parameters()).device, dtype=torch.long)
+    # MindSpeed wraps unmodified DotProductAttention and, on attention_mask=None,
+    # calls get_attention_mask(config). The real-checkpoint fixture intentionally
+    # does not provide training-only config.micro_batch_size; constructing a
+    # fixed global mask there is also incorrect for our changing 70/94/128
+    # sequence lengths. Supply the correct causal [1,1,S,S] bool mask for
+    # this independent native-reference test instead of changing the model or
+    # production Attention implementation.
+    mask = (
+        torch.triu(
+            torch.ones((1, 1, cutoff, cutoff), device=ids.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        if explicit_native_mask else None
+    )
     traces, scales, handles = _capture_model_stages(model)
     try:
         with torch.no_grad():
             logits = model(
                 input_ids=ids.unsqueeze(0),
                 position_ids=torch.arange(cutoff, device=ids.device)[None, :],
-                attention_mask=None,
+                attention_mask=mask,
             )
             if tuple(logits.shape[:2]) != (1, cutoff):
                 raise AssertionError(f"unexpected GPT logits: {tuple(logits.shape)}")
@@ -478,13 +492,26 @@ def test_real_qwen3_1_7b_first_shape_divergence():
                 model.decoder.layers[0].self_attention.core_attention,
                 qwen_fixture._ProfileFusedCausalAttention
             ), "Unmodified reference accidentally still uses TPR CANN adapter"
+            # Same NPU-compatible native DotProductAttention setup as the
+            # preexisting one-step reference-control NPU test.
+            model.config.masked_softmax_fusion = False
+            for layer in model.decoder.layers:
+                native_core = layer.self_attention.core_attention
+                native_core.scale_mask_softmax.scaled_masked_softmax_fusion = False
+            print(
+                "ROOTCAUSE NATIVE SETUP: explicit dynamic causal masks; "
+                "disabled CUDA fused softmax, kept original Megatron "
+                "DotProductAttention module",
+                flush=True,
+            )
         try:
             print(
                 f"ROOTCAUSE RUN backend={backend} cutoff=128 START",
                 flush=True,
             )
             full_trace, full_scales, full_lp = _run_recorded_prefix(
-                model, tokens, cutoff=128
+                model, tokens, cutoff=128,
+                explicit_native_mask=(backend == "unmodified_megatron"),
             )
             print(
                 f"ROOTCAUSE RUN backend={backend} cutoff=128 DONE",
@@ -499,7 +526,8 @@ def test_real_qwen3_1_7b_first_shape_divergence():
                     flush=True,
                 )
                 crop_trace, crop_scales, crop_lp = _run_recorded_prefix(
-                    model, tokens, cutoff=cutoff
+                    model, tokens, cutoff=cutoff,
+                    explicit_native_mask=(backend == "unmodified_megatron"),
                 )
                 print(
                     f"ROOTCAUSE RUN backend={backend} cutoff={cutoff} DONE",
