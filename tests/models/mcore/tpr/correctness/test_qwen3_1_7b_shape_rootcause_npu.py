@@ -209,8 +209,22 @@ def _print_fp32_core_oracle(trace, scales, backend, cutoff, *, layers=(1, 2, 3, 
 def test_real_qwen3_1_7b_first_shape_divergence():
     # This is a focused, real-TQ test, not a replacement for the Phase-5 PPO
     # correctness gate. Its default 64+64 crop is deliberately explicit.
+    # Match the real NPU/MindSpeed bootstrap used by existing Qwen Ring CP
+    # tests: unmodified DotProductAttention uses Megatron RNG and softmax
+    # paths that may require MindSpeed's NPU compatibility repatch.
+    import sys
+    saved_argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = saved_argv
     from mindspeed.args_utils import get_full_args
     vars(get_full_args()).pop("", None)
+    repatch({
+        "context_parallel_size": 1,
+        "context_parallel_algo": "megatron_cp_algo",
+    })
 
     from ..profiling._qwen3_profile_target import resolve_qwen3_profile_target
     from . import test_tpr_qwen3_compatibility_npu as qwen_fixture
