@@ -188,6 +188,15 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     # or subsequent RoPE still differs. Capture these before core Attention.
     pre_core = {}
     projection = {}
+    qkv_linear = {}
+
+    def capture_qkv_linear(_module, args, output):
+        mode = modes["value"]
+        if mode in ("full", "prefix", "suffix"):
+            tensor = output[0] if isinstance(output, tuple) else output
+            qkv_linear[mode] = (args[0].detach().clone(), tensor.detach().clone())
+
+    attention.linear_qkv.register_forward_hook(capture_qkv_linear)
 
     def capture_norm(name):
         def hook(_module, args, output):
@@ -268,6 +277,23 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     full_core = captures["full"]
     prefix_core = captures["prefix"]
     suffix_core = captures["suffix"]
+    # The suffix QKV GEMM was already seen to match exactly. The prefix
+    # QKV GEMM instead sees M=P rather than M=P+S; compare THAT input/output.
+    assert set(qkv_linear) == {"full", "prefix", "suffix"}, (
+        f"missing QKV linear capture: {set(qkv_linear)}"
+    )
+    _stats(
+        "ATTN_PREFIX_QKV_LINEAR_INPUT",
+        qkv_linear["prefix"][0], qkv_linear["full"][0][:p],
+    )
+    _stats(
+        "ATTN_PREFIX_QKV_LINEAR_OUTPUT",
+        qkv_linear["prefix"][1], qkv_linear["full"][1][:p],
+    )
+    _stats(
+        "ATTN_SUFFIX_QKV_LINEAR_OUTPUT",
+        qkv_linear["suffix"][1], qkv_linear["full"][1][-s:],
+    )
     if ("suffix", "q_norm") in pre_core:
         _stats(
             "ATTN_Q_AFTER_NORM_BEFORE_ROPE",
@@ -311,6 +337,32 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         )
     _stats("ATTN_SAME_QKV_SQUARE_VS_RECT", controlled_rect_tail, full_core["core"][-s:])
     _stats("ATTN_SAME_QKV_RECT_VS_SPLIT_CORE", suffix_core["core"], controlled_rect_tail)
+
+    # One more causal intervention: apply the real output projection to
+    # EXACTLY the full reference core's suffix tensor, but in a standalone
+    # [S,1,H] GEMM rather than the full reference's [P+S,1,H] GEMM.
+    # This isolates projection M-shape effects WITHOUT any KV differences.
+    with torch.no_grad():
+        proj_from_full_core = attention.linear_proj(full_core["core"][-s:])
+        proj_from_split_core = attention.linear_proj(suffix_core["core"])
+        if isinstance(proj_from_full_core, tuple):
+            proj_from_full_core = proj_from_full_core[0]
+        if isinstance(proj_from_split_core, tuple):
+            proj_from_split_core = proj_from_split_core[0]
+    full_proj_tail = projection["full"][1][-s:]
+    split_proj_tail = projection["suffix"][1]
+    _stats(
+        "ATTN_PROJ_SAME_CORE_DIFFERENT_M",
+        proj_from_full_core, full_proj_tail,
+    )
+    _stats(
+        "ATTN_PROJ_SHORT_M_KV_ONLY_DIFF",
+        proj_from_split_core, proj_from_full_core,
+    )
+    _stats(
+        "ATTN_PROJ_REPLAY_VS_REAL_SPLIT",
+        proj_from_split_core, split_proj_tail,
+    )
     _core_fp32_sparse_row_checks(full_core, controlled_rect_tail, prefix_length=p)
     print(
         "QWEN SPLIT CORE DIAG: q_same="
