@@ -100,6 +100,8 @@ class SegmentExecutor:
         loss_chunk_size: int | None = None,
         cp_group: Any | None = None,
         cp_backend: TPRCPBackend | str | None = None,
+        segment_loss_fn: Callable[[SegmentSpec, Tensor], tuple[Tensor, dict[str, Any]]] | None = None,
+        segment_loss_term_counts: Mapping[SegmentId, int] | None = None,
     ) -> None:
         if not isinstance(model, nn.Module):
             raise TypeError(f"model must be torch.nn.Module, got {type(model).__name__}")
@@ -119,6 +121,27 @@ class SegmentExecutor:
             raise ValueError(f"expected_layer_numbers must contain positive integers, got {expected_layer_numbers}")
         if len(set(expected_layer_numbers)) != len(expected_layer_numbers):
             raise ValueError(f"expected_layer_numbers contains duplicates: {expected_layer_numbers}")
+
+        if plan.topology_only != (segment_loss_fn is not None):
+            raise ValueError(
+                "topology_only SegmentPlan requires segment_loss_fn; "
+                "CE SegmentPlan must use the existing CE loss path"
+            )
+        if segment_loss_fn is not None and cp_group is not None:
+            raise NotImplementedError("external segment objectives currently support CP=1 only")
+        counts = dict(segment_loss_term_counts or {})
+        if segment_loss_fn is not None:
+            if not callable(segment_loss_fn):
+                raise TypeError("segment_loss_fn must be callable")
+            if not counts:
+                raise ValueError("segment_loss_term_counts is required for external objectives")
+            if any(segment_id not in plan.segments or count < 0 for segment_id, count in counts.items()):
+                raise ValueError("invalid external segment objective counts")
+        elif counts:
+            raise ValueError("segment_loss_term_counts is only valid with segment_loss_fn")
+        self.segment_loss_fn = segment_loss_fn
+        self.segment_loss_term_counts = counts
+        self.segment_loss_metrics: list[tuple[SegmentId, dict[str, Any]]] = []
 
         self.model = model
         self.plan = plan
@@ -258,7 +281,7 @@ class SegmentExecutor:
             self._assert_collected_layers(context)
 
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
-            owned_loss_term_count = len(self._owned_loss_terms(segment))
+            owned_loss_term_count = self._owned_loss_count(segment)
             roots: list[Tensor] = []
             root_gradients: list[Tensor | None] = []
             if owned_loss_term_count or self.cp_enabled:
@@ -341,7 +364,7 @@ class SegmentExecutor:
             )
             self._assert_collected_layers(context, expect_gdn_states=False)
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
-            owned_loss_term_count = len(self._owned_loss_terms(segment))
+            owned_loss_term_count = self._owned_loss_count(segment)
 
             # Every CP rank must traverse the same backward graph even when
             # this rank owns no loss term, otherwise Attention collectives hang.
@@ -429,7 +452,7 @@ class SegmentExecutor:
             )
             with rope_context, use_tpr_attention_context(context):
                 use_chunked_lm_head = (
-                    not no_grad and self._can_chunk_language_model_output()
+                    not no_grad and self.segment_loss_fn is None and self._can_chunk_language_model_output()
                 )
                 if use_chunked_lm_head:
                     # Older Megatron revisions do not expose output_processor.
@@ -593,6 +616,19 @@ class SegmentExecutor:
         segment: SegmentSpec,
         logits: Tensor | _ChunkedLanguageModelOutput,
     ) -> tuple[Tensor, Tensor]:
+        if self.segment_loss_fn is not None:
+            if not isinstance(logits, Tensor):
+                raise TypeError("external segment objective requires raw logits Tensor")
+            if not self._owned_loss_count(segment):
+                connected_zero = logits.float().sum() * 0.0
+                return connected_zero, connected_zero
+            loss, metrics = self.segment_loss_fn(segment, logits)
+            if not isinstance(loss, Tensor) or loss.numel() != 1 or not loss.requires_grad:
+                raise TypeError("external segment objective must return a differentiable scalar Tensor")
+            self.segment_loss_metrics.append((segment.segment_id, metrics))
+            # The objective supplies its original VERL global normalization.
+            # Unlike CE, there is no per-tree denominator or additional /M here.
+            return loss, loss
         if isinstance(logits, _ChunkedLanguageModelOutput):
             return logits.loss_sum, logits.normalized_loss
         owned_terms = self._owned_loss_terms(segment)
@@ -682,6 +718,11 @@ class SegmentExecutor:
             )
         loss_sum = torch.sum(per_term_loss.reshape(-1).float() * weights)
         return loss_sum, loss_sum / self.plan.total_loss_weight
+
+    def _owned_loss_count(self, segment: SegmentSpec) -> int:
+        if self.segment_loss_fn is not None:
+            return self.segment_loss_term_counts.get(segment.segment_id, 0)
+        return len(self._owned_loss_terms(segment))
 
     def _owned_loss_terms(self, segment: SegmentSpec) -> tuple[SegmentLossTerm, ...]:
         if not self.cp_enabled:
