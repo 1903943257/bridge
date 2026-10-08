@@ -124,6 +124,42 @@ When the cropped real-TQ numerical check fails, do **not** loosen
 - PPO scalar loss and sampled parameter gradient relative-L2 and cosine
   are reported even if the logprob gate fails.
 
+### Native physical-segment cutoff oracle (Phase-5 accuracy)
+
+The 64+64 real-TQ experiment confirmed two positions at which the Native
+**truncated-prefix** result exactly equals TPR, while Native full 128
+differs:
+
+| Absolute query | Native full 128 | Native cutoff | TPR forest | Cutoff length |
+| --- | ---: | ---: | ---: | ---: |
+| 69 | -4.79739285 | -4.78902054 | -4.78902054 | 70 |
+| 76 | -1.70170808 | -2.12716579 | -2.12716579 | 94 |
+
+These positions prove that TPR-specific KV/gradient mistakes are **not
+required** to produce the observed divergence. They do not prove every
+logical token and every branch is correct.
+
+To extend the causal control to **every real TQ objective reference**:
+
+```bash
+export TPR_QWEN17_PPO_SEGMENT_ORACLE=1
+```
+
+For each compressed-tree physical Segment the Phase-5 test now performs
+a Native forward on the original real tokens up to the Segment end and
+scores all of that Segment's original logical targets, including
+different child targets for a shared parent query. It prints
+`NATIVE FULL vs NATIVE PER-SEGMENT CUTOFF` and
+`TPR FOREST vs NATIVE PER-SEGMENT CUTOFF`, and per-Segment max errors.
+
+If `TPR FOREST vs NATIVE PER-SEGMENT CUTOFF` is small for all tokens,
+the large original Native-Full/Forest discrepancy is predominantly the
+precision-dependent sequence-shape effect. If not, pursue the residual
+TPR-specific discrepancy in attention/KV. This cutoff oracle is only
+for short **real-token debug runs** (<=256 total tokens) and will skip
+full-length real TQ to avoid reproducing its observed OOM. It does not
+relax the strict original Native-full gate.
+
 ### Root/branch BF16 numerical diagnosis
 
 For the Qwen3-1.7B cropped-real-TQ case, current evidence includes:
