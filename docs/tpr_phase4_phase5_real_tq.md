@@ -124,6 +124,28 @@ When the cropped real-TQ numerical check fails, do **not** loosen
 - PPO scalar loss and sampled parameter gradient relative-L2 and cosine
   are reported even if the logprob gate fails.
 
+When the 64+64 TQ crop gives repeated mismatches in nonroot Segment 1
+(e.g. real absolute query 76) while whole-segment TPR is bit-identical,
+the next gate is **attention-layer-local**. Set
+`TPR_QWEN17_PPO_TRACE_LAYERS=1` (default) to compare the actual real row-0
+queries at response offsets 6 and 13 across all Qwen layers. For each layer
+the test reports the relative L2 and maximum absolute differences of
+`self_attention` **input and output**. It maps physical Segment ownership
+from `ForestExecutionPlan`, not from hard-coded node IDs; sibling branches
+at the same absolute position cannot contaminate the trace.
+
+- First-layer input mismatch: investigate embeddings, sequence positions,
+  Qwen model/row mismatch.
+- First-layer input matches but output differs: investigate TPR attention
+  projection, RoPE, rectangular FA and NPU shape sensitivity.
+- First-layer output close but drift grows through later layers: quantify
+  BF16 shape-dependent accumulation before considering tolerances.
+
+Also, this diagnostic's PPO advantages are intentionally signed (+1.0/-0.5)
+rather than an exact +1/-1 cancellation: previously native PPO loss was 0
+by construction and hid loss-relative deviation. This is a mathematical
+probe, not real rollout advantage data.
+
 The numerical gate remains strict; none of these diagnostics changes
 acceptance thresholds or marks mismatches as passing.
 
