@@ -183,8 +183,11 @@ def test_bind_tree_exposes_loss_hook_and_ref_counts():
     }
     forest = build_tree_execution_plans(["uid_s_0", "uid_s_1"], topology_batch)
     tree_plan = forest.trees[0]
+    data = _batch()
+    data["response_mask"][1, 1] = True
+    tu.assign_non_tensor(data, batch_num_tokens=4, dp_size=1, global_batch_size=2)
     adapter = SegmentPPOObjectiveAdapter(
-        _batch(),
+        data,
         partial(ppo_loss, config=_ActorConfig()),
         log_prob_fn=_cpu_log_probs,
     )
