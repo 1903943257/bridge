@@ -99,9 +99,39 @@ def _stats(name, observed, expected):
     return rel, max_abs
 
 
-def test_real_qwen_first_attention_full_vs_external_kv():
+def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     """Actual Qwen layer-1 weights + real-token LN activations, P+S up to 16K."""
     from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+    from verl.models.mcore.tpr import rectangular_attention as cann_adapter
+    from verl.models.mcore.tpr import attention as tpr_attention_module
+
+    # Both the controlled Full reference and TPR external-KV implementation
+    # ultimately call THIS same CANN adapter. Instrument both entry points
+    # without changing Q/K/V or the backend/rounding. Distinguish:
+    #   (a) Q/K/V before core, (b) square-vs-rectangle FA with identical QKV,
+    #   (c) core-vs-linear-proj numerical differences.
+    modes = {"value": "not-started"}
+    captures = {}
+    original_cann = cann_adapter.rectangular_causal_attention
+
+    def traced_cann(query, key, value, **kwargs):
+        mode = modes["value"]
+        if mode in ("full", "prefix", "suffix"):
+            if mode in captures:
+                raise AssertionError(f"duplicate Attention Core call in mode={mode}")
+            result = original_cann(query, key, value, **kwargs)
+            captures[mode] = {
+                "q": query.detach().clone(),
+                "k": key.detach().clone(),
+                "v": value.detach().clone(),
+                "core": result.detach().clone(),
+                "scale": kwargs.get("softmax_scale"),
+            }
+            return result
+        return original_cann(query, key, value, **kwargs)
+
+    monkeypatch.setattr(cann_adapter, "rectangular_causal_attention", traced_cann)
+    monkeypatch.setattr(tpr_attention_module, "rectangular_causal_attention", traced_cann)
     fixture, target = _setup_real_model()
     p, s = _lengths()
     tokens = _real_recorded_tokens(p, s).to("npu")
@@ -124,6 +154,7 @@ def test_real_qwen_first_attention_full_vs_external_kv():
     full_mask = torch.triu(
         torch.ones((1, 1, p+s, p+s), device="npu", dtype=torch.bool), diagonal=1
     )
+    modes["value"] = "full"
     full_out, full_bias = attention(full_hidden, full_mask, rotary_pos_emb=_rope(model, 0, p+s))
     assert full_bias is None
     full_out[-s:].backward(upstream)
@@ -141,6 +172,7 @@ def test_real_qwen_first_attention_full_vs_external_kv():
     prefix_ctx = TPRAttentionContext(
         0, p, suffix_rotary_pos_emb=_rope(model, 0, p)
     )
+    modes["value"] = "prefix"
     with use_tpr_attention_context(prefix_ctx):
         attention(prefix_hidden, None)
     prefix_ctx.assert_new_kv_layers((attention.layer_number,))
@@ -151,9 +183,45 @@ def test_real_qwen_first_attention_full_vs_external_kv():
     suffix_ctx = TPRAttentionContext(
         p, s, past_key_values=past, suffix_rotary_pos_emb=_rope(model, p, s)
     )
+    modes["value"] = "suffix"
     with use_tpr_attention_context(suffix_ctx):
         suffix_out, suffix_bias = attention(suffix_hidden, None)
+    modes["value"] = "oracle"
     assert suffix_bias is None
+
+    # First compare actual post-RoPE QKV. If these differ, investigating
+    # rectangular Attention arithmetic before QKV/RoPE would be misleading.
+    assert set(captures) == {"full", "prefix", "suffix"}, (
+        f"missing core captures: {set(captures)}"
+    )
+    full_core = captures["full"]
+    prefix_core = captures["prefix"]
+    suffix_core = captures["suffix"]
+    _stats("ATTN_Q_POST_ROPE", suffix_core["q"], full_core["q"][-s:])
+    _stats("ATTN_K_PREFIX_POST_ROPE", prefix_core["k"], full_core["k"][:p])
+    _stats("ATTN_V_PREFIX", prefix_core["v"], full_core["v"][:p])
+    _stats("ATTN_K_ALL_POST_ROPE", suffix_core["k"], full_core["k"])
+    _stats("ATTN_V_ALL", suffix_core["v"], full_core["v"])
+    _stats("ATTN_CORE_FULL_VS_SPLIT", suffix_core["core"], full_core["core"][-s:])
+
+    # The strongest shape oracle: a RECTANGULAR Attention call on the
+    # exact, unchanged post-RoPE Q/K/V used by the FULL 1152x1152 kernel.
+    # If this already differs from the Full tail, the CANN square/rect
+    # physical execution shape is numerically noninvariant at this length.
+    with torch.no_grad():
+        controlled_rect_tail = original_cann(
+            full_core["q"][-s:], full_core["k"], full_core["v"],
+            softmax_scale=full_core["scale"], dropout_p=0.0
+        )
+    _stats("ATTN_SAME_QKV_SQUARE_VS_RECT", controlled_rect_tail, full_core["core"][-s:])
+    _stats("ATTN_SAME_QKV_RECT_VS_SPLIT_CORE", suffix_core["core"], controlled_rect_tail)
+    print(
+        "QWEN SPLIT CORE DIAG: q_same="
+        f"{torch.equal(suffix_core['q'],full_core['q'][-s:])} "
+        "kv_same="
+        f"{torch.equal(suffix_core['k'],full_core['k']) and torch.equal(suffix_core['v'],full_core['v'])}",
+        flush=True
+    )
     suffix_out.backward(upstream)
 
     _stats("ATTN_OUTPUT", suffix_out, full_output)
