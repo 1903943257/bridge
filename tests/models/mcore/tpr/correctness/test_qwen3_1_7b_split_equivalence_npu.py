@@ -191,6 +191,61 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     qkv_linear = {}
     qkv_output_grads = {}
 
+    # Test-only real autograd counterfactual: keep QKV forward identical,
+    # but replace only its QKV input-gradient / weight-gradient backward
+    # with an explicit FP32 dW accumulation buffer. This is deliberately
+    # CP=TP=1, bias-free Qwen3 QKV, NOT a production Megatron patch.
+    real_fp32_dw = os.environ.get("TPR_QWEN17_SPLIT_FP32_DW_BACKWARD", "0") == "1"
+    fp32_dw_state = {"buffer": None, "forward_modes": [], "backward_calls": 0}
+    if real_fp32_dw:
+        fp32_dw_state["buffer"] = torch.zeros_like(
+            attention.linear_qkv.weight, dtype=torch.float32
+        )
+
+        class _FP32QKVWGrad(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, original_output, hidden, weight, buffer):
+                ctx.save_for_backward(hidden, weight)
+                ctx.buffer = buffer
+                return original_output
+
+            @staticmethod
+            def backward(ctx, grad_qkv):
+                hidden, weight = ctx.saved_tensors
+                dy = grad_qkv.contiguous().reshape(-1, weight.shape[0])
+                x = hidden.contiguous().reshape(-1, weight.shape[1])
+                with torch.no_grad():
+                    ctx.buffer.addmm_(dy.float().transpose(0, 1), x.float())
+                    grad_input = grad_qkv.matmul(weight)
+                fp32_dw_state["backward_calls"] += 1
+                # Original output's previous autograd graph is detached;
+                # weight.grad is *not* materialized as BF16 per segment.
+                return None, grad_input, None, None
+
+        def route_qkv_wgrad_to_fp32(_module, args, output):
+            mode = modes["value"]
+            if mode not in ("prefix", "suffix"):
+                return output
+            if isinstance(output, tuple):
+                if len(output) != 2 or output[1] is not None:
+                    raise AssertionError(
+                        "test-only FP32 QKV backward supports bias-free QKV only"
+                    )
+                raw_qkv = output[0]
+            else:
+                raw_qkv = output
+            hidden = args[0]
+            fp32_dw_state["forward_modes"].append(mode)
+            surrogate = _FP32QKVWGrad.apply(
+                raw_qkv.detach(), hidden, _module.weight,
+                fp32_dw_state["buffer"],
+            )
+            return (surrogate, output[1]) if isinstance(output, tuple) else surrogate
+
+        # Must run BEFORE the existing capture hook to observe the real dY
+        # that reaches this counterfactual backward.
+        attention.linear_qkv.register_forward_hook(route_qkv_wgrad_to_fp32)
+
     def capture_qkv_linear(_module, args, output):
         mode = modes["value"]
         if mode in ("full", "prefix", "suffix"):
@@ -445,6 +500,28 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         flush=True
     )
     suffix_out.backward(upstream)
+
+    if real_fp32_dw:
+        qkv_weight = attention.linear_qkv.weight
+        assert qkv_weight.grad is None, (
+            "QKV per-segment BF16 .grad was unexpectedly materialized"
+        )
+        assert fp32_dw_state["forward_modes"] == ["prefix", "suffix"], (
+            f"unexpected FP32 QKV forward calls: {fp32_dw_state['forward_modes']}"
+        )
+        assert fp32_dw_state["backward_calls"] == 2, (
+            f"expected Prefix+Suffix dW accumulation, got "
+            f"{fp32_dw_state['backward_calls']}"
+        )
+        # The ONLY BF16 cast, after both real autograd contributions.
+        qkv_weight.grad = fp32_dw_state["buffer"].to(qkv_weight.dtype)
+        print(
+            "QWEN SPLIT ATTN_QKV_DW_REAL_FP32_BACKWARD "
+            f"calls={fp32_dw_state['backward_calls']} "
+            f"accum_dtype={fp32_dw_state['buffer'].dtype} "
+            f"final_grad_dtype={qkv_weight.grad.dtype}",
+            flush=True,
+        )
 
     # Backward decomposition is the last distinct equivalence question:
     #   (1) Are gradients delivered TO the QKV GEMM identical?
