@@ -233,7 +233,9 @@ def _make_qwen_model(
     core_attention_module=None,
     model_shape=None,
 ):
-    del max_sequence_length, model_shape
+    del model_shape
+    if not isinstance(max_sequence_length, int) or max_sequence_length <= 0:
+        raise ValueError("max_sequence_length must be a positive integer")
     if core_attention_module not in (None, _ProfileFusedCausalAttention):
         raise ValueError("real Qwen fixture only supports the controlled fused core attention")
     _validate_checkpoint_files(QWEN_MODEL_PATH)
@@ -273,7 +275,11 @@ def _make_qwen_model(
         config=config,
         transformer_layer_spec=spec,
         vocab_size=hf_config.vocab_size,
-        max_sequence_length=hf_config.max_position_embeddings,
+        # Qwen3 uses RoPE, not learned absolute embeddings. Support a real
+        # trajectory a few tokens beyond checkpoint nominal context length
+        # without changing any token IDs, RoPE theta or attention semantics.
+        # This is position extrapolation and is reported by the Phase5 test.
+        max_sequence_length=max(hf_config.max_position_embeddings, max_sequence_length),
         pre_process=True,
         post_process=True,
         parallel_output=False,
