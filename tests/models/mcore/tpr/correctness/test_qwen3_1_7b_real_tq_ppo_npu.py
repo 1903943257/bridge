@@ -281,6 +281,17 @@ def _logprob_diagnostics(batch, captured, reference_lp):
         torch.linalg.vector_norm(expected).clamp_min(1e-12)
     )
     rms = torch.sqrt(torch.mean(diff.square()))
+    # PPO optimizes exp(new_lp - old_lp), not the relative error in a
+    # negative logprob number. A 0.37 logprob shift at -16.6 may be
+    # "within_tol" here yet already change the clipped PPO branch.
+    ratio = torch.exp(actual - expected)
+    outside_clip = (ratio < 0.8) | (ratio > 1.2)
+    print(
+        "TPR PPO RATIO DIAG (using Native checkpoint logprob as old policy): "
+        f"outside_clip_0.8_1.2={int(outside_clip.sum())}/{len(all_keys)} "
+        f"min_ratio={ratio.min().item():.6g} "
+        f"max_ratio={ratio.max().item():.6g}"
+    )
     print(
         "TPR LOGPROB DIAG:"
         f" total={len(all_keys)} bad={int(bad.sum())} "
@@ -311,10 +322,12 @@ def _logprob_diagnostics(batch, captured, reference_lp):
             f"segment={info['segment_id']}[{info['segment_start']}:{info['segment_end']}] "
             f"native={expected[i].item():.6g} tpr={actual[i].item():.6g} "
             f"abs_diff={diff[i].item():.6g} "
+            f"ratio={ratio[i].item():.6g} "
+            f"ratio_clipped={bool(outside_clip[i])} "
             f"threshold={threshold[i].item():.6g}"
             + (" FAIL" if bad[i] else " within_tol")
         )
-    return all_keys, expected, actual, bad
+    return all_keys, expected, actual, bad, outside_clip
 
 
 def _probe_tpr_model_native_forward(model, batch, reference_lp, *, max_length=256):
@@ -767,7 +780,7 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         [float(old_probs[row][offset]) for row, offset in sorted(expected_keys)]
     )
     tpr_lp = torch.tensor([captured[key] for key in sorted(expected_keys)])
-    diag_keys, diag_expected, diag_actual, bad = _logprob_diagnostics(
+    diag_keys, diag_expected, diag_actual, bad, outside_clip = _logprob_diagnostics(
         batch, captured, old_probs
     )
     if bool(bad.any()):
@@ -785,6 +798,11 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     else:
         print(f"Qwen3-1.7B real TQ new_log_probs: {len(expected_keys)} logical tokens aligned")
     check_failures = []
+    if bool(outside_clip.any()):
+        check_failures.append(
+            f"PPO clip regime disagrees with Native old policy at "
+            f"{int(outside_clip.sum())} logical response tokens"
+        )
     try:
         torch.testing.assert_close(tpr_lp, baseline_lp, rtol=2e-2, atol=2e-1)
     except AssertionError as exc:
