@@ -501,6 +501,65 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         and tuple(x_suffix.shape) == (s, 1, ref_wgrad.shape[1])
         and full_dy.shape[-1] == ref_wgrad.shape[0]
     ), "QKV linear layout changed; sampled dW oracle must be updated"
+
+    # Counterfactual for BF16 cancellation: do the two independent segment
+    # wgrad GEMMs in FP32 and accumulate FP32 BEFORE the first BF16 cast.
+    # Merely calling param.grad.float() cannot recover rounded-away bits.
+    # This compares a numerical intervention without modifying autograd,
+    # TPR's backward, production Megatron, or the existing strict gate.
+    if os.getenv("TPR_QWEN17_SPLIT_FP32_DW_ORACLE", "0") == "1":
+        def wgrad_fp32(dy, x):
+            dy2 = dy.detach().reshape(-1, dy.shape[-1]).float()
+            x2 = x.detach().reshape(-1, x.shape[-1]).float()
+            return dy2.transpose(0, 1).matmul(x2)
+
+        with torch.no_grad():
+            dw_accum_fp32 = wgrad_fp32(prefix_dy, x_prefix)
+            dw_accum_fp32.add_(wgrad_fp32(suffix_dy, x_suffix))
+            dw_split_late_bf16 = dw_accum_fp32.to(torch.bfloat16)
+            dw_full_fp32 = wgrad_fp32(full_dy, x_full)
+            dw_full_late_bf16 = dw_full_fp32.to(torch.bfloat16)
+
+            ref_device = ref_wgrad.to(dw_accum_fp32.device)
+            def report_wgrad_gate(tag, candidate, reference, *, cast_bf16=False):
+                if cast_bf16:
+                    candidate = candidate.to(torch.bfloat16)
+                    reference = reference.to(torch.bfloat16)
+                candidate = candidate.float()
+                reference = reference.float()
+                abs_err = (candidate - reference).abs()
+                tol = 1e-2 + 1e-2 * reference.abs()
+                count = int((abs_err > tol).sum().item())
+                rel = float(torch.linalg.vector_norm(candidate - reference) /
+                            torch.linalg.vector_norm(reference).clamp_min(1e-12))
+                print(
+                    f"QWEN SPLIT {tag} "
+                    f"fail_count={count}/{reference.numel()} "
+                    f"rel_l2={rel:.8g} max_abs={float(abs_err.max()):.8g}",
+                    flush=True,
+                )
+
+            report_wgrad_gate(
+                "ATTN_QKV_DW_FP32_ACCUM_VS_NATIVE_BF16",
+                dw_split_late_bf16, ref_device,
+            )
+            report_wgrad_gate(
+                "ATTN_QKV_DW_FP32_ACCUM_VS_FULL_FP32",
+                dw_accum_fp32, dw_full_fp32,
+            )
+            report_wgrad_gate(
+                "ATTN_QKV_DW_FULL_FP32_VS_NATIVE_BF16",
+                dw_full_late_bf16, ref_device,
+            )
+            # Compare the production-like BF16 final materialization against
+            # the same high-precision full reference to remove the effects of
+            # native Full BF16 GEMM rounding.
+            report_wgrad_gate(
+                "ATTN_QKV_DW_FP32_ACCUM_FINAL_BF16_VS_FULL_FP32_FINAL_BF16",
+                dw_split_late_bf16, dw_full_late_bf16,
+            )
+        del dw_accum_fp32, dw_split_late_bf16, dw_full_fp32, dw_full_late_bf16
+
     for flat_index in torch.topk(wdelta.flatten(), k=min(5, wdelta.numel())).indices.tolist():
         oi, ii = divmod(flat_index, ref_wgrad.shape[1])
         f64_full = (
