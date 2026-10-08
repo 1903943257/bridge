@@ -140,6 +140,33 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     attention = model.decoder.layers[0].self_attention
     assert type(attention).__name__ == "TPRSelfAttention"
     print(f"QWEN SPLIT ATTENTION P={p} S={s} layer=1 real_weights=True", flush=True)
+    # QKV's linear output can agree while Megatron's per-head Q/K RMSNorm
+    # or subsequent RoPE still differs. Capture these before core Attention.
+    pre_core = {}
+    projection = {}
+
+    def capture_norm(name):
+        def hook(_module, args, output):
+            mode = modes["value"]
+            if mode in ("full", "prefix", "suffix"):
+                assert isinstance(output, torch.Tensor)
+                pre_core[(mode, name)] = output.detach().clone()
+        return hook
+
+    def capture_projection(_module, args, output):
+        mode = modes["value"]
+        if mode not in ("full", "prefix", "suffix"):
+            return
+        out = output[0] if isinstance(output, tuple) else output
+        projection[mode] = (
+            args[0].detach().clone(), out.detach().clone(),
+        )
+
+    if attention.q_layernorm is not None:
+        attention.q_layernorm.register_forward_hook(capture_norm("q_norm"))
+    if attention.k_layernorm is not None:
+        attention.k_layernorm.register_forward_hook(capture_norm("k_norm"))
+    attention.linear_proj.register_forward_hook(capture_projection)
 
     # This tensor is precisely the distribution seen by the first Qwen
     # Attention after word-embedding and input RMSNorm, not random hidden data.
@@ -197,12 +224,37 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
     full_core = captures["full"]
     prefix_core = captures["prefix"]
     suffix_core = captures["suffix"]
+    if ("suffix", "q_norm") in pre_core:
+        _stats(
+            "ATTN_Q_AFTER_NORM_BEFORE_ROPE",
+            pre_core[("suffix", "q_norm")],
+            pre_core[("full", "q_norm")][-s:],
+        )
+    if ("suffix", "k_norm") in pre_core:
+        _stats(
+            "ATTN_K_AFTER_NORM_BEFORE_ROPE",
+            pre_core[("suffix", "k_norm")],
+            pre_core[("full", "k_norm")][-s:],
+        )
+        _stats(
+            "ATTN_PREFIX_K_AFTER_NORM",
+            pre_core[("prefix", "k_norm")],
+            pre_core[("full", "k_norm")][:p],
+        )
     _stats("ATTN_Q_POST_ROPE", suffix_core["q"], full_core["q"][-s:])
     _stats("ATTN_K_PREFIX_POST_ROPE", prefix_core["k"], full_core["k"][:p])
     _stats("ATTN_V_PREFIX", prefix_core["v"], full_core["v"][:p])
     _stats("ATTN_K_ALL_POST_ROPE", suffix_core["k"], full_core["k"])
     _stats("ATTN_V_ALL", suffix_core["v"], full_core["v"])
     _stats("ATTN_CORE_FULL_VS_SPLIT", suffix_core["core"], full_core["core"][-s:])
+    _stats(
+        "ATTN_PROJ_INPUT",
+        projection["suffix"][0], projection["full"][0][-s:],
+    )
+    _stats(
+        "ATTN_PROJ_OUTPUT",
+        projection["suffix"][1], projection["full"][1][-s:],
+    )
 
     # The strongest shape oracle: a RECTANGULAR Attention call on the
     # exact, unchanged post-RoPE Q/K/V used by the FULL 1152x1152 kernel.
