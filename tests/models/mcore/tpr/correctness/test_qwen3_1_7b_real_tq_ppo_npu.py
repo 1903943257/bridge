@@ -224,6 +224,7 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
             )
             old_probs.append(response_lp.detach().float().cpu())
     batch["old_log_probs"] = torch.stack(old_probs)
+    tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
 
     loss_fn = partial(ppo_loss, config=_VanillaPPOConfig())
     native_loss = torch.zeros((), device=device, dtype=torch.float32)
@@ -285,6 +286,20 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         forward_only=False,
     )
     tpr_grads = _selected_gradient_snapshot(tpr)
+    captured = getattr(engine, "_tpr_captured_log_probs", None)
+    assert captured is not None, "TPR logical new-logprob capture was not enabled"
+    expected_keys = {
+        (row, offset)
+        for row in range(8)
+        for offset in torch.nonzero(batch["response_mask"][row]).flatten().tolist()
+    }
+    assert set(captured) == expected_keys
+    baseline_lp = torch.tensor(
+        [float(old_probs[row][offset]) for row, offset in sorted(expected_keys)]
+    )
+    tpr_lp = torch.tensor([captured[key] for key in sorted(expected_keys)])
+    torch.testing.assert_close(tpr_lp, baseline_lp, rtol=2e-2, atol=2e-1)
+    print(f"Qwen3-1.7B real TQ new_log_probs: {len(expected_keys)} logical tokens aligned")
     actual_loss = float(sum(output["loss"]))
     expected_loss = float(native_loss.item())
     print(f"Qwen3-1.7B real TQ PPO native_loss={expected_loss:.8f}, tpr_loss={actual_loss:.8f}")
