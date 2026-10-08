@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 
 from .segment_plan import SegmentSpec
-from .tree_plan_builder import SegmentObjectiveRef
+from .tree_plan_builder import SegmentObjectiveRef, TreeExecutionPlan
 
 
 def _rows(batch: Any, key: str) -> list[Tensor]:
@@ -87,6 +87,30 @@ class SegmentPPOObjectiveAdapter:
             if calculate_entropy is None else bool(calculate_entropy)
         )
         self.dp_group = dp_group
+
+    def bind_tree(self, tree_plan: TreeExecutionPlan):
+        """Bind an executable tree to SegmentExecutor's loss hook.
+
+        Return (loss_callback, per_segment_ref_counts). A single adapter can
+        serve every tree of the original PPO mini-batch; each call retains the
+        original batch-level normalization metadata.
+        """
+        if not isinstance(tree_plan, TreeExecutionPlan):
+            raise TypeError("tree_plan must be a TreeExecutionPlan")
+        refs_by_segment: dict[int, list[SegmentObjectiveRef]] = {
+            segment_id: [] for segment_id in tree_plan.segment_plan.segments
+        }
+        for ref in tree_plan.objective_refs:
+            refs_by_segment[ref.segment_id].append(ref)
+
+        counts = {segment_id: len(refs) for segment_id, refs in refs_by_segment.items()}
+        if not sum(counts.values()):
+            raise ValueError("tree has no supervised logical response tokens")
+
+        def segment_loss_fn(segment: SegmentSpec, logits: Tensor):
+            return self.compute_loss(segment, logits, refs_by_segment[segment.segment_id])
+
+        return segment_loss_fn, counts
 
     def _temperatures(self, refs: Sequence[SegmentObjectiveRef]) -> list[float]:
         temperature = self.batch.get("temperature", 1.0)
