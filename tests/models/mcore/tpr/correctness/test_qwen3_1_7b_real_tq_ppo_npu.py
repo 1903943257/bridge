@@ -243,16 +243,30 @@ def _compare_grads(reference, actual):
 
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
-    os.environ.setdefault(
-        "TPR_QWEN_MODEL_PATH",
-        os.environ.get("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B"),
-    )
-    from .test_tpr_qwen3_compatibility_npu import (
-        _initialize_single_rank_megatron,
-        _make_qwen_model,
-    )
-    from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
+    from ..profiling._qwen3_profile_target import resolve_qwen3_profile_target
+    from . import test_tpr_qwen3_compatibility_npu as qwen_fixture
     from verl.workers.utils.losses import ppo_loss
+
+    # Reuse the existing REAL checkpoint selector rather than inheriting the
+    # 0.6B fixture's import-time global default or an unrelated env value.
+    target = resolve_qwen3_profile_target()
+    if target.size != "1.7B":
+        pytest.fail(f"Phase5 explicitly requires Qwen3-1.7B; got {target.label}")
+    qwen_fixture.QWEN_MODEL_PATH = target.path
+    print(f"PHASE5 MODEL=Qwen3-1.7B checkpoint={target.path}")
+
+    # Same MindSpeed pytest-runtime hygiene used by the existing 1.7B Ring
+    # profile: some versions accidentally include an empty key in full args;
+    # turning that key into a dataclass field raises
+    # TypeError: Field names must be valid identifiers: ''.
+    from mindspeed.args_utils import get_full_args
+    vars(get_full_args()).pop("", None)
+
+    # Delay Engine import until after the args are sanitized; importing it
+    # triggers the MindSpeed compatibility/transformer patch stack.
+    from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
+    _initialize_single_rank_megatron = qwen_fixture._initialize_single_rank_megatron
+    _make_qwen_model = qwen_fixture._make_qwen_model
 
     # Default is the UNMODIFIED TQ forest. Both env vars are opt-in CROPPED
     # smoke controls only, and must be absent to validate all real tokens.
@@ -263,10 +277,10 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     batch = _load_real_tq_probe(prompt_length=prompt_len, response_length=response_len)
     device = torch.device("npu")
     _initialize_single_rank_megatron()
-
-    ref = _make_qwen_model(device, tpr=False, max_sequence_length=prompt_len+response_len)
-    ref_params = sum(p.numel() for p in ref.parameters())
-    assert 1_500_000_000 <= ref_params <= 1_900_000_000, f"wrong model size {ref_params}"
+    longest_row = max(len(row) for row in _rows(batch, "input_ids"))
+    print(f"PHASE5 max real sequence length={longest_row}; initializing Native reference")
+    ref = _make_qwen_model(device, tpr=False, max_sequence_length=longest_row)
+    ref_params = target.assert_model_scale(ref)
 
     # The OLD policy is the real frozen Qwen checkpoint prior to this update,
     # not invented log-probabilities. Recompute once on the actual TQ tokens.
@@ -279,6 +293,8 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
             )
             old_probs.append(response_lp.detach().float().cpu())
     batch["old_log_probs"] = _as_jagged(old_probs)
+    # Old-policy log_probs and the current model should be computed from the
+    # same real weights. Their equality is a numerical check, not rollout truth.
     tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
 
     loss_fn = partial(ppo_loss, config=_VanillaPPOConfig())
@@ -313,8 +329,9 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     gc.collect()
     torch.npu.empty_cache()
 
-    tpr = _make_qwen_model(device, tpr=True, max_sequence_length=prompt_len+response_len)
-    assert sum(p.numel() for p in tpr.parameters()) == ref_params
+    print("PHASE5: Native loss and gradients collected; initializing TPR reference")
+    tpr = _make_qwen_model(device, tpr=True, max_sequence_length=longest_row)
+    assert target.assert_model_scale(tpr) == ref_params
     tpr.config.no_sync_func = None
     tpr.config.grad_scale_func = lambda value: value
     tpr.config.finalize_model_grads_func = lambda *args, **kwargs: None
