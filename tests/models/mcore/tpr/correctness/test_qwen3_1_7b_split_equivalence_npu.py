@@ -557,6 +557,38 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
                 f"oracle_delta={float(split_exact-full_exact):.8g}",
                 flush=True,
             )
+            # Discriminate BF16 *partial* GEMM rounding plus accumulation
+            # from shape-dependent dW GEMM reduction error. This models
+            # correctly-rounded partial scalar dots, not the NPU kernel's
+            # unknown internal reduction topology; it is diagnostic only.
+            prefix_exact = (
+                prefix_dy[:, 0, oi].double().cpu()
+                * x_prefix[:, 0, ii].double().cpu()
+            ).sum()
+            suffix_exact = (
+                suffix_dy[:, 0, oi].double().cpu()
+                * x_suffix[:, 0, ii].double().cpu()
+            ).sum()
+            prefix_bf16 = prefix_exact.to(torch.bfloat16)
+            suffix_bf16 = suffix_exact.to(torch.bfloat16)
+            bf16_partial_sum = (
+                prefix_bf16.float() + suffix_bf16.float()
+            ).to(torch.bfloat16)
+            bf16_after_fp32_sum = (
+                prefix_exact.float() + suffix_exact.float()
+            ).to(torch.bfloat16)
+            print(
+                f"QWEN SPLIT ATTN_QKV_DW_PARTIAL_ROUND "
+                f"out={oi} in={ii} "
+                f"prefix_exact={float(prefix_exact):.8g} "
+                f"suffix_exact={float(suffix_exact):.8g} "
+                f"prefix_bf16={float(prefix_bf16):.8g} "
+                f"suffix_bf16={float(suffix_bf16):.8g} "
+                f"sum_bf16_partials={float(bf16_partial_sum):.8g} "
+                f"sum_fp32_then_bf16={float(bf16_after_fp32_sum):.8g} "
+                f"observed_split={float(got_wgrad[oi, ii]):.8g}",
+                flush=True,
+            )
     pgrad = dict(attention.named_parameters())[wname]
     print(
         f"QWEN SPLIT ATTN_QKV_GRAD_BUFFER "
