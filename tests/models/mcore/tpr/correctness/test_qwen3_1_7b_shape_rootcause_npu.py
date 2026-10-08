@@ -418,7 +418,7 @@ def _print_fp32_core_oracle(trace, scales, backend, cutoff, *, layers=(1, 2, 3, 
         )
 
 
-def test_real_qwen3_1_7b_first_shape_divergence():
+def test_real_qwen3_1_7b_first_shape_divergence(monkeypatch):
     # This is a focused, real-TQ test, not a replacement for the Phase-5 PPO
     # correctness gate. Its default 64+64 crop is deliberately explicit.
     # Match the real NPU/MindSpeed bootstrap used by existing Qwen Ring CP
@@ -498,6 +498,24 @@ def test_real_qwen3_1_7b_first_shape_divergence():
             for layer in model.decoder.layers:
                 native_core = layer.self_attention.core_attention
                 native_core.scale_mask_softmax.scaled_masked_softmax_fusion = False
+                assert layer.self_attention.config.attention_dropout == 0
+            # Even for p=0, Megatron DotProductAttention unconditionally
+            # enters tensor_parallel.get_cuda_rng_tracker().fork() when
+            # sequence_parallel=False. Our standalone 1-rank fixture has
+            # not registered the CUDA tracker key 'model-parallel-rng'.
+            # Follow the existing test_segment_push_pop_npu test-only NPU
+            # runtime helper; null RNG scope is exact for dropout=0.
+            from megatron.core import tensor_parallel
+            from ..equivalence.test_segment_push_pop_npu import _ZeroDropoutRngTracker
+            monkeypatch.setattr(
+                tensor_parallel, "get_cuda_rng_tracker",
+                lambda: _ZeroDropoutRngTracker(),
+            )
+            print(
+                "ROOTCAUSE NATIVE RNG SETUP: bypassed missing "
+                "model-parallel-rng tracker for dropout=0",
+                flush=True,
+            )
             print(
                 "ROOTCAUSE NATIVE SETUP: explicit dynamic causal masks; "
                 "disabled CUDA fused softmax, kept original Megatron "
