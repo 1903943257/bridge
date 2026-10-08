@@ -598,6 +598,87 @@ def _get_trace_owner_segments(batch, *, row=0, response_offsets=(6, 13)):
     return segments
 
 
+
+def _native_truncation_controls(model, batch, original_logprobs, full_trace, owners):
+    """Native-only causal control: same weights and tokens, different sequence S.
+
+    Causal invariance: changing total S from 128 to the real radix node end
+    (70 or 94) cannot mathematically affect logits at q < S. If this *alone*
+    causes comparable error, the NPU native kernel's shape-dependent rounding
+    is a confounder, not proof of incorrect TPR Prefix KV or objective mapping.
+    """
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    if not owners:
+        return
+    row = 0
+    tokens = batch["input_ids"][row].detach().cpu()
+    device = next(model.parameters()).device
+    full_length = tokens.numel()
+    if full_length > 256:
+        print("NATIVE TRUNCATION CONTROL skipped for full-length real TQ (OOM guard)")
+        return
+    grouped = {}
+    for absolute, segment in sorted(owners.items()):
+        if absolute + 1 >= full_length:
+            continue
+        grouped.setdefault(segment.position_end, []).append(absolute)
+    for cutoff, positions in sorted(grouped.items()):
+        if cutoff >= full_length:
+            print(f"NATIVE TRUNCATION cutoff={cutoff}: already full length, no shape comparison")
+            continue
+        trace, handles = _attention_trace_hooks(
+            model, monitored_positions=tuple(positions)
+        )
+        try:
+            with torch.no_grad():
+                ids = tokens[:cutoff].to(device)
+                positions_tensor = torch.arange(cutoff, device=device)[None, :]
+                logits = model(
+                    input_ids=ids.unsqueeze(0),
+                    position_ids=positions_tensor,
+                    attention_mask=None,
+                )
+                for absolute in positions:
+                    target = tokens[absolute + 1].to(device).reshape(1)
+                    lp = vocab_parallel_log_probs_from_logits(
+                        logits[0, absolute: absolute + 1], target
+                    ).detach().float().cpu().item()
+                    response_offset = absolute + 1 - len(batch["prompts"][row])
+                    baseline = float(original_logprobs[row][response_offset])
+                    delta = lp - baseline
+                    print(
+                        "NATIVE TRUNCATION LOGPROB "
+                        f"query_abs={absolute} cutoff={cutoff} full={full_length} "
+                        f"full_lp={baseline:.8f} cutoff_lp={lp:.8f} "
+                        f"delta={delta:.8f} abs_diff={abs(delta):.8f}"
+                    )
+        finally:
+            for hook in handles:
+                hook.remove()
+        for absolute in positions:
+            matched = [
+                layer for layer in range(1, len(model.decoder.layers) + 1)
+                if (layer, absolute) in full_trace and (layer, absolute) in trace
+            ]
+            print(
+                f"NATIVE TRUNCATION LAYER TRACE query_abs={absolute} "
+                f"cutoff={cutoff} matched_layers={len(matched)}"
+            )
+            for layer in matched:
+                native_input, native_output = full_trace[(layer, absolute)]
+                trunc_input, trunc_output = trace[(layer, absolute)]
+                delta_in = (trunc_input - native_input).abs()
+                delta_out = (trunc_output - native_output).abs()
+                if layer <= 6 or layer in (14, 21, 28):
+                    print(
+                        f"  native_cutoff layer={layer:02d} "
+                        f"attn_in_max={delta_in.max().item():.6g} "
+                        f"attn_out_max={delta_out.max().item():.6g}"
+                    )
+
+
+
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -720,6 +801,10 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         finally:
             for handle in native_hooks:
                 handle.remove()
+        if os.getenv("TPR_QWEN17_PPO_NATIVE_CUTOFF", "1") == "1":
+            _native_truncation_controls(
+                ref, batch, old_probs, native_trace, trace_owners
+            )
 
     del ref
     gc.collect()
