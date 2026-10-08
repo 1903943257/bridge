@@ -892,6 +892,132 @@ def _print_cutoff_oracle_comparison(batch, captured, full_native, cutoff_native,
     }
 
 
+
+def _native_core_square_vs_rectangular_oracle(
+    model,
+    batch,
+    *,
+    row=0,
+    selected_layers=(1, 2, 3, 4, 14, 28),
+    segment_starts=(70, 94, 114),
+    max_length=256,
+):
+    """Isolate CANN square/rectangular FA shape effects with IDENTICAL Q/K/V.
+
+    Hook the real Qwen Native core_attention output/input Q,K,V on a full
+    unmodified recorded-TQ row. Re-evaluate only Q[start:end] with the same
+    unmodified K/V and the production rectangular adapter. Since the new
+    queries are the last (end-start) positions, sparse_mode=3's right-down
+    causal alignment is mathematically the same as the square causal mask.
+
+    This diagnoses the isolated attention kernel shape effect, not the
+    combined QKV GEMM, RoPE, prefix-cache, or final PPO logprob error.
+    """
+    from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
+
+    recorded = batch["input_ids"][row].detach().cpu().long()
+    full_length = recorded.numel()
+    if full_length > max_length:
+        print(
+            f"CORE SHAPE ORACLE skipped: full real length={full_length} "
+            f"exceeds OOM guard={max_length}"
+        )
+        return
+
+    snapshots = {}
+    hooks = []
+    for layer in model.decoder.layers:
+        number = layer.self_attention.layer_number
+        if number not in selected_layers:
+            continue
+
+        def capture_core(core, args, output, number=number):
+            if len(args) < 3 or any(
+                not isinstance(tensor, torch.Tensor) for tensor in args[:3]
+            ):
+                raise AssertionError(
+                    f"Qwen layer {number}: core attention did not expose Q/K/V"
+                )
+            square_out = output[0] if isinstance(output, tuple) else output
+            if not isinstance(square_out, torch.Tensor):
+                raise TypeError("Native core attention output is not a Tensor")
+            snapshots[number] = (
+                tuple(t.detach().clone() for t in args[:3]),
+                square_out.detach().clone(),
+                getattr(core, "softmax_scale", None),
+            )
+
+        hooks.append(
+            layer.self_attention.core_attention.register_forward_hook(
+                capture_core
+            )
+        )
+
+    device = next(model.parameters()).device
+    try:
+        with torch.no_grad():
+            _native_response_logprobs(
+                model, recorded.to(device),
+                prompt_length=len(batch["prompts"][row]), temperature=1.0
+            )
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    with torch.no_grad():
+        for number in selected_layers:
+            if number not in snapshots:
+                print(f"CORE SHAPE ORACLE layer={number}: no QKV captured")
+                continue
+            (query, key, value), native_square, scale = snapshots[number]
+            if query.shape[0] != full_length or key.shape[0] != full_length:
+                raise AssertionError(
+                    "Expected full Native Q/K/V sequence, got "
+                    f"q={query.shape[0]} kv={key.shape[0]} "
+                    f"row={full_length}"
+                )
+            for start in segment_starts:
+                if not (0 < start < full_length):
+                    continue
+                # SAME post-RoPE Q, K and V; only the Q sequence dimension
+                # and the CANN right-down sparse causal geometry change.
+                rectangular = rectangular_causal_attention(
+                    query[start:],
+                    key,
+                    value,
+                    softmax_scale=scale,
+                    dropout_p=0.0,
+                )
+                square_tail = native_square[start:]
+                delta = rectangular.float() - square_tail.float()
+                rel_l2 = (
+                    torch.linalg.vector_norm(delta) /
+                    torch.linalg.vector_norm(square_tail.float()).clamp_min(1e-12)
+                ).item()
+                max_abs = delta.abs().max().item()
+                mean_abs = delta.abs().mean().item()
+                print(
+                    f"CORE SHAPE ORACLE layer={number:02d} "
+                    f"square={full_length}x{full_length} "
+                    f"rect={full_length-start}x{full_length} "
+                    f"query_start={start} "
+                    f"rel_l2={rel_l2:.8g} "
+                    f"max_abs={max_abs:.8g} mean_abs={mean_abs:.8g}"
+                )
+                for absolute in (76, 99, 114, 126):
+                    if absolute < start or absolute >= full_length:
+                        continue
+                    token_delta = delta[absolute-start]
+                    print(
+                        f"  CORE TOKEN layer={number:02d} "
+                        f"q={absolute} rect_start={start} "
+                        f"max_abs={token_delta.abs().max().item():.8g} "
+                        f"rel_l2={float(torch.linalg.vector_norm(token_delta) / torch.linalg.vector_norm(square_tail[absolute-start].float()).clamp_min(1e-12)):.8g}"
+                    )
+            del snapshots[number]
+
+
+
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -1019,6 +1145,8 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
                 ref, batch, old_probs, native_trace, trace_owners
             )
 
+    if os.getenv("TPR_QWEN17_PPO_CORE_ORACLE", "1") == "1":
+        _native_core_square_vs_rectangular_oracle(ref, batch)
     cutoff_oracle, cutoff_details = None, None
     if os.getenv("TPR_QWEN17_PPO_SEGMENT_ORACLE", "1") == "1":
         cutoff_oracle, cutoff_details = _native_cutoff_oracle_per_segment(
