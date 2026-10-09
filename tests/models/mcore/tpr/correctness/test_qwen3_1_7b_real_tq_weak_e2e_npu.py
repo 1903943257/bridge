@@ -306,8 +306,10 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             old_rows.append(old_lp.detach().float().cpu())
     batch["old_log_probs"] = _as_jagged(old_rows)
     execution = os.getenv("TPR_QWEN17_WEAK_E2E_EXECUTION", "tpr").lower()
-    if execution not in ("native", "tpr", "cutoff", "core"):
-        pytest.fail("weak E2E execution must be 'native', 'tpr', 'cutoff' or 'core'")
+    if execution not in ("native", "tpr", "cutoff", "core", "trace"):
+        pytest.fail(
+            "weak E2E execution must be native, tpr, cutoff, core or trace"
+        )
 
     # No-gradient native core-attention shape oracle. Hold the *actual*
     # post-RoPE Q/K/V fixed, only change square-vs-rectangular CANN
@@ -535,6 +537,140 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             "real_ppo_loss=True backward=True real_adamw_step=True "
             "production_verl_optimizer=False real_behavior_policy=False "
             "full_tq=False native_update_parity=NOT_MEASURED",
+            flush=True,
+        )
+        return
+
+    if execution == "trace":
+        from unittest.mock import patch
+
+        from ._qwen17_weak_e2e_trace import (
+            capture_query_stages, describe_trace,
+        )
+        from verl.models.mcore.tpr.megatron_adapter import (
+            _trajectory_keys_from_minibatch,
+        )
+        from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+        from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+
+        row = int(os.getenv("TPR_QWEN17_WEAK_E2E_TRACE_ROW", "5"))
+        response_offset = int(os.getenv("TPR_QWEN17_WEAK_E2E_TRACE_OFFSET", "62"))
+        if not 0 <= row < len(lengths):
+            pytest.fail(f"trace row {row} out of range")
+        forest = build_tree_execution_plans(
+            _trajectory_keys_from_minibatch(batch), batch,
+            require_loss_mask_alignment=True,
+        )
+        if len(forest.trees) != 1:
+            pytest.fail("weak leaf trace requires exactly one Forest tree")
+        hits = [
+            (tree, ref) for tree in forest.trees
+            for ref in tree.objective_refs
+            if ref.sample_row == row and ref.response_offset == response_offset
+        ]
+        if len(hits) != 1:
+            pytest.fail(
+                f"trace target row={row}, response={response_offset} "
+                f"must have one owned objective ref, found {len(hits)}"
+            )
+        tree, ref = hits[0]
+        segment = tree.segment_plan.get(ref.segment_id)
+        query_position = segment.position_start + ref.query_offset
+        native_cutoff = segment.position_end
+        if native_cutoff > lengths[row] or query_position >= native_cutoff:
+            raise AssertionError("invalid Native cutoff/segment owner geometry")
+        print(
+            "P0 WEAK_TQ TRACE_GEOMETRY "
+            f"row={row} response_offset={response_offset} "
+            f"segment_id={segment.segment_id} "
+            f"segment=[{segment.position_start}:{native_cutoff}] "
+            f"query_abs={query_position} "
+            "matching=EXACT_SEGMENT_ID no_optimizer_step=True",
+            flush=True,
+        )
+
+        # Native reference uses precisely the same model checkpoint and
+        # causal horizon (Segment end), without external KV or Forest.
+        with capture_query_stages(
+            reference, query_position=query_position,
+            get_active_span=lambda: (0, native_cutoff),
+        ) as native_trace:
+            with torch.no_grad():
+                _native_response_logprobs(
+                    reference,
+                    batch["input_ids"][row][:native_cutoff].to(device),
+                    prompt_length=len(batch["prompts"][row]),
+                    temperature=1.0,
+                )
+
+        del reference
+        gc.collect()
+        torch.npu.empty_cache()
+        tpr_model = fixture._make_qwen_model(
+            device, tpr=True, max_sequence_length=longest
+        )
+        target.assert_model_scale(tpr_model)
+        tpr_model.zero_grad(set_to_none=True)
+        trace_engine = _make_training_engine(tpr_model)
+        previous_forward = SegmentExecutor._forward
+        current = {"span": None, "captures": 0}
+
+        def traced_forward(self, physical, **kwargs):
+            prior = current["span"]
+            target_leaf = (
+                physical.segment_id == segment.segment_id
+                and kwargs.get("no_grad") is False
+            )
+            current["span"] = (
+                (physical.position_start, physical.position_end)
+                if target_leaf else None
+            )
+            if target_leaf:
+                current["captures"] += 1
+                if not torch.equal(
+                    physical.token_ids, segment.token_ids
+                ):
+                    raise AssertionError(
+                        "matched segment ID has incorrect row-5 leaf tokens"
+                    )
+            try:
+                return previous_forward(self, physical, **kwargs)
+            finally:
+                current["span"] = prior
+
+        with capture_query_stages(
+            tpr_model, query_position=query_position,
+            get_active_span=lambda: current["span"],
+        ) as tpr_trace:
+            # Patch only the test-level physical Segment execution seam.
+            # No module/operator math is modified; full PPO backward still
+            # executes to ensure this is the *real* Forest schedule.
+            with patch.object(SegmentExecutor, "_forward", traced_forward):
+                trace_out = trace_engine.forward_backward_batch(
+                    batch,
+                    loss_function=partial(
+                        ppo_loss, config=_VanillaPPOConfig()
+                    ),
+                    forward_only=False,
+                )
+        _sync()
+        if current["captures"] != 1:
+            raise AssertionError(
+                f"target Segment must be forward-with-grad exactly once, "
+                f"got {current['captures']}"
+            )
+        reports = describe_trace(
+            native_trace, tpr_trace, layers=len(tpr_model.decoder.layers)
+        )
+        for report in reports:
+            print(report, flush=True)
+        print(
+            "P0 WEAK_TQ RESULT status=PASS execution=TRACE "
+            f"row={row} query_abs={query_position} "
+            f"segment_id={segment.segment_id} "
+            f"loss={float(sum(trace_out['loss'])):.9g} "
+            "compared_stages=308 optimizer_step=False "
+            "numerical_parity=DIAGNOSTIC_ONLY",
             flush=True,
         )
         return
