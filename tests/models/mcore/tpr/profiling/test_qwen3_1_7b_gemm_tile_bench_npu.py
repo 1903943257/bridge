@@ -58,7 +58,7 @@ def _timed(name, call, *, warmup, repeats):
     return median
 
 
-def _error(name, candidate, reference):
+def _error(name, candidate, reference, *, tile=None):
     a = candidate.detach().float()
     b = reference.detach().float()
     if a.shape != b.shape:
@@ -68,11 +68,25 @@ def _error(name, candidate, reference):
     rel = float(torch.linalg.vector_norm(delta)/norm)
     max_abs = float(delta.abs().max())
     eq = torch.equal(candidate, reference)
+    changed = (candidate != reference).reshape(-1)
+    mismatch = int(changed.sum())
     print(
         f"QWEN17 GEMM BENCH NUMERICS {name} "
-        f"rel_l2={rel:.8g} max_abs={max_abs:.8g} bitwise={eq}",
+        f"rel_l2={rel:.8g} max_abs={max_abs:.8g} bitwise={eq} "
+        f"mismatched_elements={mismatch}/{changed.numel()}",
         flush=True,
     )
+    if tile is not None:
+        if candidate.shape[0] % tile:
+            raise AssertionError("tile must divide output M")
+        per_tile = (candidate != reference).reshape(
+            candidate.shape[0]//tile, tile, -1
+        ).sum(dim=(1,2)).cpu().tolist()
+        print(
+            f"QWEN17 GEMM BENCH TILE_MISMATCH {name} "
+            f"per_tile={per_tile}",
+            flush=True,
+        )
     return eq
 
 
@@ -227,18 +241,24 @@ def test_real_qwen17_physical_m_gemm_benchmark():
                             with torch.no_grad():
                                 out_grouped = grouped()
                                 out_tiled = tiled()
+                                out_full = baseline()
                                 exact = _error(
                                     f"{name} M={m} {mode} grouped_vs_tiled",
-                                    out_grouped, out_tiled,
+                                    out_grouped, out_tiled, tile=tile,
                                 )
-                                del out_grouped, out_tiled
+                                grouped_eq_full = _error(
+                                    f"{name} M={m} {mode} grouped_vs_full",
+                                    out_grouped, out_full, tile=tile,
+                                )
+                                del out_grouped, out_tiled, out_full
                             grouped_ms = _timed(
                                 f"{name} M={m} {mode}",
                                 grouped, warmup=warmup, repeats=repeats,
                             )
                             print(
                                 f"QWEN17 GEMM BENCH GROUPED {name} M={m} "
-                                f"mode={mode} status=FORWARD_OK bitwise_tile={exact} "
+                                f"mode={mode} status=FORWARD_OK "
+                                f"bitwise_tile={exact} bitwise_full={grouped_eq_full} "
                                 f"grouped_over_tiled={grouped_ms/max(tile_ms,1e-9):.4f} "
                                 f"grouped_over_baseline={grouped_ms/max(baseline_ms,1e-9):.4f} "
                                 "backward_supported=UNVERIFIED",
