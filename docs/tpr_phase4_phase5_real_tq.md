@@ -1,5 +1,95 @@
 # TPR Phase 4/5: VERL native PPO and real Qwen3-1.7B
 
+## First runnable weak E2E: real TQ -> default BF16 PPO -> actual AdamW step
+
+`tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_weak_e2e_npu.py`
+is a **standalone training-side entry**, reading the already-generated
+`tq_batch.pt`; it does NOT launch UniAgent, invoke ClaudeCode, or require
+the older `uni-agent` E2E rollout scripts. Run it from an environment where
+the bridge TPR code is installed and the real Qwen3-1.7B checkpoint and TQ
+dump are accessible. This is intentionally insulated from the
+`uniagent-cc` runner/version difference; do **not** modify or downgrade
+the working `uniagent-cc` rollout checkout to run this test.
+
+Scope is the **default BF16 Linear** and controlled CANN attention in the
+existing Phase-5 Qwen fixture. It calls the existing Engine's
+`forward_backward_batch` TPR Forest adapter, consumes the real VERL PPO
+loss and backpropagates its real autograd graph, and then actually executes
+`torch.optim.AdamW.step()` on **FP32 optimizer master parameters**,
+copies updated weights back to the BF16 Qwen model and runs a
+post-update Forward. FP32 here describes **optimizer state/master
+storage**, not any FP32 QKV/MLP GEMM. No fixed-M GEMM, grouped GEMM,
+or custom FP32-dW autograd is installed.
+
+To get a comparable, **controlled** Native baseline, run the exact
+same command with `TPR_QWEN17_WEAK_E2E_EXECUTION=native`, in its own
+pytest process. The default TPR run and the Native control use the
+same checkpoint, TQ rows, loss inputs, AdamW settings, gradient
+norm clipping, FP32 master semantics and CANN Attention Oracle.
+The performance numbers distinguish Forward/Backward seconds and
+whole optimizer seconds (including FP32 master setup, grad transfer,
+optimizer work and BF16 weight copy), and report NPU
+peak-allocated/reserved. First-run CANN/torch_npu compilation and
+CPU IO may affect comparisons; compare repeats with identical
+runtime conditions rather than treating the very first invocation
+as a production throughput benchmark.
+
+```bash
+# From bridge/verl's source tree with working Megatron/MindSpeed/NPU runtime:
+export TPR_RUN_QWEN17_WEAK_E2E=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
+export TPR_REAL_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
+export TPR_QWEN17_WEAK_E2E_PROMPT=128
+export TPR_QWEN17_WEAK_E2E_RESPONSE=64
+export TPR_QWEN17_WEAK_E2E_LR=0.0001
+export TPR_QWEN17_WEAK_E2E_MASTER_DEVICE=npu
+unset TPR_QWEN17_PPO_TILE_GEMM TPR_QWEN17_GPT_FP32_GEMM
+unset TPR_QWEN17_PPO_FC2_FIXED_M TPR_QWEN17_SPLIT_FP32_DW_BACKWARD
+
+for MODE in native tpr; do
+  TPR_QWEN17_WEAK_E2E_EXECUTION="$MODE" \
+    python -m pytest -x -s -q --tb=long \
+      tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_weak_e2e_npu.py \
+      > "/tmp/tpr_weak_e2e_${MODE}.log" 2>&1 || {
+        tail -100 "/tmp/tpr_weak_e2e_${MODE}.log"
+        exit 1
+      }
+  grep -E 'P0 WEAK_TQ|PASSED|FAILED|ERROR' \
+    "/tmp/tpr_weak_e2e_${MODE}.log"
+done
+```
+
+**NPU capacity escape hatch**: change
+`TPR_QWEN17_WEAK_E2E_MASTER_DEVICE=cpu` on **both** control and
+TPR, keeping the model and GEMMs on NPU. This validates optimizer
+math / model weight updates without the NPU memory cost of
+FP32 AdamW states; however its optimizer time becomes dominated by
+host transfers and is NOT an optimizer performance reference.
+
+**First acceptance**: require each run to print
+`P0 WEAK_TQ BACKWARD status=PASS`,
+`P0 WEAK_TQ OPTIMIZER_STEP status=PASS`, and
+`P0 WEAK_TQ RESULT status=PASS`, with nonzero BF16
+parameter updates, finite AdamW moments, a finite post-update Forward,
+matching supervised token totals, and recorded memory/time. Record
+Native/TPR loss discrepancy; this smoke does **not** enforce
+full-parameter update parity yet. It is a **real optimizer update**,
+unlike the previous sampled AdamW math-only diagnostic.
+
+**Strict boundary**: this is **not** a production VERL
+`BaseEngine.train_batch` / Megatron fused-distributed optimizer test:
+the fixture constructs an isolated Engine for backward and uses
+`torch.optim.AdamW` on FP32 masters to update actual model weights,
+not the production distributed optimizer/GradBuffer.
+Its TQ inputs are real, but old logprobs are checkpoint-recomputed
+and advantages may be diagnostic; by default it explicitly crops
+the recorded 8 trajectories to P=128/S=64. Thus the label
+is `WEAK_TQ`, not `REAL_ACTOR_E2E` or `FULL_TQ_PASS`.
+After this passes, use a real actor-update capture and the correct
+newer `uniagent-cc` integration to accept true production Actor
+optimizer semantics and full sequences.
+
 ## Default BF16 vs AReaL-DTA: do not make numerical probes mandatory (2026-10-09)
 
 This comparison was inspected against AReaL's **actual `feat/dta`
