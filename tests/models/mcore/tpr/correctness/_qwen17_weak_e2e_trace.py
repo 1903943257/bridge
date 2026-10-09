@@ -248,7 +248,7 @@ def describe_kv_trace(native_kv, tpr_kv, path, *, layers=(1, 2, 3, 4, 14, 28)):
 
 def compare_first_attention_replay(
     native_qkv, tpr_qkv, *, position_start: int, query_abs: int,
-    native_proj_input, tpr_proj_input, attention_fn=None,
+    native_proj_input, tpr_proj_input, device, attention_fn=None,
 ):
     """Replay Native/TPR's ACTUAL post-RoPE Q/K/V at the first attention layer.
 
@@ -274,7 +274,9 @@ def compare_first_attention_replay(
         raise AssertionError(
             f"Native and TPR attention softmax scales differ: {nscale} vs {tscale}"
         )
-    dev = native_proj_input.device
+    dev = torch.device(device)
+    if dev.type == "cpu" and attention_fn.__module__.endswith("rectangular_attention"):
+        raise AssertionError("CANN attention replay requires NPU device")
     # Captured query and KV tensors were saved on CPU to minimize peak NPU
     # memory while running the real Forest. Rehydrate ONLY this layer here.
     nq = nq[position_start:].to(device=dev)
