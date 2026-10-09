@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
-Policy = Literal["verl_uid", "dta_dfs"]
+Policy = Literal["verl_uid", "dta_dfs", "areal_dta"]
 
 
 @dataclass(frozen=True)
@@ -195,6 +195,68 @@ def plan_dta_dfs(
     partitions = [[order[i] for i in range(start, end)] for start, end in groups]
     return _result(sequences, partitions, "dta_dfs", dp_size, enforce_equal_rows)
 
+
+
+class _TreeTokenTimeModel:
+    """AReaL TimeModel protocol: use original tree-token metric, no scipy fit."""
+
+    def pred(self, stats: dict) -> float:
+        return float(stats["n_tree_tokens"])
+
+
+def plan_areal_dta(
+    token_sequences: Sequence[Sequence[int]],
+    dp_size: int,
+    *,
+    mode: Literal["forward", "backward"] = "backward",
+    block_size: int | None = None,
+    time_model: object | None = None,
+    enforce_equal_rows: bool = True,
+) -> DPPlacementPlan:
+    """Run **upstream AReaL-DTA's** LB_by_DFS_and_TM, with VERL guards.
+
+    The upstream solver and trie are vendored with namespace-only changes in
+    _vendor/areal_dta; no local rewrite of its DFS partition algorithm.
+    Unlike plan_dta_dfs, upstream leafization merges duplicate or contained
+    trajectories and can return uneven or empty DP bins.  Reject such cases
+    safely rather than silently breaking VERL's equal-shard data dispatcher.
+
+    For a fidelity/performance comparison, set enforce_equal_rows=False to
+    inspect a non-empty *uneven* offline partition; do not dispatch that plan.
+    Custom AReaL-compatible time models only need a .pred(stats) method.
+    """
+    from types import SimpleNamespace
+
+    import torch
+
+    from ._vendor.areal_dta.dp import LB_by_DFS_and_TM
+    from ._vendor.areal_dta.token_trie import TokenTrie
+
+    if type(dp_size) is not int or dp_size <= 0:
+        raise ValueError("dp_size must be a positive integer")
+    if mode not in ("forward", "backward"):
+        raise ValueError("mode must be forward or backward")
+    if block_size is not None and (type(block_size) is not int or block_size <= 0):
+        raise ValueError("block_size must be a positive integer or None")
+    sequences = _sequences(token_sequences)
+    if len(sequences) < dp_size:
+        raise ValueError("number of trajectories must be >= dp_size")
+    predictor = _TreeTokenTimeModel() if time_model is None else time_model
+    if not callable(getattr(predictor, "pred", None)):
+        raise TypeError("time_model must expose a callable .pred(stats) method")
+    tokens = [torch.tensor(seq, dtype=torch.long, device="cpu") for seq in sequences]
+    if len(TokenTrie(tokens).inputs) < dp_size:
+        raise ValueError(
+            "AReaL-DTA leafization yields fewer independent trie leaves than "
+            "DP replicas; use plan_dta_dfs for duplicate/contained trajectories "
+            "or reduce dp_size"
+        )
+    bins = LB_by_DFS_and_TM(
+        tokens,
+        predictor,
+        SimpleNamespace(K=dp_size, mode=mode, block_size=block_size),
+    )
+    return _result(sequences, bins, "areal_dta", dp_size, enforce_equal_rows)
 
 def plan_verl_uid(
     token_sequences: Sequence[Sequence[int]],
