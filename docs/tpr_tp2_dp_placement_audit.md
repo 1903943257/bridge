@@ -52,38 +52,37 @@ VERL already exposes `get_group_balanced_partitions(seqlen_list, uid_list, k_par
 
 For the first real DP2 implementation, reuse this native balancing **directly** in a new TPR-specific opt-in path at `_balance_batch` (not a new trainer, optimizer, or distributed backend). Validate UID contiguity and actual equal row counts. Assert mini-batch iteration keeps related UID rows together; otherwise install a group-aware sampler using VERL's existing iterator interface or fail fast with an actionable config error.
 
-### DTA as an isolated second placement policy
+### DTA reference limited to DP placement
 
-`verl/models/mcore/tpr/dp_placement.py` now provides:
+`verl/models/mcore/tpr/dp_placement.py` is the only DP-specific implementation:
 
-- `plan_verl_uid(...)`: delegates to upstream VERL `get_group_balanced_partitions`; validates contiguous UIDs and equal number of rows in each DP replica. **Only this policy is initially suitable for VERL's existing equal-shard dispatcher.**
-- `plan_dta_dfs(...)`: existing lightweight DFS-contiguous minimax baseline, with equal-cardinality tie handling for repeated trajectories. Kept for VERL contract regression until DTA direct path is validated in the container.
-- `plan_areal_dta(...)`: **directly calls vendored upstream AReaL `LB_by_DFS_and_TM`**, with original `TokenTrie`, `CompressedTrie`, `pred_time`, `try_divide` and optional `TreeTimeModel`. Only package imports were relocated; algorithm bodies are preserved in `_vendor/areal_dta/`. The adapter validates empty ranks, duplicate/prefix-contained leaf collapse, and VERL equal row cardinality.
-- `DPPlacementPlan`: rows-per-rank, tree-token costs, global cost, duplicated-prefix cost, equal-cardinality flag.
-- Default `enforce_equal_rows=True`: throw if the DTA plan violates VERL's current equal-row DP dispatch contract. `False` is **offline analysis only**; do not feed variable-sized partitions straight into `batch.reorder`.
+- `plan_tpr_dta_dp(token_sequences, trajectory_keys, dp_size)`: DP-only DFS-contiguous minimax placement **inspired by AReaL-DTA's `LB_by_DFS_and_TM`**. Uses the existing TPR trajectory-key parser and UID-scoped exact tree-token cost. It returns only global sample indices; it does not build another tree or run an alternative scheduler.
+- `plan_verl_uid(...)`: delegates to native VERL UID-group balancing for an equal-shard baseline.
+- `plan_dta_dfs(...)`: a flat/global-token LCP algorithm retained for algorithmic CPU regression; the TPR-specific wrapper adds the UID-scoped cost semantics.
+- `DPPlacementPlan`: original row partitions, per-rank/total tree costs, and equal-cardinality guard.
 
-Sample usage, on global-controller **un-padded** token sequences, not on padded `input_ids`:
+There is **no vendored AReaL TokenTrie, CompressedTrie, DTAEngine, time model,
+or runtime dependency**. All actual tree construction stays in
+`trajectory_tree.py` and `tree_plan_builder.py`, all PPO token ownership stays
+in `SegmentObjectiveRef`, and execution stays in `FixedTopologyScheduler`
+and `SegmentExecutor`. See `docs/tpr_dta_trie_vs_execution.md` for the
+end-to-end handoff and test criteria.
+
+DTA time-model cost would be incorrect if used unchanged here when separate
+TPR UIDs happen to share token prefixes. Current planning estimates cost
+from a separate exact-token forest per UID, which matches our real executor.
+The native VERL equal-row dispatch is still required, so uneven DP partitions
+are `enforce_equal_rows=False` **offline-only**, not legal training dispatch.
 
 ```python
-from verl.models.mcore.tpr.dp_placement import plan_verl_uid, plan_dta_dfs
+from verl.models.mcore.tpr.dp_placement import plan_tpr_dta_dp, plan_verl_uid
 
-# Safe baseline (when same-UID groups have fixed rollout.n):
-native = plan_verl_uid(seqs, uid_list, dp_size=2)
+placement = plan_tpr_dta_dp(seqs, trajectory_keys, dp_size=2)
+reference = plan_verl_uid(seqs, uid_list, dp_size=2)
 
-# Compare how much reuse DTA would retain after variable-size partitioning:
-offline = plan_dta_dfs(seqs, dp_size=2, enforce_equal_rows=False)
-
-# Reuse AReaL-DTA original DP algorithm, with the baseline tree-token model:
-from verl.models.mcore.tpr.dp_placement import plan_areal_dta
-areal = plan_areal_dta(seqs, dp_size=2, enforce_equal_rows=False)
-print(areal.partitions, areal.tree_tokens_by_rank)
+# Once Trainer wiring is enabled, each DP rank still runs its ordinary
+# TPR build_tree_execution_plans on the corresponding local trajectories.
 ```
-
-AReaL's `TreeTimeModel` (learned coefficients, NNLS fit) is vendored unchanged at `_vendor/areal_dta/tree_time_model.py` and can be passed as `time_model=` once `numpy/scipy` are available and it has sufficient calibration data; the default adapter uses its original interface with a dependency-free tree-token predictor.
-
-**Upstream limitation:** AReaL `TokenTrie` merges duplicate or prefix-contained rows into one trie leaf. The upstream solver can therefore yield fewer than `dp_size` non-empty bins even if total original rows are enough. The VERL wrapper rejects these inputs instead of introducing new AReaL-internal algorithm patches. The existing local `plan_dta_dfs` handles the duplicate/equal tie case and remains a fallback until actual distributed data dispatch can be changed.
-
-**License/provenance:** vendored sources come from AReaL commit `a5b0b4811a3ef7bf58f0270abcd81d7154f03ce6` and retain Apache-2.0 notices, as well as MIT attribution to the original DynamicTreeAttn upstream. See `_vendor/areal_dta/THIRD_PARTY_NOTICES.md`. Nothing requires installing AReaL as a runtime package.
 
 ### Necessary DP2 gates before wiring the planner into Trainer
 
@@ -99,7 +98,7 @@ AReaL's `TreeTimeModel` (learned coefficients, NNLS fit) is vendored unchanged a
 1. **This branch:** TP local-head support gated at outer Engine + CPU smoke; independent, reviewed DP placement planner + CPU contract tests + upstream insertion analysis.
 2. **Native TP2 NPU gate:** add real TP2 CE+PPO two-rank numerical tests and relax *only* TP Engine guards once tests pass.
 3. **Native DP2 functional gate:** add TPR-aware route at controller `_balance_batch` using `plan_verl_uid`, group-aware local mini-batch boundaries, and native loss/grad semantics.
-4. **DTA DP performance:** benchmark offline `plan_dta_dfs`; make variable-cardinality dispatch opt-in only after native dispatch/worker step counts can handle it.
+4. **DTA DP performance:** benchmark offline `plan_tpr_dta_dp`; make variable-cardinality dispatch opt-in only after native dispatch/worker step counts can handle it.
 5. TP×DP, then TP×CP; HARTS joint microbatch/slot packing and DTA time-model only when straggler profiling justifies them.
 
 Nothing in this document claims that TP2/DP2 is enabled today. The existing outer Engine restrictions intentionally remain until a real multi-rank correctness gate.
