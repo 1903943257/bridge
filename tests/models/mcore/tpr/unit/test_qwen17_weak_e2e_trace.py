@@ -9,6 +9,7 @@ from torch import nn
 
 from ..correctness._qwen17_weak_e2e_trace import (
     STAGES, capture_query_stages, describe_trace, describe_kv_trace,
+    compare_first_attention_replay,
 )
 
 
@@ -166,3 +167,64 @@ def test_trace_stages_handle_keyword_only_megatron_hidden_states():
             x, _context = layer(hidden_states=x, attention_mask=None)
     assert len(trace) == 2 * len(STAGES)
     assert (0, "layer") in trace
+
+
+
+def _fake_rectangular_attention(q, k, v, *, softmax_scale=None, dropout_p=0.0):
+    """CPU oracle with right-down causal masking for a single Q/KV head."""
+    assert dropout_p == 0.0
+    assert q.shape[1:3] == k.shape[1:3] == v.shape[1:3] == (1, 1)
+    qt, kt, vt = (x[:, 0, 0].float() for x in (q, k, v))
+    scores = (qt @ kt.T) * (float(softmax_scale) if softmax_scale else 0.7071067811865476)
+    sk, sq = kt.shape[0], qt.shape[0]
+    masked = torch.arange(sk)[None, :] > (
+        torch.arange(sq)[:, None] + (sk - sq)
+    )
+    scores = scores.masked_fill(masked, float("-inf"))
+    return (scores.softmax(dim=-1) @ vt).unsqueeze(1)
+
+
+def test_first_attention_replay_swaps_actual_inputs_independently():
+    torch.manual_seed(19)
+    q = torch.randn(6, 1, 1, 2)
+    k = torch.randn(6, 1, 1, 2)
+    v = torch.randn(6, 1, 1, 2)
+    tq = q[3:].clone()
+    tk = k.clone()
+    tv = v.clone()
+    tq[0, 0, 0, 0] += 0.2
+    tk[1, 0, 0, 1] += 0.1
+    tv[2, 0, 0, 1] -= 0.15
+    baseline = _fake_rectangular_attention(q[3:], k, v)
+    actual = _fake_rectangular_attention(tq, tk, tv)
+    messages = compare_first_attention_replay(
+        (q, k, v, None), (tq, tk, tv, None, actual),
+        position_start=3, query_abs=3,
+        native_proj_input=baseline[0],
+        tpr_proj_input=actual[0],
+        device="cpu", attention_fn=_fake_rectangular_attention,
+    )
+    assert "source=NATIVE_QKV max_abs=0" in messages[0]
+    assert "source=TPR_ALL max_abs=0" in messages[1]
+    assert "source=TPR_CORE_OUTPUT max_abs=0" in messages[2]
+    assert "variant=TPR_Q_ONLY" in messages[3]
+    assert "variant=TPR_K_ONLY" in messages[4]
+    assert "variant=TPR_V_ONLY" in messages[5]
+    assert "variant=TPR_KV" in messages[6]
+    assert "variant=TPR_ALL" in messages[7]
+    assert "query_M=3 kv_M=6" in messages[-1]
+
+
+def test_first_attention_replay_rejects_softmax_scale_mismatch():
+    q = torch.ones(6, 1, 1, 2)
+    k = torch.ones(6, 1, 1, 2)
+    v = torch.ones(6, 1, 1, 2)
+    p = torch.zeros(1, 2)
+    with pytest.raises(AssertionError, match="softmax scales differ"):
+        compare_first_attention_replay(
+            (q, k, v, 1.0),
+            (q[3:], k, v, 0.5, torch.zeros(3, 1, 2)),
+            position_start=3, query_abs=3,
+            native_proj_input=p, tpr_proj_input=p,
+            device="cpu", attention_fn=_fake_rectangular_attention,
+        )
