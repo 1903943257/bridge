@@ -806,6 +806,7 @@ def test_real_qwen_full_gpt_vs_single_split():
 
     captured = {}
     fp32_prec_cast = {}
+    fp32_prec_cast_inputs = {}
     handles = []
     restored_qkv_forwards = []
     restored_fp32_forwards = []
@@ -907,6 +908,9 @@ def test_real_qwen_full_gpt_vs_single_split():
                         first_p = out_fp32[:p] if mode == "full" else out_fp32
                         fp32_prec_cast[mode] = (
                             first_p.detach().float().cpu().contiguous()
+                        )
+                        fp32_prec_cast_inputs[mode] = (
+                            hidden_states[:p].detach().cpu().contiguous()
                         )
                 return out_fp32.to(hidden_states.dtype), None
 
@@ -1053,6 +1057,20 @@ def test_real_qwen_full_gpt_vs_single_split():
         add_capture(i, layer.mlp.linear_fc2, "fc2_out")
         add_capture(i, layer.mlp, "mlp_out")
 
+    # The original test traced only the first two layers. Capture a compact,
+    # comparable suffix trace for all 28 layers to distinguish a local drift
+    # source from later accumulation/amplification.
+    for layer in model.decoder.layers:
+        i = layer.self_attention.layer_number
+        add_capture(i, layer, "layer_out")
+        if i in layers[:2]:
+            continue
+        add_capture(i, layer.self_attention, "attn_in")
+        add_capture(i, layer.self_attention.linear_proj, "proj_in")
+        add_capture(i, layer.self_attention, "attn_out")
+        add_capture(i, layer.mlp.linear_fc2, "fc2_in")
+        add_capture(i, layer.mlp.linear_fc2, "fc2_out")
+
     try:
         with torch.no_grad():
             positions = torch.arange(p+s, device="npu").unsqueeze(0)
@@ -1102,6 +1120,39 @@ def test_real_qwen_full_gpt_vs_single_split():
                 f"{fp32_round_disagree.numel()}",
                 flush=True,
             )
+            assert set(fp32_prec_cast_inputs) == {"full", "prefix"}
+            full_x = fp32_prec_cast_inputs["full"]
+            prefix_x = fp32_prec_cast_inputs["prefix"]
+            same_inputs = torch.equal(full_x, prefix_x)
+            print(
+                "QWEN SPLIT GPT_LAYER01_PREFIX_QKV_PRECAST_INPUT "
+                f"bitwise_equal={same_inputs} "
+                f"max_abs={float((full_x.float()-prefix_x.float()).abs().max()):.8g}",
+                flush=True,
+            )
+            # Inspect a few *actual* BF16 disagreements, not random coords.
+            # FP64 scalar dot is cheap for five rows and identifies which
+            # result is consistent with a high-precision same-input oracle.
+            w_qkv = model.decoder.layers[0].self_attention.linear_qkv.weight.detach()
+            coords = fp32_round_disagree.nonzero(as_tuple=False)[:5].tolist()
+            for row, batch, out_idx in coords:
+                weight_row = w_qkv[out_idx].detach().cpu().double()
+                full_dot64 = torch.dot(full_x[row, batch].double(), weight_row)
+                prefix_dot64 = torch.dot(prefix_x[row, batch].double(), weight_row)
+                full32 = float(fp32_prec_cast["full"][row, batch, out_idx])
+                prefix32 = float(fp32_prec_cast["prefix"][row, batch, out_idx])
+                full16 = float(fp32_prec_cast["full"][row, batch, out_idx].to(torch.bfloat16))
+                prefix16 = float(fp32_prec_cast["prefix"][row, batch, out_idx].to(torch.bfloat16))
+                print(
+                    "QWEN SPLIT GPT_LAYER01_QKV_FP64_ROUNDING "
+                    f"row={row} out={out_idx} "
+                    f"full_fp32={full32:.9g} prefix_fp32={prefix32:.9g} "
+                    f"full_bf16={full16:.9g} prefix_bf16={prefix16:.9g} "
+                    f"full_dot64={float(full_dot64):.12g} "
+                    f"prefix_dot64={float(prefix_dot64):.12g} "
+                    f"fp64_bf16={float(full_dot64.to(torch.bfloat16)):.9g}",
+                    flush=True,
+                )
         for layer in layers[:2]:
             # Prefix output is a different logical range from Suffix output.
             # Compare Full[:P] with Prefix[:P] separately and explicitly.
@@ -1119,6 +1170,34 @@ def test_real_qwen_full_gpt_vs_single_split():
                 if first is None and mx != 0:
                     first = (layer, stage, mx)
         print(f"QWEN SPLIT GPT FIRST_CAPTURED_DRIFT={first}", flush=True)
+
+        # Compact 28-layer propagation trace: same logical suffix tokens.
+        # These are *observational* errors; they do not isolate each GEMM's
+        # intrinsic shape error because the inputs can already differ.
+        for layer in layers:
+            parts = []
+            for stage in (
+                "attn_in", "proj_in", "attn_out",
+                "fc2_in", "fc2_out", "layer_out",
+            ):
+                actual = captured[("split", layer, stage)]
+                expected = captured[("full", layer, stage)]
+                if actual.shape != expected.shape:
+                    raise AssertionError(
+                        f"layer={layer} stage={stage}: "
+                        f"shape mismatch {actual.shape} vs {expected.shape}"
+                    )
+                delta = actual - expected
+                rel_l2 = float(
+                    torch.linalg.vector_norm(delta) /
+                    torch.linalg.vector_norm(expected).clamp_min(1e-12)
+                )
+                parts.append(f"{stage}={rel_l2:.6g}")
+            print(
+                f"QWEN SPLIT GPT_LAYER_DRIFT layer={layer:02d} "
+                + " ".join(parts),
+                flush=True,
+            )
 
         _stats("GPT_SUFFIX_LOGITS", split_tail, full_tail)
         labels = tokens[p+1:p+s]
