@@ -144,7 +144,8 @@ def test_areal_dp1_keeps_all_original_rows():
         dp_size=1,
     )
     _assert_exact_coverage(plan, 4, 1)
-    assert plan.partitions == ((0, 1, 2, 3),)
+    # AReaL returns DFS/lexicographic order, not necessarily input row order.
+    assert sorted(plan.partitions[0]) == [0, 1, 2, 3]
     assert plan.policy == "areal_dta"
     assert plan.equal_rows_per_rank
 
