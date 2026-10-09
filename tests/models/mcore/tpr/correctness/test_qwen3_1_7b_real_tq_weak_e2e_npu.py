@@ -349,19 +349,38 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             flush=True,
         )
         start_core = time.perf_counter()
-        _native_core_square_vs_rectangular_oracle(
+        shape_results = _native_core_square_vs_rectangular_oracle(
             reference, batch, row=core_row,
             segment_starts=tuple(starts),
             token_positions=token_positions,
             selected_layers=(1, 2, 3, 4, 14, 28),
             max_length=256,
+            require_complete=True,
         )
         _sync()
+        if not shape_results:
+            raise AssertionError("CORE oracle produced no numerical comparisons")
+        worst = max(shape_results, key=lambda item: item[3])
+        query3 = [entry for entry in shape_results
+                  if lengths[core_row] - entry[1] == 3]
+        if len(query3) != 6:
+            raise AssertionError(
+                f"Expected Q=3 vs KV=192 across six layers; got {len(query3)}"
+            )
+        print(
+            "P0 WEAK_TQ CORE_SUMMARY "
+            f"compared_shapes={len(shape_results)} "
+            f"worst_layer={worst[0]} worst_query={lengths[core_row]-worst[1]} "
+            f"worst_max_abs={worst[3]:.9g} "
+            f"q3_max_abs={max(entry[3] for entry in query3):.9g} "
+            "numeric_parity=DIAGNOSTIC_ONLY",
+            flush=True,
+        )
         print(
             "P0 WEAK_TQ RESULT status=PASS execution=CORE "
             f"elapsed_seconds={time.perf_counter()-start_core:.6f} "
             "same_qkv=True optimizer_step=False "
-            "interpretation=ISOLATED_ATTENTION_SHAPE",
+            "interpretation=ISOLATED_ATTENTION_SHAPE numerical_parity=UNVERIFIED",
             flush=True,
         )
         return
