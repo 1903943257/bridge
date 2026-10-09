@@ -174,3 +174,72 @@ def describe_trace(native, tpr, *, layers: int) -> list[str]:
         "note=first_nonzero_may_be_BF16_rounding_not_first_causal_error"
     )
     return reports
+
+
+def describe_kv_trace(native_kv, tpr_kv, path, *, layers=(1, 2, 3, 4, 14, 28)):
+    """Compare actual post-RoPE K/raw-V seen by Native vs TPR leaf.
+
+    Native tensors come from the untouched core_attention forward-hook.
+    TPR tensors are concatenations of the *actual* past KV state and
+    current segment's context.new_key_values for the same layer.
+    path lists (segment_id, start, end) along the target leaf's ancestor path.
+    Report per-path region to identify shape-sensitive Prefix production
+    separately from positional or assembly faults. Pure diagnostic.
+    """
+    if not path or path[0][1] != 0:
+        raise AssertionError("KV diagnostic path must start at zero")
+    last = 0
+    for _, start, end in path:
+        if start != last or end <= start:
+            raise AssertionError(f"KV path is not contiguous: {path}")
+        last = end
+    if set(native_kv) != set(layers) or set(tpr_kv) != set(layers):
+        raise AssertionError(
+            f"KV trace missing native={sorted(set(layers)-set(native_kv))} "
+            f"tpr={sorted(set(layers)-set(tpr_kv))}"
+        )
+    report = []
+    max_error = (-1.0, None)
+    for number in layers:
+        for field, i in (("K_POST_ROPE", 0), ("V_RAW", 1)):
+            full_native = native_kv[number][i].detach().float().cpu()
+            full_tpr = tpr_kv[number][i].detach().float().cpu()
+            if full_native.shape != full_tpr.shape or full_native.shape[0] != last:
+                raise AssertionError(
+                    f"KV mismatch layer={number} {field} "
+                    f"native={tuple(full_native.shape)} "
+                    f"tpr={tuple(full_tpr.shape)} total_length={last}"
+                )
+            if not bool(torch.isfinite(full_native).all() and torch.isfinite(full_tpr).all()):
+                raise AssertionError(f"KV nonfinite in layer={number} {field}")
+            for segment_id, start, end in path:
+                a, b = full_native[start:end].double(), full_tpr[start:end].double()
+                delta = (a - b).abs()
+                delta_max = float(delta.max())
+                rel = float(
+                    torch.linalg.vector_norm(delta) /
+                    torch.linalg.vector_norm(a).clamp_min(1e-24)
+                )
+                positions = (delta.reshape(end-start, -1).amax(dim=1) > 0)
+                first_local = int(torch.nonzero(positions).flatten()[0]) if bool(positions.any()) else -1
+                first_abs = start + first_local if first_local >= 0 else -1
+                report.append(
+                    "P0 WEAK_TQ KV_TRACE "
+                    f"layer={number:02d} field={field} "
+                    f"segment={segment_id}[{start}:{end}] "
+                    f"max_abs={delta_max:.9g} rel_l2={rel:.9g} "
+                    f"differing_tokens={int(positions.sum())}/{end-start} "
+                    f"first_differing_abs={first_abs}"
+                )
+                if delta_max > max_error[0]:
+                    max_error = (delta_max, (number, field, segment_id, start, end))
+    report.append(
+        "P0 WEAK_TQ KV_SUMMARY "
+        f"compared_layers={len(layers)} "
+        f"segments_per_layer={len(path)} "
+        f"rows={len(report)} "
+        f"worst_max_abs={max_error[0]:.9g} "
+        f"worst_location={max_error[1]} "
+        "same_model_checkpoint=True probe_only=True"
+    )
+    return report
