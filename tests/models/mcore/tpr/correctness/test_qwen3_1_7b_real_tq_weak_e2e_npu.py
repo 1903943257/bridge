@@ -267,6 +267,7 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
     if target.size != "1.7B":
         pytest.fail(f"requires real Qwen3-1.7B, got {target.label}")
     fixture.QWEN_MODEL_PATH = target.path
+    token_capture_dir = os.getenv("TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE_DIR")
     raw_p = os.getenv("TPR_QWEN17_WEAK_E2E_PROMPT", "128")
     raw_s = os.getenv("TPR_QWEN17_WEAK_E2E_RESPONSE", "64")
     if not (raw_p.isdigit() and raw_s.isdigit()):
@@ -316,6 +317,7 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         from tensordict import TensorDict
 
         reference.zero_grad(set_to_none=True)
+        native_log_probs = [] if token_capture_dir else None
         total_valid = sum(
             int(mask.bool().sum()) for mask in _rows(batch, "response_mask")
         )
@@ -345,6 +347,9 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             )
             value.backward()
             native_loss += float(value.detach())
+            if native_log_probs is not None:
+                prompt_length = len(batch["prompts"][row])
+                native_log_probs.append(lp[prompt_length - 1:-1].detach())
         _sync()
         backward_seconds = time.perf_counter() - start
         if not (float("-inf") < native_loss < float("inf")):
@@ -355,6 +360,23 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             f"forward_backward_seconds={backward_seconds:.6f}",
             flush=True,
         )
+        if native_log_probs is not None:
+            from pathlib import Path
+            from ._qwen17_weak_e2e_token_capture import save_ppo_tokens
+
+            captured = {}
+            masks = _rows(batch, "response_mask")
+            for row, logical_lp in enumerate(native_log_probs):
+                lp_cpu = logical_lp.float().cpu()
+                if lp_cpu.numel() != masks[row].numel():
+                    raise AssertionError("Native response logprobs/mask length mismatch")
+                for i in torch.nonzero(
+                    masks[row].bool(), as_tuple=False
+                ).flatten().tolist():
+                    captured[(row, i)] = float(lp_cpu[i])
+            save_ppo_tokens(
+                batch, captured, Path(token_capture_dir) / "native_ppo_tokens.pt"
+            )
         optimizer_seconds = _run_real_adamw_master_step(
             reference,
             lr=float(os.getenv("TPR_QWEN17_WEAK_E2E_LR", "0.0001")),
@@ -407,6 +429,11 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
     )
     expected_tokens = sum(int(m.bool().sum()) for m in _rows(batch, "response_mask"))
     assert expected_tokens > 0 and forest.logical_loss_tokens == expected_tokens
+    if token_capture_dir:
+        # Optional per-logical-token probe; involves D2H transfers from each
+        # physical Segment and invalidates performance timing comparability.
+        tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
+        print("P0 WEAK_TQ TOKEN_CAPTURE enabled=True timings_are_diagnostic=True")
     torch.npu.reset_peak_memory_stats()
     _sync()
     start = time.perf_counter()
@@ -428,6 +455,16 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         f"forward_backward_seconds={backward_seconds:.6f}",
         flush=True,
     )
+    if token_capture_dir:
+        from pathlib import Path
+        from ._qwen17_weak_e2e_token_capture import save_ppo_tokens
+
+        captured = getattr(engine, "_tpr_captured_log_probs", None)
+        if captured is None:
+            raise AssertionError("TPR engine did not capture PPO logprobs")
+        save_ppo_tokens(
+            batch, captured, Path(token_capture_dir) / "tpr_ppo_tokens.pt"
+        )
     master_device = os.getenv("TPR_QWEN17_WEAK_E2E_MASTER_DEVICE", "npu").lower()
     lr = float(os.getenv("TPR_QWEN17_WEAK_E2E_LR", "0.0001"))
     optimizer_seconds = _run_real_adamw_master_step(
