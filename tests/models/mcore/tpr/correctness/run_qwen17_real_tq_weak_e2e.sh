@@ -71,6 +71,7 @@ fi
 run_native=0
 run_tpr=0
 run_cutoff=0
+run_core=0
 for mode in "${modes[@]}"; do
   case "$mode" in
     native)
@@ -82,8 +83,11 @@ for mode in "${modes[@]}"; do
     cutoff)
       if [[ "$run_cutoff" == 1 ]]; then echo "Duplicate mode: cutoff" >&2; exit 2; fi
       run_cutoff=1 ;;
+    core)
+      if [[ "$run_core" == 1 ]]; then echo "Duplicate mode: core" >&2; exit 2; fi
+      run_core=1 ;;
     *)
-      echo "Unsupported mode: $mode (valid: native, tpr, cutoff)" >&2
+      echo "Unsupported mode: $mode (valid: native, tpr, cutoff, core)" >&2
       exit 2 ;;
   esac
 done
