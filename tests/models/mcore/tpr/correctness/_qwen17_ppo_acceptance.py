@@ -76,6 +76,8 @@ def report_sampled_fresh_adamw(native_weights, tpr_weights,
     if native_weights.keys() != tpr_weights.keys():
         raise AssertionError("sampled AdamW weight names mismatch")
     sum_diff2 = sum_ref2 = 0.0
+    step_diff2 = step_ref2 = step_actual2 = step_dot = 0.0
+    grad_sign_flips = grad_common_nonzero = 0
     maximum = 0.0
     count = 0
     for name, before in native_weights.items():
@@ -87,18 +89,33 @@ def report_sampled_fresh_adamw(native_weights, tpr_weights,
         gt = tpr_grads[name].reshape(-1)[:n].float()
         w = before.float()
         # Bias-corrected AdamW with initially zero moments, no clipping.
-        wn = w * (1-lr*weight_decay) - lr*gn/(gn.abs()+eps)
-        wt = w * (1-lr*weight_decay) - lr*gt/(gt.abs()+eps)
+        step_n = -lr * (weight_decay*w + gn/(gn.abs()+eps))
+        step_t = -lr * (weight_decay*w + gt/(gt.abs()+eps))
+        wn = w + step_n
+        wt = w + step_t
         diff = wt-wn
+        step_diff = step_t-step_n
         sum_diff2 += float(diff.square().sum())
         sum_ref2 += float(wn.square().sum())
+        step_diff2 += float(step_diff.square().sum())
+        step_ref2 += float(step_n.square().sum())
+        step_actual2 += float(step_t.square().sum())
+        step_dot += float((step_n*step_t).sum())
+        common_nonzero = (gn != 0) & (gt != 0)
+        grad_common_nonzero += int(common_nonzero.sum())
+        grad_sign_flips += int(((gn*gt < 0) & common_nonzero).sum())
         maximum = max(maximum, float(diff.abs().max()))
         count += n
     rel_l2 = (sum_diff2/max(sum_ref2, 1e-24)) ** 0.5
+    step_rel_l2 = (step_diff2/max(step_ref2, 1e-24)) ** 0.5
+    step_cosine = step_dot / max((step_ref2*step_actual2)**0.5, 1e-24)
     print(
         "QWEN17 PPO ACCEPTANCE ADAMW_SAMPLED_FIRST_STEP "
         f"entries={count} lr={lr} weight_decay={weight_decay} "
         f"max_abs={maximum:.9g} rel_l2={rel_l2:.9g} "
+        f"update_rel_l2={step_rel_l2:.9g} "
+        f"update_cosine={step_cosine:.9g} "
+        f"gradient_sign_flips={grad_sign_flips}/{grad_common_nonzero} "
         "fresh_zero_moments=True real_optimizer_step=False",
         flush=True,
     )
