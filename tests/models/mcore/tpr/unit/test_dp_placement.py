@@ -94,3 +94,33 @@ def test_native_uid_dp1_preserves_every_row_without_importing_verl_balancer():
     assert plan.partitions == ((0, 1, 2),)
     assert plan.equal_rows_per_rank
     assert plan.policy == "verl_uid"
+
+
+def test_native_uid_delegates_to_verl_balancer(monkeypatch):
+    from verl.utils import seqlen_balancing
+
+    captured = {}
+
+    def fake_partition(*, seqlen_list, uid_list, k_partitions):
+        captured.update(seqlen_list=seqlen_list, uid_list=uid_list, k=k_partitions)
+        return [[0, 1], [2, 3]]
+
+    monkeypatch.setattr(seqlen_balancing, "get_group_balanced_partitions", fake_partition)
+    plan = plan_verl_uid([[1, 2], [1, 3], [9, 8], [9, 7]], ["a", "a", "b", "b"], 2)
+    assert plan.partitions == ((0, 1), (2, 3))
+    assert captured == {
+        "seqlen_list": [2, 2, 2, 2],
+        "uid_list": ["a", "a", "b", "b"],
+        "k": 2,
+    }
+
+
+def test_native_uid_rejects_unequal_rows_from_upstream(monkeypatch):
+    from verl.utils import seqlen_balancing
+
+    monkeypatch.setattr(
+        seqlen_balancing, "get_group_balanced_partitions",
+        lambda **kw: [[0], [1, 2, 3]],
+    )
+    with pytest.raises(ValueError, match="unequal per-DP row counts"):
+        plan_verl_uid([[1], [2], [3], [4]], ["a", "a", "b", "b"], 2)
