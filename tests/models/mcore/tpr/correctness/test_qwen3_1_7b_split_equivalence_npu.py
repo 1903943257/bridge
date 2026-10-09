@@ -1103,12 +1103,23 @@ def test_real_qwen_full_gpt_vs_single_split():
                 )
 
         def replay_full_layer_input(layer_id):
-            def hook(_module, args):
-                if not args or not isinstance(args[0], torch.Tensor):
+            # Megatron's TransformerBlock calls TransformerLayer with
+            # hidden_states=hidden_states, not necessarily as args[0].
+            # with_kwargs=True is essential to both observe and replace it.
+            def hook(_module, args, kwargs):
+                in_kwargs = "hidden_states" in kwargs
+                in_args = bool(args)
+                if in_kwargs == in_args:
                     raise AssertionError(
-                        f"layer {layer_id}: unexpected layer forward input"
+                        f"layer {layer_id}: expected hidden_states exactly once, "
+                        f"args={len(args)}, kwargs={sorted(kwargs)}"
                     )
-                x = args[0]
+                x = kwargs["hidden_states"] if in_kwargs else args[0]
+                if not isinstance(x, torch.Tensor):
+                    raise AssertionError(
+                        f"layer {layer_id}: expected Tensor hidden_states, "
+                        f"got {type(x).__name__}"
+                    )
                 ctx = get_tpr_attention_context()
                 if ctx is None:
                     if tuple(x.shape[:2]) != (p+s, 1):
@@ -1148,14 +1159,18 @@ def test_real_qwen_full_gpt_vs_single_split():
                     f"restored_full_input=True",
                     flush=True,
                 )
-                return (reference, *args[1:])
+                if in_kwargs:
+                    return args, {**kwargs, "hidden_states": reference}
+                return (reference, *args[1:]), kwargs
             return hook
 
         for layer in model.decoder.layers:
             idx = layer.self_attention.layer_number
             if idx in replay_layers:
                 handles.append(
-                    layer.register_forward_pre_hook(replay_full_layer_input(idx))
+                    layer.register_forward_pre_hook(
+                        replay_full_layer_input(idx), with_kwargs=True
+                    )
                 )
         print(
             f"QWEN SPLIT GPT TEST-ONLY FULL_LAYER_INPUT_REPLAY="
