@@ -318,3 +318,82 @@ grep -E 'GROUPED_GEMM|BF16_TILED_GEMM|GPT_SUFFIX_LOGPROBS|PPO_RATIO_MAX_DEVIATIO
 Keep `TPR_QWEN17_GPT_GROUPED_GEMM_TRACE=0` for non-trace timing tests;
 the traced version synchronizes every GroupedMatmul and is far slower.
 Even full-forward bitwise success does NOT prove autograd/backward support.
+
+## F. 2026-10-09: symmetric Tile PPO PASS, combined Grouped QKV+Projection PASS
+
+**Verified on user's Ascend 910B2C environment** (real recorded TQ cropped
+128 prompt / 64 response, 8 trajectories, 512 valid policy tokens):
+- With symmetric BF16 tile=128 in Native Full, Native Cutoff and Forest,
+  all three PPO effective clip-branch comparisons are **0/512**.
+  Native Full-vs-Forest ratio maximal absolute deviation ~9.54e-7;
+  native Full-vs-Cutoff logprob max_abs ~9.54e-7;
+  Forest-vs-Cutoff max_abs ~2.38e-7.
+- The REAL VERL PPO numerical gate prints PASS; selected-parameter grad
+  relative-L2=0.012100, cosine=0.99992683.
+- Sampled fresh AdamW **update** relative-L2 still ~0.111952, cosine
+  ~0.993734, with 59/21224 nonzero gradient signs flipped.
+  The update metrics depend on the sampled parameters and first-step
+  zero-moment/no-clip assumptions. They are not full-optimizer equivalence.
+- Complete 28-layer Qwen3-1.7B BF16 forward with **Grouped QKV +
+  Grouped Projection**, while FC1/FC2 use fixed token tiles:
+  logprob **bitwise=True** and ratio max deviation zero. 128-token
+  one-group suffix uses native M=128 GEMM.
+
+These outcomes strongly implicate physical BF16 Linear M-shape numerical
+paths for this SHORT real-TQ forward discrepancy, but do not establish
+any universal model/length/TP/CP guarantee or exact source of the remaining
+backward differences. The "global gradient" figure is for the **selected
+parameter subset** (decoder layers 0, 13, 27, plus embeddings/norm/head),
+not all 1.7B model parameters.
+
+### Next step: isolate remaining selected-gradient disagreement
+
+```bash
+export TPR_RUN_QWEN17_PPO=1
+export TPR_QWEN17_PPO_ACCEPTANCE=1
+export TPR_QWEN17_PPO_PROMPT=128
+export TPR_QWEN17_PPO_RESPONSE=64
+export TPR_QWEN17_PPO_TILE_GEMM=128
+export TPR_QWEN17_PPO_TILE_GEMM_GROUPS=qkv,proj,fc1,fc2
+export TPR_QWEN17_PPO_SEGMENT_ORACLE=0
+export TPR_QWEN17_PPO_TRACE_LAYERS=0
+export TPR_QWEN17_PPO_CORE_ORACLE=0
+export TPR_QWEN17_PPO_GRAD_BREAKDOWN=1
+unset TPR_QWEN17_PPO_FC2_FIXED_M
+
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_ppo_npu.py \
+  -k real_qwen3_1_7b_tq_ppo_loss_and_gradients \
+  > /tmp/qwen17_ppo_fixed_gradient_breakdown.log 2>&1
+
+grep -E 'GRAD BREAKDOWN|PPO grad:|ADAMW_SAMPLED|NUMERICAL GATE|FAILED|ERROR' \
+  /tmp/qwen17_ppo_fixed_gradient_breakdown.log
+```
+
+This extra diagnostic ranks selected parameters by share of squared
+gradient discrepancy to identify which layer and family contributes
+most. This does NOT establish BF16 wgrad accumulation as the cause.
+
+### Next step: check GroupedMatmul training autograd WITHOUT patching TPR
+
+The 28-layer Grouped experiment is FORWARD ONLY; its packed per-layer
+weights use `detach()`, so the wrapper itself does not propagate any
+learnable weight gradient. Before production, test whether torch_npu
+GroupedMatmul has native autograd on a SHARED trainable weight:
+
+```bash
+export TPR_RUN_QWEN17_GROUPED_BACKWARD=1
+export TPR_QWEN17_GROUPED_BACKWARD_TILE=128
+export TPR_QWEN17_GROUPED_BACKWARD_N=2
+
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/profiling/test_qwen3_1_7b_grouped_autograd_npu.py \
+  > /tmp/qwen17_grouped_backward.log 2>&1
+
+grep -E 'GROUPED BACKWARD|FAILED|ERROR' /tmp/qwen17_grouped_backward.log
+```
+
+Possible statuses: `SUPPORTED_AUTOGRAD`, `NO_AUTOGRAD`, `UNSUPPORTED`.
+If torch_npu's direct grouped operation lacks autograd, prefer searching
+the matching *installed* MindSpeed GMM training wrapper/backward kernel
+before considering new custom operations.
