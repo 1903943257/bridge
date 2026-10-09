@@ -331,6 +331,8 @@ def compare_first_attention_replay(
     # operator input or we changed a relevant kernel argument, and the
     # one-at-a-time counterfactual cannot be interpreted.
     # BF16 identical replay should be exact on the controlled CANN path.
+    witness_tolerance = 1e-5
+    witnesses_match = all(value <= witness_tolerance for value in witness.values())
     reports.append(
         "P0 WEAK_TQ FA_REPLAY_SUMMARY "
         f"q_abs={query_abs} query_M={tq.shape[0]} kv_M={nk.shape[0]} "
@@ -338,6 +340,15 @@ def compare_first_attention_replay(
         f"tpr_witness_max={witness['TPR_ALL']:.9g} "
         f"actual_core_witness_max={witness.get('TPR_CORE_OUTPUT', 0):.9g} "
         f"softmax_scale={nscale} "
+        f"witness_valid={witnesses_match} "
         "same_kernel=True gradient=False numeric_parity=DIAGNOSTIC_ONLY"
     )
+    if not witnesses_match:
+        # Fail closed rather than misattribute differences to Q/K/V
+        # when the replay's actual-source witnesses disagree with the
+        # unmodified model's saved linear_proj inputs.
+        raise AssertionError(
+            f"FA replay does not reproduce actual Native and TPR core outputs: "
+            f"{witness}, tolerance={witness_tolerance}"
+        )
     return reports
