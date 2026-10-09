@@ -91,6 +91,8 @@ def _run_real_adamw_master_step(model, *, lr: float, master_device: str):
         raise AssertionError("master_device must be 'npu' or 'cpu'")
     if not 0 < lr < 1:
         raise AssertionError("weak E2E LR must be in (0,1)")
+    _sync()
+    total_optimizer_start = time.perf_counter()
     named = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
     if not named:
         raise AssertionError("real model exposes no trainable parameters")
@@ -172,6 +174,7 @@ def _run_real_adamw_master_step(model, *, lr: float, master_device: str):
             f"optimizer did not update usable weights: FP32={changed_master}, "
             f"BF16={changed_bf16}, delta_sq={master_delta_sq}"
         )
+    total_optimizer_seconds = time.perf_counter() - total_optimizer_start
     print(
         "P0 WEAK_TQ OPTIMIZER_STEP status=PASS "
         f"optimizer=torch.optim.AdamW master_dtype=FP32 master_device={master_device} "
@@ -179,11 +182,13 @@ def _run_real_adamw_master_step(model, *, lr: float, master_device: str):
         f"updated_master_tensors={changed_master}/{len(mapped)} "
         f"updated_model_tensors={changed_bf16}/{len(mapped)} "
         f"master_update_l2={master_delta_sq**0.5:.9g} "
-        f"adamw_state_tensors={state_count} optimizer_seconds={opt_seconds:.6f} "
+        f"adamw_state_tensors={state_count} "
+        f"optimizer_core_seconds={opt_seconds:.6f} "
+        f"optimizer_total_seconds={total_optimizer_seconds:.6f} "
         "megatron_optimizer=UNVERIFIED",
         flush=True,
     )
-    return opt_seconds
+    return total_optimizer_seconds
 
 
 def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
