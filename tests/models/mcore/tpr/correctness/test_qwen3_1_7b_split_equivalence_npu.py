@@ -958,7 +958,7 @@ def test_real_qwen_full_gpt_vs_single_split():
             raise AssertionError(
                 f"fixed GEMM tile {tile_size} must divide both P={p} and S={s}"
             )
-        if fp32_groups or fixed_m_layers:
+        if fp32_groups or os.environ.get("TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS"):
             raise AssertionError(
                 "Run BF16 fixed-tile GEMM, FP32 GEMM, and QKV fixed-M "
                 "experiments separately"
