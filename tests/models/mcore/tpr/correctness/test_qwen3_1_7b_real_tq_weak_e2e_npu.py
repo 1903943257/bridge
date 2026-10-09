@@ -306,8 +306,63 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             old_rows.append(old_lp.detach().float().cpu())
     batch["old_log_probs"] = _as_jagged(old_rows)
     execution = os.getenv("TPR_QWEN17_WEAK_E2E_EXECUTION", "tpr").lower()
-    if execution not in ("native", "tpr"):
-        pytest.fail("weak E2E execution must be 'native' or 'tpr'")
+    if execution not in ("native", "tpr", "cutoff"):
+        pytest.fail("weak E2E execution must be 'native', 'tpr' or 'cutoff'")
+
+    # Native per-physical-segment cutoff oracle isolates a crucial causal
+    # shape confounder WITHOUT any TPR KV reuse or optimizer operation:
+    # compare Native(full S=192) vs Native(prefix to owner segment end).
+    # Reuse Phase-5's already-implemented, row-identity-validated oracle.
+    # Run this mode alone, alongside SAVED prior Native/TPR PPO token traces.
+    if execution == "cutoff":
+        if not token_capture_dir:
+            pytest.fail(
+                "cutoff oracle requires TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE_DIR "
+                "(run shell wrapper with TOKEN_CAPTURE=1)"
+            )
+        from pathlib import Path
+        from ._qwen17_weak_e2e_token_capture import save_ppo_tokens
+        from .test_qwen3_1_7b_real_tq_ppo_npu import (
+            _native_cutoff_oracle_per_segment,
+        )
+
+        start_cutoff = time.perf_counter()
+        cutoff, details = _native_cutoff_oracle_per_segment(
+            reference, batch, max_length=256,
+        )
+        _sync()
+        if cutoff is None or details is None:
+            raise AssertionError("real TQ S=192 cutoff oracle unexpectedly skipped")
+        save_ppo_tokens(
+            batch, cutoff, Path(token_capture_dir) / "cutoff_ppo_tokens.pt"
+        )
+        # Keep ownership metadata aligned with the exact PPO token keys.
+        # It enables reporting which physical Segment contributed a drift.
+        ordered = sorted(cutoff)
+        segment_metadata = {
+            "logical_row_offset": torch.tensor(ordered, dtype=torch.int64),
+            "segment_id_start_end": torch.tensor(
+                [(details[key][1], details[key][2], details[key][3])
+                 for key in ordered],
+                dtype=torch.int64,
+            ),
+        }
+        meta_path = Path(token_capture_dir) / "cutoff_segment_owners.pt"
+        if meta_path.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite prior cutoff segment owners: {meta_path}"
+            )
+        torch.save(segment_metadata, meta_path)
+        print(
+            "P0 WEAK_TQ RESULT status=PASS execution=CUTOFF "
+            f"ppo_tokens={len(cutoff)} "
+            f"segments={len(set((v[1], v[2], v[3]) for v in details.values()))} "
+            f"elapsed_seconds={time.perf_counter()-start_cutoff:.6f} "
+            "optimizer_step=False native_per_segment_cutoff=True "
+            "purpose=CAUSAL_SHAPE_ORACLE",
+            flush=True,
+        )
+        return
 
     # A separate native control uses identical real tokens, same checkpoint,
     # diagnostic old-logprobs/advantages, PPO loss and the same FP32-master
