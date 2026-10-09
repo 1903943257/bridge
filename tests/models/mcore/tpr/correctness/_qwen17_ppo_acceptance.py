@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 
 
-def report_ppo_clip_agreement(native_new, tpr_new, old, advantages, *, clip_ratio=0.2):
+def report_ppo_clip_agreement(native_new, tpr_new, old, advantages, *, clip_ratio=0.2, label="native_vs_tpr"):
     """Compare actual PPO objectives and advantage-aware clipped branches.
 
     All inputs refer to the SAME ordered, valid response tokens. The old
@@ -46,6 +46,7 @@ def report_ppo_clip_agreement(native_new, tpr_new, old, advantages, *, clip_rati
     mismatch = active & (branch_native != branch_tpr)
     print(
         "QWEN17 PPO ACCEPTANCE CLIP "
+        f"label={label} "
         f"valid={int(active.sum())} "
         f"native_clipped={int(branch_native.sum())} "
         f"tpr_clipped={int(branch_tpr.sum())} "
