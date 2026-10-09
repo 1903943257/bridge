@@ -44,9 +44,12 @@ class _ToyLayer(nn.Module):
         self.pre_mlp_layernorm = nn.LayerNorm(4)
         self.mlp = _ToyMLP()
 
-    def forward(self, x):
-        x = self.self_attention(self.input_layernorm(x))
-        return self.mlp(self.pre_mlp_layernorm(x))
+    def forward(self, *, hidden_states, attention_mask=None):
+        # Match real Megatron TransformerLayer's keyword-argument call site:
+        # the forward-hook receives args=() and kwargs["hidden_states"].
+        x = self.self_attention(self.input_layernorm(hidden_states))
+        # Real Megatron layers return a tuple (hidden_states, context).
+        return self.mlp(self.pre_mlp_layernorm(x)), None
 
 
 class _ToyModel(nn.Module):
@@ -66,7 +69,7 @@ def test_stage_capture_same_token_in_native_and_leaf():
     ) as native:
         x = ids
         for layer in model.decoder.layers:
-            x = layer(x)
+            x, _context = layer(hidden_states=x, attention_mask=None)
     # At the same absolute query, the leaf only contains indices 8 and 9.
     with capture_query_stages(
         model, query_position=8,
@@ -74,11 +77,14 @@ def test_stage_capture_same_token_in_native_and_leaf():
     ) as tpr:
         x = ids[8:]
         for layer in model.decoder.layers:
-            x = layer(x)
+            x, _context = layer(hidden_states=x, attention_mask=None)
     rows = describe_trace(native, tpr, layers=2)
     assert len(rows) == 2 * len(STAGES) + 1
     assert "compared_stages=22" in rows[-1]
-    assert "first_nonzero=None" in rows[-1]
+    # Same tensor/token, but GEMM sees M=10 vs M=2; a CPU float32
+    # projection can differ by ~1 ULP (observed 1.19e-7). This is
+    # insignificant and MUST NOT be a strict bitwise-parity gate.
+    assert "first_material=None" in rows[-1]
 
 
 def test_trace_does_not_capture_other_segment():
@@ -88,7 +94,7 @@ def test_trace_does_not_capture_other_segment():
     ) as output:
         x = torch.ones(4, 1, 4)
         for layer in model.decoder.layers:
-            x = layer(x)
+            x, _context = layer(hidden_states=x, attention_mask=None)
     assert not output
 
 
@@ -106,12 +112,12 @@ def test_trace_detects_real_perturbation():
     ) as native:
         x = ids
         for layer in model.decoder.layers:
-            x = layer(x)
+            x, _context = layer(hidden_states=x, attention_mask=None)
     with capture_query_stages(
         model, query_position=8, get_active_span=lambda: (0, 10),
     ) as tpr:
         x = ids.clone()
         x[8, 0, 0] += 0.5
         for layer in model.decoder.layers:
-            x = layer(x)
-    assert "first_nonzero=None" not in describe_trace(native, tpr, layers=2)[-1]
+            x, _context = layer(hidden_states=x, attention_mask=None)
+    assert "first_material=None" not in describe_trace(native, tpr, layers=2)[-1]
