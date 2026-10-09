@@ -139,6 +139,12 @@ def test_mindspeed_shared_gmm_autograd_and_fp32_fusion():
         )
         module = importlib.import_module(module_name)
     except (ImportError, OSError) as exc:
+        print(
+            f"P0 SHARED_GMM MODE={mode} "
+            f"status=WRAPPER_IMPORT_UNAVAILABLE module={module_name} "
+            f"reason={type(exc).__name__}: {exc}",
+            flush=True,
+        )
         pytest.skip(f"installed MindSpeed wrapper unavailable: {exc}")
     print(f"P0 SHARED_GMM MODE={mode} module={module_name}",flush=True)
     ms_grouped = module if mode.startswith("grouped_") else None
@@ -260,9 +266,20 @@ def test_mindspeed_shared_gmm_autograd_and_fp32_fusion():
             group_list=bounds,group_type=0,gemm_fusion=True,
         )
         _comparison("mindspeed_gmm_fp32_fusion forward",output,y_ref)
+        torch.npu.synchronize()
+        print(
+            "P0 SHARED_GMM FP32_FUSION "
+            "stage=BEFORE_BACKWARD expected=npu_gmm_backward_fusion"
+            "+npu_groupmatmul_add_fp32",
+            flush=True,
+        )
         dx = torch.autograd.grad(
             output, x, grad_outputs=dy,allow_unused=True,
         )[0]
+        print(
+            "P0 SHARED_GMM FP32_FUSION stage=AFTER_BACKWARD",
+            flush=True,
+        )
         _comparison("mindspeed_gmm_fp32_fusion dX",dx,dx_ref)
         fused_per_group=packed.main_grad
         print(
