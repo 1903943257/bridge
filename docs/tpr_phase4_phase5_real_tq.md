@@ -1,5 +1,52 @@
 # TPR Phase 4/5: VERL native PPO and real Qwen3-1.7B
 
+### Fixed: invalid FP32 linspace indices in weak-E2E optimizer sampling (2026-10-09)
+
+The first Native/TPR weak-E2E attempt failed during bounded gradient
+sampling with `ACL stream synchronize failed, error code:507035`, at
+`flat.index_select(0, indices).float().cpu()`. The **test's diagnostic
+sampler**, not a known TPR GEMM bug, was generating indices using:
+
+```python
+torch.linspace(0, flat.numel() - 1, steps=min(512, flat.numel()),
+               device=flat.device).long()
+```
+
+For large embedding parameters, the last legal index may not be exactly
+representable in FP32: e.g., 151936*2048 elements has legal maximum
+311164927, but `float32(311164927)` is **311164928**, already one
+past the end. NPU gather with such an index can produce the
+Vector-Core address fault reported later by an asynchronous `.cpu()`
+copy. This is a **strong code-grounded root cause**, although a single
+traceback without the device error log cannot prove which NPU op
+faulted first.
+
+**Fix on `bridge/main`:**
+`correctness/_qwen17_weak_e2e_sampling.py::exact_sample_indices`
+computes all sampled indices using Python integer division (CPU) and
+copies the tiny int64 index array to NPU. New CPU-only regression:
+`unit/test_qwen17_weak_e2e_sampling.py`. No model kernel, gradient
+math, precision or optimizer settings were changed.
+
+```bash
+# From the bridge/VERL training tree with the latest code:
+python -m pytest -q \
+  tests/models/mcore/tpr/unit/test_qwen17_weak_e2e_sampling.py
+
+# Rerun original full Native+TPR weak optimizer-step smoke:
+bash tests/models/mcore/tpr/correctness/run_qwen17_real_tq_weak_e2e.sh
+
+# Bypass the optional *sampling* entirely, if diagnosing remaining errors:
+TPR_QWEN17_WEAK_E2E_SAMPLE=0 \
+  bash tests/models/mcore/tpr/correctness/run_qwen17_real_tq_weak_e2e.sh
+```
+
+If a new process **still** reports 507035 after this fix and sampler
+bypass, set `ASCEND_LAUNCH_BLOCKING=1` *before* starting pytest,
+and inspect the FIRST `AICORE`/`AIVEC` `fault kernel_name` or
+`origin_op_name` in the Ascend plog, not only the Python `.cpu()`
+trace. Synchronous launch is **debug only**, as it changes performance.
+
 ## First runnable weak E2E: real TQ -> default BF16 PPO -> actual AdamW step
 
 `tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_weak_e2e_npu.py`
