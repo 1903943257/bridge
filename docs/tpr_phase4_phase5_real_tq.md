@@ -1,5 +1,143 @@
 # TPR Phase 4/5: VERL native PPO and real Qwen3-1.7B
 
+## Default BF16 vs AReaL-DTA: do not make numerical probes mandatory (2026-10-09)
+
+This comparison was inspected against AReaL's **actual `feat/dta`
+branch**, at commit `a5b0b4811a3ef7bf58f0270abcd81d7154f03ce6`,
+not against the separate newer *sparse tree training* implementation.
+
+**AReaL-DTA facts and source files:**
+
+- `examples/tau2/dta/config_1.7b_airline_dta.yaml` selects
+  `backend: archon:d2`, `dtype: bfloat16`,
+  `gradient_checkpointing: false`, `tree_training_mode: dta`,
+  AdamW/ZeRO-1, `gradient_clipping: 1.0`, and `eps_clip: 0.4`.
+- `areal/experimental/engine/archon_engine.py` expressly **rejects**
+  activation checkpointing with DTA; its DTA-specific `train_batch`
+  executes `DTAWrapper.run_backward_with_scaled_loss`, then
+  `all_reduce_zero1_gradients`, then a real `optimizer_step`.
+  The branch's FSDP and Megatron engines reject DTA mode entirely.
+- `areal/experimental/models/archon/qwen3/model/model.py` uses
+  ordinary **separate** Q/K/V and MLP `torch.nn.Linear` modules.
+  There is **no forced GEMM M=128 tile and no FP32 Linear-forward
+  substitution** in DTA's train path.
+- `areal/experimental/dta/dta_engine.py` performs no-grad prefix cache
+  Push and with-grad segment recompute/Pop, with detached
+  `requires_grad_(True)` prefix KV and explicit gradient injection.
+  KV/grad KV buffers use model dtype (BF16 in this config);
+  logprob/entropy caches are FP32. The Archon training path sets
+  `reduce_dtype=torch.float32`, which is gradient communication
+  precision, **not FP32 QKV/MLP GEMM**.
+- `tests/experimental/archon/test_dta.py` actually calls
+  `train_batch` and checks grad_norm / model update. It accepts
+  grad_norm relative gap below 0.25; its `compare_tensors` for
+  individual parameter updates uses `rtol=0.3`, then merely **prints**
+  mismatches without failing the test. Do **not** call DTA's
+  full-parameter updates bitwise/strictly equivalent to Dense/FSDP.
+
+**What is non-default in our bridge?** Three independent layers must
+not be confused:
+
+1. **TPR architecture itself:** compressed DFS, no-grad Push,
+   graph-building Pop, connected gradient injection, rectangular
+   Attention instead of ordinary square Causal Attention. The
+   variable physical Linear M dimension is an inevitable consequence
+   of per-segment execution; DTA has the same logical phenomenon.
+2. **Phase-5 test fixture baseline (always active):** Qwen3-1.7B
+   pretrained weights are loaded into a single-rank BF16 Megatron
+   model. For BOTH `tpr=False` and `tpr=True`, the fixture
+   **replaces native core-attention with a controlled CANN fused
+   attention adapter**, unless `core_attention_module="native"` is
+   explicitly requested. It additionally uses dropout=0,
+   TE=false, no fused LM head, no native Megatron recompute, and
+   CPU checkpoint initialization. These are **not** sufficient to
+   identify it as a production VERL/MindSpeed Native configuration.
+3. **Optional debugging interventions (not production defaults):**
+   `TPR_QWEN17_PPO_TILE_GEMM=128` wraps QKV/proj/FC1/FC2 on BOTH
+   Native and Forest using physical-M=128 BF16 GEMMs; partial tiles
+   are padded with zero rows and trimmed. Other separate probes use
+   `TPR_QWEN17_GPT_FP32_GEMM` (FP32 Linear forward then BF16 cast),
+   `TPR_QWEN17_SPLIT_FP32_DW_BACKWARD` (test-only alternative dW),
+   or independent grouped-dX/`npu_matmul_add_fp32` autograd.
+   **None of these optional probes is installed in the ordinary
+   `run_tpr_forward_backward_batch` PPO implementation**.
+
+**Why do Native and Forest differ without these controls?** BF16 GEMMs
+with physical M=full-sequence vs M=segment may dispatch through
+different reduction/tiling paths on Ascend CANN, producing slightly
+different rounded outputs even though both compute valid BF16
+approximations. Differences compound over 28 layers. DTA runs on a
+different GPU+Archon stack and does not require strict bitwise parity;
+its training ability does not show that a shape-dependent BF16
+difference is a correctness bug in our Ascend kernels.
+
+The short recorded-data `P=128,S=64,N=8` Phase-5 experiment passed
+its PPO numerical gate **only after symmetric test-only BF16 tiling**
+while sampled full-precision AdamW-update disagreement remained.
+These results establish a useful diagnostic oracle, **not** a
+production requirement to force all Linear GEMMs to M=128. Do not
+promote FP32 Linear or grouped FP32 dW into the normal TPR path on this
+evidence.
+
+### P0 default-first acceptance matrix
+
+Keep the **same initial weights, true captured actor-update PPO
+fields and actual optimizer** throughout. Run these configurations
+in order and record **loss, logical logprobs, all gradients,
+grad_norm, all parameter deltas, AdamW moments, step success,
+NPU peak and wall time**:
+
+| Run | Backend / shape | Numerical interventions | Purpose |
+| --- | --- | --- | --- |
+| A | Native production VERL + MindSpeed | None | Real Actor baseline |
+| B | TPR production path + native BF16 Linear | None | **P0 primary acceptance** |
+| C | Both controlled CANN Native + TPR, same BF16 | None | Attribute attention/backend differences |
+| D | Both controlled CANN Native + TPR, BF16 M=128 | Test-only **cropped** oracle | Attribute physical-M precision only |
+| E | Both paths with alternate FP32 wgrad/GMM | Explicit opt-in only | Investigate any *proven* backward blocker |
+
+**Do not require B to be bitwise A.** First require a finite,
+non-skipped update, reasonable PPO/new-logprob comparison, bounded
+normalized gradient and parameter-update errors, a second optimizer
+step retaining moments, and no unaccounted sample/token loss.
+Numerical tolerance should be recorded as an explicit predeclared
+gate rather than silently relaxed to make a failing result pass.
+Only after B is accepted should end-to-end performance be compared.
+
+**Important input precondition**: the original `tq_batch.pt` is a
+rollout/TQ capture, not a post-PPO-preprocessing actor-update
+mini-batch. The Phase-5 fixture recomputes old logprobs and may
+synthesize advantages; consequently it **cannot serve as true
+production PPO Actor Optimizer-Step acceptance**. The strict
+`test_real_actor_update_minibatch_contract.py` requires genuine
+`old_log_probs` and `advantages`; after it passes, invoke the
+**actual** `BaseEngine.train_batch` / `EngineWorker.train_batch`
+(which calls optimizer zero_grad, `forward_backward_batch`, and
+`optimizer_step`), not a hand-constructed Phase-5 engine and not
+the sampled CPU AdamW counterfactual.
+
+To capture the unmodified **default numerical control** while waiting
+for the genuine actor snapshot:
+
+```bash
+export TPR_RUN_QWEN17_PPO=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN17_PPO_ACCEPTANCE=1
+unset TPR_QWEN17_PPO_TILE_GEMM
+unset TPR_QWEN17_PPO_FC2_FIXED_M
+unset TPR_QWEN17_GPT_FP32_GEMM
+unset TPR_QWEN17_SPLIT_FP32_DW_BACKWARD
+unset TPR_QWEN17_DENSE_BACKWARD_AUTOGRAD
+# Explicit cropped-data numerical diagnosis only, NOT Actor E2E:
+export TPR_QWEN17_PPO_PROMPT=128
+export TPR_QWEN17_PPO_RESPONSE=64
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_ppo_npu.py
+```
+
+A failure in the test's strict comparison should be investigated, but
+must not be reinterpreted as evidence that a default BF16 PPO
+optimizer step cannot run or train.
+
 ## P0: real-TQ actor-update E2E closure (2026-10-09)
 
 **This is the current P0 deliverable.** The isolated GEMM/GMM
