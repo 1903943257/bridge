@@ -923,6 +923,7 @@ def _native_core_square_vs_rectangular_oracle(
     segment_starts=(70, 94, 114),
     token_positions=(76, 99, 114, 126),
     max_length=256,
+    require_complete=False,
 ):
     """Isolate CANN square/rectangular FA shape effects with IDENTICAL Q/K/V.
 
@@ -947,6 +948,7 @@ def _native_core_square_vs_rectangular_oracle(
         return
 
     snapshots = {}
+    shape_results = []
     hooks = []
     for layer in model.decoder.layers:
         number = layer.self_attention.layer_number
@@ -1018,6 +1020,7 @@ def _native_core_square_vs_rectangular_oracle(
                 ).item()
                 max_abs = delta.abs().max().item()
                 mean_abs = delta.abs().mean().item()
+                shape_results.append((number, start, rel_l2, max_abs, mean_abs))
                 print(
                     f"CORE SHAPE ORACLE layer={number:02d} "
                     f"square={full_length}x{full_length} "
@@ -1037,6 +1040,24 @@ def _native_core_square_vs_rectangular_oracle(
                         f"rel_l2={float(torch.linalg.vector_norm(token_delta) / torch.linalg.vector_norm(square_tail[absolute-start].float()).clamp_min(1e-12)):.8g}"
                     )
             del snapshots[number]
+
+    # Old tests call this only for diagnostics and may tolerate missing
+    # hooks. The weak-E2E CORE mode requests full geometry coverage:
+    # PASS must never mean that the oracle silently skipped the cases.
+    expected = {
+        (number, start)
+        for number in selected_layers
+        for start in segment_starts
+        if 0 < start < full_length
+    }
+    observed = {(number, start) for number, start, *_ in shape_results}
+    if require_complete and observed != expected:
+        missing = sorted(expected - observed)
+        unexpected = sorted(observed - expected)
+        raise AssertionError(
+            f"CORE shape oracle incomplete: missing={missing} unexpected={unexpected}"
+        )
+    return shape_results
 
 
 
