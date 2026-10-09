@@ -14,6 +14,11 @@ Actual training execution:
   3) copy updated masters back to the real BF16 Qwen checkpoint model
   4) forward again; verify finite output and actual nonzero updates.
 
+Optional baseline: TPR_QWEN17_WEAK_E2E_EXECUTION=native runs a controlled
+Native row-wise PPO+AdamW step using identical data/config; execute Native and
+TPR in separate processes, then compare measured wall time and NPU peaks.
+This is not a production MindSpeed reference or all-parameter parity test.
+
 Optional lower-HBM mode: TPR_QWEN17_WEAK_E2E_MASTER_DEVICE=cpu. In this
 mode optimizer wall time includes host-side copies; not a throughput
 comparison. Always report NPU memory and times separately.
@@ -244,6 +249,88 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             )
             old_rows.append(old_lp.detach().float().cpu())
     batch["old_log_probs"] = _as_jagged(old_rows)
+    execution = os.getenv("TPR_QWEN17_WEAK_E2E_EXECUTION", "tpr").lower()
+    if execution not in ("native", "tpr"):
+        pytest.fail("weak E2E execution must be 'native' or 'tpr'")
+
+    # A separate native control uses identical real tokens, same checkpoint,
+    # diagnostic old-logprobs/advantages, PPO loss and the same FP32-master
+    # optimizer. This is the *controlled CANN* reference, not production
+    # MindSpeed/VERL. Run in another pytest process to isolate memory/time.
+    if execution == "native":
+        from tensordict import TensorDict
+
+        reference.zero_grad(set_to_none=True)
+        total_valid = sum(
+            int(mask.bool().sum()) for mask in _rows(batch, "response_mask")
+        )
+        torch.npu.reset_peak_memory_stats()
+        _sync()
+        start = time.perf_counter()
+        native_loss = 0.0
+        for row in range(len(lengths)):
+            lp, _ = _native_response_logprobs(
+                reference, batch["input_ids"][row].to(device),
+                prompt_length=len(batch["prompts"][row]), temperature=1.0,
+            )
+            mini = TensorDict({
+                key: batch[key][row].unsqueeze(0).to(device)
+                for key in (
+                    "prompts", "responses", "attention_mask",
+                    "response_mask", "old_log_probs", "advantages",
+                )
+            }, batch_size=[1])
+            tu.assign_non_tensor(
+                mini, batch_num_tokens=total_valid,
+                global_batch_size=len(lengths), dp_size=1,
+            )
+            value, _ = ppo_loss(
+                model_output={"log_probs": lp}, data=mini,
+                config=_VanillaPPOConfig(), dp_group=None,
+            )
+            value.backward()
+            native_loss += float(value.detach())
+        _sync()
+        backward_seconds = time.perf_counter() - start
+        if not (float("-inf") < native_loss < float("inf")):
+            raise AssertionError("native PPO returned nonfinite loss")
+        print(
+            "P0 WEAK_TQ BACKWARD status=PASS execution=NATIVE "
+            f"loss={native_loss:.9g} ppo_tokens={total_valid} "
+            f"forward_backward_seconds={backward_seconds:.6f}",
+            flush=True,
+        )
+        optimizer_seconds = _run_real_adamw_master_step(
+            reference,
+            lr=float(os.getenv("TPR_QWEN17_WEAK_E2E_LR", "0.0001")),
+            master_device=os.getenv(
+                "TPR_QWEN17_WEAK_E2E_MASTER_DEVICE", "npu"
+            ).lower(),
+        )
+        reference.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            _, updated = _native_response_logprobs(
+                reference, batch["input_ids"][0].to(device),
+                prompt_length=len(batch["prompts"][0]), temperature=1.0,
+            )
+        if not bool(torch.isfinite(updated).all()):
+            raise AssertionError("native post-update forward is nonfinite")
+        _sync()
+        print(
+            "P0 WEAK_TQ RESULT status=PASS execution=NATIVE "
+            f"updated_forward_tokens={updated.numel()} "
+            f"npu_peak_alloc_mib={torch.npu.max_memory_allocated()/(1024**2):.3f} "
+            f"npu_peak_reserved_mib={torch.npu.max_memory_reserved()/(1024**2):.3f} "
+            f"forward_backward_seconds={backward_seconds:.6f} "
+            f"optimizer_seconds={optimizer_seconds:.6f} "
+            "real_tokens=True real_checkpoint=True "
+            "real_ppo_loss=True backward=True real_adamw_step=True "
+            "production_verl_optimizer=False real_behavior_policy=False "
+            "full_tq=False native_update_parity=NOT_MEASURED",
+            flush=True,
+        )
+        return
+
     del reference
     gc.collect()
     torch.npu.empty_cache()
@@ -299,7 +386,7 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         raise AssertionError("updated real Qwen forward produced nonfinite logprobs")
     _sync()
     print(
-        "P0 WEAK_TQ RESULT status=PASS "
+        "P0 WEAK_TQ RESULT status=PASS execution=TPR "
         f"updated_forward_tokens={updated_lp.numel()} "
         f"npu_peak_alloc_mib={torch.npu.max_memory_allocated()/(1024**2):.3f} "
         f"npu_peak_reserved_mib={torch.npu.max_memory_reserved()/(1024**2):.3f} "
