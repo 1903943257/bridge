@@ -1,5 +1,68 @@
 # TPR Phase 4/5: VERL native PPO and real Qwen3-1.7B
 
+## P0: real-TQ actor-update E2E closure (2026-10-09)
+
+**This is the current P0 deliverable.** The isolated GEMM/GMM
+performance work is a supporting P1 optimization unless a numerical
+defect is conclusively blocking a real actor optimizer step. Do not
+wait for a fast production grouped-GEMM path before executing an
+initial slow, correctness-first offline E2E.
+
+Definition of the **offline actor-update E2E P0**:
+
+1. Capture an actual Uni-Agent rollout actor `mini_batch_td` at the
+   update boundary. Preserve **original** `old_log_probs` from the
+   behavior policy, **original** advantages, responses, masks, sampling
+   temperature, trajectory IDs, grouping IDs, and weights/config used
+   during that update. Do not recompute old policy values from the
+   checkpoint or silently synthesize advantages.
+2. Make sure the eight trajectories meant to share a prefix appear
+   together in **the same actor update mini-batch**; merely naming a
+   directory `GBS1_N8` is not evidence they share a training batch.
+   Verify `tpr_trajectory_keys` / grouping, the resulting forest
+   topology, logical loss-token count, and total PPO denominator.
+3. With **the same initialization, real PPO inputs and optimizer
+   configuration**, execute Native and Forest on the same NPU setup:
+   forward -> loss -> backward -> gradient synchronization/finalization
+   -> optimizer step. Compare logical response logprobs, loss,
+   all trainable parameters' pre/post gradients, parameter updates,
+   optimizer states, and one subsequent forward. Do not use the
+   Phase-5 test's hand-constructed engine (which only calls
+   `forward_backward_batch`) as evidence of optimizer E2E.
+4. Verify at least one more consecutive update with fresh gradient
+   reset and preserved optimizer moments. Report exceptions/OOM as
+   blockers, not numerical PASS; don't loosen the existing gates.
+5. Measure NPU peak allocated/reserved and the end-to-end wall time
+   against a **matched**, actual production Native reference. The
+   controlled CANN Native oracle and cropped symmetric BF16 tile oracle
+   are debugging controls, not automatically the production baseline.
+
+**First unblock the E2E without waiting for GMM:** Start with the
+smallest genuine actor mini-batch that fits in memory; retain the
+recorded token IDs/advantages/old logprobs/masks unchanged. The
+existing Python fixed-tile GEMM is a *short-sequence diagnosis only*,
+not an unconditional long-context production intervention. If the
+full recorded trajectories fail capacity, report the memory limit and
+enable a supported checkpoint/offload/length strategy with explicit
+correctness revalidation rather than mislabeling a cropped smoke
+as a complete E2E.
+
+**Follow-on P0:** after offline actor-update succeeds, run one
+Uni-Agent rollout -> trajectory grouping -> VERL actor update ->
+next rollout using the updated checkpoint. Verify checkpoint change,
+finite optimizer state, stable trajectory identities, logical loss
+token count, and actual end-to-end runtime. Grouped GEMM performance,
+alternative CP/TP/DP setups and full-length stress sweeps can be
+optimized independently after an initially correct E2E.
+
+**Observed current status (not yet E2E PASS):** real checkpoint,
+recorded TQ, compressed forest, native VERL PPO loss and TPR backward
+already run in the Phase-5 fixture; a cropped symmetric BF16
+fixed-tile comparison passed the numerical gate, with selected
+gradient relative-L2 around 0.0121. The actor-mini-batch capture,
+full optimizer integration and rollout-to-next-rollout loop remain
+unverified.
+
 ## Supported / deliberately unsupported
 
 * Training target: **real Qwen3-1.7B checkpoint**, no synthetic model.
