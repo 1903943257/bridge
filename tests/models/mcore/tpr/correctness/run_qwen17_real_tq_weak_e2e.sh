@@ -123,8 +123,16 @@ for mode in "${modes[@]}"; do
   elif [[ "$mode" == "trace" ]]; then
     # All 308 module-stage records are retained in trace.log. Keep the
     # console short and show the first 4 layers + summary only.
-    grep -E '^P0 WEAK_TQ (CONFIG|TRACE_GEOMETRY|TRACE_SUMMARY|RESULT)' "$logfile"
+    grep -E '^P0 WEAK_TQ (CONFIG|TRACE_GEOMETRY|TRACE_SUMMARY|KV_SUMMARY|RESULT)' "$logfile"
     grep -E '^P0 WEAK_TQ TRACE layer=0[0-3] ' "$logfile"
+    # Prefix KV is the remaining unisolated input to real Forest FA.
+    # Show layers 1-2 broken down by actual ancestor segment, preserving
+    # full details for all six selected layers in trace.log.
+    grep -E '^P0 WEAK_TQ KV_TRACE layer=0[12] ' "$logfile"
+    if ! grep -q '^P0 WEAK_TQ KV_SUMMARY ' "$logfile"; then
+      echo "TRACE: actual leaf Prefix KV oracle did not run; see $logfile" >&2
+      exit 1
+    fi
     if ! grep -q '^P0 WEAK_TQ TRACE_SUMMARY compared_stages=308' "$logfile"; then
       echo "TRACE: missing all 28x11 module-stage comparisons; see $logfile" >&2
       exit 1
