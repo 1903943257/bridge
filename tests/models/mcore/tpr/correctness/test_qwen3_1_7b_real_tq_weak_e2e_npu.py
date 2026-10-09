@@ -396,10 +396,14 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
     target.assert_model_scale(tpr)
     tpr.zero_grad(set_to_none=True)
     engine = _make_training_engine(tpr)
+    from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
     from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    # Reuse EXACTLY the production TPR Engine's trajectory-key resolver,
+    # including its required tu.get_non_tensor_data(..., default=None)
+    # contract. The real TQ loader preserves these identities.
+    keys = _trajectory_keys_from_minibatch(batch)
     forest = build_tree_execution_plans(
-        tu.get_non_tensor_data(batch, key="tpr_trajectory_keys"), batch,
-        require_loss_mask_alignment=True,
+        keys, batch, require_loss_mask_alignment=True,
     )
     expected_tokens = sum(int(m.bool().sum()) for m in _rows(batch, "response_mask"))
     assert expected_tokens > 0 and forest.logical_loss_tokens == expected_tokens
