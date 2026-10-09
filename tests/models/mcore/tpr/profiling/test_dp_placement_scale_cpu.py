@@ -106,7 +106,7 @@ def _plan_timed(title, function):
         (32, 8, 4096, 512, 8),     # 256 rows, ~4K prefix, variable suffix
     ],
 )
-def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffix, dp):
+def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffix, dp, monkeypatch):
     seqs, uids = make_agentic_forest(
         n_groups=n_groups,
         siblings_per_group=siblings,
@@ -141,12 +141,39 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
     # planning memory/time for long shared prompts even when DTA DP is fast.
     import torch
 
-    from verl.models.mcore.tpr.trajectory_tree import build_trajectory_trees
+    from verl.models.mcore.tpr import trajectory_tree as old_tree_builder
 
+    # Profile production implementation without changing its source. Timers
+    # measure whole-row insertion, then final compression; the remainder is
+    # validation / source-row tensor handling and builder overhead.
+    subtimes = {"insert": 0.0, "compress": 0.0}
+    for attribute, bucket in (
+        ("_insert_sequence", "insert"),
+        ("_compress_real_root", "compress"),
+    ):
+        original = getattr(old_tree_builder, attribute)
+
+        def measured(*args, __fn=original, __bucket=bucket, **kwargs):
+            started = time.perf_counter()
+            try:
+                return __fn(*args, **kwargs)
+            finally:
+                subtimes[__bucket] += time.perf_counter() - started
+
+        monkeypatch.setattr(old_tree_builder, attribute, measured)
+
+    build_trajectory_trees = old_tree_builder.build_trajectory_trees
     input_rows = [torch.tensor(row, dtype=torch.long) for row in seqs]
     start = time.perf_counter()
     trees = build_trajectory_trees(keys, {"input_ids": input_rows})
     build_seconds = time.perf_counter() - start
+    print(
+        f"TPR_DP_SCALE legacy_tree_breakdown: total_secs={build_seconds:.3f} "
+        f"per_token_insert_secs={subtimes['insert']:.3f} "
+        f"compress_secs={subtimes['compress']:.3f} "
+        f"other_secs={max(0.0, build_seconds - sum(subtimes.values())):.3f}",
+        flush=True,
+    )
 
     from verl.models.mcore.tpr.trajectory_tree_radix import (
         build_trajectory_trees_radix,
