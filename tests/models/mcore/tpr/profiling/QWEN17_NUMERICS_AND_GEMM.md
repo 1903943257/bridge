@@ -679,3 +679,92 @@ operator combination works in isolation, NOT that its manual calls are
 wired into autograd, Megatron FP32 main_grad, TPR Forest, optimizer
 fusion or end-to-end PPO. Do not merge into production before autograd
 glue, gradient scaling/microbatch reduction, and throughput profiling.
+
+## K. 2026-10-09: grouped dX + shared FP32 main_grad validation
+
+User's real-Qwen layer-1 P1 run on Ascend 910B2C (recorded TQ
+activations, BF16 weight and synthetic BF16 upstream dY, G=8/M=1024)
+verified **both** independent backward primitive combinations:
+
+| Family | Route | dX vs BF16 tiled rel-L2 | shared FP32 dW vs FP32 rel-L2 | Incremental peak |
+| --- | --- | ---: | ---: | ---: |
+| qkv | grouped_dx | 3.50516e-5 | 2.19258e-7 | 36.002 MiB |
+| qkv | mindspeed_fused | 3.50516e-5 | 2.19258e-7 | 148.003 MiB |
+| proj | grouped_dx | 3.71101e-5 | 2.33174e-7 | 20.001 MiB |
+| proj | mindspeed_fused | 3.71101e-5 | 2.33174e-7 | 84.002 MiB |
+
+The corresponding BF16 dX vs the mathematically full FP32 matrix
+product is ~0.00166; native BF16 tiled dX has the **same** FP32
+discrepancy. This is NOT evidence that grouped dX introduced a 0.16%
+regression relative to the native BF16 execution. Unlike an earlier
+failed `GMMFunction(gemm_fusion=True)` probe, the **isolated** MindSpeed
+dX-fusion primitive also completed successfully in this run.
+The fused dX route is more memory-intensive for these exact shapes;
+its speed is still unmeasured. Both routes write dW using the same
+**separate** existing MindSpeed `npu_matmul_add_fp32` primitive.
+
+### Test-only P2: hook the combination into real autograd
+
+The P1 backward test now has a strictly opt-in P2 experimental path.
+It adds a small `torch.autograd.Function` around *existing* GMM forward,
+`torch_npu.npu_grouped_matmul` dX, and `npu_matmul_add_fp32` dW, without
+creating a custom NPU kernel or editing production Linear implementations.
+Two successive backward calls use the same shared BF16 weight and
+one persistent FP32 main_grad. Gates: bitwise forward vs tiled BF16;
+dX relative L2 <=2e-4 vs tiled BF16; FP32 main_grad relative L2
+<=1e-5 vs a full-M FP32 oracle after each backward; no BF16
+`weight.grad` materialization; FP32 buffer identity unchanged.
+
+```bash
+export TPR_RUN_QWEN17_DENSE_FP32_BACKWARD=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN17_DENSE_BACKWARD_GROUPS=8
+export TPR_QWEN17_DENSE_BACKWARD_LAYER=1
+export TPR_QWEN17_DENSE_BACKWARD_MODE=grouped_dx
+export TPR_QWEN17_DENSE_BACKWARD_AUTOGRAD=1
+
+for LINEAR in qkv proj; do
+  export TPR_QWEN17_DENSE_BACKWARD_LINEAR="$LINEAR"
+  log="/tmp/tpr_p2_shared_fp32_autograd_${LINEAR}.log"
+  python -m pytest -s -q --tb=short \
+    tests/models/mcore/tpr/profiling/test_qwen17_dense_fp32_shared_gmm_backward_npu.py \
+    > "$log" 2>&1
+  echo "===== $LINEAR ====="
+  grep -E 'P1 DENSE_FP32|P2 DENSE_FP32|FAILED|ERROR' "$log" | tail -40
+done
+```
+
+This new P2 path is **not yet NPU-executed**: the four table rows above
+are the P1 measurements supplied by the user. A P2 PASS does **not**
+validate `weight.main_grad` ownership, gradient scale, DDP reduction,
+Megatron zero_grad/reset, optimizer updates, or full PPO.
+
+### Explicit path to end-to-end acceptance
+
+1. **P2 standalone autograd**: run the new optional test above with
+   actual recorded-token activations, repeated backward, and memory gate.
+2. **P3 model autograd adapter (test-only first)**: integrate one shared
+   Dense Linear in a real 28-layer Qwen execution, including M<128
+   / ragged tail, G=1 fallback, BF16 outputs, FP32 main_grad,
+   loss scaling, and consistent parameter/gradient ownership. Extend
+   from qkv/proj to fc1/fc2 only after family-specific bitwise triads.
+3. **P4 offline full actor update**: feed *captured* actor
+   `mini_batch_td` including genuine rollout `old_log_probs`,
+   `advantages`, masks, temperature, stable trajectory identity;
+   compare Native vs Forest new logprobs, real PPO objective,
+   all trainable parameter gradients, optimizer step, and optimizer
+   state. Run at least one repeated step; a cropped/selected-parameter
+   smoke is not a full acceptance result.
+4. **P5 full recorded-TQ lengths and capacity**: remove cropped prompt/
+   response settings, manage large LM-head and activations, test
+   variable segments and memory/offload under the actual trajectory
+   distribution; do not confuse 128/64-token numerical PASS with this.
+5. **P6 Uni-Agent E2E**: rollout -> TQ grouping/tree building ->
+   actual VERL actor minibatch -> TPR backward -> optimizer step ->
+   updated rollout. Benchmark time-to-train and peak memory against a
+   matched native baseline; TP/CP/DP>1 require separate correctness
+   validation if the deployment needs them.
+
+Neither the P1 logs nor the P2 isolated autograd test establish an
+end-to-end training throughput gain. Keep the baseline physically
+shape-matched when attributing numerical differences to reuse.
