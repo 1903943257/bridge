@@ -306,8 +306,65 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             old_rows.append(old_lp.detach().float().cpu())
     batch["old_log_probs"] = _as_jagged(old_rows)
     execution = os.getenv("TPR_QWEN17_WEAK_E2E_EXECUTION", "tpr").lower()
-    if execution not in ("native", "tpr", "cutoff"):
-        pytest.fail("weak E2E execution must be 'native', 'tpr' or 'cutoff'")
+    if execution not in ("native", "tpr", "cutoff", "core"):
+        pytest.fail("weak E2E execution must be 'native', 'tpr', 'cutoff' or 'core'")
+
+    # No-gradient native core-attention shape oracle. Hold the *actual*
+    # post-RoPE Q/K/V fixed, only change square-vs-rectangular CANN
+    # attention dimensions; this isolates the kernel from any GEMM, RoPE
+    # projection or external Prefix KV cache.
+    if execution == "core":
+        from .test_qwen3_1_7b_real_tq_ppo_npu import (
+            _native_core_square_vs_rectangular_oracle,
+        )
+        from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
+        from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+
+        core_row = int(os.getenv("TPR_QWEN17_WEAK_E2E_CORE_ROW", "5"))
+        if not 0 <= core_row < len(lengths):
+            pytest.fail(f"core-row={core_row} is out of range")
+        forest = build_tree_execution_plans(
+            _trajectory_keys_from_minibatch(batch), batch
+        )
+        # Test actual physical M used in this Forest for nodes whose KV
+        # end matches the native S=192, including M=3 for [189:192].
+        starts = sorted({
+            seg.position_start
+            for tree in forest.trees
+            for seg in tree.segment_plan.segments.values()
+            if seg.position_end == lengths[core_row]
+            and 0 < seg.position_start < lengths[core_row]
+        })
+        if not starts:
+            pytest.fail("core oracle requires a multi-node tree with leaves ending at S")
+        # Tail query 189 is the worst Native-Full vs Forest PPO token, row 5.
+        token_positions = tuple(
+            range(max(starts), lengths[core_row])
+        )
+        print(
+            "P0 WEAK_TQ CORE_GEOMETRY "
+            f"row={core_row} total_S={lengths[core_row]} "
+            f"query_starts={starts} tail_queries={token_positions} "
+            "same_post_rope_QKV=True",
+            flush=True,
+        )
+        start_core = time.perf_counter()
+        _native_core_square_vs_rectangular_oracle(
+            reference, batch, row=core_row,
+            segment_starts=tuple(starts),
+            token_positions=token_positions,
+            selected_layers=(1, 2, 3, 4, 14, 28),
+            max_length=256,
+        )
+        _sync()
+        print(
+            "P0 WEAK_TQ RESULT status=PASS execution=CORE "
+            f"elapsed_seconds={time.perf_counter()-start_core:.6f} "
+            "same_qkv=True optimizer_step=False "
+            "interpretation=ISOLATED_ATTENTION_SHAPE",
+            flush=True,
+        )
+        return
 
     # Native per-physical-segment cutoff oracle isolates a crucial causal
     # shape confounder WITHOUT any TPR KV reuse or optimizer operation:
