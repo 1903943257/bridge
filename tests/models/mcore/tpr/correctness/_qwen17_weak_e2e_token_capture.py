@@ -99,12 +99,81 @@ def compare_ppo_tokens(native: dict, tpr: dict, *, clip_ratio: float = 0.2):
     return result
 
 
+
+def compare_ppo_threeway(native: dict, cutoff: dict, tpr: dict,
+                         segment_owners: dict) -> list[str]:
+    """Attribute full Native/TPR logprob drift to native cutoff vs Forest."""
+    ids = native["logical_row_offset"]
+    if not torch.equal(ids, cutoff["logical_row_offset"]) or not torch.equal(
+        ids, tpr["logical_row_offset"]
+    ) or not torch.equal(ids, segment_owners["logical_row_offset"]):
+        raise ValueError("Native/Cutoff/TPR logical PPO identities differ")
+    descriptors = segment_owners["segment_id_start_end"]
+    if descriptors.ndim != 2 or descriptors.shape != (len(ids), 3):
+        raise ValueError("cutoff owner metadata has invalid [tokens, 3] shape")
+    comparisons = (
+        ("NATIVE_FULL_TO_NATIVE_CUTOFF", native, cutoff),
+        ("NATIVE_CUTOFF_TO_TPR", cutoff, tpr),
+        ("NATIVE_FULL_TO_TPR", native, tpr),
+    )
+    result = []
+    for label, a, b in comparisons:
+        metrics = compare_ppo_tokens(a, b)
+        result.append(
+            f"P0 WEAK_TQ CUTOFF_ORACLE {label} "
+            + " ".join(f"{key}={value}" for key, value in metrics.items())
+        )
+    # Map logical refs back to physical owner Segments. This separates
+    # errors due to changing the native *total input length* from errors
+    # due to the external KV / rectangular attention / segment M.
+    full_d = (native["new"].float() - cutoff["new"].float()).abs()
+    forest_d = (tpr["new"].float() - cutoff["new"].float()).abs()
+    grouped: dict[tuple[int, int, int], list[int]] = {}
+    for i, seg in enumerate(descriptors.tolist()):
+        grouped.setdefault(tuple(map(int, seg)), []).append(i)
+    for (seg_id, start, end), indices in sorted(
+        grouped.items(), key=lambda pair: pair[0][1:]
+    ):
+        idx = torch.tensor(indices, dtype=torch.long)
+        a = full_d.index_select(0, idx)
+        b = forest_d.index_select(0, idx)
+        result.append(
+            "P0 WEAK_TQ CUTOFF_SEGMENT "
+            f"segment={seg_id}[{start}:{end}] tokens={len(indices)} "
+            f"native_full_to_cutoff_max={float(a.max()):.9g} "
+            f"native_full_to_cutoff_mean={float(a.mean()):.9g} "
+            f"forest_to_cutoff_max={float(b.max()):.9g} "
+            f"forest_to_cutoff_mean={float(b.mean()):.9g}"
+        )
+    worst = torch.argsort(
+        (native["new"].float() - tpr["new"].float()).abs(),
+        descending=True,
+    )[:12]
+    for ix in worst.tolist():
+        row, offset = ids[ix].tolist()
+        seg_id, start, end = descriptors[ix].tolist()
+        result.append(
+            "P0 WEAK_TQ CUTOFF_WORST "
+            f"row={row} response={offset} segment={seg_id}[{start}:{end}] "
+            f"full={float(native['new'][ix]):.9g} "
+            f"cutoff={float(cutoff['new'][ix]):.9g} "
+            f"forest={float(tpr['new'][ix]):.9g}"
+        )
+    return result
+
+
 if __name__ == "__main__":
     import argparse
 
     cli = argparse.ArgumentParser(description="Compare exact real-TQ PPO clipping")
     cli.add_argument("native")
     cli.add_argument("tpr")
+    cli.add_argument(
+        "--cutoff", help="Optional native per-physical-Segment PPO logprobs"
+    )
+    cli.add_argument(
+        "--owners", help="cutoff_segment_owners.pt for per-Segment attribution"
+    )
     args = cli.parse_args()
     n = torch.load(args.native, map_location="cpu", weights_only=True)
     t = torch.load(args.tpr, map_location="cpu", weights_only=True)
@@ -114,3 +183,10 @@ if __name__ == "__main__":
         + " ".join(f"{key}={value}" for key, value in result.items()),
         flush=True,
     )
+    if bool(args.cutoff) != bool(args.owners):
+        cli.error("--cutoff and --owners must be supplied together")
+    if args.cutoff:
+        c = torch.load(args.cutoff, map_location="cpu", weights_only=True)
+        owners = torch.load(args.owners, map_location="cpu", weights_only=True)
+        for row in compare_ppo_threeway(n, c, t, owners):
+            print(row, flush=True)
