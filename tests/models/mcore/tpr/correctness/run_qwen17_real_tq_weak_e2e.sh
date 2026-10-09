@@ -123,7 +123,7 @@ for mode in "${modes[@]}"; do
   elif [[ "$mode" == "trace" ]]; then
     # All 308 module-stage records are retained in trace.log. Keep the
     # console short and show the first 4 layers + summary only.
-    grep -E '^P0 WEAK_TQ (CONFIG|TRACE_GEOMETRY|TRACE_SUMMARY|KV_SUMMARY|FA_REPLAY|RESULT)' "$logfile"
+    grep -E '^P0 WEAK_TQ (CONFIG|TRACE_GEOMETRY|TRACE_SUMMARY|KV_SUMMARY|FA_REPLAY|ROOT_PROVENANCE|RESULT)' "$logfile"
     grep -E '^P0 WEAK_TQ TRACE layer=0[0-3] ' "$logfile"
     # Prefix KV is the remaining unisolated input to real Forest FA.
     # Show layers 1-2 broken down by actual ancestor segment, preserving
@@ -135,6 +135,10 @@ for mode in "${modes[@]}"; do
     fi
     if ! grep -q '^P0 WEAK_TQ FA_REPLAY_SUMMARY ' "$logfile"; then
       echo "TRACE: first-layer actual-QKV Attention replay missing; see $logfile" >&2
+      exit 1
+    fi
+    if ! grep -q '^P0 WEAK_TQ ROOT_PROVENANCE_SUMMARY ' "$logfile"; then
+      echo "TRACE: first-layer root V full/cutoff/tree provenance incomplete; see $logfile" >&2
       exit 1
     fi
     if ! grep -q '^P0 WEAK_TQ TRACE_SUMMARY compared_stages=308' "$logfile"; then
