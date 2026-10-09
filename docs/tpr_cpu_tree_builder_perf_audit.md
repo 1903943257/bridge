@@ -88,9 +88,12 @@ TPR_DTA_SCALE_STRESS=1 python -m pytest -vv -s \
   tests/models/mcore/tpr/profiling/test_dp_placement_scale_cpu.py -k long_prefix_16k
 ```
 
-Medium-scale test `tree_builder_compare` prints old and radix CPU times and
-requires exact tree equality; the 16K stress gate only constructs the new
-radix tree to avoid allocating millions of one-token legacy nodes.
+Medium-scale test `tree_builder_compare` prints old and radix CPU times on
+the whole global batch, and `rank_local_tree_compare` *separately* measures
+old/radix builders on each DP partition (reporting max-rank latency as the
+relevant local straggler proxy). Every comparison requires exact tree equality.
+The 16K stress gate only constructs the new radix tree to avoid allocating
+millions of one-token legacy nodes.
 
 The benchmark results in this file were observed **before the new builder**
 and do not claim a speedup for an unmeasured code path.
