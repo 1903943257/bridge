@@ -44,7 +44,9 @@ def _metric(name, actual, reference):
     rel = float(torch.linalg.vector_norm(dd) /
                 torch.linalg.vector_norm(bb).clamp_min(1e-12))
     mx = float(dd.abs().max())
-    eq = torch.equal(actual, reference)
+    # Compare canonical CPU FP32 copies; reference may reside on CPU so it
+    # does not increase the independent NPU GroupedMatmul peak.
+    eq = torch.equal(aa, bb)
     print(
         f"P1 REAL_SHARED_GMM {name} rel_l2={rel:.9g} "
         f"max_abs={mx:.9g} bitwise={eq} "
