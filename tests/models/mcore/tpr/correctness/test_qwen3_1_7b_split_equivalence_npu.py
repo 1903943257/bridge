@@ -1021,6 +1021,11 @@ def test_real_qwen_full_gpt_vs_single_split():
                 flush=True,
             )
 
+        grouped_trace = os.environ.get(
+            "TPR_QWEN17_GPT_GROUPED_GEMM_TRACE", "0"
+        ) == "1"
+        single_group_reported = set()
+
         def install_grouped_linear(module, label):
             # Diagnostic ONLY: extra W^T contiguous buffer for each patched
             # module, and precomputed group-list tensors. Do not mistake this
@@ -1070,35 +1075,80 @@ def test_real_qwen_full_gpt_vs_single_split():
                         f"{_label}: unexpected token length M={length}"
                     )
                 n_groups = length // tile_size
+                # A single physical token tile needs no grouping.  Using the
+                # native GEMM(M=tile_size) here is numerically identical to
+                # our fixed-tile oracle, and avoids device/version-specific
+                # edge cases in 1-group GroupedMatmul (not covered by the
+                # earlier 1024/1152 microbenchmarks).
+                if n_groups == 1:
+                    if "suffix" not in single_group_reported:
+                        print(
+                            "QWEN SPLIT GPT GROUPED_GEMM "
+                            f"SINGLE_TILE_NATIVE_FALLBACK label={_label} "
+                            f"M={length}",
+                            flush=True,
+                        )
+                        single_group_reported.add("suffix")
+                    return original_forward(
+                        hidden_states.contiguous(), *args, **kwargs
+                    )
                 parts = [packed_w] * n_groups
-                if grouped_mode == "single_x_multi_w":
-                    # One concatenated X and a cumsum boundary list.
-                    ys = torch_npu.npu_grouped_matmul(
-                        [hidden_states[:,0,:].contiguous()],
-                        parts,
-                        group_list=lists[length],
-                        group_type=0,
-                        group_list_type=0,
-                        split_item=2,
+                if grouped_trace:
+                    print(
+                        f"QWEN SPLIT GPT GROUPED_GEMM CALL "
+                        f"label={_label} M={length} n_groups={n_groups} "
+                        f"mode={grouped_mode}",
+                        flush=True,
                     )
-                    if not isinstance(ys, (list, tuple)) or len(ys) != 1:
-                        raise AssertionError(
-                            f"{_label}: grouped output layout mismatch"
+                try:
+                    if grouped_mode == "single_x_multi_w":
+                        # One concatenated X and a cumsum boundary list.
+                        ys = torch_npu.npu_grouped_matmul(
+                            [hidden_states[:,0,:].contiguous()],
+                            parts,
+                            group_list=lists[length],
+                            group_type=0,
+                            group_list_type=0,
+                            split_item=2,
                         )
-                    result = ys[0].unsqueeze(1)
-                else:
-                    xs = [
-                        part.contiguous()
-                        for part in hidden_states[:,0,:].split(tile_size, dim=0)
-                    ]
-                    ys = torch_npu.npu_grouped_matmul(
-                        xs, parts, group_type=-1, split_item=0,
+                        if not isinstance(ys, (list, tuple)) or len(ys) != 1:
+                            raise AssertionError(
+                                f"{_label}: grouped output layout mismatch"
+                            )
+                        result = ys[0].unsqueeze(1)
+                    else:
+                        xs = [
+                            part.contiguous()
+                            for part in hidden_states[:,0,:].split(
+                                tile_size, dim=0
+                            )
+                        ]
+                        ys = torch_npu.npu_grouped_matmul(
+                            xs, parts, group_type=-1, split_item=0,
+                        )
+                        if not isinstance(ys, (list, tuple)) or len(ys) != n_groups:
+                            raise AssertionError(
+                                f"{_label}: grouped output layout mismatch"
+                            )
+                        result = torch.cat(ys, dim=0).unsqueeze(1)
+                    if grouped_trace:
+                        # Forces a synchronous attribution of asynchronous
+                        # ACL failure to the exact layer/M, test-only.
+                        torch.npu.synchronize()
+                        print(
+                            f"QWEN SPLIT GPT GROUPED_GEMM OK "
+                            f"label={_label} M={length} n_groups={n_groups}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        f"QWEN SPLIT GPT GROUPED_GEMM FAILED "
+                        f"label={_label} M={length} n_groups={n_groups} "
+                        f"mode={grouped_mode} "
+                        f"exception={type(exc).__name__}: {exc}",
+                        flush=True,
                     )
-                    if not isinstance(ys, (list, tuple)) or len(ys) != n_groups:
-                        raise AssertionError(
-                            f"{_label}: grouped output layout mismatch"
-                        )
-                    result = torch.cat(ys, dim=0).unsqueeze(1)
+                    raise
                 if result.shape != (
                     length, 1, weight.shape[0],
                 ):
