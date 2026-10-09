@@ -807,6 +807,95 @@ def test_real_qwen_full_gpt_vs_single_split():
     captured = {}
     handles = []
     restored_qkv_forwards = []
+    restored_fp32_forwards = []
+    npu_hf32_handle = None
+    previous_allow_hf32 = None
+
+    # Numerical intervention ONLY. Keep model parameters, Attention/RoPE,
+    # RMSNorm and downstream activation contracts BF16. Perform selected
+    # Linear matrix multiplications in FP32 for BOTH Full and Split, then
+    # round each Linear output once back to its original BF16 dtype.
+    #
+    # Supported values: qkv, proj, fc1, fc2, head, comma-separated, or all.
+    # This is NOT an all-FP32 model or production GEMM implementation.
+    fp32_mode = os.environ.get("TPR_QWEN17_GPT_FP32_GEMM", "").strip().lower()
+    fp32_groups = set()
+    if fp32_mode:
+        choices = {"qkv", "proj", "fc1", "fc2", "head"}
+        fp32_groups = choices if fp32_mode == "all" else {
+            item.strip() for item in fp32_mode.split(",")
+        }
+        if not fp32_groups or not fp32_groups.issubset(choices):
+            raise AssertionError(
+                "TPR_QWEN17_GPT_FP32_GEMM must be 'all' or a "
+                "comma-separated subset of qkv,proj,fc1,fc2,head"
+            )
+        if os.getenv("TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS"):
+            raise AssertionError(
+                "Run FP32 GEMM and QKV fixed-M experiments separately"
+            )
+        if model.config.tensor_model_parallel_size != 1:
+            raise AssertionError("FP32 GEMM test-only intervention needs TP=1")
+
+        # Ascend can optionally use reduced HF32 for FP32 Matmul. Disable it
+        # during this diagnostic, where the purpose is increased precision.
+        npu_hf32_handle = getattr(getattr(torch, "npu", None), "matmul", None)
+        if npu_hf32_handle is not None and hasattr(npu_hf32_handle, "allow_hf32"):
+            previous_allow_hf32 = npu_hf32_handle.allow_hf32
+            npu_hf32_handle.allow_hf32 = False
+
+        def install_fp32_linear(module, label):
+            if getattr(module, "bias", None) is not None:
+                raise AssertionError(
+                    f"{label}: test-only FP32 Linear requires bias-free Qwen3"
+                )
+            if module.weight.dtype != torch.bfloat16:
+                raise AssertionError(
+                    f"{label}: expected BF16 weights, got {module.weight.dtype}"
+                )
+            original_forward = module.forward
+
+            def fp32_linear_forward(hidden_states, *args, _module=module,
+                                   _label=label, **kwargs):
+                if args or kwargs:
+                    raise AssertionError(
+                        f"{_label}: test-only FP32 Linear got extra forward args"
+                    )
+                if hidden_states.dtype != torch.bfloat16:
+                    raise AssertionError(
+                        f"{_label}: expected BF16 activations, got "
+                        f"{hidden_states.dtype}"
+                    )
+                # Do not silently allow autocast to convert FP32 GEMM
+                # operands back to BF16.
+                with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                    out_fp32 = torch.nn.functional.linear(
+                        hidden_states.float(), _module.weight.float()
+                    )
+                return out_fp32.to(hidden_states.dtype), None
+
+            module.forward = fp32_linear_forward
+            restored_fp32_forwards.append((module, original_forward))
+
+        for decoder_layer in model.decoder.layers:
+            i = decoder_layer.self_attention.layer_number
+            candidates = {
+                "qkv": decoder_layer.self_attention.linear_qkv,
+                "proj": decoder_layer.self_attention.linear_proj,
+                "fc1": decoder_layer.mlp.linear_fc1,
+                "fc2": decoder_layer.mlp.linear_fc2,
+            }
+            for group in fp32_groups.intersection(candidates):
+                install_fp32_linear(candidates[group], f"L{i:02d}_{group}")
+        if "head" in fp32_groups:
+            install_fp32_linear(model.output_layer, "lm_head")
+        print(
+            "QWEN SPLIT GPT TEST-ONLY FP32_GEMM "
+            f"groups={sorted(fp32_groups)} layers={len(layers)} "
+            f"bf16_activation_outputs=True "
+            f"npu_matmul_allow_hf32={getattr(npu_hf32_handle, 'allow_hf32', 'unknown')}",
+            flush=True,
+        )
 
     # TEST ONLY: reproduce the Full M=P+S QKV GEMM shape while running a
     # logically shorter Prefix. This probes shape-sensitive BF16 arithmetic,
@@ -998,3 +1087,7 @@ def test_real_qwen_full_gpt_vs_single_split():
             handle.remove()
         for qkv_module, original_forward in restored_qkv_forwards:
             qkv_module.forward = original_forward
+        for module, original_forward in restored_fp32_forwards:
+            module.forward = original_forward
+        if previous_allow_hf32 is not None:
+            npu_hf32_handle.allow_hf32 = previous_allow_hf32
