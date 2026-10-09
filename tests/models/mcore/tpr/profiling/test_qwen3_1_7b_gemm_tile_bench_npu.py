@@ -95,9 +95,21 @@ def test_real_qwen17_physical_m_gemm_benchmark():
 
     fixture, target = _setup_real_model()
     device = torch.device("npu")
+    # Allocate for the longest requested GEMM M, including real activation
+    # capture. No-grad full GPT path only, no TPR KV-context intervention.
+    requested_m = tuple(
+        int(v.strip()) for v in os.environ.get(
+            "TPR_QWEN17_GEMM_M", "128,1024,1152"
+        ).split(",")
+    )
+    if not requested_m or any(v <= 0 for v in requested_m):
+        raise AssertionError("GEMM benchmark requires positive M values")
+    max_seq = max(
+        max(requested_m),
+        int(os.environ.get("TPR_QWEN17_GEMM_MAX_SEQ", "1152")),
+    )
     model = fixture._make_qwen_model(
-        device, tpr=True,
-        max_sequence_length=int(os.environ.get("TPR_QWEN17_GEMM_MAX_SEQ", "1152")),
+        device, tpr=True, max_sequence_length=max_seq,
     )
     assert target.assert_model_scale(model) > 1_500_000_000
 
@@ -126,6 +138,22 @@ def test_real_qwen17_physical_m_gemm_benchmark():
     if not groups or not groups.issubset(available):
         raise AssertionError(f"Invalid GEMM groups: {groups}")
 
+    input_mode = os.environ.get(
+        "TPR_QWEN17_GEMM_INPUT", "random"
+    ).strip().lower()
+    if input_mode not in ("random", "real"):
+        raise AssertionError("TPR_QWEN17_GEMM_INPUT must be random or real")
+    target_layer = int(os.environ.get("TPR_QWEN17_GEMM_LAYER", "1"))
+    if not 1 <= target_layer <= len(model.decoder.layers):
+        raise AssertionError(f"Invalid target layer={target_layer}")
+    if input_mode == "real":
+        selected = model.decoder.layers[target_layer - 1]
+        available = {
+            "qkv": selected.self_attention.linear_qkv,
+            "proj": selected.self_attention.linear_proj,
+            "fc1": selected.mlp.linear_fc1,
+            "fc2": selected.mlp.linear_fc2,
+        }
     try_grouped = os.environ.get("TPR_QWEN17_GEMM_TRY_GROUPED", "0") == "1"
     try:
         import torch_npu
@@ -137,10 +165,53 @@ def test_real_qwen17_physical_m_gemm_benchmark():
         f"tile={tile} M={rows} groups={sorted(groups)} "
         f"grouped_api_present={grouped_api is not None} "
         f"try_grouped={try_grouped} "
+        f"input_mode={input_mode} layer={target_layer} "
         f"torch={torch.__version__} "
         f"torch_npu={getattr(torch_npu,'__version__','unavailable')}",
         flush=True,
     )
+
+    real_inputs = {}
+    if input_mode == "real":
+        from ..correctness.test_qwen3_1_7b_split_equivalence_npu import (
+            _real_recorded_tokens,
+        )
+        # The existing helper draws genuine recorded TQ token IDs.
+        # The original 1024/128 boundary is used when max(M)=1152;
+        # for other lengths use a prompt-plus-response window.
+        max_m = max(rows)
+        recorded_tokens = _real_recorded_tokens(
+            max_m - min(128, max_m - 2), min(128, max_m - 2)
+        ).to(device)
+        handles = []
+        for group in sorted(groups):
+            def capture(_mod, args, _group=group):
+                if not args or not isinstance(args[0], torch.Tensor):
+                    raise AssertionError(
+                        f"{_group}: expected positional Linear input tensor"
+                    )
+                real_inputs[_group] = args[0].detach().contiguous()
+            handles.append(available[group].register_forward_pre_hook(capture))
+        try:
+            with torch.no_grad():
+                positions = torch.arange(max_m, device=device).unsqueeze(0)
+                logits = model(
+                    recorded_tokens.unsqueeze(0),
+                    positions, attention_mask=None,
+                )
+                del logits
+        finally:
+            for handle in handles:
+                handle.remove()
+        if set(real_inputs) != groups:
+            raise AssertionError(
+                f"Missing real activation inputs {groups-set(real_inputs)}"
+            )
+        print(
+            f"QWEN17 GEMM BENCH REAL_ACTIVATIONS layer={target_layer} "
+            f"length={max_m} groups={sorted(real_inputs)}",
+            flush=True,
+        )
 
     for name in sorted(groups):
         module = available[name]
@@ -151,7 +222,15 @@ def test_real_qwen17_physical_m_gemm_benchmark():
         # Real pretrained Qwen weights, controlled BF16 input; separate from
         # recorded-token correctness tests (which use actual activations).
         for m in rows:
-            x = torch.randn((m,1,nin), device=device, dtype=torch.bfloat16)
+            x = (
+                real_inputs[name][:m].contiguous()
+                if input_mode == "real"
+                else torch.randn((m,1,nin), device=device, dtype=torch.bfloat16)
+            )
+            if x.shape != (m, 1, nin) or x.dtype != torch.bfloat16:
+                raise AssertionError(
+                    f"{name}: invalid activation shape/dtype {x.shape}/{x.dtype}"
+                )
 
             def baseline():
                 return _out(module(x))
