@@ -1354,7 +1354,30 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         report_ppo_clip_agreement(
             native_new_lp, tpr_lp, baseline_lp, advantages,
             clip_ratio=_VanillaPPOConfig.clip_ratio,
+            label="native_full_vs_tpr_forest",
         )
+        if cutoff_oracle is not None:
+            if set(cutoff_oracle) != expected_keys:
+                raise AssertionError(
+                    "Cutoff oracle cannot score all real PPO logical tokens"
+                )
+            cutoff_new_lp = torch.tensor(
+                [cutoff_oracle[key] for key in keys_sorted],
+                dtype=torch.float32,
+            )
+            # Hold the same old policy and advantages fixed for ALL three
+            # policy-output counterfactuals. Note: current old logprobs are
+            # recomputed from the same Native checkpoint, not rollout-old.
+            report_ppo_clip_agreement(
+                native_new_lp, cutoff_new_lp, baseline_lp, advantages,
+                clip_ratio=_VanillaPPOConfig.clip_ratio,
+                label="native_full_vs_native_cutoff",
+            )
+            report_ppo_clip_agreement(
+                cutoff_new_lp, tpr_lp, baseline_lp, advantages,
+                clip_ratio=_VanillaPPOConfig.clip_ratio,
+                label="native_cutoff_vs_tpr_forest",
+            )
         report_sampled_fresh_adamw(
             native_param_samples, tpr_param_samples,
             native_grads, tpr_grads,
