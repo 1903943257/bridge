@@ -72,9 +72,22 @@ Semantics deliberately preserved:
 | Model/KV/CP/TP/offload/grad | none by default | only if explicit opt-in later; before enabling production run NPU correctness |
 | CPU memory/latency | potentially large improvement | print old vs radix times on same input, never assume before measurement |
 
-Existing TPR `build_trajectory_trees` is not modified. The fast builder is
-**not routed through the Engine by default**. This isolates risk from active
-BF16/GEMM gradient debugging.
+Existing TPR `build_trajectory_trees` is not modified. The fast builder
+is **NOT enabled by default**. The regular PPO `megatron_adapter.py` entry
+now selects the constructor via `TPR_TREE_BUILDER` and forwards it into
+the original `build_tree_execution_plans` and original TPR execution:
+```bash
+# Existing single-rank TPR PPO path remains unchanged by default.
+unset TPR_TREE_BUILDER
+
+# Explicit training-side opt-in; do not enable during BF16/GEMM diagnostics
+# unless running a separate paired native-vs-TPR numerical check.
+export TPR_TREE_BUILDER=radix
+```
+An invalid selector fails fast instead of silently changing semantics.
+The switch only changes CPU topology construction, not attention, backward,
+optimizer, or gradient finalization. Run NPU correctness before changing
+the default globally.
 
 ## Tests to run
 
@@ -95,5 +108,18 @@ relevant local straggler proxy). Every comparison requires exact tree equality.
 The 16K stress gate only constructs the new radix tree to avoid allocating
 millions of one-token legacy nodes.
 
-The benchmark results in this file were observed **before the new builder**
-and do not claim a speedup for an unmeasured code path.
+### Observed initial CPU benchmark (user's Docker, 2026-10-09)
+
+128 trajectories (2K shared prefix): original 0.867s vs radix 0.021s,
+**40.47x**, per-token insertion accounted for 0.844s (97.3%).
+DP4 rank-local max (sequential timing proxy): old 0.350s vs new 0.004s.
+
+256 trajectories (4K shared prefix): original 2.075s vs radix 0.096s,
+**21.58x**, per-token insertion accounted for 1.979s (95.4%).
+DP8 rank-local max (sequential timing proxy): old 0.386s vs new 0.008s.
+
+Both benchmark cases passed `radix_trees == trees` equality checks;
+the structural differential unit suite and model-weight/gradient parity
+must be verified independently before claiming training correctness.
+Per-rank times are serial CPU estimates (potential warm-up and GC effects),
+**not** measured concurrent multi-DP worker times or train throughput.
