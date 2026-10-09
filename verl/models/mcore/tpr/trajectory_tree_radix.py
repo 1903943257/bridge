@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental direct-compressed LCP/radix builder for the EXISTING TPR tree.
+"""Direct-compressed LCP/radix builder for the EXISTING TPR tree.
 
 Motivation: trajectory_tree._insert_sequence materializes one temporary
 _TrieNode per distinct token before compressing. This builder inserts entire
@@ -25,8 +25,9 @@ No DTA TokenTrie, DTAEngine, KV, or distributed runtime is imported.
 Crucially this returns the *same* TrajectoryTree / TrajectoryNode / SegmentRef
 as build_trajectory_trees (including node ids, UID-scoped trees, children in
 first-appearance order, and logical duplicate/terminal row ownership).
-The original builder remains the default. Call this separately and pass its
-trees= argument into build_tree_execution_plans to opt in for CPU experiments.
+The original public build_trajectory_trees now selects this builder by default;
+the old per-token builder is retained as build_trajectory_trees_legacy for
+explicit regression comparisons, with the same downstream TPR execution.
 """
 
 from __future__ import annotations
@@ -167,7 +168,7 @@ def _to_tpr_tree(
 def build_trajectory_trees_radix(
     keys: list[str] | tuple[str, ...], batch: Any
 ) -> tuple[TrajectoryTree, ...]:
-    """Drop-in experimental builder; does not alter the normal TPR code path.
+    """Direct-compressed default TPR builder; only CPU tree construction changes.
 
     Accepts the same keys/batch as the original builder. In particular, UIDs
     are *candidate sharing boundaries* and the dummy root is never executed.
