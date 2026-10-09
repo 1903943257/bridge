@@ -139,16 +139,23 @@ def _run_real_adamw_master_step(model, *, lr: float, master_device: str):
     signature_dir = os.getenv("TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR")
     signature = {} if signature_dir else None
     if signature is not None:
+        from ._qwen17_weak_e2e_sampling import exact_sample_indices
+
         for name, _param, master in mapped:
             flat = master.grad.detach().reshape(-1)
-            indices = torch.linspace(
-                0, flat.numel() - 1,
-                steps=min(512, flat.numel()),
-                device=flat.device,
-            ).long()
+            # NEVER use torch.linspace(...).long() for tensor indices:
+            # FP32 rounds large Embedding's last valid index to numel,
+            # triggering an out-of-bounds NPU index_select / ACL 507035.
+            # Compute exact indices on CPU with Python integer arithmetic.
+            cpu_indices = torch.tensor(
+                exact_sample_indices(flat.numel()), dtype=torch.long
+            )
+            indices = cpu_indices.to(flat.device)
+            assert int(cpu_indices[-1]) == flat.numel() - 1
+            sampled = flat.index_select(0, indices)
             signature[name] = {
-                "grad": flat.index_select(0, indices).float().cpu().clone(),
-                "indices": indices.cpu().clone(),
+                "grad": sampled.detach().float().cpu().clone(),
+                "indices": cpu_indices,
             }
 
     step_start = time.perf_counter()
