@@ -208,6 +208,42 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
         flush=True,
     )
 
+    # Real DP2/DP8 executes the tree builder *after* sharding: each replica
+    # builds only its local rows, not the entire controller batch. Report
+    # max local-rank time, the relevant straggler estimate, separately from
+    # the controller-sized global builder benchmark above.
+    old_rank_secs, radix_rank_secs = [], []
+    for rank, original_indices in enumerate(dta.partitions):
+        local_batch = {
+            "input_ids": [input_rows[i] for i in original_indices]
+        }
+        local_keys = [keys[i] for i in original_indices]
+
+        t0 = time.perf_counter()
+        old_rank_trees = build_trajectory_trees(local_keys, local_batch)
+        old_rank_secs.append(time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        radix_rank_trees = build_trajectory_trees_radix(local_keys, local_batch)
+        radix_rank_secs.append(time.perf_counter() - t0)
+        assert old_rank_trees == radix_rank_trees
+        rank_tokens = sum(
+            node.segment.length
+            for tree in radix_rank_trees
+            for node in tree.nodes.values()
+        )
+        assert rank_tokens == dta.tree_tokens_by_rank[rank]
+    print(
+        f"TPR_DP_SCALE rank_local_tree_compare: dp={dp} "
+        f"max_old_secs={max(old_rank_secs):.3f} "
+        f"max_radix_secs={max(radix_rank_secs):.3f} "
+        f"max_time_speedup="
+        f"{max(old_rank_secs) / max(max(radix_rank_secs), 1e-9):.2f}x "
+        f"sum_old_secs={sum(old_rank_secs):.3f} "
+        f"sum_radix_secs={sum(radix_rank_secs):.3f}",
+        flush=True,
+    )
+
 
 def test_many_duplicates_and_prefix_contained_trajectories_survive_tpr_dp():
     base, base_uids = make_agentic_forest(
