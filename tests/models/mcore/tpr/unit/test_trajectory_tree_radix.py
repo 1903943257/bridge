@@ -153,3 +153,26 @@ def test_radix_selector_in_original_ppo_forest_entry_is_opt_in():
 def test_radix_selector_rejects_unknown_strategy_before_execution():
     with pytest.raises(ValueError, match="unsupported TPR tree_builder"):
         build_tree_execution_plans([], {"input_ids": []}, tree_builder="typo")
+
+
+def test_public_default_builder_routes_to_compressed_radix(monkeypatch):
+    from verl.models.mcore.tpr import trajectory_tree, trajectory_tree_radix
+
+    rows = [[1, 2, 3, 4], [1, 2, 3, 5]]
+    keys = ["a_trace_0", "a_trace_1"]
+    batch = _batch(rows)
+    real_radix = trajectory_tree_radix.build_trajectory_trees_radix
+    called = []
+
+    def traced_radix(*args, **kwargs):
+        called.append(True)
+        return real_radix(*args, **kwargs)
+
+    monkeypatch.setattr(
+        trajectory_tree_radix, "build_trajectory_trees_radix", traced_radix
+    )
+    default_trees = trajectory_tree.build_trajectory_trees(keys, batch)
+    assert called == [True]
+    assert default_trees == trajectory_tree.build_trajectory_trees_legacy(
+        keys, batch
+    )
