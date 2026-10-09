@@ -35,8 +35,9 @@ for knob in \
   fi
 done
 
-log_dir="${TPR_QWEN17_WEAK_E2E_LOG_DIR:-/tmp/tpr_qwen17_weak_e2e}"
+log_dir="${TPR_QWEN17_WEAK_E2E_LOG_DIR:-$(mktemp -d /tmp/tpr_qwen17_weak_e2e.XXXXXX)}"
 mkdir -p "$log_dir"
+export TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR="$log_dir"
 test_path="tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_weak_e2e_npu.py"
 if [[ ! -f "$test_path" ]]; then
   echo "Run from the bridge/VERL root where $test_path exists" >&2
@@ -91,5 +92,42 @@ print(f"  loss_native={native['loss']:.9g}, loss_tpr={tpr['loss']:.9g}, abs_delt
 print(f"  fwd_bwd_native={native['fb']:.5f}s, tpr={tpr['fb']:.5f}s, speedup={native['fb']/max(tpr['fb'],1e-12):.4f}x")
 print(f"  optimizer_total_native={native['opt']:.5f}s, tpr={tpr['opt']:.5f}s")
 print(f"  peak_alloc_native={native['peak']:.3f}MiB, tpr={tpr['peak']:.3f}MiB")
+import torch
+native_sample = torch.load(
+    sys.argv[1].replace("native.log", "native_optimizer_sample.pt"),
+    map_location="cpu", weights_only=True,
+)
+tpr_sample = torch.load(
+    sys.argv[2].replace("tpr.log", "tpr_optimizer_sample.pt"),
+    map_location="cpu", weights_only=True,
+)
+if set(native_sample) != set(tpr_sample):
+    raise SystemExit("Native/TPR sampled trainable parameter names disagree")
+for metric_name in ("grad", "update"):
+    delta2 = ref2 = cand2 = dot = 0.0
+    sign_flips = nonzero = entries = 0
+    for name in native_sample:
+        a = native_sample[name][metric_name].float()
+        b = tpr_sample[name][metric_name].float()
+        if not torch.equal(
+            native_sample[name]["indices"], tpr_sample[name]["indices"]
+        ):
+            raise SystemExit(f"{name}: sampled indices do not align")
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            raise SystemExit(f"{name}: sampled {metric_name} nonfinite")
+        delta2 += float(((a - b) ** 2).sum())
+        ref2 += float((a ** 2).sum())
+        cand2 += float((b ** 2).sum())
+        dot += float((a * b).sum())
+        common = (a != 0) & (b != 0)
+        sign_flips += int(((a * b < 0) & common).sum())
+        nonzero += int(common.sum())
+        entries += a.numel()
+    print(
+        f"  sampled_{metric_name}_rel_l2={(delta2/max(ref2,1e-24))**0.5:.9g}, "
+        f"cosine={dot/max((ref2*cand2)**0.5,1e-24):.9g}, "
+        f"sign_flips={sign_flips}/{nonzero}, "
+        f"sampled_entries={entries} trainable_tensors={len(native_sample)}"
+    )
 print("  all_parameter_update_parity=UNVERIFIED true_rollout_old_logprobs=UNVERIFIED")
 PY
