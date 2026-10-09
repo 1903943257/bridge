@@ -947,6 +947,10 @@ def test_real_qwen_full_gpt_vs_single_split():
     # tile, preserving BF16 kernel behavior while controlling GEMM M.
     # It has heavy Python/kernel-launch overhead; not a production schedule.
     tiled_spec = os.environ.get("TPR_QWEN17_GPT_TILE_GEMM", "").strip()
+    if not tiled_spec and os.environ.get("TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS"):
+        raise AssertionError(
+            "Grouped GEMM probe requires TPR_QWEN17_GPT_TILE_GEMM"
+        )
     if tiled_spec:
         try:
             tile_size = int(tiled_spec)
@@ -978,6 +982,133 @@ def test_real_qwen_full_gpt_vs_single_split():
                 "TPR_QWEN17_GPT_TILE_GEMM_GROUPS must be 'all' or a "
                 "comma-separated subset of qkv,proj,fc1,fc2,head"
             )
+
+        # Test-only selective replacement: keep native BF16 token tiles for
+        # all selected Linear families except those explicitly routed through
+        # Ascend GroupedMatmul. This allows full 28-layer Full/Split validation
+        # of the fast grouped numerical path (NOT just isolated GEMM outputs).
+        grouped_spec = os.environ.get(
+            "TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS", ""
+        ).strip().lower()
+        grouped_groups = (
+            {x.strip() for x in grouped_spec.split(",")}
+            if grouped_spec else set()
+        )
+        if grouped_groups and (
+            "head" in grouped_groups
+            or not grouped_groups.issubset(tile_groups)
+        ):
+            raise AssertionError(
+                "Grouped GEMM groups must be a subset of tiled "
+                "qkv,proj,fc1,fc2 (head is not supported)"
+            )
+        grouped_mode = os.environ.get(
+            "TPR_QWEN17_GPT_GROUPED_GEMM_MODE", "single_x_multi_w"
+        ).strip().lower()
+        if grouped_mode not in {"single_x_multi_w", "multi_x_multi_w"}:
+            raise AssertionError(
+                f"Unsupported GroupedMatmul mode={grouped_mode}"
+            )
+        if grouped_groups:
+            import torch_npu
+            if not hasattr(torch_npu, "npu_grouped_matmul"):
+                raise AssertionError("torch_npu.npu_grouped_matmul unavailable")
+            print(
+                "QWEN SPLIT GPT TEST-ONLY GROUPED_GEMM "
+                f"groups={sorted(grouped_groups)} mode={grouped_mode} "
+                f"tile={tile_size} "
+                "forward_only=True packed_weights_outside_timing=True",
+                flush=True,
+            )
+
+        def install_grouped_linear(module, label):
+            # Diagnostic ONLY: extra W^T contiguous buffer for each patched
+            # module, and precomputed group-list tensors. Do not mistake this
+            # for a production, memory-optimized weight-sharing implementation.
+            import torch_npu
+
+            original_forward = module.forward
+            weight = getattr(module, "weight", None)
+            if (
+                not isinstance(weight, torch.Tensor)
+                or weight.dtype != torch.bfloat16
+                or getattr(module, "bias", None) is not None
+            ):
+                raise AssertionError(
+                    f"{label}: grouped probe expects allocated BF16 "
+                    "bias-free Linear weight"
+                )
+            packed_w = weight.detach().transpose(0, 1).contiguous()
+            lists = {
+                t: torch.arange(
+                    tile_size, t + 1, tile_size,
+                    device=weight.device, dtype=torch.int64,
+                )
+                for t in set((p, s, p+s))
+            }
+            if any(t % tile_size for t in lists):
+                raise AssertionError("Grouped probe requires aligned M")
+
+            def grouped_forward(hidden_states, *args, _label=label, **kwargs):
+                if args or kwargs:
+                    raise AssertionError(
+                        f"{_label}: GroupedMatmul unexpected forward options"
+                    )
+                if (
+                    hidden_states.ndim != 3
+                    or hidden_states.shape[1] != 1
+                    or hidden_states.shape[2] != weight.shape[1]
+                    or hidden_states.dtype != torch.bfloat16
+                ):
+                    raise AssertionError(
+                        f"{_label}: unsupported grouped input "
+                        f"shape={hidden_states.shape} dtype={hidden_states.dtype}"
+                    )
+                length = hidden_states.shape[0]
+                if length not in lists:
+                    raise AssertionError(
+                        f"{_label}: unexpected token length M={length}"
+                    )
+                n_groups = length // tile_size
+                parts = [packed_w] * n_groups
+                if grouped_mode == "single_x_multi_w":
+                    # One concatenated X and a cumsum boundary list.
+                    ys = torch_npu.npu_grouped_matmul(
+                        [hidden_states[:,0,:].contiguous()],
+                        parts,
+                        group_list=lists[length],
+                        group_type=0,
+                        group_list_type=0,
+                        split_item=2,
+                    )
+                    if not isinstance(ys, (list, tuple)) or len(ys) != 1:
+                        raise AssertionError(
+                            f"{_label}: grouped output layout mismatch"
+                        )
+                    result = ys[0].unsqueeze(1)
+                else:
+                    xs = [
+                        part.contiguous()
+                        for part in hidden_states[:,0,:].split(tile_size, dim=0)
+                    ]
+                    ys = torch_npu.npu_grouped_matmul(
+                        xs, parts, group_type=-1, split_item=0,
+                    )
+                    if not isinstance(ys, (list, tuple)) or len(ys) != n_groups:
+                        raise AssertionError(
+                            f"{_label}: grouped output layout mismatch"
+                        )
+                    result = torch.cat(ys, dim=0).unsqueeze(1)
+                if result.shape != (
+                    length, 1, weight.shape[0],
+                ):
+                    raise AssertionError(
+                        f"{_label}: grouped output shape={result.shape}"
+                    )
+                return result, None
+
+            module.forward = grouped_forward
+            restored_tiled_forwards.append((module, original_forward))
 
         def install_tiled_linear(module, label):
             original_forward = module.forward
@@ -1039,12 +1170,17 @@ def test_real_qwen_full_gpt_vs_single_split():
                 "fc2": decoder_layer.mlp.linear_fc2,
             }
             for group in sorted(tile_groups.intersection(modules)):
-                install_tiled_linear(modules[group], f"L{index:02d}_{group}")
+                installer = (
+                    install_grouped_linear
+                    if group in grouped_groups else install_tiled_linear
+                )
+                installer(modules[group], f"L{index:02d}_{group}")
         if "head" in tile_groups:
             install_tiled_linear(model.output_layer, "lm_head")
         print(
             "QWEN SPLIT GPT TEST-ONLY BF16_TILED_GEMM "
-            f"tile={tile_size} groups={sorted(tile_groups)} "
+            f"tile={tile_size} groups={sorted(tile_groups - grouped_groups)} "
+            f"grouped_groups={sorted(grouped_groups)} "
             f"full_tiles={(p+s)//tile_size} prefix_tiles={p//tile_size} "
             f"suffix_tiles={s//tile_size}",
             flush=True,
