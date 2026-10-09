@@ -50,10 +50,21 @@ def test_dta_duplicate_trajectories_remain_distinct_rows():
     sequences = [[1, 2, 3]] * 4
     plan = plan_dta_dfs(sequences, 2)
     _assert_exact_coverage(plan, 4, 2)
+    assert tuple(map(len, plan.partitions)) == (2, 2)
+    assert plan.equal_rows_per_rank
     assert plan.global_tree_tokens == 3
     assert plan.tree_tokens_by_rank == (3, 3)
     assert plan.duplicated_tree_tokens == 3
 
+
+
+def test_dta_duplicate_ties_choose_equal_rows_for_three_replicas():
+    sequences = [[11, 22, 33]] * 6
+    plan = plan_dta_dfs(sequences, 3)
+    _assert_exact_coverage(plan, 6, 3)
+    assert tuple(map(len, plan.partitions)) == (2, 2, 2)
+    assert plan.tree_tokens_by_rank == (3, 3, 3)
+    assert plan.duplicated_tree_tokens == 6
 
 def test_dta_minimax_matches_exhaustive_small_case():
     sequences = [
