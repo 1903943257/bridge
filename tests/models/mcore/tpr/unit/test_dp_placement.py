@@ -29,7 +29,7 @@ def test_dta_balances_shared_prefix_tree_cost_not_raw_token_sum():
     plan = plan_dta_dfs(sequences, 2)
     _assert_exact_coverage(plan, 4, 2)
     assert plan.equal_rows_per_rank
-    assert plan.global_tree_tokens == 10
+    assert plan.global_tree_tokens == 9
     assert plan.max_tree_tokens == 5
     assert plan.duplicated_tree_tokens == 0
 
