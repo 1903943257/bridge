@@ -98,6 +98,8 @@ def test_real_actor_update_minibatch_preserves_ppo_inputs_and_forest():
         if not (r.numel() == mask.numel() == old.numel() == advantage.numel()):
             pytest.fail(f"row {row}: response/mask/old_log_probs/advantages length mismatch")
         if lm.numel() == ids_row.numel():
+            if bool(lm[:-r.numel()].bool().any()):
+                pytest.fail(f"row {row}: loss_mask unexpectedly selects prompt tokens")
             lm = lm[-r.numel():]
         if lm.numel() != r.numel() or not torch.equal(lm.bool(), mask.bool()):
             pytest.fail(f"row {row}: loss_mask and response_mask disagree")
@@ -122,7 +124,9 @@ def test_real_actor_update_minibatch_preserves_ppo_inputs_and_forest():
     )
     if _trajectory_keys_from_minibatch(batch) != tuple(keys):
         pytest.fail("actor mini-batch trajectory keys were lost before Engine routing")
-    plan = build_tree_execution_plans(tuple(keys), batch)
+    plan = build_tree_execution_plans(
+        tuple(keys), batch, require_loss_mask_alignment=True
+    )
     if plan.logical_loss_tokens != valid_tokens:
         pytest.fail(
             f"Forest PPO denominator mismatch: {plan.logical_loss_tokens} vs {valid_tokens}"
