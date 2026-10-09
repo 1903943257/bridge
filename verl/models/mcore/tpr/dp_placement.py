@@ -164,6 +164,25 @@ def plan_dta_dfs(
         else:
             low = mid + 1
     groups = divide(low)
+    # DTA's greedy feasibility scan deliberately fills each rank as far as it
+    # can.  When many rows have identical token sequences, adding another row
+    # costs zero tree tokens: a valid minimax solution may then contain 3/1
+    # rows even though a 2/2 split has exactly the SAME optimal tree cost.
+    #
+    # For VERL's equal-cardinality dispatch, prefer equally sized contiguous
+    # intervals *only if* they preserve the DTA minimax objective.  Do not
+    # silently sacrifice load balance to force equal rows: when that is
+    # impossible, keep the original unequal solution and let _result reject
+    # it until variable-cardinality worker dispatch is supported.
+    if enforce_equal_rows and len(order) % dp_size == 0:
+        rows_per_rank = len(order) // dp_size
+        equal_groups = [
+            (rank * rows_per_rank, (rank + 1) * rows_per_rank)
+            for rank in range(dp_size)
+        ]
+        if all(cost(start, end) <= low for start, end in equal_groups):
+            groups = equal_groups
+
     # Monotone partition cost means splitting an interval cannot increase its
     # tree-token cost.  Split until all DP ranks have a non-empty interval.
     while len(groups) < dp_size:
