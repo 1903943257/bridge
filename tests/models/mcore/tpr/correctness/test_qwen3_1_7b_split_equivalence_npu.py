@@ -806,6 +806,93 @@ def test_real_qwen_full_gpt_vs_single_split():
 
     captured = {}
     handles = []
+    restored_qkv_forwards = []
+
+    # TEST ONLY: reproduce the Full M=P+S QKV GEMM shape while running a
+    # logically shorter Prefix. This probes shape-sensitive BF16 arithmetic,
+    # not padding for attention masks or for CP divisibility. The option
+    # accepts "all" or a comma-separated list of 1-based decoder layer IDs.
+    fixed_m_layers = os.environ.get("TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS")
+    if fixed_m_layers:
+        if fixed_m_layers == "all":
+            selected_layers = set(layers)
+        else:
+            try:
+                selected_layers = {
+                    int(part.strip()) for part in fixed_m_layers.split(",")
+                }
+            except ValueError as exc:
+                raise AssertionError(
+                    "TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS must be "
+                    "'all' or a comma-separated list of layer numbers"
+                ) from exc
+            if not selected_layers or not selected_layers.issubset(set(layers)):
+                raise AssertionError(
+                    f"invalid QKV fixed-M layers: {sorted(selected_layers)}; "
+                    f"model layers={layers}"
+                )
+        for decoder_layer in model.decoder.layers:
+            layer_id = decoder_layer.self_attention.layer_number
+            if layer_id not in selected_layers:
+                continue
+            qkv_module = decoder_layer.self_attention.linear_qkv
+            original_forward = qkv_module.forward
+
+            def fixed_prefix_qkv(
+                hidden_states, *args, _original=original_forward,
+                _layer_id=layer_id, **kwargs
+            ):
+                ctx = get_tpr_attention_context()
+                if ctx is None or ctx.prefix_length != 0 or ctx.suffix_length != p:
+                    return _original(hidden_states, *args, **kwargs)
+                assert hidden_states.shape[0] == p, (
+                    f"layer {_layer_id}: Prefix GEMM M={hidden_states.shape[0]} != {p}"
+                )
+                physical_input = torch.cat(
+                    (
+                        hidden_states,
+                        hidden_states.new_zeros((s, *hidden_states.shape[1:])),
+                    ),
+                    dim=0,
+                )
+                output = _original(physical_input, *args, **kwargs)
+                if isinstance(output, tuple):
+                    return (output[0][:p], *output[1:])
+                if not isinstance(output, torch.Tensor):
+                    raise TypeError(f"unexpected QKV output: {type(output)!r}")
+                return output[:p]
+
+            qkv_module.forward = fixed_prefix_qkv
+            restored_qkv_forwards.append((qkv_module, original_forward))
+        print(
+            f"QWEN SPLIT GPT TEST-ONLY PREFIX_QKV_FIXED_M={p+s} "
+            f"layers={sorted(selected_layers)}",
+            flush=True,
+        )
+
+    def add_prefix_qkv_capture(layer_id, qkv_module):
+        # The ordinary suffix qkv_out capture compares only the last S rows;
+        # it says NOTHING about the cached Prefix K/V used by Split Attention.
+        def hook(_module, _args, output):
+            ctx = get_tpr_attention_context()
+            if ctx is None:
+                mode = "full"
+            elif ctx.prefix_length == 0 and ctx.suffix_length == p:
+                mode = "prefix"
+            else:
+                return
+            tensor = output[0] if isinstance(output, tuple) else output
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"unexpected prefix QKV output: {type(tensor)!r}")
+            value = tensor[:p] if mode == "full" else tensor
+            if value.shape[0] != p:
+                raise AssertionError(
+                    f"layer {layer_id}: Prefix QKV capture M={value.shape[0]} != {p}"
+                )
+            captured[(mode, layer_id, "prefix_qkv_out")] = (
+                value.detach().float().cpu().contiguous()
+            )
+        handles.append(qkv_module.register_forward_hook(hook))
 
     def add_capture(layer, module, stage):
         def hook(_module, args, output):
@@ -830,6 +917,11 @@ def test_real_qwen_full_gpt_vs_single_split():
         i = layer.self_attention.layer_number
         add_capture(i, layer.self_attention, "attn_in")
         add_capture(i, layer.self_attention.linear_qkv, "qkv_out")
+        add_prefix_qkv_capture(i, layer.self_attention.linear_qkv)
+        # Separate core output from the output-projection GEMM: attn_out
+        # includes BOTH, so the old first-drift label was not a root cause.
+        add_capture(i, layer.self_attention.linear_proj, "proj_in")
+        add_capture(i, layer.self_attention.linear_proj, "proj_out")
         add_capture(i, layer.self_attention, "attn_out")
         add_capture(i, layer.mlp.linear_fc1, "fc1_out")
         add_capture(i, layer.mlp.linear_fc2, "fc2_in")
@@ -867,8 +959,15 @@ def test_real_qwen_full_gpt_vs_single_split():
 
         first = None
         for layer in layers[:2]:
+            # Prefix output is a different logical range from Suffix output.
+            # Compare Full[:P] with Prefix[:P] separately and explicitly.
+            _stats(
+                f"GPT_LAYER{layer:02d}_PREFIX_QKV_OUT",
+                captured[("prefix", layer, "prefix_qkv_out")],
+                captured[("full", layer, "prefix_qkv_out")],
+            )
             for stage in (
-                "attn_in", "qkv_out", "attn_out",
+                "attn_in", "qkv_out", "proj_in", "proj_out", "attn_out",
                 "fc1_out", "fc2_in", "fc2_out", "mlp_out",
             ):
                 a, b = captured[("split", layer, stage)], captured[("full", layer, stage)]
@@ -897,3 +996,5 @@ def test_real_qwen_full_gpt_vs_single_split():
     finally:
         for handle in handles:
             handle.remove()
+        for qkv_module, original_forward in restored_qkv_forwards:
+            qkv_module.forward = original_forward
