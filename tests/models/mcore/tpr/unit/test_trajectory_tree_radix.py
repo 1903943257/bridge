@@ -7,7 +7,7 @@ import random
 import pytest
 import torch
 
-from verl.models.mcore.tpr.trajectory_tree import build_trajectory_trees
+from verl.models.mcore.tpr.trajectory_tree import build_trajectory_trees, build_trajectory_trees_legacy
 from verl.models.mcore.tpr.trajectory_tree_radix import build_trajectory_trees_radix
 from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
 
@@ -27,11 +27,12 @@ def _batch(rows):
 def _assert_equivalent(rows, uids):
     batch = _batch(rows)
     keys = [f"{uid}_trace_{i}" for i, uid in enumerate(uids)]
-    old = build_trajectory_trees(keys, batch)
+    old = build_trajectory_trees_legacy(keys, batch)
     new = build_trajectory_trees_radix(keys, batch)
     # Strong identity: exactly the same UID/tree-order, segment spans,
     # original source rows, terminal/duplicate members and node IDs.
     assert new == old
+    assert build_trajectory_trees(keys, batch) == new
 
     baseline = build_tree_execution_plans(
         keys, batch, trees=old, require_loss_mask_alignment=True
