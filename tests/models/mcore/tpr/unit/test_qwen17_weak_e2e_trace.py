@@ -9,7 +9,7 @@ from torch import nn
 
 from ..correctness._qwen17_weak_e2e_trace import (
     STAGES, capture_query_stages, describe_trace, describe_kv_trace,
-    compare_first_attention_replay,
+    compare_first_attention_replay, compare_root_v_provenance,
 )
 
 
@@ -227,4 +227,46 @@ def test_first_attention_replay_rejects_softmax_scale_mismatch():
             position_start=3, query_abs=3,
             native_proj_input=p, tpr_proj_input=p,
             device="cpu", attention_fn=_fake_rectangular_attention,
+        )
+
+
+def test_first_layer_root_v_provenance_attributes_native_length_effect():
+    full_v = torch.arange(12, dtype=torch.float32).reshape(6, 1, 2)
+    cutoff_v = full_v[:4].clone()
+    cutoff_v[1, 0, 0] += 0.25
+    tpr_v = cutoff_v.clone()
+    full_in = torch.ones(6, 1, 3)
+    root_in = full_in[:4].clone()
+    tpr_in = root_in.clone()
+
+    rows = compare_root_v_provenance(
+        full_v, cutoff_v, tpr_v,
+        full_in, root_in, tpr_in,
+    )
+    assert len(rows) == 7
+    assert any(
+        "field=V_RAW pair=FULL_TO_CUTOFF" in row
+        and "max_abs=0.25" in row and "changed_tokens=1/4" in row
+        for row in rows
+    )
+    assert any(
+        "field=V_RAW pair=CUTOFF_TO_TPR" in row and "max_abs=0" in row
+        for row in rows
+    )
+    assert any(
+        "field=QKV_INPUT" in row and "max_abs=0" in row
+        for row in rows
+    )
+    assert "compared_fields=2 compared_pairs=3 root_tokens=4" in rows[-1]
+
+
+def test_first_layer_root_v_provenance_rejects_mismatched_projection_inputs():
+    full_v = torch.ones(6, 1, 2)
+    root_v = torch.ones(4, 1, 2)
+    with pytest.raises(AssertionError, match="shape mismatch"):
+        compare_root_v_provenance(
+            full_v, root_v, root_v,
+            torch.ones(6, 1, 3),
+            torch.ones(4, 1, 3),
+            torch.ones(4, 1, 2),
         )
