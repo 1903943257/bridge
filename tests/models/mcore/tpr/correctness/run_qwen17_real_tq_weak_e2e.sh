@@ -55,7 +55,30 @@ echo "P0 WEAK_TQ START tq=$TPR_REAL_TQ_BATCH"
 echo "P0 WEAK_TQ START master_device=$TPR_QWEN17_WEAK_E2E_MASTER_DEVICE"
 echo "P0 WEAK_TQ START log_dir=$log_dir"
 
-for mode in native tpr; do
+# Select "tpr" alone after the Native gate has already passed.
+# Default remains both modes for same-run numerical comparisons.
+read -r -a modes <<< "${TPR_QWEN17_WEAK_E2E_MODES:-native tpr}"
+if [[ "${#modes[@]}" -eq 0 ]]; then
+  echo "Set TPR_QWEN17_WEAK_E2E_MODES to native, tpr or 'native tpr'" >&2
+  exit 2
+fi
+run_native=0
+run_tpr=0
+for mode in "${modes[@]}"; do
+  case "$mode" in
+    native)
+      if [[ "$run_native" == 1 ]]; then echo "Duplicate mode: native" >&2; exit 2; fi
+      run_native=1 ;;
+    tpr)
+      if [[ "$run_tpr" == 1 ]]; then echo "Duplicate mode: tpr" >&2; exit 2; fi
+      run_tpr=1 ;;
+    *)
+      echo "Unsupported mode: $mode (valid: native, tpr)" >&2
+      exit 2 ;;
+  esac
+done
+
+for mode in "${modes[@]}"; do
   logfile="$log_dir/${mode}.log"
   echo "===== $mode default BF16 training with real TQ tokens ====="
   TPR_QWEN17_WEAK_E2E_EXECUTION="$mode" \
@@ -70,6 +93,11 @@ for mode in native tpr; do
     exit 1
   fi
 done
+
+if [[ "$run_native" != 1 || "$run_tpr" != 1 ]]; then
+  echo "P0 WEAK_TQ single-mode result: ${modes[*]}; skipping cross-run comparison"
+  exit 0
+fi
 
 python - "$log_dir/native.log" "$log_dir/tpr.log" <<'PY'
 import re, sys
