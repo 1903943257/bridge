@@ -128,3 +128,62 @@ Reference: https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/custo
    before treating a grouped kernel as numerically equivalent.
 4. Grouped GEMM training backward support, selective FP32 dW accumulation,
    unaligned segment lengths and CP>1 remain separate required gates.
+
+## C. Measured results 2026-10-09, and selective fast-tile validation
+
+Real 8-row TQ smoke (P=128/S=64), checkpoint-matched old-policy logprobs:
+Native no_grad vs no_grad repeated bitwise, Native no_grad vs grad-enabled
+bitwise; TPR changes advantage-aware PPO clipped branch for **31 / 512**
+tokens. PPO loss -0.250000 vs -0.247312, sampled selected-gradient relative
+L2=0.523553, cosine=0.89627931. This should be treated as a current
+numerical acceptance failure, not dismissed using tiny relative-to-weight
+first-step AdamW differences. Updated AdamW diagnostic also reports
+`update_rel_l2`, `update_cosine`, and `gradient_sign_flips`.
+
+Real layer-1 activations, M=1024/1152, torch_npu 2.9 GroupedMatmul:
+- FC2 both GMM layouts are bitwise **native full-M**, not fixed tile.
+  Thus fast but NOT a drop-in numerical oracle for FC2.
+- Projection both GMM layouts are bitwise **fixed-tile**, not native full-M,
+  while Single-X timing was around native GEMM in this microbenchmark.
+- QKV and FC1 require the same *real-activation* triad before drawing
+  conclusions.
+
+Test-only full-model intervention, after fixing tile=128 for four GEMM
+families, selectively substitute GroupedMatmul for Projection while all
+other families stay on fixed token tiles:
+
+```bash
+export TPR_RUN_QWEN17_SPLIT=1
+export TPR_QWEN17_SPLIT_P=1024
+export TPR_QWEN17_SPLIT_S=128
+export TPR_QWEN17_GPT_TILE_GEMM=128
+export TPR_QWEN17_GPT_TILE_GEMM_GROUPS=qkv,proj,fc1,fc2
+export TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS=proj
+export TPR_QWEN17_GPT_GROUPED_GEMM_MODE=single_x_multi_w
+unset TPR_QWEN17_GPT_FP32_GEMM
+unset TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS
+unset TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS
+
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_split_equivalence_npu.py \
+  -k full_gpt_vs_single_split \
+  > /tmp/qwen17_full28_grouped_proj.log 2>&1
+
+grep -E 'GROUPED_GEMM|BF16_TILED_GEMM|GPT_SUFFIX_LOGPROBS|PPO_RATIO_MAX_DEVIATION|FULL-GPT EQUIVALENCE|FAILED|ERROR' \
+  /tmp/qwen17_full28_grouped_proj.log
+```
+
+If the final logprobs are bitwise, replace the Python tiled Projection
+with the fused GMM **only inside the diagnostic**. A full-model bitwise result
+does not prove that NPU GroupedMatmul has usable training autograd, avoids
+weight transpose buffers, or supports TP/CP.
+
+Optionally change
+`TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS=fc2` (same four
+`TPR_QWEN17_GPT_TILE_GEMM_GROUPS`) as an expected negative control.
+If bitwise fails, it validates that a numerically-native-like GMM cannot
+replace the fixed-tile FC2 oracle.
+
+Before choosing QKV/FC1 fast routes, run with
+`TPR_QWEN17_GEMM_GROUPS=qkv,fc1`, `TPR_QWEN17_GEMM_INPUT=real`, and
+`TPR_QWEN17_GEMM_TRY_GROUPED=1` to compare Grouped-vs-Tile-vs-Native.
