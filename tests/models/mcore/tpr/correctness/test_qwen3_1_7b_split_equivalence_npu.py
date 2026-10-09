@@ -1071,6 +1071,98 @@ def test_real_qwen_full_gpt_vs_single_split():
         add_capture(i, layer.mlp.linear_fc2, "fc2_in")
         add_capture(i, layer.mlp.linear_fc2, "fc2_out")
 
+    # Diagnostic counterfactual: replay exact Full-layer hidden inputs into
+    # both Prefix and Suffix at chosen decoder layers. This removes *inherited*
+    # upstream drift at those boundaries, leaving local split-vs-full shape
+    # effects inside the chosen layer. Normal runs have zero intervention.
+    #
+    # Values: unset (baseline), "all", or comma-separated 1-based layer IDs.
+    # This is no_grad/TP=CP=1 testing only; never use for production TPR.
+    replay_spec = os.environ.get(
+        "TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS", ""
+    ).strip()
+    replay_layers = set()
+    full_layer_inputs = {}
+    if replay_spec:
+        if replay_spec == "all":
+            replay_layers = set(layers)
+        else:
+            try:
+                replay_layers = {
+                    int(part.strip()) for part in replay_spec.split(",")
+                }
+            except ValueError as exc:
+                raise AssertionError(
+                    "TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS must be "
+                    "'all' or comma-separated layer indices"
+                ) from exc
+            if not replay_layers or not replay_layers.issubset(set(layers)):
+                raise AssertionError(
+                    f"invalid replay layers={sorted(replay_layers)}, "
+                    f"valid={layers}"
+                )
+
+        def replay_full_layer_input(layer_id):
+            def hook(_module, args):
+                if not args or not isinstance(args[0], torch.Tensor):
+                    raise AssertionError(
+                        f"layer {layer_id}: unexpected layer forward input"
+                    )
+                x = args[0]
+                ctx = get_tpr_attention_context()
+                if ctx is None:
+                    if tuple(x.shape[:2]) != (p+s, 1):
+                        raise AssertionError(
+                            f"layer {layer_id}: Full input shape={tuple(x.shape)}"
+                        )
+                    full_layer_inputs[layer_id] = x.detach().cpu().contiguous()
+                    return None
+                if ctx.prefix_length == 0 and ctx.suffix_length == p:
+                    mode, start, end = "prefix", 0, p
+                elif ctx.prefix_length == p and ctx.suffix_length == s:
+                    mode, start, end = "suffix", p, p+s
+                else:
+                    return None
+                if layer_id not in full_layer_inputs:
+                    raise AssertionError(
+                        f"layer {layer_id}: Full input was not captured"
+                    )
+                full_part = full_layer_inputs[layer_id][start:end]
+                if x.shape != full_part.shape or x.dtype != full_part.dtype:
+                    raise AssertionError(
+                        f"layer {layer_id} {mode}: replay layout mismatch "
+                        f"{tuple(x.shape)}/{x.dtype} vs "
+                        f"{tuple(full_part.shape)}/{full_part.dtype}"
+                    )
+                with torch.no_grad():
+                    reference = full_part.to(device=x.device)
+                    inherited = (x.detach().float() - reference.float())
+                    incoming_rel = float(
+                        torch.linalg.vector_norm(inherited) /
+                        torch.linalg.vector_norm(reference.float()).clamp_min(1e-12)
+                    )
+                print(
+                    f"QWEN SPLIT GPT_LAYER_INPUT_REPLAY "
+                    f"layer={layer_id:02d} mode={mode} "
+                    f"incoming_rel_l2={incoming_rel:.8g} "
+                    f"restored_full_input=True",
+                    flush=True,
+                )
+                return (reference, *args[1:])
+            return hook
+
+        for layer in model.decoder.layers:
+            idx = layer.self_attention.layer_number
+            if idx in replay_layers:
+                handles.append(
+                    layer.register_forward_pre_hook(replay_full_layer_input(idx))
+                )
+        print(
+            f"QWEN SPLIT GPT TEST-ONLY FULL_LAYER_INPUT_REPLAY="
+            f"{sorted(replay_layers)}",
+            flush=True,
+        )
+
     try:
         with torch.no_grad():
             positions = torch.arange(p+s, device="npu").unsqueeze(0)
