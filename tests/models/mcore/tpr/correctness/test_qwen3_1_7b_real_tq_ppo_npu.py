@@ -1135,6 +1135,33 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
             )
             old_probs.append(response_lp.detach().float().cpu())
     batch["old_log_probs"] = _as_jagged(old_probs)
+    acceptance_enabled = os.environ.get("TPR_QWEN17_PPO_ACCEPTANCE", "0") == "1"
+    native_new_log_probs = {}
+    if acceptance_enabled:
+        # Native(A) vs Native(B) MUST use same weights, identical physical
+        # shape and identical no_grad execution; separate from no_grad-vs-grad.
+        native_repeat = []
+        with torch.no_grad():
+            for row in range(8):
+                _, lp2 = _native_response_logprobs(
+                    ref, batch["input_ids"][row].to(device),
+                    prompt_length=len(batch["prompts"][row]), temperature=1.0,
+                )
+                valid = batch["response_mask"][row].bool().cpu()
+                diff = (
+                    lp2.detach().float().cpu()[valid]
+                    - old_probs[row][valid]
+                ).abs()
+                native_repeat.append(diff)
+        self_diff = torch.cat(native_repeat)
+        print(
+            "QWEN17 PPO ACCEPTANCE NATIVE_NO_GRAD_REPEAT "
+            f"tokens={self_diff.numel()} "
+            f"max_abs={float(self_diff.max()):.9g} "
+            f"mean_abs={float(self_diff.mean()):.9g} "
+            f"bitwise={bool((self_diff == 0).all())}",
+            flush=True,
+        )
     # Old-policy log_probs and the current model should be computed from the
     # same real weights. Their equality is a numerical check, not rollout truth.
     tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
@@ -1154,6 +1181,9 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         row_start = len(batch["prompts"][row]) - 1
         row_new = lp[row_start:-1].detach().float().cpu()
         row_mask = batch["response_mask"][row].bool().cpu()
+        if acceptance_enabled:
+            for off in torch.nonzero(row_mask, as_tuple=False).flatten().tolist():
+                native_new_log_probs[(row, off)] = float(row_new[off])
         native_repeat_abs.append(
             (row_new[row_mask] - old_probs[row][row_mask]).abs()
         )
@@ -1182,6 +1212,14 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         f"mean_abs={repeat_differences.mean().item():.6g}"
     )
     native_grads = _selected_gradient_snapshot(ref)
+    if acceptance_enabled:
+        # Bounded CPU samples; we do not copy a second 1.7B checkpoint or
+        # pretend this is a sharded production optimizer step.
+        native_param_samples = {
+            name: param.detach().reshape(-1)[:1024].float().cpu().clone()
+            for name, param in ref.named_parameters() if name in native_grads
+        }
+        assert native_param_samples.keys() == native_grads.keys()
 
     # No synthetic model or token fixtures. Trace the exact original row-0
     # query positions for early/root and shared nonroot response tokens.
@@ -1282,6 +1320,11 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
             native_trace, tpr_trace, tuple(sorted(trace_owners))
         )
     tpr_grads = _selected_gradient_snapshot(tpr)
+    if acceptance_enabled:
+        tpr_param_samples = {
+            name: param.detach().reshape(-1)[:1024].float().cpu().clone()
+            for name, param in tpr.named_parameters() if name in tpr_grads
+        }
     captured = getattr(engine, "_tpr_captured_log_probs", None)
     assert captured is not None, "TPR logical new-logprob capture was not enabled"
     expected_keys = {
@@ -1294,6 +1337,28 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
         [float(old_probs[row][offset]) for row, offset in sorted(expected_keys)]
     )
     tpr_lp = torch.tensor([captured[key] for key in sorted(expected_keys)])
+    if acceptance_enabled:
+        from ._qwen17_ppo_acceptance import (
+            report_ppo_clip_agreement, report_sampled_fresh_adamw,
+        )
+        keys_sorted = sorted(expected_keys)
+        if set(native_new_log_probs) != expected_keys:
+            raise AssertionError("Native gradient-enabled logical tokens not aligned")
+        native_new_lp = torch.tensor(
+            [native_new_log_probs[key] for key in keys_sorted], dtype=torch.float32
+        )
+        advantages = torch.tensor([
+            float(batch["advantages"][row][off])
+            for row, off in keys_sorted
+        ], dtype=torch.float32)
+        report_ppo_clip_agreement(
+            native_new_lp, tpr_lp, baseline_lp, advantages,
+            clip_ratio=_VanillaPPOConfig.clip_ratio,
+        )
+        report_sampled_fresh_adamw(
+            native_param_samples, tpr_param_samples,
+            native_grads, tpr_grads,
+        )
     diag_keys, diag_expected, diag_actual, bad, outside_clip = _logprob_diagnostics(
         batch, captured, old_probs
     )
