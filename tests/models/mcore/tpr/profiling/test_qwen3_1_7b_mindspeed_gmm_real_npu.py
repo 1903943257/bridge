@@ -162,6 +162,22 @@ def test_real_qwen17_shared_gmm_autograd_8_or_9_groups():
     torch.manual_seed(3407)
     dy = torch.randn((m,n), device=device, dtype=torch.bfloat16)
 
+    # Check the *actual* Megatron M=128 path, rather than assuming that a
+    # standalone F.linear tile uses the same implementation. This check is
+    # excluded from both independent memory measurements.
+    with torch.no_grad():
+        flinear_tile = torch.cat([
+            F.linear(part.contiguous(), w0)
+            for part in x0.split(tile, dim=0)
+        ], dim=0)
+        _metric("megatron_tile_vs_Flinear_tile", megatron_tile, flinear_tile)
+        if not torch.equal(megatron_tile, flinear_tile):
+            raise AssertionError(
+                "Megatron M=128 differs from F.linear M=128; the latter "
+                "cannot serve as a bitwise Megatron numerical oracle"
+            )
+    del flinear_tile
+
     # Run the reference alone. Keep only CPU copies of its outputs before
     # GroupedMatmul, so GMM peak is not inflated by live reference gradients.
     del megatron_tile
@@ -234,13 +250,25 @@ def test_real_qwen17_shared_gmm_autograd_8_or_9_groups():
         for sx, sdy in zip(x0.split(tile), dy.split(tile), strict=True):
             npu_matmul_add_fp32(sx.contiguous(), sdy.contiguous(), main_grad)
         torch.npu.synchronize()
-        _metric("FP32_main_grad_vs_FP32_full", main_grad, fp32_reference)
+        r_fp32 = _metric(
+            "FP32_main_grad_vs_FP32_full", main_grad, fp32_reference
+        )
         _metric("BF16_tile_dW_vs_FP32_full", dwref_cpu, fp32_reference)
         _metric("BF16_grouped_dW_vs_FP32_full", dw, fp32_reference)
         _metric("BF16_grouped_dW_vs_FP32_main_grad", dw, main_grad)
+    # Capability and numerical acceptance are distinct: BF16 group-vs-tile
+    # dW is diagnostic only, while input grad and the independent FP32
+    # accumulation primitive must clear their own explicit numerical gates.
+    if r_dx > 2e-4 or r_fp32 > 1e-5:
+        raise AssertionError(
+            f"shared GMM numerical gate failed: dX={r_dx:.9g}, "
+            f"FP32 main_grad={r_fp32:.9g}"
+        )
     print(
         "P1 REAL_SHARED_GMM RESULT "
-        f"status={'SUPPORTED_SHARED_AUTOGRAD' if r_dx is not None and r_dw is not None else 'MISSING_GRAD'} "
+        "status=SUPPORTED_SHARED_AUTOGRAD "
+        "numerical_gate=DX_AND_FP32_MAIN_GRAD_PASS "
+        "bf16_group_vs_tile_dw=DIAGNOSTIC_ONLY "
         "shared_weight_forward_view=True "
         "main_grad_integration=UNVERIFIED "
         "full_model_training=UNVERIFIED",
