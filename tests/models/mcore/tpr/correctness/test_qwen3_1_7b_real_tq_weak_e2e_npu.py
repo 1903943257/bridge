@@ -133,6 +133,24 @@ def _run_real_adamw_master_step(model, *, lr: float, master_device: str):
     if not bool(torch.isfinite(grad_norm)):
         raise AssertionError("nonfinite FP32 master gradient norm")
 
+    # A bounded deterministic, *strided* sample across EVERY trainable
+    # tensor for cross-process Native-vs-TPR diagnostics. Sampling is not
+    # an all-parameter exact equivalence claim.
+    signature_dir = os.getenv("TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR")
+    signature = {} if signature_dir else None
+    if signature is not None:
+        for name, _param, master in mapped:
+            flat = master.grad.detach().reshape(-1)
+            indices = torch.linspace(
+                0, flat.numel() - 1,
+                steps=min(512, flat.numel()),
+                device=flat.device,
+            ).long()
+            signature[name] = {
+                "grad": flat.index_select(0, indices).float().cpu().clone(),
+                "indices": indices.cpu().clone(),
+            }
+
     step_start = time.perf_counter()
     opt.step()
     if master_device == "npu":
@@ -153,6 +171,11 @@ def _run_real_adamw_master_step(model, *, lr: float, master_device: str):
             if bool((delta != 0).any()):
                 changed_master += 1
             master_delta_sq += float(delta.square().sum())
+            if signature is not None:
+                indices = signature[name]["indices"].to(delta.device)
+                signature[name]["update"] = delta.reshape(-1).index_select(
+                    0, indices
+                ).float().cpu().clone()
             cast_update = master.detach().to(
                 device=param.device, dtype=param.dtype
             )
@@ -175,6 +198,26 @@ def _run_real_adamw_master_step(model, *, lr: float, master_device: str):
             f"BF16={changed_bf16}, delta_sq={master_delta_sq}"
         )
     total_optimizer_seconds = time.perf_counter() - total_optimizer_start
+    if signature is not None:
+        from pathlib import Path
+
+        base = Path(signature_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        backend = os.getenv("TPR_QWEN17_WEAK_E2E_EXECUTION", "tpr").lower()
+        if backend not in ("tpr", "native"):
+            raise AssertionError(f"unexpected signature backend {backend}")
+        path = base / f"{backend}_optimizer_sample.pt"
+        if path.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite prior optimizer sample: {path}"
+            )
+        torch.save(signature, path)
+        print(
+            "P0 WEAK_TQ OPTIMIZER_SAMPLE "
+            f"path={path} tensors={len(signature)} entries_per_tensor<=512 "
+            "all_parameters_sampled=True full_parameter_equivalence=False",
+            flush=True,
+        )
     print(
         "P0 WEAK_TQ OPTIMIZER_STEP status=PASS "
         f"optimizer=torch.optim.AdamW master_dtype=FP32 master_device={master_device} "
