@@ -57,7 +57,8 @@ For the first real DP2 implementation, reuse this native balancing **directly** 
 `verl/models/mcore/tpr/dp_placement.py` now provides:
 
 - `plan_verl_uid(...)`: delegates to upstream VERL `get_group_balanced_partitions`; validates contiguous UIDs and equal number of rows in each DP replica. **Only this policy is initially suitable for VERL's existing equal-shard dispatcher.**
-- `plan_dta_dfs(...)`: AReaL-DTA-inspired DFS-contiguous minimax partition over exact **unpadded** token sequences, calculating each interval's unique trie-token cost from adjacent LCP lengths. An exact duplicate trajectory is retained as an independently weighted training row.
+- `plan_dta_dfs(...)`: existing lightweight DFS-contiguous minimax baseline, with equal-cardinality tie handling for repeated trajectories. Kept for VERL contract regression until DTA direct path is validated in the container.
+- `plan_areal_dta(...)`: **directly calls vendored upstream AReaL `LB_by_DFS_and_TM`**, with original `TokenTrie`, `CompressedTrie`, `pred_time`, `try_divide` and optional `TreeTimeModel`. Only package imports were relocated; algorithm bodies are preserved in `_vendor/areal_dta/`. The adapter validates empty ranks, duplicate/prefix-contained leaf collapse, and VERL equal row cardinality.
 - `DPPlacementPlan`: rows-per-rank, tree-token costs, global cost, duplicated-prefix cost, equal-cardinality flag.
 - Default `enforce_equal_rows=True`: throw if the DTA plan violates VERL's current equal-row DP dispatch contract. `False` is **offline analysis only**; do not feed variable-sized partitions straight into `batch.reorder`.
 
@@ -71,10 +72,18 @@ native = plan_verl_uid(seqs, uid_list, dp_size=2)
 
 # Compare how much reuse DTA would retain after variable-size partitioning:
 offline = plan_dta_dfs(seqs, dp_size=2, enforce_equal_rows=False)
-print(offline.partitions, offline.tree_tokens_by_rank)
+
+# Reuse AReaL-DTA original DP algorithm, with the baseline tree-token model:
+from verl.models.mcore.tpr.dp_placement import plan_areal_dta
+areal = plan_areal_dta(seqs, dp_size=2, enforce_equal_rows=False)
+print(areal.partitions, areal.tree_tokens_by_rank)
 ```
 
-DTA's time-model `TreeTimeModel` (learned coefficients, NNLS fit) can be reused later for placement cost estimation, **not** a prerequisite for first DP2 correctness.
+AReaL's `TreeTimeModel` (learned coefficients, NNLS fit) is vendored unchanged at `_vendor/areal_dta/tree_time_model.py` and can be passed as `time_model=` once `numpy/scipy` are available and it has sufficient calibration data; the default adapter uses its original interface with a dependency-free tree-token predictor.
+
+**Upstream limitation:** AReaL `TokenTrie` merges duplicate or prefix-contained rows into one trie leaf. The upstream solver can therefore yield fewer than `dp_size` non-empty bins even if total original rows are enough. The VERL wrapper rejects these inputs instead of introducing new AReaL-internal algorithm patches. The existing local `plan_dta_dfs` handles the duplicate/equal tie case and remains a fallback until actual distributed data dispatch can be changed.
+
+**License/provenance:** vendored sources come from AReaL commit `a5b0b4811a3ef7bf58f0270abcd81d7154f03ce6` and retain Apache-2.0 notices, as well as MIT attribution to the original DynamicTreeAttn upstream. See `_vendor/areal_dta/THIRD_PARTY_NOTICES.md`. Nothing requires installing AReaL as a runtime package.
 
 ### Necessary DP2 gates before wiring the planner into Trainer
 
