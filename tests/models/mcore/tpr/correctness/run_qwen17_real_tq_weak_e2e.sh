@@ -72,6 +72,7 @@ run_native=0
 run_tpr=0
 run_cutoff=0
 run_core=0
+run_trace=0
 for mode in "${modes[@]}"; do
   case "$mode" in
     native)
@@ -86,8 +87,11 @@ for mode in "${modes[@]}"; do
     core)
       if [[ "$run_core" == 1 ]]; then echo "Duplicate mode: core" >&2; exit 2; fi
       run_core=1 ;;
+    trace)
+      if [[ "$run_trace" == 1 ]]; then echo "Duplicate mode: trace" >&2; exit 2; fi
+      run_trace=1 ;;
     *)
-      echo "Unsupported mode: $mode (valid: native, tpr, cutoff, core)" >&2
+      echo "Unsupported mode: $mode (valid: native, tpr, cutoff, core, trace)" >&2
       exit 2 ;;
   esac
 done
@@ -116,6 +120,16 @@ for mode in "${modes[@]}"; do
       echo "CORE: missing same-QKV shape evidence (including 3x192); see $logfile" >&2
       exit 1
     fi
+  elif [[ "$mode" == "trace" ]]; then
+    # All 308 module-stage records are retained in trace.log. Keep the
+    # console short and show the first 4 layers + summary only.
+    grep -E '^P0 WEAK_TQ (CONFIG|TRACE_GEOMETRY|TRACE_SUMMARY|RESULT)' "$logfile"
+    grep -E '^P0 WEAK_TQ TRACE layer=0[0-3] ' "$logfile"
+    if ! grep -q '^P0 WEAK_TQ TRACE_SUMMARY compared_stages=308' "$logfile"; then
+      echo "TRACE: missing all 28x11 module-stage comparisons; see $logfile" >&2
+      exit 1
+    fi
+    echo "P0 WEAK_TQ TRACE_FULL_LOG=$logfile"
   else
     grep -E 'P0 WEAK_TQ (CONFIG|BACKWARD|OPTIMIZER_STEP|RESULT)' "$logfile"
   fi
