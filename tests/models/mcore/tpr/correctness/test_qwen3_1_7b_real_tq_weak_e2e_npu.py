@@ -545,8 +545,9 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         from unittest.mock import patch
 
         from ._qwen17_weak_e2e_trace import (
-            capture_query_stages, describe_trace,
+            capture_query_stages, describe_trace, describe_kv_trace,
         )
+        from verl.models.mcore.tpr.attention import TPRSelfAttention
         from verl.models.mcore.tpr.megatron_adapter import (
             _trajectory_keys_from_minibatch,
         )
@@ -589,19 +590,57 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             flush=True,
         )
 
-        # Native reference uses precisely the same model checkpoint and
-        # causal horizon (Segment end), without external KV or Forest.
-        with capture_query_stages(
-            reference, query_position=query_position,
-            get_active_span=lambda: (0, native_cutoff),
-        ) as native_trace:
-            with torch.no_grad():
-                _native_response_logprobs(
-                    reference,
-                    batch["input_ids"][row][:native_cutoff].to(device),
-                    prompt_length=len(batch["prompts"][row]),
-                    temperature=1.0,
+        # Capture post-RoPE K and raw V *actually sent to native core
+        # attention*. A full-query trace alone cannot tell whether TPR's
+        # cached ancestor KV differs from Native. This compares every
+        # physical segment of the exact row-5 ancestor path.
+        kv_layers = (1, 2, 3, 4, 14, 28)
+        native_kv = {}
+        kv_handles = []
+
+        def capture_native_kv(_module, args, _result, *, number):
+            if len(args) < 3 or not all(
+                isinstance(t, torch.Tensor) for t in args[:3]
+            ):
+                raise AssertionError(
+                    f"Native core_attention layer={number} must expose Q/K/V"
                 )
+            if number in native_kv:
+                raise AssertionError(f"Duplicate Native KV layer={number}")
+            native_kv[number] = (
+                args[1].detach().cpu().clone(),
+                args[2].detach().cpu().clone(),
+            )
+
+        for layer in reference.decoder.layers:
+            number = layer.self_attention.layer_number
+            if number in kv_layers:
+                kv_handles.append(
+                    layer.self_attention.core_attention.register_forward_hook(
+                        partial(capture_native_kv, number=number)
+                    )
+                )
+        try:
+            # Native reference uses precisely the same model checkpoint and
+            # causal horizon (Segment end), without external KV or Forest.
+            with capture_query_stages(
+                reference, query_position=query_position,
+                get_active_span=lambda: (0, native_cutoff),
+            ) as native_trace:
+                with torch.no_grad():
+                    _native_response_logprobs(
+                        reference,
+                        batch["input_ids"][row][:native_cutoff].to(device),
+                        prompt_length=len(batch["prompts"][row]),
+                        temperature=1.0,
+                    )
+        finally:
+            for handle in kv_handles:
+                handle.remove()
+        if set(native_kv) != set(kv_layers):
+            raise AssertionError(
+                f"Native core KV capture incomplete: got={sorted(native_kv)}"
+            )
 
         del reference
         gc.collect()
@@ -613,7 +652,33 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         tpr_model.zero_grad(set_to_none=True)
         trace_engine = _make_training_engine(tpr_model)
         previous_forward = SegmentExecutor._forward
+        previous_tree_forward = TPRSelfAttention._tree_forward
+        tpr_kv = {}
         current = {"span": None, "captures": 0}
+
+        def trace_actual_tree_kv(attention, hidden_states, context):
+            result = previous_tree_forward(attention, hidden_states, context)
+            layer_number = attention.layer_number
+            if current["span"] is not None and layer_number in kv_layers:
+                if layer_number in tpr_kv:
+                    raise AssertionError(
+                        f"Duplicate exact-Segment TPR KV layer={layer_number}"
+                    )
+                if context.prefix_length != segment.position_start:
+                    raise AssertionError(
+                        "Leaf KV prefix length differs from physical Segment start"
+                    )
+                past_kv = context.get_past_kv(layer_number)
+                if past_kv is None:
+                    raise AssertionError(
+                        f"Target leaf layer={layer_number} missing Prefix KV"
+                    )
+                new_k, new_v = context.new_key_values[layer_number]
+                tpr_kv[layer_number] = (
+                    torch.cat((past_kv[0], new_k), dim=0).detach().cpu().clone(),
+                    torch.cat((past_kv[1], new_v), dim=0).detach().cpu().clone(),
+                )
+            return result
 
         def traced_forward(self, physical, **kwargs):
             prior = current["span"]
@@ -645,7 +710,12 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             # Patch only the test-level physical Segment execution seam.
             # No module/operator math is modified; full PPO backward still
             # executes to ensure this is the *real* Forest schedule.
-            with patch.object(SegmentExecutor, "_forward", traced_forward):
+            with (
+                patch.object(SegmentExecutor, "_forward", traced_forward),
+                patch.object(
+                    TPRSelfAttention, "_tree_forward", trace_actual_tree_kv
+                ),
+            ):
                 trace_out = trace_engine.forward_backward_batch(
                     batch,
                     loss_function=partial(
@@ -663,6 +733,18 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             native_trace, tpr_trace, layers=len(tpr_model.decoder.layers)
         )
         for report in reports:
+            print(report, flush=True)
+        # Diagnose if the FIRST Attention input discrepancy arises from
+        # numerical differences in ancestor K/V computed with smaller M.
+        # Path inspection never assumes a given tree node ID or branch.
+        path = [
+            (item.segment_id, item.position_start, item.position_end)
+            for item in tree.segment_plan.path_to(segment.segment_id)
+        ]
+        kv_reports = describe_kv_trace(
+            native_kv, tpr_kv, path, layers=kv_layers
+        )
+        for report in kv_reports:
             print(report, flush=True)
         print(
             "P0 WEAK_TQ RESULT status=PASS execution=TRACE "
