@@ -229,18 +229,39 @@ def _selected_gradient_snapshot(model):
 def _compare_grads(reference, actual):
     assert reference.keys() == actual.keys()
     square_diff = square_ref = dot = square_actual = 0.0
+    detailed = os.getenv("TPR_QWEN17_PPO_GRAD_BREAKDOWN", "0") == "1"
+    by_parameter = []
     for name, ref in reference.items():
         got = actual[name]
         delta = got - ref
-        square_diff += torch.sum(delta.square()).item()
-        square_ref += torch.sum(ref.square()).item()
-        square_actual += torch.sum(got.square()).item()
-        dot += torch.sum(got * ref).item()
-        rel_l2 = float(torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(ref).clamp_min(1e-12))
+        d2 = float(torch.sum(delta.square()))
+        r2 = float(torch.sum(ref.square()))
+        g2 = float(torch.sum(got.square()))
+        product = float(torch.sum(got * ref))
+        square_diff += d2
+        square_ref += r2
+        square_actual += g2
+        dot += product
+        rel_l2 = (d2 / max(r2, 1e-24)) ** .5
         print(f"grad {name}: relative_l2={rel_l2:.6f}")
+        if detailed:
+            by_parameter.append((name, d2, r2, rel_l2))
     relative_l2 = (square_diff / max(square_ref, 1e-24)) ** .5
     cosine = dot / max((square_ref * square_actual) ** .5, 1e-24)
     print(f"Qwen3-1.7B PPO grad: global_relative_l2={relative_l2:.6f}, cosine={cosine:.8f}")
+    if detailed:
+        # Contribution measures dW error ENERGY. Ranking only by per-tensor
+        # relative-L2 would overemphasize tiny, near-zero gradient tensors.
+        for name, d2, r2, rel_l2 in sorted(
+            by_parameter, key=lambda item: item[1], reverse=True
+        )[:15]:
+            print(
+                "QWEN17 PPO GRAD BREAKDOWN "
+                f"name={name} relative_l2={rel_l2:.9g} "
+                f"error_energy_share={d2/max(square_diff,1e-24):.9g} "
+                f"reference_energy_share={r2/max(square_ref,1e-24):.9g}",
+                flush=True,
+            )
     assert relative_l2 < .08 and cosine > .997
 
 
