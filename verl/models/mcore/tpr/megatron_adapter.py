@@ -272,11 +272,11 @@ def run_tpr_forward_backward_batch(
     keys = _trajectory_keys_from_minibatch(data)
     # Opt-in *only* to a different CPU topology constructor. The downstream
     # SegmentPlan, PPO objective, gradient relay and native optimizer remain
-    # exactly the same. Keep legacy as default while multi-NPU/numerics
-    # investigations are ongoing.
+    # exactly the same. Radix is the default; use TPR_TREE_BUILDER=legacy
+    # only for regression comparison with the previous CPU builder.
     import os
 
-    builder = os.environ.get("TPR_TREE_BUILDER", "legacy").strip().lower()
+    builder = os.environ.get("TPR_TREE_BUILDER", "radix").strip().lower()
     forest = build_tree_execution_plans(keys, data, tree_builder=builder)
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
