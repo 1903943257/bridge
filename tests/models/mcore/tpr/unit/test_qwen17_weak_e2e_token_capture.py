@@ -44,3 +44,42 @@ def test_ppo_diagnostics_refuse_mismatched_logical_keys():
     t["logical_row_offset"][0] = torch.tensor([7, 7])
     with pytest.raises(ValueError, match="identities"):
         compare_ppo_tokens(n, t)
+
+
+def test_threeway_cutoff_oracle_identifies_native_shape_drift():
+    from ..correctness._qwen17_weak_e2e_token_capture import (
+        compare_ppo_threeway,
+    )
+
+    n = _snapshot([0., 0., 0.], [0., 0., 0.], [1., -1., 1.])
+    c = _snapshot([0.1, 0., -0.1], [0., 0., 0.], [1., -1., 1.])
+    t = _snapshot([0.1, 0.5, -0.1], [0., 0., 0.], [1., -1., 1.])
+    owners = {
+        "logical_row_offset": n["logical_row_offset"].clone(),
+        "segment_id_start_end": torch.tensor(
+            [[3, 1, 20], [3, 1, 20], [5, 20, 40]]
+        ),
+    }
+    result = "\n".join(compare_ppo_threeway(n, c, t, owners))
+    assert "NATIVE_FULL_TO_NATIVE_CUTOFF" in result
+    assert "NATIVE_CUTOFF_TO_TPR" in result
+    assert "NATIVE_FULL_TO_TPR" in result
+    assert "segment=3[1:20]" in result
+    assert "segment=5[20:40]" in result
+    assert "row=0 response=1" in result
+
+
+def test_threeway_refuses_mismatched_owners():
+    from ..correctness._qwen17_weak_e2e_token_capture import (
+        compare_ppo_threeway,
+    )
+
+    n = _snapshot([0., 0., 0.], [0., 0., 0.], [1., -1., 1.])
+    owners = {
+        "logical_row_offset": n["logical_row_offset"] + 1,
+        "segment_id_start_end": torch.tensor(
+            [[3, 1, 20], [3, 1, 20], [5, 20, 40]]
+        ),
+    }
+    with pytest.raises(ValueError, match="identities"):
+        compare_ppo_threeway(n, n, n, owners)
