@@ -1,5 +1,38 @@
 # TPR Phase 4/5: VERL native PPO and real Qwen3-1.7B
 
+### Fixed: weak-E2E forest preflight required `default` for metadata accessor
+
+On Ascend NPU the real 8-row Native weak Actor Step has **actually
+passed** with default BF16 Linear, real `torch.optim.AdamW` on
+FP32 optimizer masters and post-step BF16 Forward. Reported:
+loss -0.25, 512 PPO tokens, grad_norm 33.4427567,
+226/226 updated FP32 master tensors, 215/226 updated BF16 model
+tensors, 226/226 finite AdamW states, Forward/Backward 1.119227 s,
+optimizer total 1.735091 s, and 35204.141 MiB peak allocated.
+
+The first TPR attempt failed **before Forest execution** at:
+
+```python
+tu.get_non_tensor_data(batch, key="tpr_trajectory_keys")
+# TypeError: required positional argument: 'default'
+```
+
+This is a **Python test harness bug**, NOT a GEMM, BF16 or TPR
+backward failure. The test now reuses the existing production
+`_trajectory_keys_from_minibatch(batch)` resolver from
+`megatron_adapter.py` instead of separately calling the accessor.
+The runner also supports `TPR_QWEN17_WEAK_E2E_MODES=tpr` for a
+single TPR rerun (without redoing the already-passed Native run):
+
+```bash
+TPR_QWEN17_WEAK_E2E_MODES=tpr \
+  bash tests/models/mcore/tpr/correctness/run_qwen17_real_tq_weak_e2e.sh
+```
+
+**Status:** Native weak Actor Step PASS (NPU result supplied by user).
+TPR weak Actor Step **UNVERIFIED pending rerun**; no TPR numerical
+or performance results may be inferred from this Python exception.
+
 ### Fixed: invalid FP32 linspace indices in weak-E2E optimizer sampling (2026-10-09)
 
 The first Native/TPR weak-E2E attempt failed during bounded gradient
