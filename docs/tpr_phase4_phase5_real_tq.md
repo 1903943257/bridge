@@ -24,7 +24,11 @@ or custom FP32-dW autograd is installed.
 **Recommended single command:** A checked-in shell runner now executes
 Native and TPR as two **separate** NPU pytest processes, checks real
 AdamW-step PASS for both, and prints loss, Forward/Backward time,
-optimizer total time and peak allocated HBM comparisons:
+optimizer total time and peak allocated HBM comparisons. It also
+writes bounded strided samples across **every trainable parameter**
+(maximum 512 entries each) and compares the actual clipped gradients
+and FP32 AdamW updates by sampled relative L2, cosine and sign flips.
+These samples are diagnostic, not full-parameter equality gates:
 
 ```bash
 export TPR_REAL_TQ_BATCH=/absolute/path/from/uniagent-cc/tq_batch.pt
