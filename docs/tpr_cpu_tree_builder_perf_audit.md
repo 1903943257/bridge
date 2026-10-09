@@ -29,7 +29,7 @@ are retained. The cost is millions of Python list/dict/object operations and
 much larger peak temporary metadata than the final plan requires. This is
 a direct-compression opportunity, **not an Attention, KV or DP algorithm flaw**.
 
-## Experimental design (strictly opt-in, no default behavior change)
+## Implemented: direct-compressed radix is now the default TPR builder
 
 `verl/models/mcore/tpr/trajectory_tree_radix.py` exports:
 
@@ -69,25 +69,26 @@ Semantics deliberately preserved:
 | `SegmentRef(row,start,end)` | none | full node equality |
 | `node_id`, tree order, DFS Push/Pop | none | exact plan event equality |
 | PPO query/target/sample ownership | none | `SegmentObjectiveRef` equality |
-| Model/KV/CP/TP/offload/grad | none by default | only if explicit opt-in later; before enabling production run NPU correctness |
+| Model/KV/CP/TP/offload/grad | no execution-code changes | NPU parity still belongs to wider TPR E2E gate |
 | CPU memory/latency | potentially large improvement | print old vs radix times on same input, never assume before measurement |
 
-Existing TPR `build_trajectory_trees` is not modified. The fast builder
-is **NOT enabled by default**. The regular PPO `megatron_adapter.py` entry
-now selects the constructor via `TPR_TREE_BUILDER` and forwards it into
-the original `build_tree_execution_plans` and original TPR execution:
+After CPU topology and PPO-reference parity plus the reported 21–40×
+speedup, `trajectory_tree.build_trajectory_trees` now delegates to the fast
+Radix builder **by default**. The previous code remains available as
+`build_trajectory_trees_legacy` for regression only; it is not invoked
+by standard TPR training.
+
+The regular PPO `megatron_adapter.py` reads `TPR_TREE_BUILDER`:
 ```bash
-# Existing single-rank TPR PPO path remains unchanged by default.
+# Default accelerated CPU tree builder
 unset TPR_TREE_BUILDER
 
-# Explicit training-side opt-in; do not enable during BF16/GEMM diagnostics
-# unless running a separate paired native-vs-TPR numerical check.
-export TPR_TREE_BUILDER=radix
+# Optional regression comparison against original per-token trie
+export TPR_TREE_BUILDER=legacy
 ```
-An invalid selector fails fast instead of silently changing semantics.
-The switch only changes CPU topology construction, not attention, backward,
-optimizer, or gradient finalization. Run NPU correctness before changing
-the default globally.
+An invalid selector fails fast. No changes to TPR SegmentPlan, Scheduler,
+KV, Attention, backward, optimizer, or Megatron gradient finalization.
+This verifies CPU structure, NOT untested single-rank PPO E2E numerics.
 
 ## Tests to run
 
