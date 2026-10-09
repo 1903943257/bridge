@@ -21,6 +21,25 @@ post-update Forward. FP32 here describes **optimizer state/master
 storage**, not any FP32 QKV/MLP GEMM. No fixed-M GEMM, grouped GEMM,
 or custom FP32-dW autograd is installed.
 
+**Recommended single command:** A checked-in shell runner now executes
+Native and TPR as two **separate** NPU pytest processes, checks real
+AdamW-step PASS for both, and prints loss, Forward/Backward time,
+optimizer total time and peak allocated HBM comparisons:
+
+```bash
+export TPR_REAL_TQ_BATCH=/absolute/path/from/uniagent-cc/tq_batch.pt
+export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
+# Optional: CPU master for low-HBM correctness smoke only
+# export TPR_QWEN17_WEAK_E2E_MASTER_DEVICE=cpu
+bash tests/models/mcore/tpr/correctness/run_qwen17_real_tq_weak_e2e.sh
+```
+
+Run from the installed training-side bridge/VERL source directory,
+not from an unrelated old `uni-agent` checkout. The current server
+has to use bridge's compatible `verl.models.mcore.tpr` modules and
+correctness tests. The script does not consume credentials or start
+the rollout system.
+
 To get a comparable, **controlled** Native baseline, run the exact
 same command with `TPR_QWEN17_WEAK_E2E_EXECUTION=native`, in its own
 pytest process. The default TPR run and the Native control use the
