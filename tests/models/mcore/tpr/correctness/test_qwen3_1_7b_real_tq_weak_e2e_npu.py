@@ -831,12 +831,11 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         )
         try:
             with capture_query_stages(
-            tpr_model, query_position=query_position,
-            get_active_span=lambda: current["span"],
+                tpr_model, query_position=query_position,
+                get_active_span=lambda: current["span"],
             ) as tpr_trace:
-                # Patch only the test-level physical Segment execution seam.
-            # No module/operator math is modified; full PPO backward still
-            # executes to ensure this is the *real* Forest schedule.
+                # Test-level execution seam only. No operator math is
+                # modified; actual Forest forward/backward still executes.
                 with (
                     patch.object(SegmentExecutor, "_forward", traced_forward),
                     patch.object(
