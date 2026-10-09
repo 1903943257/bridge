@@ -1,5 +1,71 @@
 # TPR Phase 4/5: VERL native PPO and real Qwen3-1.7B
 
+### Numerical gate status: REAL-TQ AdamW PASS, numerical parity NOT PASS (2026-10-09)
+
+Second independent NPU run (same real TQ rows, P=128/S=64, 1.7B):
+Native loss=-0.25, GradNorm=33.4427567, Forward/Backward=1.154933 s,
+AdamW total=1.715302 s, allocated peak=35204.141 MiB;
+TPR loss=-0.247665048, GradNorm=32.0759048,
+Forward/Backward=1.980659 s, AdamW total=1.674167 s,
+allocated peak=35202.426 MiB. Both complete actual optimizer update and
+post-update BF16 Forward; no special FP32 GEMM or fixed-tile Linear.
+
+**Critical**: sampled post-clip gradient relative L2=0.748188,
+cosine=0.685975, sign flips=24715/94115; sampled actual AdamW
+update relative L2=1.020061, cosine=0.479735. These are NOT
+acceptable as a gradient-equivalence PASS, even though optimizer runs.
+All reported gradient/update comparisons are based on bounded
+**strided 512 entries per trainable parameter** rather than uniform
+full-model sampling. They can overrepresent tiny gradients; and the
+first AdamW step can amplify sign changes for near-zero gradients.
+Do not conclude full-model cosine or algorithmic root cause from
+these two aggregate sampled values alone.
+
+**No NPU rerun required for first diagnosis.** The capture runner
+already saved exact *sampled* clipped gradients and actual FP32-master
+AdamW parameter deltas in its log directory. Analyze error
+contributions by parameter, Transformer layer, and gradient energy:
+
+```bash
+python tests/models/mcore/tpr/correctness/analyze_qwen17_weak_e2e_samples.py \
+  /tmp/tpr_qwen17_weak_e2e.MNeKEG/native_optimizer_sample.pt \
+  /tmp/tpr_qwen17_weak_e2e.MNeKEG/tpr_optimizer_sample.pt \
+  --top 25
+
+# CPU-only tests for analysis logic:
+python -m pytest -q \
+  tests/models/mcore/tpr/unit/test_qwen17_weak_e2e_analysis.py \
+  tests/models/mcore/tpr/unit/test_qwen17_weak_e2e_token_capture.py
+```
+
+This reports `err_share`, `ref_share`, `flipped_ref_energy_share`
+and `near_zero_ref_energy_share`. In particular, 26% sign flips
+alone do not imply 26% of gradient *energy* is wrong.
+
+**Optional next NPU run**, only if layer/parameter breakdown does not
+localize the divergence: capture the exact 512 logical PPO token
+predictions from Native and TPR (no additional forward needed):
+
+```bash
+TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE=1 \
+  TPR_QWEN17_WEAK_E2E_MODES="native tpr" \
+  bash tests/models/mcore/tpr/correctness/run_qwen17_real_tq_weak_e2e.sh
+```
+
+This prints `P0 WEAK_TQ PPO_TOKEN_COMPARISON`:
+Native vs TPR new-logprob abs error, ratio error, advantage-aware
+PPO clipped branch disagreement and policy-loss delta on the same
+real logical tokens. The script also saves
+`native_ppo_tokens.pt` and `tpr_ppo_tokens.pt` in its log directory.
+**Token capture performs extra host synchronizations during TPR
+Forward/Backward; its time MUST NOT be compared to benchmark runs.**
+
+Diagnosis priority: (1) confirm sampled gradient error concentration,
+(2) separate PPO clip/objective discrepancy from BF16 physical
+GEMM shape and graph-relay numerics, (3) only consider operator
+modification if supported by that evidence. AReaL-DTA using BF16
+does not by itself validate the current TPR's numerical accuracy.
+
 ### Fixed: weak-E2E forest preflight required `default` for metadata accessor
 
 On Ascend NPU the real 8-row Native weak Actor Step has **actually
