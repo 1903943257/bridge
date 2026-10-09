@@ -60,7 +60,10 @@ def compare_ppo_tokens(native: dict, tpr: dict, *, clip_ratio: float = 0.2):
         raise ValueError("Native and TPR logical PPO token identities differ")
     old, other_old = native["old"].float(), tpr["old"].float()
     adv, other_adv = native["advantage"].float(), tpr["advantage"].float()
-    if not torch.equal(old, other_old) or not torch.equal(adv, other_adv):
+    # Different processes may recompute the same frozen BF16 old policy
+    # with a few floating-point ulps of noise. Flag any *material* mismatch,
+    # but do not reject harmless sub-1e-5 differences as different PPO data.
+    if not torch.allclose(old, other_old, atol=1e-5, rtol=0) or not torch.equal(adv, other_adv):
         raise ValueError("Native/TPR old policy or advantages differ")
     a, b = native["new"].float(), tpr["new"].float()
     if not a.numel() or a.shape != b.shape:
@@ -80,6 +83,7 @@ def compare_ppo_tokens(native: dict, tpr: dict, *, clip_ratio: float = 0.2):
     diff = (b - a).abs()
     result = {
         "logical_tokens": int(a.numel()),
+        "recomputed_old_max_abs": float((old - other_old).abs().max()),
         "clip_native": int(clipped_a.sum()),
         "clip_tpr": int(clipped_b.sum()),
         "clip_disagreement": int(differ.sum()),
