@@ -548,3 +548,67 @@ and an extra BF16 reduction. This requires separate end-to-end
 parameter-grad and optimizer-state validation.
 
 **No production changes or new low-level kernel have been made.**
+
+## I. P1 real Qwen G=8/9 findings: BF16 dW drift and memory pressure
+
+**Actual NPU log supplied on 2026-10-09:**
+
+| Linear | G | grouped fwd vs tile | grouped dX rel L2 | grouped shared dW rel L2 | reported reference peak MiB | reported grouped peak MiB |
+|---|---:|---|---:|---:|---:|---:|
+| qkv | 8 | bitwise | 4.1863e-5 | 0.0040484 | 151.520 | 386.524 |
+| qkv | 9 | bitwise | 4.0971e-5 | 0.0042349 | 155.583 | 424.083 |
+| proj | 8 | bitwise | 2.7966e-5 | 0.0040107 | 91.017 | 205.021 |
+| proj | 9 | bitwise | 2.6966e-5 | 0.0042138 | 95.830 | 225.084 |
+
+The original memory comparison was **confounded**: the reference
+forward/dX/dW tensors were still resident when GroupedMatmul was measured.
+Do not subtract the printed raw peaks and claim isolated per-op overhead.
+The new test keeps reference outputs/grads on CPU, frees the NPU copies,
+and reports `baseline_mib` plus `incremental_peak_mib` separately.
+
+The shared expanded weight still uses only one [N,K] physical storage
+(16 MiB QKV / 8 MiB Projection), but the GMM backward may allocate
+per-group [G,K,N] temporary gradients (128/144 MiB logical BF16 QKV,
+64/72 MiB Projection). The 0.4% discrepancy in shared dW is **BF16
+autograd vs BF16 tiled-autograd**, not yet proof of a wrong kernel.
+Compare both against an independent FP32 dW and MindSpeed's FP32
+`npu_matmul_add_fp32` with identical X/dY before choosing an implementation.
+
+The updated P1 real-Qwen probe prints:
+- `native_tile_reference incremental_peak_mib`
+- `mindspeed_gmm_autograd incremental_peak_mib` with GPU reference removed
+- `FP32_main_grad_vs_FP32_full`
+- `BF16_tile_dW_vs_FP32_full`
+- `BF16_grouped_dW_vs_FP32_full`
+- `BF16_grouped_dW_vs_FP32_main_grad`
+
+Recommended quick two-case rerun (same parameters as earlier):
+
+```bash
+export TPR_RUN_QWEN17_MINDSPEED_REAL_GMM=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN17_REAL_GMM_TILE=128
+export TPR_QWEN17_REAL_GMM_LAYER=1
+export TPR_QWEN17_REAL_GMM_GROUPS=8
+
+for LINEAR in qkv proj; do
+  export TPR_QWEN17_REAL_GMM_LINEAR="$LINEAR"
+  python -m pytest -s -q --tb=short \
+    tests/models/mcore/tpr/profiling/test_qwen3_1_7b_mindspeed_gmm_real_npu.py \
+    > "/tmp/tpr_real_gmm_fp32_${LINEAR}.log" 2>&1
+  grep -E 'P1 REAL_SHARED_GMM|FAILED|ERROR' \
+    "/tmp/tpr_real_gmm_fp32_${LINEAR}.log"
+done
+```
+
+Interpretation:
+- If both BF16 paths differ from FP32 similarly, **rounding and
+  accumulation** can account for much of the discrepancy; not necessarily
+  a GMM implementation correctness issue.
+- If MindSpeed GMM differs markedly more from FP32 than native-tiled
+  BF16, investigate its backward kernel/group gradient sum.
+- If grouped incremental peak remains large after memory isolation,
+  do not ship it as the default TPR training backward; benchmark a
+  native dense dX path plus MindSpeed FP32 shared `main_grad` route.
+- A PASS from this numerical/peak probe still does not verify training
+  optimizer integration, end-to-end performance or the PPO gradient gate.
