@@ -147,6 +147,25 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
     start = time.perf_counter()
     trees = build_trajectory_trees(keys, {"input_ids": input_rows})
     build_seconds = time.perf_counter() - start
+
+    from verl.models.mcore.tpr.trajectory_tree_radix import (
+        build_trajectory_trees_radix,
+    )
+
+    start = time.perf_counter()
+    radix_trees = build_trajectory_trees_radix(keys, {"input_ids": input_rows})
+    radix_seconds = time.perf_counter() - start
+    # Strong correctness gate: exact TPR public tree objects, node ids,
+    # segment rows and spans, children and terminal ownership, not just counts.
+    assert radix_trees == trees
+    print(
+        f"TPR_DP_SCALE tree_builder_compare: old_secs={build_seconds:.3f} "
+        f"radix_secs={radix_seconds:.3f} "
+        f"speedup={build_seconds / max(radix_seconds, 1e-9):.2f}x "
+        f"rows={n_rows} prefix={prefix} compact_nodes="
+        f"{sum(len(tree.nodes) for tree in trees)}",
+        flush=True,
+    )
     execution_tree_tokens = sum(
         node.segment.length for tree in trees for node in tree.nodes.values()
     )
@@ -209,3 +228,33 @@ def test_long_prefix_16k_512_trajectories_8dp():
         plan = _plan_timed(f"stress_{name}", fn)
         _check_plan(plan, n_rows=n_rows, n_ranks=8, total_raw_tokens=total_raw)
         assert plan.global_tree_tokens == _uid_scoped_tree_cost(seqs, uids)
+
+    # Keep the legacy one-token-node constructor OFF in the 16K stress gate:
+    # it may instantiate millions of temporary objects. Validate only the
+    # candidate compressed builder against DP's estimated physical forest cost.
+    import torch
+
+    from verl.models.mcore.tpr.trajectory_tree_radix import (
+        build_trajectory_trees_radix,
+    )
+
+    input_rows = [torch.tensor(row, dtype=torch.long) for row in seqs]
+    started = time.perf_counter()
+    fast_trees = build_trajectory_trees_radix(
+        keys, {"input_ids": input_rows}
+    )
+    secs = time.perf_counter() - started
+    token_cost = sum(
+        node.segment.length
+        for tree in fast_trees
+        for node in tree.nodes.values()
+    )
+    assert token_cost == _uid_scoped_tree_cost(seqs, uids)
+    assert sorted(row for tree in fast_trees for row in tree.member_rows) == list(range(n_rows))
+    print(
+        f"TPR_DP_SCALE stress_radix_builder: secs={secs:.3f} "
+        f"trees={len(fast_trees)} compact_nodes="
+        f"{sum(len(tree.nodes) for tree in fast_trees)} "
+        f"execution_tree_tokens={token_cost}",
+        flush=True,
+    )
