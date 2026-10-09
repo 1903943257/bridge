@@ -125,6 +125,19 @@ def test_real_qwen17_shared_gmm_autograd_8_or_9_groups():
             f"Unexpected Qwen data input={x0.shape}/{x0.dtype} "
             f"weight={w0.shape}/{w0.dtype}"
         )
+    # Verify that F.linear reference really matches the existing Megatron
+    # physical-M=128 execution for these exact pretrained inputs/weights.
+    with torch.no_grad():
+        true_tile_outputs = []
+        for part in x0.split(tile, dim=0):
+            result = module(part.unsqueeze(1).contiguous())
+            if isinstance(result, tuple):
+                if len(result)!=2 or result[1] is not None:
+                    raise AssertionError("Unexpected Megatron Linear bias")
+                result = result[0]
+            true_tile_outputs.append(result[:,0,:].contiguous())
+        megatron_tile = torch.cat(true_tile_outputs, dim=0)
+        del true_tile_outputs
     del model, module, layer_mod, modules, activation, tokens
     gc.collect()
     torch.npu.empty_cache()
@@ -156,9 +169,11 @@ def test_real_qwen17_shared_gmm_autograd_8_or_9_groups():
             for chunk in xref.split(tile, dim=0)
         ], dim=0
     )
+    _metric("F_linear_vs_Megatron_tile",ref,megatron_tile)
     dxref, dwref = torch.autograd.grad(
         ref, (xref,wref), grad_outputs=dy,
     )
+    del megatron_tile
     torch.npu.synchronize()
     _print_memory("native_tile_reference")
     del xref, wref
