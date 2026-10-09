@@ -9,7 +9,7 @@ import pytest
 from verl.models.mcore.tpr.dp_placement import (
     _tree_token_cost,
     plan_dta_dfs,
-    plan_areal_dta,
+    plan_tpr_dta_dp,
     plan_verl_uid,
 )
 
@@ -138,63 +138,35 @@ def test_native_uid_rejects_unequal_rows_from_upstream(monkeypatch):
         plan_verl_uid([[1], [2], [3], [4]], ["a", "a", "b", "b"], 2)
 
 
-def test_areal_dp1_keeps_all_original_rows():
-    plan = plan_areal_dta(
-        [[1, 2, 3], [1, 2, 4], [9, 8], [9, 7, 6]],
-        dp_size=1,
-    )
-    _assert_exact_coverage(plan, 4, 1)
-    # AReaL returns DFS/lexicographic order, not necessarily input row order.
-    assert sorted(plan.partitions[0]) == [0, 1, 2, 3]
-    assert plan.policy == "areal_dta"
-    assert plan.equal_rows_per_rank
+
+def test_tpr_dp_uid_scoped_cost_matches_existing_tpr_semantics():
+    # Token-identical trajectories from different UIDs are NOT coalesced by
+    # our existing build_trajectory_trees. DTA's global trie would say 5,
+    # but the actual TPR forest has two independent 4-token paths.
+    sequences = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 3, 4]]
+    keys = ["uidA_rollout_0", "uidA_rollout_1", "uidB_rollout_0"]
+    plan = plan_tpr_dta_dp(sequences, keys, dp_size=1)
+    assert plan.policy == "tpr_dta"
+    assert plan.global_tree_tokens == 9
+    assert plan.tree_tokens_by_rank == (9,)
+    assert _tree_token_cost(sequences) == 6
 
 
-def test_areal_direct_upstream_parity_on_distinct_leaves():
-    from types import SimpleNamespace
-
-    import torch
-
-    from verl.models.mcore.tpr._vendor.areal_dta.dp import LB_by_DFS_and_TM
-    from verl.models.mcore.tpr.dp_placement import _TreeTokenTimeModel
-
-    sequences = [
-        [1, 2, 3, 4],
-        [1, 2, 3, 5],
-        [9, 8, 7],
-        [9, 8, 6],
-    ]
-    original = LB_by_DFS_and_TM(
-        [torch.tensor(row, dtype=torch.long) for row in sequences],
-        _TreeTokenTimeModel(),
-        SimpleNamespace(K=2, mode="backward", block_size=None),
-    )
-    plan = plan_areal_dta(sequences, 2, enforce_equal_rows=False)
+def test_tpr_dp_keeps_duplicate_logical_rows_and_equal_cardinality():
+    sequences = [[1, 2, 3, 4]] * 4
+    keys = [f"uidA_rollout_{i}" for i in range(4)]
+    plan = plan_tpr_dta_dp(sequences, keys, dp_size=2)
     _assert_exact_coverage(plan, 4, 2)
-    assert plan.partitions == tuple(tuple(part) for part in original)
-    assert plan.policy == "areal_dta"
+    assert tuple(map(len, plan.partitions)) == (2, 2)
+    assert plan.global_tree_tokens == 4
+    assert plan.tree_tokens_by_rank == (4, 4)
+    assert plan.duplicated_tree_tokens == 4
 
 
-def test_areal_rejects_fewer_unique_leaves_than_dp_replicas():
-    with pytest.raises(ValueError, match="fewer independent trie leaves"):
-        plan_areal_dta([[1, 2, 3]] * 4, dp_size=2)
-    # Upstream merges a prefix that ends before another sequence, too.
-    with pytest.raises(ValueError, match="fewer independent trie leaves"):
-        plan_areal_dta([[1, 2], [1, 2, 3], [1, 2, 3]], dp_size=2)
-
-
-def test_areal_strict_equal_cardinality_guard(monkeypatch):
-    from verl.models.mcore.tpr._vendor.areal_dta import dp
-
-    monkeypatch.setattr(dp, "LB_by_DFS_and_TM", lambda *a: [[0], [1, 2, 3]])
-    sequences = [[1], [2], [3], [4]]
-    with pytest.raises(ValueError, match="unequal per-DP row counts"):
-        plan_areal_dta(sequences, dp_size=2)
-    offline = plan_areal_dta(sequences, dp_size=2, enforce_equal_rows=False)
-    assert offline.partitions == ((0,), (1, 2, 3))
-    assert not offline.equal_rows_per_rank
-
-
-def test_areal_rejects_invalid_time_model():
-    with pytest.raises(TypeError, match="time_model"):
-        plan_areal_dta([[1], [2]], 2, time_model=object())
+def test_tpr_dp_key_contract():
+    with pytest.raises(ValueError, match="equal lengths"):
+        plan_tpr_dta_dp([[1]], [], 1)
+    with pytest.raises(ValueError, match="unique"):
+        plan_tpr_dta_dp([[1], [1]], ["a_b_0", "a_b_0"], 1)
+    with pytest.raises(ValueError, match="trajectory key"):
+        plan_tpr_dta_dp([[1]], ["invalid"], 1)
