@@ -187,3 +187,51 @@ replace the fixed-tile FC2 oracle.
 Before choosing QKV/FC1 fast routes, run with
 `TPR_QWEN17_GEMM_GROUPS=qkv,fc1`, `TPR_QWEN17_GEMM_INPUT=real`, and
 `TPR_QWEN17_GEMM_TRY_GROUPED=1` to compare Grouped-vs-Tile-vs-Native.
+
+## D. 2026-10-09 follow-up: GroupedMatmul single-tile probe and PPO cutoff branches
+
+Additional real activations / layer-1 microbench:
+- QKV grouped single-X matches fixed tile at both M=1024 and M=1152;
+  at M=1152 original native also happens to match the tile oracle.
+  Relative-to-native latency M=1152 was ~0.882.
+- FC1 grouped single-X matches fixed tile but costs ~1.526x native at
+  M=1152, so immediate production speed benefit is unproven.
+- Previous Projection matches tile near native speed; FC2 matches native
+  and differs from tile. No conclusion about other layers yet.
+
+Attempting full-28-layer selective Projection GroupedMatmul initially
+raised `ERR00100 PTA call acl api failed`, without a provided full traceback.
+The previous microbench only covered M=1024 and M=1152; the split suffix
+uses M=128 = ONE group. The full-model diagnostic now routes one group to
+ordinary native M=128 GEMM (which is exactly the fixed-tile calculation),
+and offers `TPR_QWEN17_GPT_GROUPED_GEMM_TRACE=1` to synchronously attribute
+any remaining NPU kernel error to its layer and M. **Single-group root
+cause remains a hypothesis until rerun**; it has not been NPU verified.
+
+```bash
+export TPR_QWEN17_GPT_GROUPED_GEMM_TRACE=1
+# Keep the prior four-family tile=128, grouped_groups=proj environment.
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_split_equivalence_npu.py \
+  -k full_gpt_vs_single_split \
+  > /tmp/qwen17_grouped_proj_trace.log 2>&1
+grep -E 'GROUPED_GEMM|GPT_SUFFIX_LOGPROBS|PPO_RATIO_MAX_DEVIATION|FAILED|ERROR' \
+  /tmp/qwen17_grouped_proj_trace.log
+```
+
+Real TQ PPO acceptance now explicitly reports 3 clip-branch comparisons
+when `TPR_QWEN17_PPO_SEGMENT_ORACLE=1`:
+- `native_full_vs_tpr_forest`,
+- `native_full_vs_native_cutoff`,
+- `native_cutoff_vs_tpr_forest`.
+
+All three comparisons use exactly the same checkpoint-recomputed old
+logprobs and the same signed advantages. They help attribute clipping
+differences to ordinary shape/truncation versus Forest-specific execution;
+they do NOT by themselves prove KV-reuse or scheduling bug isolation.
+
+Previously observed: 31/512 Native-vs-Forest clipping branches disagree;
+selected parameter gradient relative L2=0.523553 / cosine=0.89627931;
+sampled fresh AdamW update relative L2=0.783774842 / cosine=0.693042952.
+The native Full vs Native Cutoff logprob max_abs=0.37499237, while
+TPR Forest vs Native Cutoff max_abs=0.73060608. Both differences matter.
