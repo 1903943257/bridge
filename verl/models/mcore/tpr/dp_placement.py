@@ -122,7 +122,7 @@ def _result(
     global_cost = cost_of(range(len(sequences)))
     duplication = sum(costs) - global_cost
     if duplication < 0:
-        raise AssertionError("DP partition cannot use fewer total unique tokens than the global trie")
+        raise AssertionError("DP partitions cannot require fewer unique tree tokens than the global forest")
     return DPPlacementPlan(
         partitions=tuple(tuple(part) for part in partitions),
         tree_tokens_by_rank=costs,
@@ -142,10 +142,12 @@ def plan_dta_dfs(
 ) -> DPPlacementPlan:
     """DTA DFS-contiguous minimax partition using unique trie-token cost.
 
-    Duplicate trajectories remain distinct *logical rows*.  Global exact-token
-    ordering is independent of prompt UID; each DP rebuilds its own local trie.
-    No KV or dKV crosses DP ranks.  Set enforce_equal_rows=False ONLY to
-    inspect/offline-evaluate DTA's variable-cardinality partition.
+    Duplicate trajectories remain distinct *logical rows*. With uid_list,
+    sorting and tree-token costs follow the **existing TPR UID boundary**;
+    without it, this is the flat lexical-token DTA baseline. This function
+    only plans sample placement; it never builds another execution trie.
+    No KV or dKV crosses DP ranks. Set enforce_equal_rows=False only for
+    offline inspection of variable-cardinality assignments.
     """
     if type(dp_size) is not int or dp_size <= 0:
         raise ValueError("dp_size must be a positive integer")
