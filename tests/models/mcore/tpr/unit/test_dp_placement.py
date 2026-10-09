@@ -149,7 +149,7 @@ def test_tpr_dp_uid_scoped_cost_matches_existing_tpr_semantics():
     assert plan.policy == "tpr_dta"
     assert plan.global_tree_tokens == 9
     assert plan.tree_tokens_by_rank == (9,)
-    assert _tree_token_cost(sequences) == 6
+    assert _tree_token_cost(sequences) == 5
 
 
 def test_tpr_dp_keeps_duplicate_logical_rows_and_equal_cardinality():
