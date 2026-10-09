@@ -66,7 +66,14 @@ def _run_probe(label, fn):
         # Report incompatibility instead of failing the whole diagnostic. In
         # particular, some installed MindSpeed versions lack the compiled GMM
         # extension, and zero-stride 3D weight views may be unsupported.
-        torch.npu.synchronize()
+        try:
+            torch.npu.synchronize()
+        except RuntimeError as sync_exc:
+            print(
+                f"P0 SHARED_GMM {label} sync_status=ERROR "
+                f"error={type(sync_exc).__name__}: {str(sync_exc)[:400]}",
+                flush=True,
+            )
         return
     torch.npu.synchronize()
 
@@ -118,11 +125,24 @@ def test_mindspeed_shared_gmm_autograd_and_fp32_fusion():
         flush=True,
     )
 
+    mode = os.getenv("TPR_QWEN17_P0_MODE", "grouped_view").strip()
+    supported = {
+        "grouped_view", "grouped_contiguous",
+        "gmm_view", "gmm_contiguous", "gmm_fp32_fusion",
+    }
+    if mode not in supported:
+        raise ValueError(f"TPR_QWEN17_P0_MODE must be one of {sorted(supported)}")
     try:
-        ms_grouped = importlib.import_module("mindspeed.ops.grouped_matmul")
-        ms_gmm = importlib.import_module("mindspeed.ops.gmm")
-    except ImportError as exc:
-        pytest.skip(f"installed MindSpeed GMM not accessible: {exc}")
+        module_name = (
+            "mindspeed.ops.grouped_matmul" if mode.startswith("grouped_")
+            else "mindspeed.ops.gmm"
+        )
+        module = importlib.import_module(module_name)
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"installed MindSpeed wrapper unavailable: {exc}")
+    print(f"P0 SHARED_GMM MODE={mode} module={module_name}",flush=True)
+    ms_grouped = module if mode.startswith("grouped_") else None
+    ms_gmm = module if not mode.startswith("grouped_") else None
 
     # _GroupedMatmul is shipped in MindSpeed, wraps torch_npu forward
     # with its own backward. Weight is [G,K,N], but all G groups share ONE
@@ -173,10 +193,12 @@ def test_mindspeed_shared_gmm_autograd_and_fp32_fusion():
             flush=True,
         )
 
-    for contiguous in (False, True):
+    if mode.startswith("grouped_"):
         _run_probe(
-            f"mindspeed_grouped contiguous={contiguous}",
-            lambda c=contiguous: run_mindspeed_grouped(contiguous=c),
+            f"mindspeed_grouped mode={mode}",
+            lambda: run_mindspeed_grouped(
+                contiguous=mode=="grouped_contiguous"
+            ),
         )
 
     def run_mindspeed_gmm(*, contiguous):
@@ -208,10 +230,12 @@ def test_mindspeed_shared_gmm_autograd_and_fp32_fusion():
             flush=True,
         )
 
-    for contiguous in (False, True):
+    if mode.startswith("gmm_") and mode != "gmm_fp32_fusion":
         _run_probe(
-            f"mindspeed_gmm contiguous={contiguous}",
-            lambda c=contiguous: run_mindspeed_gmm(contiguous=c),
+            f"mindspeed_gmm mode={mode}",
+            lambda: run_mindspeed_gmm(
+                contiguous=mode=="gmm_contiguous"
+            ),
         )
 
     # The upstream FP32 GMM+ADD path wants [G,K,N] main_grad storage
@@ -258,7 +282,8 @@ def test_mindspeed_shared_gmm_autograd_and_fp32_fusion():
             flush=True,
         )
 
-    _run_probe("mindspeed_gmm_fp32_fusion",run_mindspeed_fp32_fusion)
+    if mode=="gmm_fp32_fusion":
+        _run_probe("mindspeed_gmm_fp32_fusion",run_mindspeed_fp32_fusion)
     print(
         "P0 SHARED_GMM COMPLETE "
         "All statuses are capability observations, not training PASS.",
