@@ -352,3 +352,54 @@ def compare_first_attention_replay(
             f"{witness}, tolerance={witness_tolerance}"
         )
     return reports
+
+
+def compare_root_v_provenance(
+    native_full_v, native_root_v, tpr_root_v,
+    native_full_input, native_root_input, tpr_root_input,
+):
+    """Distinguish physical-M effects from incorrect root KV reuse.
+
+    All three forwards use the same exact checkpoint. Native full processes
+    M=192, Native root cutoff M=134, and TPR root processes M=134.
+    The Root inputs are compared before the QKV GEMM, and V values are
+    compared after the projection. Diagnostic only; nothing is patched in
+    the training model.
+    """
+    n_full_v = native_full_v[:native_root_v.shape[0]]
+    n_full_in = native_full_input[:native_root_input.shape[0]]
+    fields = {
+        "QKV_INPUT": (n_full_in, native_root_input, tpr_root_input),
+        "V_RAW": (n_full_v, native_root_v, tpr_root_v),
+    }
+    reports = []
+    for label, values in fields.items():
+        full, cutoff, tree = (
+            v.detach().float().cpu() for v in values
+        )
+        if full.shape != cutoff.shape or full.shape != tree.shape:
+            raise AssertionError(
+                f"root {label} shape mismatch: "
+                f"full={tuple(full.shape)} cutoff={tuple(cutoff.shape)} "
+                f"tpr={tuple(tree.shape)}"
+            )
+        for name, left, right in (
+            ("FULL_TO_CUTOFF", full, cutoff),
+            ("CUTOFF_TO_TPR", cutoff, tree),
+            ("FULL_TO_TPR", full, tree),
+        ):
+            delta = (left.double() - right.double()).abs()
+            max_abs, rel = _metric(left, right)
+            changed = delta.reshape(delta.shape[0], -1).amax(dim=1) > 0
+            reports.append(
+                "P0 WEAK_TQ ROOT_PROVENANCE "
+                f"field={label} pair={name} root_tokens={len(left)} "
+                f"max_abs={max_abs:.9g} rel_l2={rel:.9g} "
+                f"changed_tokens={int(changed.sum())}/{len(left)}"
+            )
+    reports.append(
+        "P0 WEAK_TQ ROOT_PROVENANCE_SUMMARY "
+        f"compared_fields={len(fields)} compared_pairs=3 root_tokens={len(n_full_v)} "
+        "same_checkpoint=True all_default_BF16=True diagnostic_only=True"
+    )
+    return reports
