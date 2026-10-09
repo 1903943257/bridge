@@ -612,3 +612,70 @@ Interpretation:
   native dense dX path plus MindSpeed FP32 shared `main_grad` route.
 - A PASS from this numerical/peak probe still does not verify training
   optimizer integration, end-to-end performance or the PPO gradient gate.
+
+## J. 2026-10-09: independent real-Qwen FP32 dW comparison and dx-only probe
+
+User NPU measurements (real pretrained Qwen layer-1, recorded real tokens,
+G=8, M=1024):
+
+| Family | GMM BF16 dW vs FP32 | native BF16 tiled dW vs FP32 | MindSpeed FP32 main_grad vs FP32 |
+| --- | ---: | ---: | ---: |
+| qkv | 0.00234818 | 0.00408423 | 2.19676e-7 |
+| proj | 0.00234757 | 0.00404395 | 2.32716e-7 |
+
+MindSpeed GMM's BF16 shared weight gradient is actually **closer** to
+the FP32 reference than the native tiled BF16 result. The previously
+observed 0.004 GMM-vs-tile dW difference is a difference BETWEEN TWO
+BF16 backward algorithms, not direct evidence the GMM kernel is worse.
+The results do not validate full-model backward; optimizer semantics
+are still unverified.
+
+Memory measured with separate reference GPU gradient cleanup and equal
+input baselines:
+
+| Family | Native tile incremental peak | MindSpeed ordinary GMM incremental peak |
+| --- | ---: | ---: |
+| qkv | 109.008 MiB | 304.007 MiB |
+| proj | 57.007 MiB | 156.006 MiB |
+
+The GMM dW path consumes substantial peak temporary memory despite the
+zero-stride expanded **forward** weight view being genuinely shared.
+These are independent operator-probe peaks, not measured full-model
+added HBM or latency.
+
+**New isolated P1 test:** probe already-existing MindSpeed GMM dx-only
+backward fusion separately from the known-failing grouped FP32 wgrad
+fusion, OR use torch_npu grouped GEMM directly for dX. Both modes then
+feed real Qwen BF16 X/dY tile partitions into the existing
+`npu_matmul_add_fp32` with one shared [N,K] FP32 buffer. Both are
+existing vendor kernels; the test is NOT a production custom autograd
+Function. In particular, the native MindSpeed `GMMFunction` path
+`gemm_fusion=True` currently errors with 'setup failed', potentially
+in either dx-fusion or group-gradient add. The isolated test distinguishes
+these stages.
+
+```bash
+export TPR_RUN_QWEN17_DENSE_FP32_BACKWARD=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN17_DENSE_BACKWARD_GROUPS=8
+export TPR_QWEN17_DENSE_BACKWARD_LAYER=1
+
+for LINEAR in qkv proj; do
+  for MODE in grouped_dx mindspeed_fused; do
+    export TPR_QWEN17_DENSE_BACKWARD_LINEAR="$LINEAR"
+    export TPR_QWEN17_DENSE_BACKWARD_MODE="$MODE"
+    LOG="/tmp/tpr_p1_dense_${LINEAR}_${MODE}.log"
+    python -m pytest -s -q --tb=short \
+      tests/models/mcore/tpr/profiling/test_qwen17_dense_fp32_shared_gmm_backward_npu.py \
+      > "$LOG" 2>&1
+    echo "===== $LINEAR $MODE ====="
+    grep -E 'P1 DENSE_FP32|FAILED|ERROR' "$LOG" | tail -35
+  done
+done
+```
+
+An `DX_AND_SHARED_FP32_WGRAD_AVAILABLE` result means the EXISTING
+operator combination works in isolation, NOT that its manual calls are
+wired into autograd, Megatron FP32 main_grad, TPR Forest, optimizer
+fusion or end-to-end PPO. Do not merge into production before autograd
+glue, gradient scaling/microbatch reduction, and throughput profiling.
