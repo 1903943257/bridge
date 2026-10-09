@@ -214,11 +214,18 @@ class TPRSelfAttention(SelfAttention):
 
         if float(getattr(self.config, "attention_dropout", 0.0)) != 0.0:
             raise ValueError("TPR external-KV MVP requires attention_dropout=0")
-        for name in (
-            "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
-            "expert_model_parallel_size",
-        ):
+        # Megatron's QKV and output projections already own TP collectives.
+        # Their attention inputs/outputs are rank-local head shards, so TPR
+        # must never all-gather KV along the TP dimension here.
+        tp_size = getattr(self.config, "tensor_model_parallel_size", 1)
+        if tp_size < 1:
+            raise ValueError(f"invalid tensor_model_parallel_size={tp_size}")
+        if tp_size > 1 and getattr(self.config, "sequence_parallel", False):
+            raise NotImplementedError(
+                "TPR TP local-head path has not validated Megatron sequence_parallel; "
+                "set sequence_parallel=False for the TP2 correctness gate"
+            )
+        for name in ("pipeline_model_parallel_size", "expert_model_parallel_size"):
             value = getattr(self.config, name, 1)
             if value != 1:
                 raise NotImplementedError(f"TPR external-KV MVP requires {name}=1, got {value}")
