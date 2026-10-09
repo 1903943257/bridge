@@ -734,10 +734,30 @@ for LINEAR in qkv proj; do
 done
 ```
 
-This new P2 path is **not yet NPU-executed**: the four table rows above
-are the P1 measurements supplied by the user. A P2 PASS does **not**
-validate `weight.main_grad` ownership, gradient scale, DDP reduction,
-Megatron zero_grad/reset, optimizer updates, or full PPO.
+**P2 executed on user's Ascend NPU: PASS (2026-10-09), G=8/M=1024, layer 1.**
+
+| Family | Forward vs BF16 tile | Visit 1 dX vs BF16 tile | Visit 1 FP32 dW vs FP32 | Visit 2 FP32 accumulated dW vs 2x FP32 | P2 incremental peak |
+| --- | --- | ---: | ---: | ---: | ---: |
+| QKV | bitwise | 3.50516239e-5 | 2.19257899e-7 | 2.22189257e-7 | 156.003 MiB |
+| Projection | bitwise | 3.71100687e-5 | 2.33174106e-7 | 2.36128344e-7 | 88.002 MiB |
+
+Both paths report `P2 DENSE_FP32 AUTOGRAD_RESULT status=PASS`,
+`accumulated_visits=2`, `weight_grad_materialized=False`.
+This establishes isolated **Autograd side-effect** accumulation of a
+single dense FP32 buffer with accurate repeated backward and BF16 forward
+equivalence; the test upstream `dY` is random BF16 and **not** the actual
+PPO loss gradient.
+
+**Do not compare** P2 peak (QKV 156 MiB / Proj 88 MiB) to P1
+grouped-dX-only peaks (36 / 20 MiB) as if the difference were dX
+workspace: P2 includes GMM forward, saved backward state, two
+autograd visits and retained tensors. Likewise these are not real
+full-model training memory peaks.
+
+Remaining **P0** is a genuine Actor mini-batch and optimizer step,
+not further standalone GEMM experiments. P2 does **not** validate
+Megatron/DistributedDataParallel `main_grad` ownership, grad-scale/
+zeroing/reduction, optimizer state, or full PPO.
 
 ### Explicit path to end-to-end acceptance
 
