@@ -742,7 +742,7 @@ Megatron zero_grad/reset, optimizer updates, or full PPO.
 ### Explicit path to end-to-end acceptance
 
 1. **P2 standalone autograd**: run the new optional test above with
-   actual recorded-token activations, repeated backward, and memory gate.
+   actual recorded-token activations, repeated backward, and memory report.
 2. **P3 model autograd adapter (test-only first)**: integrate one shared
    Dense Linear in a real 28-layer Qwen execution, including M<128
    / ragged tail, G=1 fallback, BF16 outputs, FP32 main_grad,
