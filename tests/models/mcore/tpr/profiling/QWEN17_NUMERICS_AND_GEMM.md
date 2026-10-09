@@ -475,7 +475,7 @@ reference. It **does not yet replace** Megatron's production Linear
 backward or integrate with Megatron's DDP main-grad allocation.
 
 **Performance/memory warning:** 8 groups with K=2048, N=4096 would
-require ~268 MiB of FP32 [8,K,N] temporary group weight gradients
+require 256 MiB of FP32 [8,K,N] temporary group weight gradients
 per QKV layer if fully materialized. This is an illustrative
 minimum-sized group-gradient tensor, NOT a measured runtime peak.
 Converting per-group gradients back to the single original dW in
