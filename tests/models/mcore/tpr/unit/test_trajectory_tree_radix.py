@@ -119,3 +119,36 @@ def test_radix_rejects_bad_input_just_like_original():
         )
     with pytest.raises(ValueError, match="row mismatch"):
         build_trajectory_trees_radix(["x_trace_0"], batch)
+
+
+def test_radix_selector_in_original_ppo_forest_entry_is_opt_in():
+    rows = [[1, 2, 3, 4, 5], [1, 2, 3, 4, 6], [1, 2, 3], [9, 8, 7]]
+    keys = [f"uid_trace_{i}" for i in range(len(rows))]
+    batch = _batch(rows)
+
+    baseline = build_tree_execution_plans(
+        keys, batch, tree_builder="legacy", require_loss_mask_alignment=True
+    )
+    radix = build_tree_execution_plans(
+        keys, batch, tree_builder="radix", require_loss_mask_alignment=True
+    )
+    assert len(baseline.trees) == len(radix.trees)
+    assert baseline.logical_loss_tokens == radix.logical_loss_tokens
+    for old, new in zip(baseline.trees, radix.trees, strict=True):
+        assert old.tree == new.tree
+        assert old.objective_refs == new.objective_refs
+        assert old.segment_plan.validate_events(
+            old.segment_plan.dfs_events()
+        ) == new.segment_plan.validate_events(
+            new.segment_plan.dfs_events()
+        )
+        for seg_id in old.segment_plan.segments:
+            assert torch.equal(
+                old.segment_plan.get(seg_id).token_ids,
+                new.segment_plan.get(seg_id).token_ids,
+            )
+
+
+def test_radix_selector_rejects_unknown_strategy_before_execution():
+    with pytest.raises(ValueError, match="unsupported TPR tree_builder"):
+        build_tree_execution_plans([], {"input_ids": []}, tree_builder="typo")
