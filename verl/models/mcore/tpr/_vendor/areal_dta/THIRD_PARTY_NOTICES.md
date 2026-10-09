@@ -7,6 +7,7 @@ at commit `a5b0b4811a3ef7bf58f0270abcd81d7154f03ce6` (branch `feat/dta`):
 - `dp.py` from `areal/experimental/dta/dp.py`
 - `token_trie.py` from `areal/experimental/dta/token_trie.py`
 - `trie.py` from `areal/experimental/dta/trie.py`
+- `tree_time_model.py` from `areal/experimental/dta/tree_time_model.py`
 
 The **only source changes** are namespace-only imports from
 `areal.experimental.dta.*` to `verl.models.mcore.tpr._vendor.areal_dta.*`.
