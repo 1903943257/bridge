@@ -93,3 +93,20 @@ def compare_ppo_tokens(native: dict, tpr: dict, *, clip_ratio: float = 0.2):
         ),
     }
     return result
+
+
+if __name__ == "__main__":
+    import argparse
+
+    cli = argparse.ArgumentParser(description="Compare exact real-TQ PPO clipping")
+    cli.add_argument("native")
+    cli.add_argument("tpr")
+    args = cli.parse_args()
+    n = torch.load(args.native, map_location="cpu", weights_only=True)
+    t = torch.load(args.tpr, map_location="cpu", weights_only=True)
+    result = compare_ppo_tokens(n, t)
+    print(
+        "P0 WEAK_TQ PPO_TOKEN_COMPARISON "
+        + " ".join(f"{key}={value}" for key, value in result.items()),
+        flush=True,
+    )
