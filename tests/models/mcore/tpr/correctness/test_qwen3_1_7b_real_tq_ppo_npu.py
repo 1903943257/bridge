@@ -921,6 +921,7 @@ def _native_core_square_vs_rectangular_oracle(
     row=0,
     selected_layers=(1, 2, 3, 4, 14, 28),
     segment_starts=(70, 94, 114),
+    token_positions=(76, 99, 114, 126),
     max_length=256,
 ):
     """Isolate CANN square/rectangular FA shape effects with IDENTICAL Q/K/V.
@@ -1025,7 +1026,7 @@ def _native_core_square_vs_rectangular_oracle(
                     f"rel_l2={rel_l2:.8g} "
                     f"max_abs={max_abs:.8g} mean_abs={mean_abs:.8g}"
                 )
-                for absolute in (76, 99, 114, 126):
+                for absolute in token_positions:
                     if absolute < start or absolute >= full_length:
                         continue
                     token_delta = delta[absolute-start]
