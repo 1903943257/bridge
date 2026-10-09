@@ -270,7 +270,14 @@ def run_tpr_forward_backward_batch(
         raise ValueError("Engine must attach positive batch_num_tokens and dp_size=1 before TPR routing")
 
     keys = _trajectory_keys_from_minibatch(data)
-    forest = build_tree_execution_plans(keys, data)
+    # Opt-in *only* to a different CPU topology constructor. The downstream
+    # SegmentPlan, PPO objective, gradient relay and native optimizer remain
+    # exactly the same. Keep legacy as default while multi-NPU/numerics
+    # investigations are ongoing.
+    import os
+
+    builder = os.environ.get("TPR_TREE_BUILDER", "legacy").strip().lower()
+    forest = build_tree_execution_plans(keys, data, tree_builder=builder)
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
     objective = SegmentPPOObjectiveAdapter(
