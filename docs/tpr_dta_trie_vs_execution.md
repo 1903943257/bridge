@@ -1,43 +1,87 @@
-# AReaL-DTA trie vs TPR trajectory tree: design and scale gates
+# TPR data-parallel design — DTA-inspired placement only
 
-Sources:
-- DTA paper: https://arxiv.org/pdf/2602.00482 (sections 3–4; Algorithms 1–4).
-- Exact implementation: https://github.com/areal-project/AReaL/tree/feat/dta/areal/experimental/dta
-- Local execution: `verl/models/mcore/tpr/{trajectory_tree.py,tree_plan_builder.py,segment_plan.py,fixed_topology_scheduler.py}`.
+**Scope**: This change modifies only *which complete trajectory rows belong to a
+logical DP replica*. It is NOT a DTA runtime or a second TPR tree builder.
 
-## The two tries have overlapping LCP logic but different consumers
+Reference: [AReaL-DTA original DP partition](https://github.com/areal-project/AReaL/blob/feat/dta/areal/experimental/dta/dp.py)
+and [DynamicTreeAttn](https://github.com/Whisper-6/DynamicTreeAttn/blob/main/data_parallel.py).
 
-| Layer | AReaL-DTA | Our TPR | Decision |
-| --- | --- | --- | --- |
-| Global planner (pre-DP) | `TokenTrie`: lexical sort, adjacent LCP, merge duplicates and contained terminal rows into `attach_lists` | Previous `plan_dta_dfs` repeats lexical/LCP logic | Reuse AReaL `TokenTrie` via vendored `plan_areal_dta`; keep previous algorithm as duplicate/equal-row fallback |
-| Workload prediction | `CompressedTrie`: lightweight topology, optimized forward/backward DFS order, per-tree metrics | `TrajectoryTree` stores explicit executable node spans | Use AReaL for DP time prediction; do not create `SegmentPlan` globally |
-| DP partition | `LB_by_DFS_and_TM`: binary-search minimax threshold with contiguous DFS leaf ranges; optional fitted time model | No live DP dispatcher yet | Prefix-aware placement must run at trainer/controller `_balance_batch`, *before* per-rank data dispatch |
-| Local executable tree | `TokenTrie` + DTAEngine take advantage of attachment indices and LCP, running one active sequence path | `TrajectoryTree` has `SegmentRef`, `member_rows`, `terminal_rows`, parents/children | Keep local `TrajectoryTree` + `SegmentPlan` + `FixedTopologyScheduler` |
-| PPO token ownership | DTA attachment captures per-original-row loss | `SegmentObjectiveRef` captures original `sample_row`, `response_offset`, and query/target across parent-child boundary | Preserve our `tree_plan_builder.py` |
-| Execution | DTA `push` saves detached KV + forward-only cache; `pop` redoes differentiable forward (chunked backwards) and injects KV gradient | TPR Push/Visit/Pop is integrated with Megatron/CP and optional offload/recompute | Do NOT replace runtime with DTAEngine |
+## Production path (unchanged downstream components)
 
-### The UID scope matters
-
-Our `build_trajectory_trees` groups by `uid` first; within each UID it computes exact token-prefix sharing. AReaL-DTA's global token sort can cluster *different UIDs* that happen to have identical tokens, whereas the local TPR executor will **not** share across those UID boundaries. Hence the current placement's `DPPlacementPlan.tree_tokens_by_rank` is an optimistic upper bound on saved work when different UIDs share long prefixes. Before production dispatch, compute predicted cost from the same UID-scoped execution forest, or explicitly opt in to cross-UID reuse after verifying semantics.
-
-Our builder creates one executable tree per real first-token root (dummy root is not an executable segment), so it does not assume that the root equals a prompt boundary. DTA `attach_lists` and our `terminal_rows` both preserve duplicate and prefix-contained **logical trajectories**; neither implies losses should be de-duplicated.
-
-### DP vs microbatch boundary
-
-AReaL DP partition cost is an estimate of compute, not a guarantee of current VERL dispatchability. Native VERL requires equal row counts and synchronizable local mini-batch iterations. After global placement, shuffling or re-slicing same-UID trajectories in `TrainingWorker.train_mini_batch` can erase planned prefix reuse. Validate mini-batch grouping before claiming real speedup.
-
-### CPU scale gates
-
-```bash
-pytest -vv -s \
-  tests/models/mcore/tpr/unit/test_dta_trie_semantics.py \
-  tests/models/mcore/tpr/profiling/test_dp_placement_scale_cpu.py
-
-# Explicit long-prefix stress: 512 trajectories x >=16K tokens, DP=8
-TPR_DTA_SCALE_STRESS=1 pytest -vv -s \
-  tests/models/mcore/tpr/profiling/test_dp_placement_scale_cpu.py
+```
+global real TQ actor trajectories and trajectory_keys
+   |
+   +-- DP placement: plan_tpr_dta_dp (DTA DFS-contiguous minimax idea)
+   |       outputs original row-index partitions only
+   |
+VERL controller global batch.reorder + native DP dispatch  [NOT WIRED YET]
+   |
+TrainingWorker local minibatch iterator                 [NOT WIRED YET]
+   |
+run_tpr_forward_backward_batch (existing)
+   |
+build_tree_execution_plans (existing)
+   +-- build_trajectory_trees (existing, UID-scoped, prefix-exact)
+   +-- SegmentPlan + SegmentObjectiveRef (existing)
+   |
+FixedTopologyScheduler + SegmentExecutor (existing)
+   |
+TPR KV / gradient relay, PPO, native Megatron optimizer (existing)
 ```
 
-Workloads include 128 and 256 unique trajectories with 2K/4K group prefix, four-level branching and variable suffix; 272 logical rows with duplicates/prefix-terminal attachments; 512 x 16K explicit stress. The scale gate runs native VERL `plan_verl_uid`, directly vendored AReaL `plan_areal_dta`, and old `plan_dta_dfs` side-by-side, measuring wall time, maximum rank tree tokens, extra duplicated tree tokens and per-rank sample counts. Timings are diagnostic, not stable CI thresholds. These workloads are synthetic; real Agent trajectories should be measured separately before accepting scheduling efficiency.
+`plan_tpr_dta_dp(token_sequences, trajectory_keys, dp_size, enforce_equal_rows=True)`
+uses the same `trajectory_keys` accepted by the TPR tree builder. It extracts
+UIDs through the original TPR key parser and sorts DFS candidates by UID then
+token sequence. Its cost estimator computes exact unique token counts **separately
+per UID**, mirroring the existing `TrajectoryTree` scope. It never merges
+two UIDs simply because tokens happen to match. The min-max, greedy threshold,
+binary search, and equal-row optimal-tie logic are DP scheduling only.
 
-This is **not** a TP2/DP2 numerical or throughput test: Engine's existing parallelism gate is unchanged.
+`plan_dta_dfs` remains a historical flat/global-token cost baseline for
+independent unit tests; **it is not used by the TPR-aware DP path unless
+called with a UID list**. `plan_verl_uid` remains a wrapper around the native
+VERL UID group balancing strategy. No AReaL library or TokenTrie package
+is copied or imported. The original AReaL optimizer's fitted TreeTimeModel is
+not used; using such a model later would require measuring actual TPR forest
+time rather than DTA execution time.
+
+## Why the previous vendor approach was removed
+
+AReaL's `dp.py` imports `TokenTrie` and `CompressedTrie` to estimate time
+and partition leaf groups. Copying these into TPR inadvertently made a
+parallel data-model stack and cost estimates that considered prefix reuse
+across UIDs. It also introduced duplicate/contained sequence leafization
+semantics not needed by our execution path. All vendored source files and
+tests exercising only the duplicate DTA trie were removed.
+
+## Verification — what is and is not checked
+
+1. Existing `test_dp_placement.py`: DFS minimax, exact sample coverage,
+   duplicated trajectories, equal-cardinality safety, UID-scoped cost.
+2. **New direct integration**
+   `tests/models/mcore/tpr/integration/test_tpr_dp_placement_to_forest_cpu.py`:
+   uses TPR's actual `build_tree_execution_plans` on each DP partition,
+   validates physical Segment costs, exact logical PPO token references, and
+   original row identity after reindexing.
+3. Medium/large scale `test_dp_placement_scale_cpu.py`: 128×2K, 256×4K,
+   272 duplicated/prefix-terminal rows, opt-in 512×16K. Measures DTA-inspired
+   planner and VERL UID balancer; also measures TPR's *actual* executable
+   `TrajectoryTree` build on medium cases.
+4. **Not verified**: real DP2 VERL dispatch, equal minibatch update counts,
+   PPO gradient scaling, optimizer synchronization, actual multi-NPU speedup.
+   These require a separate Trainer entry change and end-to-end gate.
+
+```bash
+python -m pytest -vv -s \
+  tests/models/mcore/tpr/unit/test_dp_placement.py \
+  tests/models/mcore/tpr/integration/test_tpr_dp_placement_to_forest_cpu.py \
+  tests/models/mcore/tpr/profiling/test_dp_placement_scale_cpu.py
+
+TPR_DTA_SCALE_STRESS=1 python -m pytest -vv -s \
+  tests/models/mcore/tpr/profiling/test_dp_placement_scale_cpu.py \
+  -k long_prefix_16k
+```
+
+Current worker adapter and Engine DP=1/TP=1 gates remain intact until
+parallel NPU correctness is proven. This change does not touch the other
+ongoing BF16/GEMM numerical experiments.
