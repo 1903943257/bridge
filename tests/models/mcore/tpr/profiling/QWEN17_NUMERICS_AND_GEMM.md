@@ -480,3 +480,71 @@ per QKV layer if fully materialized. This is an illustrative
 minimum-sized group-gradient tensor, NOT a measured runtime peak.
 Converting per-group gradients back to the single original dW in
 FP32 remains necessary.
+
+## H. P0 NPU findings and P1 real Qwen backward/temporary-memory gate (2026-10-09)
+
+**P0 verified on Ascend 910B2C (torch_npu 2.9.0):**
+
+- `mindspeed.ops.gmm.npu_gmm` with `W.T.unsqueeze(0).expand(G,-1,-1)`
+  at G=2, M=256, K=256,N=384: **bitwise equivalent** to token-tiled
+  BF16 GEMM forward, dX and *shared-parameter dW* via PyTorch autograd.
+  This is the non-contiguous, zero-stride **expanded weight view**;
+  it does not deliberately make G explicit forward weight copies.
+- `gmm_contiguous` also passed forward/dX/shared dW, but duplicates the
+  logical weight G times and is not a preferred production memory path.
+- `mindspeed.ops.grouped_matmul` (grouped_view and
+  grouped_contiguous) printed only CONFIG/REFERENCE in the supplied
+  grepped log. Those do **not** establish support or failure; import
+  skips may have been hidden. The test now prints explicit
+  WRAPPER_IMPORT_UNAVAILABLE reasons.
+- `gmm_fp32_fusion` forward succeeded but its backward raised
+  `RuntimeError: setup failed!`. The probe now prints a synchronous
+  BEFORE_BACKWARD/AFTER_BACKWARD marker to localize this in the
+  installed extension. Do not treat this as proof that all FP32 wgrad
+  accumulation is unsupported.
+- `mindspeed.ops.npu_matmul_add.npu_matmul_add_fp32` with identical
+  BF16 X and dY, writing into a single [N,K] FP32 buffer:
+  M=128 one chunk / M=64 times 2 / M=32 times 4:
+  relative L2 to FP32 reference approximately 6.65e-8 /
+  7.24e-8 / 7.35e-8. The corresponding naive BF16 accumulation
+  errors were ~0.00165 / 0.00246 / 0.00314.
+  Partitioned FP32 accumulation is numerically stable in this
+  standalone experiment, but it **does not** eliminate shape-sensitive
+  BF16 **forward** drift when M changes.
+
+**Next validation: pretrained Qwen real weight + real activation GMM G=8/9.**
+This compares the exact Megatron M=128 tiled forward against a
+F.linear(M=128) reference before checking MindSpeed GMM, and then
+compares dX/shared-dW as well. It reports NPU memory usage and the
+logical/storage difference of an expanded weight view. It is still a
+standalone autograd experiment, not complete 28-layer training.
+
+```bash
+export TPR_RUN_QWEN17_MINDSPEED_REAL_GMM=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN17_REAL_GMM_TILE=128
+export TPR_QWEN17_REAL_GMM_LAYER=1
+
+for LINEAR in qkv proj; do
+  for G in 8 9; do
+    export TPR_QWEN17_REAL_GMM_LINEAR="$LINEAR"
+    export TPR_QWEN17_REAL_GMM_GROUPS="$G"
+    log="/tmp/tpr_p1_real_gmm_${LINEAR}_g${G}.log"
+    python -m pytest -s -q --tb=short \
+      tests/models/mcore/tpr/profiling/test_qwen3_1_7b_mindspeed_gmm_real_npu.py \
+      > "$log" 2>&1
+    echo "===== $LINEAR G=$G ====="
+    grep -E 'P1 REAL_SHARED_GMM|FAILED|ERROR' "$log" | tail -35
+  done
+done
+```
+
+A critical distinction: BF16 GMM backward already returned a shared
+BF16 dW via PyTorch expanded-weight autograd, but this **does not
+mean** it writes the FP32 Megatron `weight.main_grad` using a shared
+2D buffer. For production, prefer reusing existing Megatron/MindSpeed
+FP32 grad accumulation rather than per-group temporary gradients
+and an extra BF16 reduction. This requires separate end-to-end
+parameter-grad and optimizer-state validation.
+
+**No production changes or new low-level kernel have been made.**
