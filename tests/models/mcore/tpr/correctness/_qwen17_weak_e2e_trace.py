@@ -243,3 +243,99 @@ def describe_kv_trace(native_kv, tpr_kv, path, *, layers=(1, 2, 3, 4, 14, 28)):
         "same_model_checkpoint=True probe_only=True"
     )
     return report
+
+
+
+def compare_first_attention_replay(
+    native_qkv, tpr_qkv, *, position_start: int, query_abs: int,
+    native_proj_input, tpr_proj_input, attention_fn=None,
+):
+    """Replay Native/TPR's ACTUAL post-RoPE Q/K/V at the first attention layer.
+
+    Swap one tensor at a time while leaving the real CANN rectangular FA
+    operator unchanged. We do NOT replace any module's forward in training.
+    Inputs and projection-entry witnesses are taken from the existing Trace.
+    No learned weights or FP32 GEMM intervention is used.
+    """
+    if attention_fn is None:
+        from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
+        attention_fn = rectangular_causal_attention
+    nq, nk, nv, nscale = native_qkv
+    tq, tk, tv, tscale, actual_tpr_out = tpr_qkv
+    if not (0 <= position_start <= query_abs < nk.shape[0]):
+        raise AssertionError("attention replay query outside Native KV")
+    if nk.shape != tk.shape or nv.shape != tv.shape:
+        raise AssertionError("Native/TPR KV shape mismatch")
+    if nq.shape[0] != nk.shape[0] or tq.shape[0] != tk.shape[0] - position_start:
+        raise AssertionError("Native/TPR Q shape differs from leaf geometry")
+    if not (nq.dtype == tq.dtype == nk.dtype == tk.dtype == nv.dtype == tv.dtype):
+        raise AssertionError("Native/TPR attention dtypes must match")
+    if nscale != tscale:
+        raise AssertionError(
+            f"Native and TPR attention softmax scales differ: {nscale} vs {tscale}"
+        )
+    dev = native_proj_input.device
+    # Captured query and KV tensors were saved on CPU to minimize peak NPU
+    # memory while running the real Forest. Rehydrate ONLY this layer here.
+    nq = nq[position_start:].to(device=dev)
+    tq, nk, nv, tk, tv = (x.to(device=dev) for x in (tq, nk, nv, tk, tv))
+    q_index = query_abs - position_start
+
+    variants = (
+        ("NATIVE_QKV", nq, nk, nv),
+        ("TPR_Q_ONLY", tq, nk, nv),
+        ("TPR_K_ONLY", nq, tk, nv),
+        ("TPR_V_ONLY", nq, nk, tv),
+        ("TPR_KV", nq, tk, tv),
+        ("TPR_ALL", tq, tk, tv),
+    )
+    results = {}
+    with torch.no_grad():
+        for name, q, k, v in variants:
+            out = attention_fn(
+                q, k, v, softmax_scale=nscale, dropout_p=0.0,
+            )
+            if not isinstance(out, torch.Tensor) or out.ndim != 3:
+                raise AssertionError(
+                    f"attention replay expected [Sq, batch, H*D], got {type(out)}"
+                )
+            results[name] = out[q_index].float().cpu().clone()
+
+    ref = results["NATIVE_QKV"]
+    reports = []
+    from_native = {
+        "NATIVE_QKV": native_proj_input.float().cpu(),
+        "TPR_ALL": tpr_proj_input.float().cpu(),
+    }
+    if actual_tpr_out is not None:
+        from_native["TPR_CORE_OUTPUT"] = actual_tpr_out[q_index].float().cpu()
+    witness = {}
+    for name, tensor in from_native.items():
+        replay = results["TPR_ALL"] if name != "NATIVE_QKV" else ref
+        max_abs, rel = _metric(replay, tensor)
+        witness[name] = max_abs
+        reports.append(
+            "P0 WEAK_TQ FA_REPLAY_WITNESS "
+            f"source={name} max_abs={max_abs:.9g} rel_l2={rel:.9g}"
+        )
+    for name, _q, _k, _v in variants[1:]:
+        max_abs, rel = _metric(ref, results[name])
+        reports.append(
+            "P0 WEAK_TQ FA_REPLAY "
+            f"variant={name} query_abs={query_abs} "
+            f"max_abs={max_abs:.9g} rel_l2={rel:.9g}"
+        )
+    # If witness mismatch is material, the captured QKV was not the actual
+    # operator input or we changed a relevant kernel argument, and the
+    # one-at-a-time counterfactual cannot be interpreted.
+    # BF16 identical replay should be exact on the controlled CANN path.
+    reports.append(
+        "P0 WEAK_TQ FA_REPLAY_SUMMARY "
+        f"q_abs={query_abs} query_M={tq.shape[0]} kv_M={nk.shape[0]} "
+        f"native_witness_max={witness['NATIVE_QKV']:.9g} "
+        f"tpr_witness_max={witness['TPR_ALL']:.9g} "
+        f"actual_core_witness_max={witness.get('TPR_CORE_OUTPUT', 0):.9g} "
+        f"softmax_scale={nscale} "
+        "same_kernel=True gradient=False numeric_parity=DIAGNOSTIC_ONLY"
+    )
+    return reports
