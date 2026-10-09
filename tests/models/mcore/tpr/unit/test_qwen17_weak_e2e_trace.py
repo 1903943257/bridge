@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from ..correctness._qwen17_weak_e2e_trace import (
-    STAGES, capture_query_stages, describe_trace,
+    STAGES, capture_query_stages, describe_trace, describe_kv_trace,
 )
 
 
@@ -121,3 +121,48 @@ def test_trace_detects_real_perturbation():
         for layer in model.decoder.layers:
             x, _context = layer(hidden_states=x, attention_mask=None)
     assert "first_material=None" not in describe_trace(native, tpr, layers=2)[-1]
+
+
+def test_actual_leaf_prefix_kv_oracle_localizes_first_changed_ancestor():
+    path = [(0, 0, 4), (1, 4, 7), (5, 7, 10)]
+    base_k = torch.arange(20, dtype=torch.float32).reshape(10, 1, 1, 2)
+    base_v = -base_k.clone()
+    native_kv = {1: (base_k.clone(), base_v.clone())}
+    forest_k = base_k.clone()
+    forest_k[5, 0, 0, 0] += 0.5
+    forest_kv = {1: (forest_k, base_v.clone())}
+    rows = describe_kv_trace(native_kv, forest_kv, path, layers=(1,))
+    assert len(rows) == 7
+    assert any(
+        "segment=1[4:7]" in row and
+        "field=K_POST_ROPE" in row and
+        "differing_tokens=1/3" in row and
+        "first_differing_abs=5" in row
+        for row in rows
+    )
+    assert any(
+        "field=V_RAW" in row and "max_abs=0" in row
+        for row in rows
+    )
+    assert "rows=6" in rows[-1]
+    assert "worst_max_abs=0.5" in rows[-1]
+
+
+def test_kv_oracle_rejects_broken_ancestor_path():
+    kv = {1: (torch.zeros(5, 1, 1, 2), torch.zeros(5, 1, 1, 2))}
+    with pytest.raises(AssertionError, match="contiguous"):
+        describe_kv_trace(
+            kv, kv, [(0, 0, 2), (5, 3, 5)], layers=(1,)
+        )
+
+
+def test_trace_stages_handle_keyword_only_megatron_hidden_states():
+    model = _ToyModel()
+    with capture_query_stages(
+        model, query_position=1, get_active_span=lambda: (0, 3)
+    ) as trace:
+        x = torch.ones(3, 1, 4)
+        for layer in model.decoder.layers:
+            x, _context = layer(hidden_states=x, attention_mask=None)
+    assert len(trace) == 2 * len(STAGES)
+    assert (0, "layer") in trace
