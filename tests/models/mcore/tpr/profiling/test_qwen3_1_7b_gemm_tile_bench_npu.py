@@ -175,56 +175,82 @@ def test_real_qwen17_physical_m_gemm_benchmark():
                         flush=True,
                     )
                 else:
-                    # GroupedMatmul expects [M,K] and [K,N]. Repeating tensor
-                    # *references* avoids explicit weight copies, but does
-                    # not guarantee the kernel reuses weights on device.
+                    # torch_npu 2.9 requires an explicit group_type.
+                    # Compare two PUBLIC supported operand layouts:
+                    #   -1: multiple x, multiple weight, multiple y
+                    #    0: single x, multiple weight, single y, cumsum
+                    # Both lists point at ONE weight tensor. No full weight
+                    # duplication in Python; the kernel may still reload it.
+                    # Weight transposition/packing below is OUTSIDE timings.
                     x_parts = [
                         part.contiguous()
-                        for part in x[:,0,:].split(tile, dim=0)
+                        for part in x[:, 0, :].split(tile, dim=0)
                     ]
-                    w = weight.detach().transpose(0,1).contiguous()
+                    x_full = x[:, 0, :].contiguous()
+                    w = weight.detach().transpose(0, 1).contiguous()
                     weight_list = [w] * len(x_parts)
+                    group_cumsum = torch.arange(
+                        tile, m + 1, tile,
+                        device=device, dtype=torch.int64,
+                    )
 
-                    def grouped():
+                    def multi_x_multi_w():
                         ys = grouped_api(
-                            x_parts, weight_list, split_item=0,
+                            x_parts, weight_list,
+                            group_type=-1, split_item=0,
                         )
                         if not isinstance(ys, (tuple, list)) or len(ys) != len(x_parts):
                             raise AssertionError(
-                                f"Grouped GEMM returned {type(ys)} "
-                                f"with length={len(ys) if hasattr(ys,'__len__') else '?'}"
+                                f"GROUPED_MMM returned {type(ys)} "
+                                f"length={len(ys) if hasattr(ys, '__len__') else '?'}"
                             )
                         return torch.cat(ys, dim=0).unsqueeze(1)
 
-                    try:
-                        with torch.no_grad():
-                            out_grouped = grouped()
-                            out_tiled = tiled()
-                            exact = _error(
-                                f"{name} M={m} grouped_vs_tiled",
-                                out_grouped, out_tiled,
+                    def single_x_multi_w():
+                        ys = grouped_api(
+                            [x_full], weight_list,
+                            group_list=group_cumsum, group_type=0,
+                            group_list_type=0, split_item=2,
+                        )
+                        if not isinstance(ys, (tuple, list)) or len(ys) != 1:
+                            raise AssertionError(
+                                f"GROUPED_SMM returned {type(ys)} "
+                                f"length={len(ys) if hasattr(ys, '__len__') else '?'}"
                             )
-                            del out_grouped, out_tiled
-                        grouped_ms = _timed(
-                            f"{name} M={m} grouped",
-                            grouped, warmup=warmup, repeats=repeats,
-                        )
-                        print(
-                            f"QWEN17 GEMM BENCH GROUPED {name} M={m} "
-                            f"status=FORWARD_OK bitwise_tile={exact} "
-                            f"grouped_over_tiled={grouped_ms/max(tile_ms,1e-9):.4f} "
-                            "backward_supported=UNVERIFIED",
-                            flush=True,
-                        )
-                    except (RuntimeError, TypeError, ValueError, AssertionError) as exc:
-                        # A kernel/layout/dtype unsupported error is a useful
-                        # feasibility result, not evidence that BF16 tiling
-                        # cannot work with another supported CANN backend.
-                        print(
-                            f"QWEN17 GEMM BENCH GROUPED {name} M={m} "
-                            f"status=UNSUPPORTED error={type(exc).__name__}: {exc}",
-                            flush=True,
-                        )
-                    del x_parts, weight_list, w
+                        return ys[0].unsqueeze(1)
+
+                    for mode, grouped in (
+                        ("multi_x_multi_w", multi_x_multi_w),
+                        ("single_x_multi_w", single_x_multi_w),
+                    ):
+                        try:
+                            with torch.no_grad():
+                                out_grouped = grouped()
+                                out_tiled = tiled()
+                                exact = _error(
+                                    f"{name} M={m} {mode} grouped_vs_tiled",
+                                    out_grouped, out_tiled,
+                                )
+                                del out_grouped, out_tiled
+                            grouped_ms = _timed(
+                                f"{name} M={m} {mode}",
+                                grouped, warmup=warmup, repeats=repeats,
+                            )
+                            print(
+                                f"QWEN17 GEMM BENCH GROUPED {name} M={m} "
+                                f"mode={mode} status=FORWARD_OK bitwise_tile={exact} "
+                                f"grouped_over_tiled={grouped_ms/max(tile_ms,1e-9):.4f} "
+                                f"grouped_over_baseline={grouped_ms/max(baseline_ms,1e-9):.4f} "
+                                "backward_supported=UNVERIFIED",
+                                flush=True,
+                            )
+                        except (RuntimeError, TypeError, ValueError, AssertionError) as exc:
+                            print(
+                                f"QWEN17 GEMM BENCH GROUPED {name} M={m} "
+                                f"mode={mode} status=UNSUPPORTED "
+                                f"error={type(exc).__name__}: {exc}",
+                                flush=True,
+                            )
+                    del x_parts, x_full, weight_list, w, group_cumsum
             del x
     print("QWEN17 GEMM BENCH COMPLETE: forward microbenchmark only", flush=True)
