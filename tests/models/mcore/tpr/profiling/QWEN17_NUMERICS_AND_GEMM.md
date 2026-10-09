@@ -235,3 +235,86 @@ selected parameter gradient relative L2=0.523553 / cosine=0.89627931;
 sampled fresh AdamW update relative L2=0.783774842 / cosine=0.693042952.
 The native Full vs Native Cutoff logprob max_abs=0.37499237, while
 TPR Forest vs Native Cutoff max_abs=0.73060608. Both differences matter.
+
+## E. 2026-10-09: full-28 Projection success, PPO cutoff attribution, symmetric M oracle
+
+**Verified on user's Ascend stack:**
+- Full 28-layer Qwen3-1.7B with fixed token tiles in QKV/FC1/FC2
+  and Grouped Projection (single-X / multiple-W) **passes bitwise logprob
+  equality**. The 1-group suffix path falls back to ordinary M=128 GEMM.
+- Native Full repeat is bitwise (512 tokens).
+- PPO native Full clipping = 0, cutoff clipping = 13, Forest clipping = 31;
+  cutoff-vs-Forest branch XOR = 30. Therefore cutoff/Forest clipped-set
+  intersection = 7, cutoff-only = 6, Forest-only = 24. This proves extra
+  Forest-vs-Cutoff numerical behavior, **not** necessarily a semantic KV bug.
+- Cropped real-TQ selected grads native-vs-Forest relative L2 ~0.524,
+  cosine ~0.896; sampled AdamW step direction cosine ~0.693.
+  The native Cutoff and Forest GEMM execution shapes differ!
+
+### Next NPU step A: symmetric real-TQ fixed token tile
+
+Native Full, per-segment Native Cutoff, and TPR Forest must ALL use the
+same BF16 physical token tile size, **including ragged segments**. This
+test-only oracle pads the LAST GEMM tile to M=128 and slices off dummy rows.
+It does not change sequence/attention positions, tree topology, or KV length.
+Activation/training time will be slower; gradient accumulation paths may
+still differ even if Forward becomes bitwise.
+
+```bash
+export TPR_RUN_QWEN17_PPO=1
+export TPR_QWEN17_PPO_ACCEPTANCE=1
+export TPR_QWEN17_PPO_PROMPT=128
+export TPR_QWEN17_PPO_RESPONSE=64
+export TPR_QWEN17_PPO_SEGMENT_ORACLE=1
+export TPR_QWEN17_PPO_TILE_GEMM=128
+export TPR_QWEN17_PPO_TILE_GEMM_GROUPS=qkv,proj,fc1,fc2
+export TPR_QWEN17_PPO_TRACE_LAYERS=0
+export TPR_QWEN17_PPO_CORE_ORACLE=0
+unset TPR_QWEN17_PPO_FC2_FIXED_M
+
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_ppo_npu.py \
+  -k real_qwen3_1_7b_tq_ppo_loss_and_gradients \
+  > /tmp/qwen17_ppo_symmetric_tile.log 2>&1
+
+grep -E 'SYMMETRIC|ACCEPTANCE CLIP|ADAMW_SAMPLED|NATIVE FULL vs NATIVE PER-SEGMENT CUTOFF|TPR FOREST vs NATIVE PER-SEGMENT CUTOFF|PPO grad:|NUMERICAL GATE|FAILED|ERROR' \
+  /tmp/qwen17_ppo_symmetric_tile.log
+```
+
+A TPR failure with full/cutoff/Forest symmetric shapes suggests
+additional attention-state, tree/segment, or backward numerical pathways.
+A successful full forward but failing parameter gradients indicates an
+additional backward accumulation problem, not necessarily Forward error.
+
+CPU-only test for arbitrary ragged M and chain-rule preserved by the probe:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/unit/test_qwen17_fixed_tile_probe.py
+```
+
+### Next NPU step B: combine fast QKV + fast Projection in full 28 layers
+
+```bash
+export TPR_RUN_QWEN17_SPLIT=1
+export TPR_QWEN17_SPLIT_P=1024
+export TPR_QWEN17_SPLIT_S=128
+export TPR_QWEN17_GPT_TILE_GEMM=128
+export TPR_QWEN17_GPT_TILE_GEMM_GROUPS=qkv,proj,fc1,fc2
+export TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS=qkv,proj
+export TPR_QWEN17_GPT_GROUPED_GEMM_MODE=single_x_multi_w
+unset TPR_QWEN17_GPT_FP32_GEMM
+unset TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS
+unset TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS
+
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_split_equivalence_npu.py \
+  -k full_gpt_vs_single_split \
+  > /tmp/qwen17_grouped_qkv_proj_full28.log 2>&1
+
+grep -E 'GROUPED_GEMM|BF16_TILED_GEMM|GPT_SUFFIX_LOGPROBS|PPO_RATIO_MAX_DEVIATION|FULL-GPT EQUIVALENCE|FAILED|ERROR' \
+  /tmp/qwen17_grouped_qkv_proj_full28.log
+```
+
+Keep `TPR_QWEN17_GPT_GROUPED_GEMM_TRACE=0` for non-trace timing tests;
+the traced version synchronizes every GroupedMatmul and is far slower.
+Even full-forward bitwise success does NOT prove autograd/backward support.
