@@ -810,6 +810,7 @@ def test_real_qwen_full_gpt_vs_single_split():
     handles = []
     restored_qkv_forwards = []
     restored_fp32_forwards = []
+    restored_tiled_forwards = []
     npu_hf32_handle = None
     previous_allow_hf32 = None
 
@@ -934,6 +935,118 @@ def test_real_qwen_full_gpt_vs_single_split():
             f"groups={sorted(fp32_groups)} layers={len(layers)} "
             f"bf16_activation_outputs=True "
             f"npu_matmul_allow_hf32={getattr(npu_hf32_handle, 'allow_hf32', 'unknown')}",
+            flush=True,
+        )
+
+    # Diagnostic ONLY: hold the physical GEMM M constant at a small tile
+    # (e.g. 128) in the Full, Prefix and Suffix paths, without computing
+    # padded/dummy tokens. P and S must both be multiples of the tile, so
+    # absolute tile boundaries remain identical across segmentations.
+    #
+    # This intentionally calls the UNMODIFIED Megatron Linear forward for each
+    # tile, preserving BF16 kernel behavior while controlling GEMM M.
+    # It has heavy Python/kernel-launch overhead; not a production schedule.
+    tiled_spec = os.environ.get("TPR_QWEN17_GPT_TILE_GEMM", "").strip()
+    if tiled_spec:
+        try:
+            tile_size = int(tiled_spec)
+        except ValueError as exc:
+            raise AssertionError(
+                "TPR_QWEN17_GPT_TILE_GEMM must be a positive integer"
+            ) from exc
+        if tile_size <= 0 or p % tile_size or s % tile_size:
+            raise AssertionError(
+                f"fixed GEMM tile {tile_size} must divide both P={p} and S={s}"
+            )
+        if fp32_groups or fixed_m_layers:
+            raise AssertionError(
+                "Run BF16 fixed-tile GEMM, FP32 GEMM, and QKV fixed-M "
+                "experiments separately"
+            )
+        if model.config.tensor_model_parallel_size != 1:
+            raise AssertionError("fixed-tile GEMM test requires TP=1")
+
+        tile_groups_spec = os.environ.get(
+            "TPR_QWEN17_GPT_TILE_GEMM_GROUPS", "qkv,proj,fc1,fc2"
+        ).strip().lower()
+        choices = {"qkv", "proj", "fc1", "fc2", "head"}
+        tile_groups = choices if tile_groups_spec == "all" else {
+            part.strip() for part in tile_groups_spec.split(",")
+        }
+        if not tile_groups or not tile_groups.issubset(choices):
+            raise AssertionError(
+                "TPR_QWEN17_GPT_TILE_GEMM_GROUPS must be 'all' or a "
+                "comma-separated subset of qkv,proj,fc1,fc2,head"
+            )
+
+        def install_tiled_linear(module, label):
+            original_forward = module.forward
+
+            def tiled_forward(hidden_states, *args, _forward=original_forward,
+                              _label=label, **kwargs):
+                if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim != 3:
+                    raise AssertionError(
+                        f"{_label}: expected [T, B, H] input Tensor, "
+                        f"got {type(hidden_states)}"
+                    )
+                t = hidden_states.shape[0]
+                if t % tile_size:
+                    raise AssertionError(
+                        f"{_label}: M={t} must divide tile_size={tile_size}"
+                    )
+                tiles = []
+                shared_bias = None
+                return_tuple = None
+                for start in range(0, t, tile_size):
+                    x = hidden_states[start:start+tile_size].contiguous()
+                    output = _forward(x, *args, **kwargs)
+                    if isinstance(output, tuple):
+                        if len(output) != 2:
+                            raise AssertionError(
+                                f"{_label}: unexpected Linear return tuple"
+                            )
+                        y, bias = output
+                        if bias is not None:
+                            raise AssertionError(
+                                f"{_label}: test supports bias-free Qwen3 only"
+                            )
+                        this_tuple = True
+                    else:
+                        y = output
+                        this_tuple = False
+                    if return_tuple is None:
+                        return_tuple = this_tuple
+                    elif return_tuple != this_tuple:
+                        raise AssertionError(f"{_label}: inconsistent Linear return")
+                    if not isinstance(y, torch.Tensor) or y.shape[0] != tile_size:
+                        raise AssertionError(
+                            f"{_label}: unexpected tile output shape "
+                            f"{getattr(y, 'shape', None)}"
+                        )
+                    tiles.append(y)
+                merged = torch.cat(tiles, dim=0)
+                return (merged, shared_bias) if return_tuple else merged
+
+            module.forward = tiled_forward
+            restored_tiled_forwards.append((module, original_forward))
+
+        for decoder_layer in model.decoder.layers:
+            index = decoder_layer.self_attention.layer_number
+            modules = {
+                "qkv": decoder_layer.self_attention.linear_qkv,
+                "proj": decoder_layer.self_attention.linear_proj,
+                "fc1": decoder_layer.mlp.linear_fc1,
+                "fc2": decoder_layer.mlp.linear_fc2,
+            }
+            for group in sorted(tile_groups.intersection(modules)):
+                install_tiled_linear(modules[group], f"L{index:02d}_{group}")
+        if "head" in tile_groups:
+            install_tiled_linear(model.output_layer, "lm_head")
+        print(
+            "QWEN SPLIT GPT TEST-ONLY BF16_TILED_GEMM "
+            f"tile={tile_size} groups={sorted(tile_groups)} "
+            f"full_tiles={(p+s)//tile_size} prefix_tiles={p//tile_size} "
+            f"suffix_tiles={s//tile_size}",
             flush=True,
         )
 
@@ -1329,6 +1442,8 @@ def test_real_qwen_full_gpt_vs_single_split():
         for qkv_module, original_forward in restored_qkv_forwards:
             qkv_module.forward = original_forward
         for module, original_forward in restored_fp32_forwards:
+            module.forward = original_forward
+        for module, original_forward in restored_tiled_forwards:
             module.forward = original_forward
         if previous_allow_hf32 is not None:
             npu_hf32_handle.allow_hf32 = previous_allow_hf32
