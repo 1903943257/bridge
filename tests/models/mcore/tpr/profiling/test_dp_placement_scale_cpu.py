@@ -9,8 +9,9 @@ Also run 512 trajectories with a 16K-token shared prefix:
     TPR_DTA_SCALE_STRESS=1 pytest -vv -s \
         tests/models/mcore/tpr/profiling/test_dp_placement_scale_cpu.py
 
-These are deterministic synthetic *planning* workloads, not claims about
-actual communication speed or policy-gradient numerical correctness.
+These are deterministic synthetic *planning* workloads. The medium cases
+also run our existing executable TPR tree builder to check estimated costs,
+not a DTA runtime. No communication/optimizer claims.
 """
 
 from __future__ import annotations
@@ -21,9 +22,8 @@ import time
 import pytest
 
 from verl.models.mcore.tpr.dp_placement import (
-    _tree_token_cost,
-    plan_areal_dta,
-    plan_dta_dfs,
+    _uid_scoped_tree_cost,
+    plan_tpr_dta_dp,
     plan_verl_uid,
 )
 
@@ -121,23 +121,20 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
         "verl_uid",
         lambda: plan_verl_uid(seqs, uids, dp),
     )
+    keys = [f"{uid}_trace_{row}" for row, uid in enumerate(uids)]
     dta = _plan_timed(
-        "areal_dta",
-        lambda: plan_areal_dta(seqs, dp, enforce_equal_rows=False),
+        "tpr_dta_dp",
+        lambda: plan_tpr_dta_dp(seqs, keys, dp, enforce_equal_rows=False),
     )
-    local = _plan_timed(
-        "local_dta",
-        lambda: plan_dta_dfs(seqs, dp, enforce_equal_rows=False),
-    )
-    for plan in (native, dta, local):
+    for plan in (native, dta):
         _check_plan(plan, n_rows=n_rows, n_ranks=dp, total_raw_tokens=raw_tokens)
-        assert plan.global_tree_tokens == _tree_token_cost(seqs)
+        assert plan.global_tree_tokens == _uid_scoped_tree_cost(seqs, uids)
 
     # No speed assertions: DTA/VERL planners optimize different objectives
     # and the fitted time model may value backward differently than tree cost.
     assert native.equal_rows_per_rank
     assert native.policy == "verl_uid"
-    assert dta.policy == "areal_dta"
+    assert dta.policy == "tpr_dta"
 
     # Our execution builder currently constructs a per-token Python trie and
     # then compresses it.  Measure this independently: it can dominate CPU
@@ -147,7 +144,6 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
     from verl.models.mcore.tpr.trajectory_tree import build_trajectory_trees
 
     input_rows = [torch.tensor(row, dtype=torch.long) for row in seqs]
-    keys = [f"{uid}_trace_{row}" for row, uid in enumerate(uids)]
     start = time.perf_counter()
     trees = build_trajectory_trees(keys, {"input_ids": input_rows})
     build_seconds = time.perf_counter() - start
@@ -157,18 +153,18 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
     execution_nodes = sum(len(tree.nodes) for tree in trees)
     covered_rows = sorted(row for tree in trees for row in tree.member_rows)
     assert covered_rows == list(range(n_rows))
-    assert execution_tree_tokens >= dta.global_tree_tokens
+    assert execution_tree_tokens == dta.global_tree_tokens
     print(
         f"TPR_DP_SCALE executable_trie: secs={build_seconds:.3f} "
         f"trees={len(trees)} compact_nodes={execution_nodes} "
         f"execution_tree_tokens={execution_tree_tokens} "
-        f"global_DTA_tree_tokens={dta.global_tree_tokens}",
+        f"predicted_TPR_tree_tokens={dta.global_tree_tokens}",
         flush=True,
     )
 
 
-def test_many_duplicates_and_prefix_contained_trajectories_survive_areal_leafization():
-    base, _ = make_agentic_forest(
+def test_many_duplicates_and_prefix_contained_trajectories_survive_tpr_dp():
+    base, base_uids = make_agentic_forest(
         n_groups=16,
         siblings_per_group=4,
         prefix_tokens=1024,
@@ -177,15 +173,18 @@ def test_many_duplicates_and_prefix_contained_trajectories_survive_areal_leafiza
     # 64 distinct leaves, 4 logical training samples per leaf, plus 16
     # terminal rows that are strict prefixes of existing trajectories.
     seqs = [row for row in base for _ in range(4)]
+    uids = [uid for uid in base_uids for _ in range(4)]
     seqs.extend(row[:1024] for row in base[::4])
+    uids.extend(base_uids[::4])
     assert len(seqs) == 272
     total_raw = sum(map(len, seqs))
+    keys = [f"{uid}_trace_{row}" for row, uid in enumerate(uids)]
     dta = _plan_timed(
-        "areal_duplicates_and_contained",
-        lambda: plan_areal_dta(seqs, dp_size=4, enforce_equal_rows=False),
+        "tpr_duplicates_and_contained",
+        lambda: plan_tpr_dta_dp(seqs, keys, dp_size=4, enforce_equal_rows=False),
     )
     _check_plan(dta, n_rows=len(seqs), n_ranks=4, total_raw_tokens=total_raw)
-    assert dta.global_tree_tokens == _tree_token_cost(seqs)
+    assert dta.global_tree_tokens == _uid_scoped_tree_cost(seqs, uids)
 
 
 @pytest.mark.skipif(
@@ -202,11 +201,11 @@ def test_long_prefix_16k_512_trajectories_8dp():
     n_rows = len(seqs)
     assert n_rows == 512
     total_raw = sum(map(len, seqs))
+    keys = [f"{uid}_trace_{row}" for row, uid in enumerate(uids)]
     for name, fn in (
         ("verl_uid", lambda: plan_verl_uid(seqs, uids, 8)),
-        ("areal_dta", lambda: plan_areal_dta(seqs, 8, enforce_equal_rows=False)),
-        ("local_dta", lambda: plan_dta_dfs(seqs, 8, enforce_equal_rows=False)),
+        ("tpr_dta_dp", lambda: plan_tpr_dta_dp(seqs, keys, 8, enforce_equal_rows=False)),
     ):
         plan = _plan_timed(f"stress_{name}", fn)
         _check_plan(plan, n_rows=n_rows, n_ranks=8, total_raw_tokens=total_raw)
-        assert plan.global_tree_tokens == _tree_token_cost(seqs)
+        assert plan.global_tree_tokens == _uid_scoped_tree_cost(seqs, uids)
