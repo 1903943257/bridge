@@ -73,7 +73,7 @@ def _summary(data: dict[str, float]) -> str:
 
 
 def _group_name(name: str) -> str:
-    layer = re.search(r"(?:^|\\.)decoder\\.layers\\.(\\d+)\\.", name)
+    layer = re.search(r"(?:^|\.)decoder\.layers\.(\d+)\.", name)
     if layer:
         return f"decoder.layers.{int(layer.group(1)):02d}"
     if "embedding" in name or "output_layer" in name:
