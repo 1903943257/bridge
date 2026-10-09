@@ -1081,7 +1081,7 @@ def _diagnostic_fixed_m_fc2(model, *, physical_m: int):
 
 
 
-def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
+def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
     # construct dataclasses during their module import/bootstrap.
@@ -1120,9 +1120,38 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     device = torch.device("npu")
     _initialize_single_rank_megatron()
     longest_row = max(len(row) for row in _rows(batch, "input_ids"))
+    tile_spec = os.getenv("TPR_QWEN17_PPO_TILE_GEMM", "").strip()
+    tile_size = int(tile_spec) if tile_spec else 0
+    tile_groups = tuple(
+        item.strip() for item in os.getenv(
+            "TPR_QWEN17_PPO_TILE_GEMM_GROUPS", "qkv,proj,fc1,fc2"
+        ).split(",")
+    )
+    if tile_size and longest_row > 256:
+        pytest.fail(
+            "Symmetric fixed-tile PPO oracle is for cropped real-TQ "
+            "rows with max token length <= 256 only; it is too costly "
+            "for long-sequence production training"
+        )
+    if tile_size and os.getenv("TPR_QWEN17_PPO_FC2_FIXED_M") is not None:
+        pytest.fail(
+            "Do not combine TPR_QWEN17_PPO_TILE_GEMM with "
+            "TPR_QWEN17_PPO_FC2_FIXED_M"
+        )
+    if tile_size:
+        from ._qwen17_fixed_tile_probe import install_test_only_fixed_tile_gemm
+        print(
+            f"QWEN17 PPO TEST-ONLY SYMMETRIC FIXED GEMM M={tile_size} "
+            f"groups={sorted(tile_groups)} max_row={longest_row}",
+            flush=True,
+        )
     print(f"PHASE5 max real sequence length={longest_row}; initializing Native reference")
     ref = _make_qwen_model(device, tpr=False, max_sequence_length=longest_row)
     ref_params = target.assert_model_scale(ref)
+    if tile_size:
+        install_test_only_fixed_tile_gemm(
+            ref, monkeypatch, tile_size=tile_size, groups=tile_groups,
+        )
 
     # The OLD policy is the real frozen Qwen checkpoint prior to this update,
     # not invented log-probabilities. Recompute once on the actual TQ tokens.
@@ -1261,6 +1290,10 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients():
     print("PHASE5: Native loss and gradients collected; initializing TPR reference")
     tpr = _make_qwen_model(device, tpr=True, max_sequence_length=longest_row)
     assert target.assert_model_scale(tpr) == ref_params
+    if tile_size:
+        install_test_only_fixed_tile_gemm(
+            tpr, monkeypatch, tile_size=tile_size, groups=tile_groups,
+        )
     tpr.config.no_sync_func = None
     tpr.config.grad_scale_func = lambda value: value
     tpr.config.finalize_model_grads_func = lambda *args, **kwargs: None
