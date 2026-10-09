@@ -105,9 +105,22 @@ for mode in "${modes[@]}"; do
       tail -120 "$logfile" >&2
       exit 1
     }
-  grep -E 'P0 WEAK_TQ (CONFIG|BACKWARD|OPTIMIZER_STEP|RESULT)' "$logfile"
+  if [[ "$mode" == "core" ]]; then
+    # The core oracle reports real per-layer/per-shape errors without the
+    # P0 WEAK_TQ prefix. The original grep silently hid the only useful
+    # numerical diagnostic while still reporting CORE status=PASS.
+    grep -E 'P0 WEAK_TQ (CONFIG|CORE_GEOMETRY|CORE_SUMMARY|RESULT)|CORE SHAPE ORACLE|CORE TOKEN' "$logfile"
+    if ! grep -q '^CORE SHAPE ORACLE layer=' "$logfile" || \
+       ! grep -q 'rect=3x192' "$logfile" || \
+       ! grep -q 'P0 WEAK_TQ CORE_SUMMARY' "$logfile"; then
+      echo "CORE: missing same-QKV shape evidence (including 3x192); see $logfile" >&2
+      exit 1
+    fi
+  else
+    grep -E 'P0 WEAK_TQ (CONFIG|BACKWARD|OPTIMIZER_STEP|RESULT)' "$logfile"
+  fi
   if ! grep -q "P0 WEAK_TQ RESULT status=PASS execution=$(echo "$mode" | tr '[:lower:]' '[:upper:]')" "$logfile"; then
-    echo "$mode: missing explicit completed optimizer/updated-forward PASS" >&2
+    echo "$mode: missing explicit PASS; inspect $logfile" >&2
     exit 1
   fi
 done
