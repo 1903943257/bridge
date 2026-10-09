@@ -193,6 +193,56 @@ token count, and actual end-to-end runtime. Grouped GEMM performance,
 alternative CP/TP/DP setups and full-length stress sweeps can be
 optimized independently after an initially correct E2E.
 
+### One-time opt-in capture hook in the real VERL Actor worker
+
+This code is now checked into `bridge/main`:
+
+- `verl/models/mcore/tpr/actor_capture.py`: save a copy of the **actual**
+  actor-update mini-batch immediately before its real train step. It
+  never overwrites existing captures, invents advantages/old logprobs
+  or changes the original training tensors.
+- `patches/apply_tpr_actor_capture.py`: idempotently inserts the
+  capture call in the working VERL `TrainingWorker.train_mini_batch`
+  immediately before `actor_output = self.train_batch(mini_batch_td)`.
+  Default behavior remains unchanged when the env variable is unset.
+- `tests/models/mcore/tpr/unit/test_actor_capture_patcher.py`:
+  CPU-only patcher validation.
+
+Only run this if the currently running VERL checkout has the latest
+TPR helper module installed, and **review the target path first**.
+Do not run `git pull` inside the VERL working checkout just to apply it.
+
+```bash
+# From bridge (the source repository), inspect compatibility first:
+python patches/apply_tpr_actor_capture.py --check \
+  /workspace/uni-agent/verl/verl/workers/engine_workers.py
+python -m pytest -q \
+  tests/models/mcore/tpr/unit/test_actor_capture_patcher.py
+
+# Verify actor_capture.py exists in the *running VERL Python package*:
+test -f /workspace/uni-agent/verl/verl/models/mcore/tpr/actor_capture.py
+
+# Then apply the reviewed targeted patch (does not touch optimizer):
+python patches/apply_tpr_actor_capture.py \
+  /workspace/uni-agent/verl/verl/workers/engine_workers.py
+
+# Set in the ACTOR WORKER process environment for a real training run:
+export TPR_CAPTURE_ACTOR_MINIBATCH_DIR=/workspace/tpr_actor_capture
+```
+
+After the actual actor job runs through `train_mini_batch`, look for
+`actor_update_rank0_batch0.pt`; run the strict P0 contract below
+with `TPR_REAL_ACTOR_MINIBATCH` pointed to that file. Other DP ranks
+write their own rank-labelled captures. If the real TQ trajectory
+identity was not propagated through the actor data loader, the capture
+will contain an empty `keys` tuple and the contract must FAIL:
+fix identity propagation rather than constructing artificial row keys.
+
+This hook **captures before the optimizer update**. The next P0
+validation must inspect the *actual* `train_batch` results, the
+non-skipped optimizer step, parameter deltas and optimizer state. A
+successful capture on its own does not establish any of these.
+
 ### First P0 gate: capture the actual actor-update mini-batch
 
 A strict, opt-in CPU test has been added at
