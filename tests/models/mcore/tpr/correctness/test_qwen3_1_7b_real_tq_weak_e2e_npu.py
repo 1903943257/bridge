@@ -546,7 +546,8 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
 
         from ._qwen17_weak_e2e_trace import (
             capture_query_stages, describe_trace, describe_kv_trace,
-            compare_first_attention_replay,
+            compare_first_attention_replay, compare_root_v_provenance,
+            _first_input_tensor,
         )
         from verl.models.mcore.tpr.attention import TPRSelfAttention
         from verl.models.mcore.tpr import attention as tpr_attention_module
@@ -578,6 +579,10 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             )
         tree, ref = hits[0]
         segment = tree.segment_plan.get(ref.segment_id)
+        ancestors = tree.segment_plan.path_to(segment.segment_id)
+        root = ancestors[0]
+        if root.position_start != 0:
+            raise AssertionError("Native root V provenance needs root starting at 0")
         query_position = segment.position_start + ref.query_offset
         native_cutoff = segment.position_end
         if native_cutoff > lengths[row] or query_position >= native_cutoff:
@@ -599,7 +604,24 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         kv_layers = (1, 2, 3, 4, 14, 28)
         native_kv = {}
         native_first_qkv = {}
+        native_full_qkv_input = {}
+        native_cutoff_root = {}
         kv_handles = []
+
+        def capture_full_qkv_input(_module, args, kwargs, _out):
+            if native_full_qkv_input:
+                raise AssertionError("Duplicate full Native layer-1 QKV input")
+            x = _first_input_tensor(args, kwargs)
+            if x is None or x.shape[0] != native_cutoff:
+                raise AssertionError("Native full QKV probe did not see full sequence")
+            native_full_qkv_input["data"] = (
+                x[:root.position_end].detach().cpu().clone()
+            )
+        kv_handles.append(
+            reference.decoder.layers[0].self_attention.linear_qkv.register_forward_hook(
+                capture_full_qkv_input, with_kwargs=True,
+            )
+        )
 
         def capture_native_kv(_module, args, _result, *, number):
             if len(args) < 3 or not all(
@@ -651,6 +673,51 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             raise AssertionError(
                 f"Native core KV capture incomplete: got={sorted(native_kv)}"
             )
+        if set(native_full_qkv_input) != {"data"}:
+            raise AssertionError("Native full QKV input was not captured")
+
+        # Run Native once more with the *exact real root cutoff M*,
+        # using unchanged checkpoint/kernel/default BF16. This isolates
+        # the sequence-M effect without invoking TPR or cached KV.
+        def capture_root_native_kv(_module, args, _result):
+            if len(args) < 3 or not isinstance(args[2], torch.Tensor):
+                raise AssertionError("Native root attention did not expose V")
+            if "v" in native_cutoff_root:
+                raise AssertionError("Native root V captured more than once")
+            native_cutoff_root["v"] = args[2].detach().cpu().clone()
+
+        def capture_root_native_input(_module, args, kwargs, _out):
+            if "input" in native_cutoff_root:
+                raise AssertionError("Native root QKV input captured more than once")
+            x = _first_input_tensor(args, kwargs)
+            if x is None:
+                raise AssertionError("Native root QKV projection lacked input tensor")
+            native_cutoff_root["input"] = x.detach().cpu().clone()
+
+        root_attention = reference.decoder.layers[0].self_attention
+        root_hooks = [
+            root_attention.core_attention.register_forward_hook(
+                capture_root_native_kv
+            ),
+            root_attention.linear_qkv.register_forward_hook(
+                capture_root_native_input, with_kwargs=True
+            ),
+        ]
+        try:
+            with torch.no_grad():
+                _native_response_logprobs(
+                    reference,
+                    batch["input_ids"][row][:root.position_end].to(device),
+                    prompt_length=len(batch["prompts"][row]),
+                    temperature=1.0,
+                )
+        finally:
+            for handle in root_hooks:
+                handle.remove()
+        if set(native_cutoff_root) != {"v", "input"}:
+            raise AssertionError(
+                f"Native root cutoff capture incomplete: {tuple(native_cutoff_root)}"
+            )
 
         del reference
         gc.collect()
@@ -665,7 +732,20 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         previous_tree_forward = TPRSelfAttention._tree_forward
         tpr_kv = {}
         tpr_first_qkv = {}
-        current = {"span": None, "captures": 0, "layer": None}
+        tpr_root = {}
+        current = {
+            "span": None, "captures": 0, "layer": None,
+            "segment_id": None,
+        }
+
+        def capture_tpr_root_input(_module, args, kwargs, _out):
+            if current["segment_id"] != root.segment_id:
+                return
+            if "input" not in tpr_root:
+                x = _first_input_tensor(args, kwargs)
+                if x is None:
+                    raise AssertionError("TPR root QKV projection lacked an input")
+                tpr_root["input"] = x.detach().cpu().clone()
 
         # This wrapper observes the exact Q and assembled K/V passed to the
         # production CANN rectangular adapter for the target leaf. It
@@ -694,6 +774,9 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             finally:
                 current["layer"] = previous_layer
             layer_number = attention.layer_number
+            if (current["segment_id"] == root.segment_id and
+                    layer_number == 1 and "v" not in tpr_root):
+                tpr_root["v"] = context.new_key_values[1][1].detach().cpu().clone()
             if current["span"] is not None and layer_number in kv_layers:
                 if layer_number in tpr_kv:
                     raise AssertionError(
@@ -717,6 +800,8 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
 
         def traced_forward(self, physical, **kwargs):
             prior = current["span"]
+            prior_segment = current["segment_id"]
+            current["segment_id"] = physical.segment_id
             target_leaf = (
                 physical.segment_id == segment.segment_id
                 and kwargs.get("no_grad") is False
@@ -737,31 +822,40 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
                 return previous_forward(self, physical, **kwargs)
             finally:
                 current["span"] = prior
+                current["segment_id"] = prior_segment
 
-        with capture_query_stages(
+        root_input_handle = (
+            tpr_model.decoder.layers[0].self_attention.linear_qkv.register_forward_hook(
+                capture_tpr_root_input, with_kwargs=True
+            )
+        )
+        try:
+            with capture_query_stages(
             tpr_model, query_position=query_position,
             get_active_span=lambda: current["span"],
-        ) as tpr_trace:
-            # Patch only the test-level physical Segment execution seam.
+            ) as tpr_trace:
+                # Patch only the test-level physical Segment execution seam.
             # No module/operator math is modified; full PPO backward still
             # executes to ensure this is the *real* Forest schedule.
-            with (
-                patch.object(SegmentExecutor, "_forward", traced_forward),
-                patch.object(
-                    TPRSelfAttention, "_tree_forward", trace_actual_tree_kv
-                ),
-                patch.object(
-                    tpr_attention_module, "rectangular_causal_attention",
-                    trace_rectangular,
-                ),
-            ):
-                trace_out = trace_engine.forward_backward_batch(
-                    batch,
-                    loss_function=partial(
-                        ppo_loss, config=_VanillaPPOConfig()
+                with (
+                    patch.object(SegmentExecutor, "_forward", traced_forward),
+                    patch.object(
+                        TPRSelfAttention, "_tree_forward", trace_actual_tree_kv
                     ),
-                    forward_only=False,
-                )
+                    patch.object(
+                        tpr_attention_module, "rectangular_causal_attention",
+                        trace_rectangular,
+                    ),
+                ):
+                    trace_out = trace_engine.forward_backward_batch(
+                        batch,
+                        loss_function=partial(
+                            ppo_loss, config=_VanillaPPOConfig()
+                        ),
+                        forward_only=False,
+                    )
+        finally:
+            root_input_handle.remove()
         _sync()
         if current["captures"] != 1:
             raise AssertionError(
@@ -799,6 +893,18 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             device=device,
         )
         for report in replay_reports:
+            print(report, flush=True)
+        if set(tpr_root) != {"v", "input"}:
+            raise AssertionError(
+                f"TPR root first-layer capture incomplete: {tuple(tpr_root)}"
+            )
+        root_reports = compare_root_v_provenance(
+            native_kv[1][1][:root.position_end],
+            native_cutoff_root["v"], tpr_root["v"],
+            native_full_qkv_input["data"],
+            native_cutoff_root["input"], tpr_root["input"],
+        )
+        for report in root_reports:
             print(report, flush=True)
         print(
             "P0 WEAK_TQ RESULT status=PASS execution=TRACE "
