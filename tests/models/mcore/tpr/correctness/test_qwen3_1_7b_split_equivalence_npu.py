@@ -857,20 +857,31 @@ def test_real_qwen_full_gpt_vs_single_split():
 
             def fp32_linear_forward(hidden_states, *args, _module=module,
                                    _label=label, **kwargs):
-                if args or kwargs:
+                # GPTModel can pass weight=None and runtime_gather_output=None
+                # to its LM head; preserve TP=1 semantics for those options.
+                specified_weight = kwargs.pop("weight", None)
+                runtime_gather_output = kwargs.pop("runtime_gather_output", None)
+                if args or kwargs or runtime_gather_output not in (None, False):
                     raise AssertionError(
-                        f"{_label}: test-only FP32 Linear got extra forward args"
+                        f"{_label}: unexpected extra forward options"
                     )
                 if hidden_states.dtype != torch.bfloat16:
                     raise AssertionError(
                         f"{_label}: expected BF16 activations, got "
                         f"{hidden_states.dtype}"
                     )
+                active_weight = (
+                    _module.weight if specified_weight is None else specified_weight
+                )
+                if active_weight.dtype != torch.bfloat16:
+                    raise AssertionError(
+                        f"{_label}: expected BF16 weight, got {active_weight.dtype}"
+                    )
                 # Do not silently allow autocast to convert FP32 GEMM
                 # operands back to BF16.
                 with torch.autocast(device_type=hidden_states.device.type, enabled=False):
                     out_fp32 = torch.nn.functional.linear(
-                        hidden_states.float(), _module.weight.float()
+                        hidden_states.float(), active_weight.float()
                     )
                 return out_fp32.to(hidden_states.dtype), None
 
