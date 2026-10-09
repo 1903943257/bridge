@@ -27,6 +27,11 @@ Run using the existing real TQ file and real Qwen checkpoint:
 export TPR_RUN_QWEN17_PPO=1
 export TPR_QWEN_PROFILE_SIZE=1.7B
 export TPR_QWEN17_PPO_ACCEPTANCE=1
+# Clear experimental knobs retained in shell from earlier work:
+unset TPR_QWEN17_PPO_FC2_FIXED_M
+unset TPR_QWEN17_GPT_FP32_GEMM
+unset TPR_QWEN17_GPT_TILE_GEMM
+unset TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS
 
 # OPTIONAL smoke with *real* cropped rows (not a training acceptance test):
 # export TPR_QWEN17_PPO_PROMPT=128
@@ -43,7 +48,16 @@ grep -E 'ACCEPTANCE|NATIVE REPEATABILITY|PPO native_loss|PPO grad:|NUMERICAL GAT
 
 An exit code of 1 from the **existing** strict gradient/logprob gate is not
 equivalent to the diagnostic itself failing. Inspect all acceptance reports
-before interpreting a gate failure.
+before interpreting a gate failure. A previously exported
+`TPR_QWEN17_PPO_FC2_FIXED_M` can make this test abort **before** any TPR
+forward; always clear it unless deliberately testing FC2 physical padding.
+
+IMPORTANT: this fixture currently **recomputes** `old_log_probs` using the
+same native checkpoint instead of consuming the saved rollout behavior-policy
+logprobs. Its PPO branch comparison is therefore a checkpoint-matched
+counterfactual, NOT a verified historical rollout-old-policy test. Advantages
+are similarly synthetic signed coefficients if missing from the TQ dump.
+Never claim a real policy-lag experiment based solely on this result.
 
 Do **not** claim 20-100-step real PPO replay or full AdamW optimizer equivalence
 from the sampled first-step probe. A multi-step experiment needs repeatedly
@@ -72,6 +86,10 @@ export TPR_QWEN_PROFILE_SIZE=1.7B
 export TPR_QWEN17_GEMM_TILE=128
 export TPR_QWEN17_GEMM_M=128,1024,1152
 export TPR_QWEN17_GEMM_GROUPS=qkv,proj,fc1,fc2
+# Either 'random' or real hidden activations captured from the unmodified
+# Full Qwen forward using actual recorded TQ token IDs:
+export TPR_QWEN17_GEMM_INPUT=real
+export TPR_QWEN17_GEMM_LAYER=1
 export TPR_QWEN17_GEMM_WARMUP=2
 export TPR_QWEN17_GEMM_REPEATS=8
 
@@ -84,6 +102,12 @@ python -m pytest -s -q --tb=short \
 
 grep -E 'QWEN17 GEMM BENCH|FAILED|ERROR' /tmp/qwen17_gemm_tile_bench.log
 ```
+
+For the grouped kernels, the diagnostic now explicitly compares **three**
+results: grouped vs **fixed-tile**, grouped vs **native full-M**, and native
+vs fixed-tile, including per-128-token mismatch counts. This is necessary
+because FC2 grouped forward can differ from fixed-tiling even when its speed
+is comparable to native (and relative-L2 alone does not prove it matches native).
 
 `npu_grouped_matmul` receives one physical weight per group *by reference*;
 this does not guarantee any on-device weight reuse, supported backward, or
