@@ -868,9 +868,14 @@ def test_real_qwen_full_gpt_vs_single_split():
                 # to its LM head; preserve TP=1 semantics for those options.
                 specified_weight = kwargs.pop("weight", None)
                 runtime_gather_output = kwargs.pop("runtime_gather_output", None)
-                if args or kwargs or runtime_gather_output not in (None, False):
+                if args or kwargs or runtime_gather_output not in (None, False, True):
                     raise AssertionError(
                         f"{_label}: unexpected extra forward options"
+                    )
+                # TP=1: gathered and ungathered outputs are identical.
+                if runtime_gather_output is True and _label != "lm_head":
+                    raise AssertionError(
+                        f"{_label}: gather override is valid for LM head only"
                     )
                 if hidden_states.dtype != torch.bfloat16:
                     raise AssertionError(
