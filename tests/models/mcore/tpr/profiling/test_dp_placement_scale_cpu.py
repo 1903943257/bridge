@@ -139,6 +139,33 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
     assert native.policy == "verl_uid"
     assert dta.policy == "areal_dta"
 
+    # Our execution builder currently constructs a per-token Python trie and
+    # then compresses it.  Measure this independently: it can dominate CPU
+    # planning memory/time for long shared prompts even when DTA DP is fast.
+    import torch
+
+    from verl.models.mcore.tpr.trajectory_tree import build_trajectory_trees
+
+    input_rows = [torch.tensor(row, dtype=torch.long) for row in seqs]
+    keys = [f"{uid}_trace_{row}" for row, uid in enumerate(uids)]
+    start = time.perf_counter()
+    trees = build_trajectory_trees(keys, {"input_ids": input_rows})
+    build_seconds = time.perf_counter() - start
+    execution_tree_tokens = sum(
+        node.segment.length for tree in trees for node in tree.nodes.values()
+    )
+    execution_nodes = sum(len(tree.nodes) for tree in trees)
+    covered_rows = sorted(row for tree in trees for row in tree.member_rows)
+    assert covered_rows == list(range(n_rows))
+    assert execution_tree_tokens >= dta.global_tree_tokens
+    print(
+        f"TPR_DP_SCALE executable_trie: secs={build_seconds:.3f} "
+        f"trees={len(trees)} compact_nodes={execution_nodes} "
+        f"execution_tree_tokens={execution_tree_tokens} "
+        f"global_DTA_tree_tokens={dta.global_tree_tokens}",
+        flush=True,
+    )
+
 
 def test_many_duplicates_and_prefix_contained_trajectories_survive_areal_leafization():
     base, _ = make_agentic_forest(
