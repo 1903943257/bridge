@@ -162,7 +162,7 @@ def test_midscale_dta_vs_native_verl_placement(n_groups, siblings, prefix, suffi
 
         monkeypatch.setattr(old_tree_builder, attribute, measured)
 
-    build_trajectory_trees = old_tree_builder.build_trajectory_trees
+    build_trajectory_trees = old_tree_builder.build_trajectory_trees_legacy
     input_rows = [torch.tensor(row, dtype=torch.long) for row in seqs]
     start = time.perf_counter()
     trees = build_trajectory_trees(keys, {"input_ids": input_rows})
