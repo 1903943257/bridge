@@ -70,6 +70,7 @@ if [[ "${#modes[@]}" -eq 0 ]]; then
 fi
 run_native=0
 run_tpr=0
+run_cutoff=0
 for mode in "${modes[@]}"; do
   case "$mode" in
     native)
@@ -78,11 +79,18 @@ for mode in "${modes[@]}"; do
     tpr)
       if [[ "$run_tpr" == 1 ]]; then echo "Duplicate mode: tpr" >&2; exit 2; fi
       run_tpr=1 ;;
+    cutoff)
+      if [[ "$run_cutoff" == 1 ]]; then echo "Duplicate mode: cutoff" >&2; exit 2; fi
+      run_cutoff=1 ;;
     *)
-      echo "Unsupported mode: $mode (valid: native, tpr)" >&2
+      echo "Unsupported mode: $mode (valid: native, tpr, cutoff)" >&2
       exit 2 ;;
   esac
 done
+if [[ "$run_cutoff" == 1 && "${TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE:-0}" != "1" ]]; then
+  echo "cutoff oracle requires TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE=1" >&2
+  exit 2
+fi
 
 for mode in "${modes[@]}"; do
   logfile="$log_dir/${mode}.log"
@@ -100,8 +108,19 @@ for mode in "${modes[@]}"; do
   fi
 done
 
+if [[ "$run_cutoff" == 1 ]]; then
+  if [[ -f "$log_dir/native_ppo_tokens.pt" && -f "$log_dir/tpr_ppo_tokens.pt" ]]; then
+    python tests/models/mcore/tpr/correctness/_qwen17_weak_e2e_token_capture.py \
+      "$log_dir/native_ppo_tokens.pt" "$log_dir/tpr_ppo_tokens.pt" \
+      --cutoff "$log_dir/cutoff_ppo_tokens.pt" \
+      --owners "$log_dir/cutoff_segment_owners.pt"
+  else
+    echo "P0 WEAK_TQ CUTOFF saved, but Native+TPR token traces not in $log_dir"
+    echo "Run full Native/TPR with TOKEN_CAPTURE=1 in the same log directory to compare."
+  fi
+fi
 if [[ "$run_native" != 1 || "$run_tpr" != 1 ]]; then
-  echo "P0 WEAK_TQ single-mode result: ${modes[*]}; skipping cross-run comparison"
+  echo "P0 WEAK_TQ selected modes: ${modes[*]}; skipping full Native-vs-TPR optimizer comparison"
   exit 0
 fi
 
