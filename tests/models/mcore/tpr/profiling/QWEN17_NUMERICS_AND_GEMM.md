@@ -397,3 +397,86 @@ Possible statuses: `SUPPORTED_AUTOGRAD`, `NO_AUTOGRAD`, `UNSUPPORTED`.
 If torch_npu's direct grouped operation lacks autograd, prefer searching
 the matching *installed* MindSpeed GMM training wrapper/backward kernel
 before considering new custom operations.
+
+## G. P0: native MindSpeed shared-weight GMM autograd and FP32 main_grad
+
+**Code inspection (Ascend/MindSpeed master, 2026-10-09):**
+- `mindspeed/ops/grouped_matmul.py` implements a native
+  `torch.autograd.Function` which calls `torch_npu.npu_grouped_matmul`
+  in forward, and GMM group_type=0 for dX / group_type=2 for dW.
+  Its weight shape is **[num_groups,K,N]**; it is designed for
+  per-group/MoE weights. The probe tests whether
+  `W.T.unsqueeze(0).expand(G,-1,-1)` can share one actual [N,K]
+  parameter, with PyTorch summing expanded gradients.
+- `mindspeed/ops/gmm.py` provides separate `npu_gmm`,
+  `GMMFunction.backward`, optional `gemm_fusion=True`,
+  `original_weight.main_grad`, and calls
+  `npu_groupmatmul_add_fp32`. This ALSO expects grouped 3D weights.
+  In the current `mindspeed/ops/npu_groupmatmul_add.py` path, the
+  A5 branch explicitly views `main_grad` as
+  `[num_groups,K,N]`; for 910B2C/A2 the extension receives the same
+  grouped inputs. A regular shared dense Linear has
+  `main_grad` shape **[N,K]**, so the grouped fusion should NOT be
+  assumed to accumulate directly into this single 2D buffer.
+- `mindspeed/ops/npu_matmul_add.py` ALREADY offers
+  `npu_matmul_add_fp32(total_input, grad_output, main_grad)`.
+  It accumulates regular dense dW to the SAME 2D FP32 main_grad,
+  segment by segment. This is the appropriate existing primitive to
+  probe before designing any new shared-weight grouped backward.
+- Multiplying all weights by G via `.contiguous()` could make the
+  runtime group layout valid but may negate TPR memory/performance wins.
+  A zero-stride `.expand()` view only avoids the forward weight copies
+  if the installed GMM accepts that layout; even then grouped 3D dW
+  can still consume G times weight-size temporary memory.
+
+**P0.1 — shared-weight MindSpeed GMM autograd:** separate processes
+per mode, because a device-kernel error can poison an NPU context.
+
+```bash
+export TPR_RUN_QWEN17_MINDSPEED_GMM=1
+export TPR_QWEN17_P0_TILE=128
+export TPR_QWEN17_P0_GROUPS=2
+export TPR_QWEN17_P0_K=256
+export TPR_QWEN17_P0_N=384
+
+for MODE in grouped_view grouped_contiguous gmm_view gmm_contiguous gmm_fp32_fusion; do
+  export TPR_QWEN17_P0_MODE="$MODE"
+  python -m pytest -s -q --tb=short \
+    tests/models/mcore/tpr/profiling/test_qwen17_mindspeed_shared_gmm_npu.py \
+    > "/tmp/tpr_p0_gmm_${MODE}.log" 2>&1
+  echo "===== $MODE ====="
+  grep -E 'P0 SHARED_GMM|FAILED|ERROR' "/tmp/tpr_p0_gmm_${MODE}.log" | tail -30
+done
+```
+
+A `SUPPORTED_SHARED_AUTOGRAD` outcome requires BOTH dX and
+shared 2D dW non-None. Forward error and gradient error are printed
+separately. The `gmm_fp32_fusion` route measures a GROUPED 3D FP32
+buffer with a **separate FP32 sum back to shared W**; it is NOT the
+production 2D `main_grad` interface. Statuses are capability reports,
+not unconditional correctness PASS.
+
+**P0.2 — the existing dense FP32 main_grad primitive:**
+
+```bash
+export TPR_RUN_QWEN17_FP32_MAIN_GRAD=1
+python -m pytest -s -q --tb=short \
+  tests/models/mcore/tpr/profiling/test_qwen17_fp32_main_grad_npu.py \
+  > /tmp/tpr_p0_main_grad.log 2>&1
+
+grep -E 'P0 MAIN_GRAD|FAILED|ERROR' /tmp/tpr_p0_main_grad.log
+```
+
+This compares 128 once, 64 twice and 32 four times on EXACTLY the
+same BF16 X/dY and writes to a shared 2D FP32 main_grad using the
+MindSpeed native `npu_matmul_add_fp32`. It also reports reverse
+order, a deliberately naive BF16 accumulation, and a FP32 GEMM
+reference. It **does not yet replace** Megatron's production Linear
+backward or integrate with Megatron's DDP main-grad allocation.
+
+**Performance/memory warning:** 8 groups with K=2048, N=4096 would
+require ~268 MiB of FP32 [8,K,N] temporary group weight gradients
+per QKV layer if fully materialized. This is an illustrative
+minimum-sized group-gradient tensor, NOT a measured runtime peak.
+Converting per-group gradients back to the single original dW in
+FP32 remains necessary.
