@@ -120,11 +120,8 @@ def test_real_qwen_shared_dense_fp32_backward_only():
     with torch.no_grad():
         fp32_dx=dy.float() @ w.float()
         fp32_dw=dy.float().T @ x.float()
-        ref_dx=torch.cat(
-            [part @ w for part in dy.split(tile)],dim=0
-        )
-        # Expected BF16 dW from one F.linear shared-weight autograd
-        # reference, not an FP32 accuracy target.
+        # Compare with the actual native tiled BF16 autograd reference,
+        # and a separate high-precision reference using identical X/dY.
     xref=x.detach().clone().requires_grad_(True)
     wref=w.detach().clone().requires_grad_(True)
     yref=torch.cat([
@@ -136,7 +133,9 @@ def test_real_qwen_shared_dense_fp32_backward_only():
     )
     _stats("REFERENCE_BF16_DX_AUTOGRAD_VS_FP32",ref_dx_auto,fp32_dx)
     _stats("REFERENCE_BF16_DW_AUTOGRAD_VS_FP32",ref_dw_auto,fp32_dw)
-    del xref,wref,yref,ref_dw_auto
+    ref_dx_cpu=ref_dx_auto.detach().cpu().clone()
+    ref_dw_cpu=ref_dw_auto.detach().cpu().clone()
+    del xref,wref,yref,ref_dx_auto,ref_dw_auto
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.synchronize()
@@ -166,7 +165,11 @@ def test_real_qwen_shared_dense_fp32_backward_only():
             outs=GMMFunction.builder.load().npu_gmm_backward_fusion(
                 [dy.contiguous()],[packed],boundaries,0,
             )
-            if not isinstance(outs,(list,tuple)) or not outs[0]:
+            if (
+                not isinstance(outs,(list,tuple))
+                or not isinstance(outs[0],(list,tuple))
+                or len(outs[0])!=1
+            ):
                 raise AssertionError("unexpected native dx fusion outputs")
             dx=outs[0][0]
             print(
@@ -176,7 +179,7 @@ def test_real_qwen_shared_dense_fp32_backward_only():
             )
         torch.npu.synchronize()
         _stats(f"{mode}_dX_vs_FP32",dx,fp32_dx)
-        _stats(f"{mode}_dX_vs_native_tiled",dx,ref_dx_auto)
+        _stats(f"{mode}_dX_vs_native_tiled",dx,ref_dx_cpu)
     except (RuntimeError,TypeError,AttributeError,NotImplementedError) as exc:
         print(
             f"P1 DENSE_FP32 DX status=UNSUPPORTED mode={mode} "
@@ -196,13 +199,7 @@ def test_real_qwen_shared_dense_fp32_backward_only():
             )
     torch.npu.synchronize()
     _stats("shared_main_grad_vs_FP32",main_grad,fp32_dw)
-    _stats("shared_main_grad_vs_native_BF16_dW",main_grad,
-           torch.autograd.grad(
-               torch.cat([F.linear(xi.contiguous(),w.detach().clone().requires_grad_(True)) for xi in x.split(tile)],dim=0
-               ), [], allow_unused=True
-           )[0] if False else fp32_dw)
-    # Above comparison uses the FP32 reference (there is no need to
-    # retain the BF16 native weight grad after ref validation).
+    _stats("shared_main_grad_vs_native_BF16_dW",main_grad,ref_dw_cpu)
     print(
         "P1 DENSE_FP32 MEMORY "
         f"baseline_mib={initial/(1024**2):.3f} "
