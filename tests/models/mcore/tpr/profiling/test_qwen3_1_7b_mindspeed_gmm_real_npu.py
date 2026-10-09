@@ -34,8 +34,10 @@ def _metric(name, actual, reference):
         raise AssertionError(f"{name} missing gradient/output")
     if actual.shape != reference.shape:
         raise AssertionError(f"{name}: shape {actual.shape} != {reference.shape}")
-    aa = actual.detach().float()
-    bb = reference.detach().float()
+    # Use host tensors for diagnostics so reference GPU memory can be freed
+    # before measuring the independent GroupedMatmul peak.
+    aa = actual.detach().float().cpu()
+    bb = reference.detach().float().cpu()
     if not bool(torch.isfinite(aa).all()):
         raise AssertionError(f"{name}: nonfinite values")
     dd = aa - bb
@@ -52,14 +54,16 @@ def _metric(name, actual, reference):
     return rel
 
 
-def _print_memory(prefix):
+def _print_memory(prefix, *, baseline_bytes):
     try:
         current = torch.npu.memory_allocated()
         peak = torch.npu.max_memory_allocated()
         print(
             f"P1 REAL_SHARED_GMM MEMORY {prefix} "
+            f"baseline_mib={baseline_bytes / (1024**2):.3f} "
             f"current_mib={current / (1024**2):.3f} "
-            f"peak_mib={peak / (1024**2):.3f}",
+            f"peak_mib={peak / (1024**2):.3f} "
+            f"incremental_peak_mib={(peak-baseline_bytes)/(1024**2):.3f}",
             flush=True,
         )
     except (AttributeError, RuntimeError) as exc:
@@ -156,28 +160,43 @@ def test_real_qwen17_shared_gmm_autograd_8_or_9_groups():
     torch.manual_seed(3407)
     dy = torch.randn((m,n), device=device, dtype=torch.bfloat16)
 
-    # Same original weight and activation bytes for both paths.
-    xref = x0.clone().detach().requires_grad_(True)
-    wref = w0.clone().detach().requires_grad_(True)
+    # Run the reference alone. Keep only CPU copies of its outputs before
+    # GroupedMatmul, so GMM peak is not inflated by live reference gradients.
+    del megatron_tile
+    gc.collect()
+    torch.npu.synchronize()
+    ref_baseline = torch.npu.memory_allocated()
     try:
         torch.npu.reset_peak_memory_stats()
     except (RuntimeError, AttributeError):
         pass
+    xref = x0.clone().detach().requires_grad_(True)
+    wref = w0.clone().detach().requires_grad_(True)
     ref = torch.cat(
         [
             F.linear(chunk.contiguous(), wref)
             for chunk in xref.split(tile, dim=0)
         ], dim=0
     )
-    _metric("F_linear_vs_Megatron_tile",ref,megatron_tile)
     dxref, dwref = torch.autograd.grad(
         ref, (xref,wref), grad_outputs=dy,
     )
-    del megatron_tile
     torch.npu.synchronize()
-    _print_memory("native_tile_reference")
-    del xref, wref
+    _print_memory("native_tile_reference", baseline_bytes=ref_baseline)
+    ref_cpu = ref.detach().cpu().clone()
+    dxref_cpu = dxref.detach().cpu().clone()
+    dwref_cpu = dwref.detach().cpu().clone()
+    del xref, wref, ref, dxref, dwref
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.synchronize()
 
+    # Independent peak measurement, with no live GPU reference outputs.
+    gmm_baseline = torch.npu.memory_allocated()
+    try:
+        torch.npu.reset_peak_memory_stats()
+    except (RuntimeError, AttributeError):
+        pass
     x = x0.clone().detach().requires_grad_(True)
     w = w0.clone().detach().requires_grad_(True)
     grouped_weight = w.t().unsqueeze(0).expand(groups, -1, -1)
@@ -189,26 +208,39 @@ def test_real_qwen17_shared_gmm_autograd_8_or_9_groups():
         f"logical_mib={grouped_weight.numel()*grouped_weight.element_size()/(1024**2):.3f}",
         flush=True,
     )
-    try:
-        torch.npu.reset_peak_memory_stats()
-    except (RuntimeError, AttributeError):
-        pass
     y = npu_gmm(
-        x,grouped_weight,group_list=group_boundaries,
-        group_type=0,gemm_fusion=False,
+        x, grouped_weight, group_list=group_boundaries,
+        group_type=0, gemm_fusion=False,
     )
-    _metric("forward_gmm_vs_tile", y, ref)
+    _metric("forward_gmm_vs_tile", y, ref_cpu)
     dx, dw = torch.autograd.grad(
         y, (x,w), grad_outputs=dy, allow_unused=True,
     )
     torch.npu.synchronize()
-    _print_memory("mindspeed_gmm_autograd")
-    r_dx = _metric("dX_gmm_vs_tile", dx, dxref)
-    r_dw = _metric("shared_dW_gmm_vs_tile", dw, dwref)
+    _print_memory("mindspeed_gmm_autograd", baseline_bytes=gmm_baseline)
+    r_dx = _metric("dX_gmm_vs_tile", dx, dxref_cpu)
+    r_dw = _metric("shared_dW_gmm_vs_tile", dw, dwref_cpu)
+
+    # FP32 wgrad oracle from EXACT same X/dY values. The full-M FP32
+    # matmul, MindSpeed fused dense main_grad, and BF16 backward paths
+    # are numerically distinct. Compare all of them before attributing
+    # BF16 dW error to GroupedMatmul specifically.
+    from mindspeed.ops.npu_matmul_add import npu_matmul_add_fp32
+    with torch.no_grad():
+        fp32_reference = dy.float().t() @ x0.float()
+        main_grad = torch.zeros((n,k), dtype=torch.float32, device=device)
+        for sx, sdy in zip(x0.split(tile), dy.split(tile), strict=True):
+            npu_matmul_add_fp32(sx.contiguous(), sdy.contiguous(), main_grad)
+        torch.npu.synchronize()
+        _metric("FP32_main_grad_vs_FP32_full", main_grad, fp32_reference)
+        _metric("BF16_tile_dW_vs_FP32_full", dwref_cpu, fp32_reference)
+        _metric("BF16_grouped_dW_vs_FP32_full", dw, fp32_reference)
+        _metric("BF16_grouped_dW_vs_FP32_main_grad", dw, main_grad)
     print(
         "P1 REAL_SHARED_GMM RESULT "
         f"status={'SUPPORTED_SHARED_AUTOGRAD' if r_dx is not None and r_dw is not None else 'MISSING_GRAD'} "
         "shared_weight_forward_view=True "
+        "main_grad_integration=UNVERIFIED "
         "full_model_training=UNVERIFIED",
         flush=True,
     )
