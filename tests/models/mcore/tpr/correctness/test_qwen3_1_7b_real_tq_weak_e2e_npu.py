@@ -546,8 +546,10 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
 
         from ._qwen17_weak_e2e_trace import (
             capture_query_stages, describe_trace, describe_kv_trace,
+            compare_first_attention_replay,
         )
         from verl.models.mcore.tpr.attention import TPRSelfAttention
+        from verl.models.mcore.tpr import attention as tpr_attention_module
         from verl.models.mcore.tpr.megatron_adapter import (
             _trajectory_keys_from_minibatch,
         )
@@ -596,6 +598,7 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         # physical segment of the exact row-5 ancestor path.
         kv_layers = (1, 2, 3, 4, 14, 28)
         native_kv = {}
+        native_first_qkv = {}
         kv_handles = []
 
         def capture_native_kv(_module, args, _result, *, number):
@@ -611,6 +614,13 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
                 args[1].detach().cpu().clone(),
                 args[2].detach().cpu().clone(),
             )
+            if number == 1:
+                native_first_qkv["inputs"] = (
+                    args[0].detach().cpu().clone(),
+                    args[1].detach().cpu().clone(),
+                    args[2].detach().cpu().clone(),
+                    getattr(_module, "softmax_scale", None),
+                )
 
         for layer in reference.decoder.layers:
             number = layer.self_attention.layer_number
@@ -654,10 +664,35 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         previous_forward = SegmentExecutor._forward
         previous_tree_forward = TPRSelfAttention._tree_forward
         tpr_kv = {}
-        current = {"span": None, "captures": 0}
+        tpr_first_qkv = {}
+        current = {"span": None, "captures": 0, "layer": None}
+
+        # This wrapper observes the exact Q and assembled K/V passed to the
+        # production CANN rectangular adapter for the target leaf. It
+        # returns the original output without changing any forward math.
+        original_rectangular = tpr_attention_module.rectangular_causal_attention
+
+        def trace_rectangular(q, k, v, **kwargs):
+            out = original_rectangular(q, k, v, **kwargs)
+            if current["span"] is not None and current["layer"] == 1:
+                if tpr_first_qkv:
+                    raise AssertionError("Duplicate first-layer leaf CANN replay input")
+                tpr_first_qkv["inputs"] = (
+                    q.detach().cpu().clone(),
+                    k.detach().cpu().clone(),
+                    v.detach().cpu().clone(),
+                    kwargs.get("softmax_scale"),
+                    out.detach().cpu().clone(),
+                )
+            return out
 
         def trace_actual_tree_kv(attention, hidden_states, context):
-            result = previous_tree_forward(attention, hidden_states, context)
+            previous_layer = current["layer"]
+            current["layer"] = attention.layer_number
+            try:
+                result = previous_tree_forward(attention, hidden_states, context)
+            finally:
+                current["layer"] = previous_layer
             layer_number = attention.layer_number
             if current["span"] is not None and layer_number in kv_layers:
                 if layer_number in tpr_kv:
@@ -715,6 +750,10 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
                 patch.object(
                     TPRSelfAttention, "_tree_forward", trace_actual_tree_kv
                 ),
+                patch.object(
+                    tpr_attention_module, "rectangular_causal_attention",
+                    trace_rectangular,
+                ),
             ):
                 trace_out = trace_engine.forward_backward_batch(
                     batch,
@@ -745,6 +784,21 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
             native_kv, tpr_kv, path, layers=kv_layers
         )
         for report in kv_reports:
+            print(report, flush=True)
+        if set(native_first_qkv) != {"inputs"} or set(tpr_first_qkv) != {"inputs"}:
+            raise AssertionError(
+                f"first-layer replay inputs not captured: "
+                f"native={tuple(native_first_qkv)} tpr={tuple(tpr_first_qkv)}"
+            )
+        replay_reports = compare_first_attention_replay(
+            native_first_qkv["inputs"], tpr_first_qkv["inputs"],
+            position_start=segment.position_start,
+            query_abs=query_position,
+            native_proj_input=native_trace[(0, "attn_proj")][0],
+            tpr_proj_input=tpr_trace[(0, "attn_proj")][0],
+            device=device,
+        )
+        for report in replay_reports:
             print(report, flush=True)
         print(
             "P0 WEAK_TQ RESULT status=PASS execution=TRACE "
