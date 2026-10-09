@@ -37,7 +37,14 @@ done
 
 log_dir="${TPR_QWEN17_WEAK_E2E_LOG_DIR:-$(mktemp -d /tmp/tpr_qwen17_weak_e2e.XXXXXX)}"
 mkdir -p "$log_dir"
-export TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR="$log_dir"
+# Sampling is only a diagnostic, NEVER a prerequisite for the real
+# optimizer-step correctness gate. Set SAMPLE=0 to isolate a sampling
+# kernel error while retaining Native and TPR AdamW step validation.
+if [[ "${TPR_QWEN17_WEAK_E2E_SAMPLE:-1}" == "1" ]]; then
+  export TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR="$log_dir"
+else
+  unset TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR
+fi
 test_path="tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_weak_e2e_npu.py"
 if [[ ! -f "$test_path" ]]; then
   echo "Run from the bridge/VERL root where $test_path exists" >&2
@@ -92,6 +99,10 @@ print(f"  loss_native={native['loss']:.9g}, loss_tpr={tpr['loss']:.9g}, abs_delt
 print(f"  fwd_bwd_native={native['fb']:.5f}s, tpr={tpr['fb']:.5f}s, speedup={native['fb']/max(tpr['fb'],1e-12):.4f}x")
 print(f"  optimizer_total_native={native['opt']:.5f}s, tpr={tpr['opt']:.5f}s")
 print(f"  peak_alloc_native={native['peak']:.3f}MiB, tpr={tpr['peak']:.3f}MiB")
+import os
+if os.environ.get("TPR_QWEN17_WEAK_E2E_SAMPLE", "1") != "1":
+    print("  sampled_grad_update=SKIPPED (optimizer step still executed)")
+    sys.exit(0)
 import torch
 native_sample = torch.load(
     sys.argv[1].replace("native.log", "native_optimizer_sample.pt"),
