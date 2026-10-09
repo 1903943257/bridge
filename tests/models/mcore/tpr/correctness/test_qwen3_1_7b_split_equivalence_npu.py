@@ -805,6 +805,7 @@ def test_real_qwen_full_gpt_vs_single_split():
     print(f"QWEN SPLIT FULL-GPT P={p} S={s} n_layers={len(layers)}", flush=True)
 
     captured = {}
+    fp32_prec_cast = {}
     handles = []
     restored_qkv_forwards = []
     restored_fp32_forwards = []
@@ -849,9 +850,15 @@ def test_real_qwen_full_gpt_vs_single_split():
                 raise AssertionError(
                     f"{label}: test-only FP32 Linear requires bias-free Qwen3"
                 )
-            if module.weight.dtype != torch.bfloat16:
+            allocated_weight = getattr(module, "weight", None)
+            # Qwen3-1.7B ties the LM head to token embeddings; Megatron
+            # can set output_layer.weight=None and pass the shared weight
+            # explicitly to forward(weight=output_weight).
+            if allocated_weight is None and label != "lm_head":
+                raise AssertionError(f"{label}: Linear has no allocated weight")
+            if allocated_weight is not None and allocated_weight.dtype != torch.bfloat16:
                 raise AssertionError(
-                    f"{label}: expected BF16 weights, got {module.weight.dtype}"
+                    f"{label}: expected BF16 weights, got {allocated_weight.dtype}"
                 )
             original_forward = module.forward
 
@@ -883,6 +890,19 @@ def test_real_qwen_full_gpt_vs_single_split():
                     out_fp32 = torch.nn.functional.linear(
                         hidden_states.float(), active_weight.float()
                     )
+                if _label == "L01_qkv":
+                    ctx = get_tpr_attention_context()
+                    if ctx is None:
+                        mode = "full"
+                    elif ctx.prefix_length == 0 and ctx.suffix_length == p:
+                        mode = "prefix"
+                    else:
+                        mode = None
+                    if mode is not None:
+                        first_p = out_fp32[:p] if mode == "full" else out_fp32
+                        fp32_prec_cast[mode] = (
+                            first_p.detach().float().cpu().contiguous()
+                        )
                 return out_fp32.to(hidden_states.dtype), None
 
             module.forward = fp32_linear_forward
@@ -1058,6 +1078,25 @@ def test_real_qwen_full_gpt_vs_single_split():
             del split_logits
 
         first = None
+        if "qkv" in fp32_groups:
+            assert set(fp32_prec_cast) == {"full", "prefix"}, (
+                f"missing QKV FP32 pre-cast captures: {set(fp32_prec_cast)}"
+            )
+            _stats(
+                "GPT_LAYER01_PREFIX_QKV_PRECAST_FP32",
+                fp32_prec_cast["prefix"], fp32_prec_cast["full"],
+            )
+            # A tiny real FP32 difference can cross a BF16 rounding boundary.
+            fp32_round_disagree = (
+                fp32_prec_cast["prefix"].to(torch.bfloat16)
+                != fp32_prec_cast["full"].to(torch.bfloat16)
+            )
+            print(
+                "QWEN SPLIT GPT_LAYER01_PREFIX_QKV_FP32_ROUND_DISAGREEMENTS "
+                f"count={int(fp32_round_disagree.sum())}/"
+                f"{fp32_round_disagree.numel()}",
+                flush=True,
+            )
         for layer in layers[:2]:
             # Prefix output is a different logical range from Suffix output.
             # Compare Full[:P] with Prefix[:P] separately and explicitly.
