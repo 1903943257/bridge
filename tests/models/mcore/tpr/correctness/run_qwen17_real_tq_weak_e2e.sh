@@ -45,6 +45,12 @@ if [[ "${TPR_QWEN17_WEAK_E2E_SAMPLE:-1}" == "1" ]]; then
 else
   unset TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR
 fi
+if [[ "${TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE:-0}" == "1" ]]; then
+  export TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE_DIR="$log_dir"
+  echo "P0 WEAK_TQ WARNING: token capture synchronizes Segment logprobs; timing is NOT a benchmark"
+else
+  unset TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE_DIR
+fi
 test_path="tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_weak_e2e_npu.py"
 if [[ ! -f "$test_path" ]]; then
   echo "Run from the bridge/VERL root where $test_path exists" >&2
@@ -170,3 +176,8 @@ for metric_name in ("grad", "update"):
     )
 print("  all_parameter_update_parity=UNVERIFIED true_rollout_old_logprobs=UNVERIFIED")
 PY
+
+if [[ "${TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE:-0}" == "1" ]]; then
+  python tests/models/mcore/tpr/correctness/_qwen17_weak_e2e_token_capture.py \\
+    "$log_dir/native_ppo_tokens.pt" "$log_dir/tpr_ppo_tokens.pt"
+fi
