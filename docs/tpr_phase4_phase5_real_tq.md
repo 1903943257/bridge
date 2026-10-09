@@ -55,6 +55,42 @@ token count, and actual end-to-end runtime. Grouped GEMM performance,
 alternative CP/TP/DP setups and full-length stress sweeps can be
 optimized independently after an initially correct E2E.
 
+### First P0 gate: capture the actual actor-update mini-batch
+
+A strict, opt-in CPU test has been added at
+`tests/models/mcore/tpr/integration/test_real_actor_update_minibatch_contract.py`.
+It requires the **post-PPO-preprocessing** `mini_batch_td`, not the
+original rollout-only `tq_batch.pt`. At the real VERL actor update
+boundary, preserve the exact mini-batch plus its original trajectory
+keys in this snapshot format:
+
+```python
+torch.save({
+    "capture_stage": "actor_update_mini_batch",
+    "tensordict": mini_batch_td.cpu(),
+    "keys": tuple(exact_trajectory_keys),
+}, "/tmp/tpr_real_actor_update.pt")
+```
+
+The exact keys must correspond to the same mini-batch rows (and must be
+derived from actual rollout identity; do not fabricate them).
+Do not store credentials or sensitive trajectory contents in a public
+repo; keep this snapshot on the private NPU server.
+
+```bash
+export TPR_RUN_REAL_ACTOR_MINIBATCH_CONTRACT=1
+export TPR_REAL_ACTOR_MINIBATCH=/tmp/tpr_real_actor_update.pt
+python -m pytest -s -q --tb=short \\
+  tests/models/mcore/tpr/integration/test_real_actor_update_minibatch_contract.py
+```
+
+This fails if the capture lacks any original
+`old_log_probs`, `advantages`, `temperature`, masks or trajectory IDs,
+or if token alignment/Forest PPO denominator disagrees. **It does not
+run PPO backward or optimizer step.** Next execute the captured real
+mini-batch through actual Native and TPR `train_batch` with a matched
+optimizer; this remains the acceptance-critical part of P0.
+
 **Observed current status (not yet E2E PASS):** real checkpoint,
 recorded TQ, compressed forest, native VERL PPO loss and TPR backward
 already run in the Phase-5 fixture; a cropped symmetric BF16
