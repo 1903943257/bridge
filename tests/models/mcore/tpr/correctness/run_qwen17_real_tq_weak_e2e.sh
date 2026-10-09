@@ -178,6 +178,6 @@ print("  all_parameter_update_parity=UNVERIFIED true_rollout_old_logprobs=UNVERI
 PY
 
 if [[ "${TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE:-0}" == "1" ]]; then
-  python tests/models/mcore/tpr/correctness/_qwen17_weak_e2e_token_capture.py \\
+  python tests/models/mcore/tpr/correctness/_qwen17_weak_e2e_token_capture.py \
     "$log_dir/native_ppo_tokens.pt" "$log_dir/tpr_ppo_tokens.pt"
 fi
