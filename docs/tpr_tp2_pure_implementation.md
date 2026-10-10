@@ -57,7 +57,7 @@ has yet been reported.** This is not an E2E PPO or multi-dimensional result.
       row-parallel O/MLP down projections and vocabulary-sharded tied
       embeddings; checks all parameter coverage. This is necessary
       because the existing real-Qwen CP weight loader assumes TP=1.
-    - Native TP2 independent complete trajectories vs TPR TP2 Tree
+    - Megatron TP2 independent complete trajectories vs TPR TP2 Tree
       `MegatronEngine.forward_backward_batch`: BF16 scalar CE,
       rank-local parameter gradients, and an SGD update. Vocab labels
       target **the second TP vocab shard** (global IDs above 75968).
@@ -86,3 +86,32 @@ The two-rank NPU tests are the acceptance gate; **do not claim TP2
 correctness, throughput or numerical parity before they pass**.
 Do not enable TP+SP or TP+CP implicitly. Preserve ongoing BF16 GEMM
 precision debugging by avoiding modifications to native kernels.
+
+## 2026-10-10 — two independent test failures after switching to real Qwen3-1.7B
+
+1. **Device kernel failure during the first full-trajectory reference**:
+   `ScaledMaskedSoftmax` expected a 4D mask but received a 2D mask.
+   Merely setting `config.use_flash_attn=True` selected MindSpeed's
+   two-dimensional flash causal mask but did **not** switch the Megatron
+   `DotProductAttention` module to a flash kernel. The genuine checkpoint
+   and TP2 weight placement were loaded; failure preceded the TPR path.
+   Fix: install the **existing real-Qwen controlled CANN square-causal
+   reference** (`_ProfileFusedCausalAttention`) into the model spec's
+   `core_attention` on both reference and TPR models; assert correct
+   class after construction. This is **not** a validated unmodified
+   MindSpeed native-FlashAttention comparison. It avoids changing TPR
+   runtime or upstream MindSpeed operators.
+2. **Forest raised 'response is not an input_ids suffix'** in a following
+   test. The test builds both tensors via the *same suffix* in
+   `torch.cat(prefix, suffix)` and `torch.stack(suffixes)`; no code
+   evidence so far supports a real Radix/Forest mapping failure.
+   Given the preceding unrecoverable asynchronous NPU operator error,
+   a poisoned device context is possible. Added explicit, CPU-side
+   preflight of both input/response rows to distinguish malformed test
+   data from a stale NPU runtime. If this still reproduces in a **fresh
+   separate process**, inspect the preflight and report the first
+   mismatching row; do not weaken the production Forest invariants.
+3. Run in a fresh torchrun process; do not treat results from a worker
+   that previously hit E89999 as an independent clean GPU/NPU validation.
+
+TP2 accuracy remains UNVERIFIED until real two-rank Qwen3-1.7B tests pass.
