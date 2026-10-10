@@ -525,7 +525,7 @@ def test_tp2_real_qwen_engine_phase4_route_two_updates(tp2_runtime):
     prefix = torch.arange(21, 85, dtype=torch.long)
     first = torch.arange(80101, 80133, dtype=torch.long)
     second = torch.arange(100201, 100233, dtype=torch.long)
-    optim = torch.optim.SGD(model.parameters(), lr=0.25)
+    optim = torch.optim.SGD(model.parameters(), lr=0.05)
     metrics = []
     observed_update = False
     for step in range(2):
