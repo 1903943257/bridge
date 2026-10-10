@@ -17,10 +17,11 @@ log_dir="${TPR_QWEN17_DTA_LOG_DIR:-$(mktemp -d /tmp/tpr_qwen17_hf_dta.XXXXXX)}"
 mkdir -p "$log_dir"
 test_file="tests/models/mcore/tpr/correctness/test_qwen3_1_7b_hf_dta_reference_npu.py"
 unit_file="tests/models/mcore/tpr/unit/test_qwen17_dta_style_reference.py"
+areal_unit_file="tests/models/mcore/tpr/unit/test_qwen17_areal_exact_reference.py"
 
 echo "P0 DTA_HF START log_dir=$log_dir checkpoint=$TPR_QWEN_1_7B_PATH"
 echo "P0 DTA_HF START tq=$TPR_REAL_TQ_BATCH attn=$TPR_QWEN17_DTA_HF_ATTN"
-python -m pytest -x -q --tb=short "$unit_file" > "$log_dir/unit.log" 2>&1 || {
+python -m pytest -x -q --tb=short "$unit_file" "$areal_unit_file" > "$log_dir/unit.log" 2>&1 || {
   echo "DTA HF CPU unit tests failed: $log_dir/unit.log" >&2
   tail -100 "$log_dir/unit.log" >&2
   exit 1
@@ -31,7 +32,7 @@ python -m pytest -x -q -s --tb=short "$test_file" > "$log_dir/hf_dta.log" 2>&1 |
   tail -100 "$log_dir/hf_dta.log" >&2
   exit 1
 }
-grep -E '^P0 DTA_HF (CONFIG|DFS_ROW|DFS_SUMMARY|RESPONSE_SUMMARY|FIXED_PATH|ROOT_V_SHAPE|ROOT_CUTOFF_TO_DTA|RESULT)' "$log_dir/hf_dta.log"
+grep -E '^P0 DTA_HF (CONFIG|DFS_ROW|DFS_SUMMARY|RESPONSE_SUMMARY|AREAL_ROW|AREAL_SUMMARY|AREAL_RESPONSE_SUMMARY|AREAL_VS_LEXICAL|AREAL_OUTLIER|AREAL_TARGET|FIXED_PATH|ROOT_V_SHAPE|ROOT_CUTOFF_TO_DTA|RESULT)' "$log_dir/hf_dta.log"
 if ! grep -q '^P0 DTA_HF RESULT status=PASS execution=FORWARD_CONTROL' "$log_dir/hf_dta.log"; then
   echo "DTA HF reference did not complete: $log_dir/hf_dta.log" >&2
   exit 1
