@@ -123,3 +123,32 @@ See `tests/models/mcore/tpr/correctness/_qwen17_weak_e2e_trace.py`, `test_qwen3_
 - BF16 GEMM M-dependence is established for Root `linear_qkv` at M134 vs M192; the **0.749 Forest vs Full difference remains unresolved**.
 - DTA stable reward curves / non-strict numerical unit tests do not settle the strict logprob question. Compare under **same model/hardware/inputs** and include per-token errors, not only mean reward/loss.
 - When this document is extended with results, record exact commits, NPU/CANN/torch/transformers versions, shapes, test gates and failures.
+
+
+## 5. Implemented follow-up: HF DTA-style forward oracle (committed, **NPU pending**)
+
+Added in `tests/models/mcore/tpr/correctness/`:
+- `_qwen17_dta_style_reference.py`: stand-alone `DynamicCache` adapter, lexicographic LCP/DFS prefix persistence, shifted fork-token logprobs, full-HF and fixed-chunk baselines; **no dependency on the TPR executor**.
+- `test_qwen3_1_7b_hf_dta_reference_npu.py`: real Qwen3-1.7B HF BF16 checkpoint, eight cropped real TQ trajectories on Ascend, `HF_FULL` vs `HF_LCP_DFS` vs `HF_FIXED_PATH`. Records all-token `DFS_SUMMARY`, separately **512 response logprobs** in `RESPONSE_SUMMARY`, `FIXED_PATH` for row5 query189, and first-layer HF `ROOT_V_SHAPE` / `ROOT_CUTOFF_TO_DTA` triple.
+- `../unit/test_qwen17_dta_style_reference.py`: CPU-only fake HF `DynamicCache` oracle for shifted fork logits, nested prefixes, duplicates, no sharing, and fixed chunks.
+- `run_qwen17_hf_dta_reference.sh`: one entrypoint to CPU tests and opt-in NPU.
+
+**Run from the bridge-backed VERL repository root (not a stale vendored checkout):**
+
+```bash
+export TPR_REAL_TQ_BATCH="${TPR_REAL_TQ_BATCH:-/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt}"
+export TPR_QWEN_1_7B_PATH="${TPR_QWEN_1_7B_PATH:-/workspace/hf_models/Qwen3-1.7B}"
+TPR_QWEN17_DTA_HF_ATTN=sdpa \
+  bash tests/models/mcore/tpr/correctness/run_qwen17_hf_dta_reference.sh
+```
+
+Optional `TPR_QWEN17_DTA_HF_ATTN=eager` rerun if the specific transformers/torch_npu version does not support cached `sdpa`; **record this as an attention-backend change**, not the same kernel.
+
+**Interpretation after a real run:**
+- `RESPONSE_SUMMARY` (HF Full vs HF LCP/DFS) gives DTA-style same-framework actor-token drift. Comparing only aggregate prompt+response mean would mask PPO-sensitive tails.
+- `FIXED_PATH` compares HF Full to the **same five segment lengths** as TPR target row5. If `FIXED_PATH` is much worse than `DFS`, scheduling/physical M distribution is important even within the same HF backend.
+- `ROOT_V_SHAPE` compares HF Full `M=192` against HF cutoff `M=134`; `ROOT_CUTOFF_TO_DTA` compares cutoff against the **actual fixed-path HF DTA root** `M=134`. This mirrors the Megatron triple-control.
+- **Do not directly subtract** HF DTA logprob from Megatron TPR logprob to attribute algorithmic error; that mixes framework/weight mapping/attention implementation differences.
+- `status=PASS execution=FORWARD_CONTROL` means the probe completed, **not** a strong tolerance gate.
+
+**Not implemented:** AReaL's `backward_permute`, `pop_byblock`, suffix recompute, KV/logprob/fork-logit gradient relay, and full AdamW/ppo training. The current port is intentionally **Phase 1 (forward)**. A full DTA training comparison will need separate CPU unit gates and same-checkpoint NPU gradient tests. Current session cannot run the user's NPU or HF checkpoint, so no claim of observed HF DTA numerical results is made.
