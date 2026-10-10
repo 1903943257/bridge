@@ -492,6 +492,38 @@ def test_real_areal_dta_full_backward_ppo_gemm():
                 f"param_count={count}",
                 flush=True,
             )
+        # Optional cross-framework THREE-WAY comparison artifact.
+        # HF Full and HF DTA share exact weights. Megatron Native/TPR is a
+        # separate backend; compare the Full-to-Full numerical baseline
+        # before attributing any HF-to-TPR difference to prefix reuse.
+        triplet_dir=os.getenv("TPR_DTA_TRIPLET_DIR")
+        if triplet_dir and mode=="native":
+            target_dir=Path(triplet_dir)
+            target_dir.mkdir(parents=True,exist_ok=True)
+            artifact={
+                "backend":"HF_QWEN3_1_7B",
+                "objective":objective,
+                "n_rows":n_rows,
+                "prompt_length":p,
+                "response_length":s,
+                "checkpoint":str(checkpoint),
+                "full_response_logprobs":torch.stack(
+                    [x[p-1:p+s-1].detach().float().cpu()
+                     for x in reference["logprobs"]]),
+                "dta_response_logprobs":torch.stack(
+                    [x[p-1:p+s-1].detach().float().cpu()
+                     for x in current["logprobs"]]),
+                "dta_grad_rel_l2":grad_stats["relative_l2"],
+                "dta_grad_cosine":grad_stats["cosine"],
+                "dta_loss_delta":current["loss_value"]-reference["loss_value"],
+                "dta_step_sample_rel_l2":step_rel_l2,
+            }
+            target_path=target_dir/"hf_full_dta.pt"
+            torch.save(artifact,target_path)
+            print("P1 DTA_TRIPLET HF_ARTIFACT "
+                  f"path={target_path} backend=HF objective={objective} "
+                  "grad_metric=FULL_PARAMETERS",
+                  flush=True)
         for name, rel, norm, diff in grad_stats["worst"]:
             print(
                 "P1 DTA_BACKWARD WORST_GRAD "
