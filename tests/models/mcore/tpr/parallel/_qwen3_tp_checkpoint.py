@@ -23,6 +23,7 @@ from verl.models.mcore.config_converter import (
     hf_to_mcore_config_dense,
 )
 from verl.models.mcore.tpr import replace_self_attention_with_tpr
+from ..profiling.test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
 
 from ..correctness.test_tpr_qwen3_compatibility_npu import (
     _load_hf_state_dict,
@@ -185,12 +186,29 @@ def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool =
         bias_dropout_fusion=False,
         use_cpu_initialization=True,
     )
-    config.use_flash_attn = True  # MindSpeed's native reference causal mask.
+    # IMPORTANT: setting use_flash_attn=True on a TransformerConfig does
+    # not replace Megatron's DotProductAttention implementation. The latter
+    # still invokes MindSpeed's ScaledMaskedSoftmax and rejects the 2D mask
+    # generated for Flash Attention (requires an NPU-operator 4D mask).
+    # Use the established real-Qwen NPU reference adapter from the existing
+    # TPR Qwen compatibility tests. It executes a full square causal
+    # attention with the CANN rectangular kernel, independently of the TPR
+    # Prefix/Suffix cache path. This is a *controlled square-causal oracle*,
+    # not a claim of equality to MindSpeed's unmodified native FA kernel.
     spec = replace_self_attention_with_tpr(
         get_gpt_decoder_block_spec(
             config, use_transformer_engine=False, pp_rank=0
         )
     )
+    layer_specs = (
+        spec.submodules.layer_specs
+        if getattr(spec.submodules, "layer_specs", None) is not None
+        else [spec]
+    )
+    for layer_spec in layer_specs:
+        layer_spec.submodules.self_attention.submodules.core_attention = (
+            _ProfileFusedCausalAttention
+        )
     from types import SimpleNamespace
     pg = SimpleNamespace(
         tp=runtime.tp_group, cp=runtime.cp_group,
