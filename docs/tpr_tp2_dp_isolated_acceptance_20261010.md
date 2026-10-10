@@ -153,3 +153,30 @@ torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29534 \
   stabilize in the other development thread. Do not touch existing
   E2E scripts, old/new logprobs, advantages, PPO clip ratio, or GEMM
   precision treatments from this branch.
+
+## 2026-10-10 actual TP2 Engine smoke — token normalization root cause
+
+First real two-rank TP2 Engine-route execution reached VERL's native
+`batch_num_tokens` metadata and the TPR adapter. The test initially failed:
+
+```
+AssertionError: native Engine global token count mismatch: 128
+assert 128 == (2 * 32)
+```
+
+The harness had incorrectly bound
+`engine.get_data_parallel_group = lambda: None`.
+In `torch.distributed.all_reduce`, `group=None` means **the world
+group**, not a singleton/no-op: the TP2 peers both contribute the same
+logical 64 supervised response tokens, producing 128.
+`DP=1` must use its **real Megatron singleton DP group**. Corrected
+`test_tpr_tp2_npu.py::_tpr_ppo_nll_run` to call
+`parallel_state.get_data_parallel_group()` and to assert
+`dist.get_world_size(group=dp_group)==1` before passing that group
+through `engine.get_data_parallel_group`.
+The test still insists on `batch_num_tokens == 64`; it must **not**
+accept 128, because that would silently halve the NLL gradient scaling.
+
+This is solely a test-double Engine group-wiring error, not evidence
+that VERL's real MegatronEngine implements a world-group token reduction.
+The correction has been committed; **NPU rerun pending**.
