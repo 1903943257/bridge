@@ -99,8 +99,12 @@ def _linear_ablation(model, mode: str, tile_m: int):
             for name, layer in model.named_modules():
                 if not isinstance(layer, torch.nn.Linear):
                     continue
+                # named_modules() emits relative paths: unit-test modules
+                # may start with "self_attn.", while HF Qwen3 prefixes them
+                # with "model.layers.N.". Match component boundaries in both.
+                path = f".{name}."
                 if not (
-                    ".self_attn." in name or ".mlp." in name
+                    ".self_attn." in path or ".mlp." in path
                     or name == "lm_head"
                 ):
                     continue
