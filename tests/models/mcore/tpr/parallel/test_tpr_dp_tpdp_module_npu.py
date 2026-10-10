@@ -25,8 +25,10 @@ distributed optimizer/gradient finalization. Runtime DP training stays gated.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,7 +122,17 @@ def parallel_runtime():
 
 
 def _real_tq_two_trajectories(runtime):
-    # REAL TQ ONLY. No fabricated token sequences or tiny/random model.
+    """Select truly distinct real-token DP workloads at recorded branch points.
+
+    The first 160 tokens of different recorded TQ rows may be identical even
+    if their *logical row IDs* differ. Using those shared prompt tokens made
+    both DP ranks report identical CE/gradient values while never exercising
+    different physical forests. We now select actual sibling divergence
+    windows, using unchanged recorded token IDs and no random/synthetic data.
+
+    The 160-token window is an explicitly cropped, local-position test:
+    it does not model the original full long-context causal history.
+    """
     if not _REAL_TQ.is_file():
         pytest.skip(f"real UniAgent TQ dump is unavailable: {_REAL_TQ}")
     dump = torch.load(str(_REAL_TQ), weights_only=False, map_location="cpu")
@@ -130,23 +142,65 @@ def _real_tq_two_trajectories(runtime):
     assert len(seqs) >= 8 and len(keys) == len(seqs), (
         "real TQ gate requires the recorded >=8 distinct trajectory rows"
     )
-    selected = (0, 1) if runtime.dp_rank == 0 else (4, 5)
-    tokens = [seqs[index].detach().cpu().to(torch.long) for index in selected]
-    prefix_len = 128
-    suffix_len = 32
-    assert all(t.numel() >= prefix_len + suffix_len for t in tokens)
-    prefix = tokens[0][:prefix_len].contiguous()
-    assert torch.equal(prefix, tokens[1][:prefix_len]), (
-        "selected real TQ pair lacks the required exact 128-token LCP"
-    )
-    # Use recorded physical tokens, not synthetic input IDs.
-    first, second = (
-        tokens[0][prefix_len:prefix_len + suffix_len].contiguous(),
-        tokens[1][prefix_len:prefix_len + suffix_len].contiguous(),
-    )
-    assert max(int(torch.max(v).item()) for v in (prefix, first, second)) < 151936
-    return prefix, first, second, selected
+    prefix_len, suffix_len = 128, 32
+    tokens = [value.detach().cpu().to(torch.long) for value in seqs]
 
+    def candidate_windows(rows):
+        windows = []
+        for first_row, second_row in combinations(rows, 2):
+            left, right = tokens[first_row], tokens[second_row]
+            common_length = min(left.numel(), right.numel())
+            if common_length < prefix_len + suffix_len:
+                continue
+            mismatches = torch.nonzero(
+                left[:common_length] != right[:common_length],
+                as_tuple=False,
+            ).flatten()
+            if not mismatches.numel():
+                continue  # Identical token path or strict-prefix row.
+            fork = int(mismatches[0])
+            if fork < prefix_len or fork + suffix_len > common_length:
+                continue  # Cannot form the required true 128+32 fork window.
+            start = fork - prefix_len
+            prefix = left[start:fork].contiguous()
+            assert torch.equal(prefix, right[start:fork])
+            suffixes = (
+                left[fork:fork + suffix_len].contiguous(),
+                right[fork:fork + suffix_len].contiguous(),
+            )
+            assert not torch.equal(*suffixes), "fork suffixes must differ"
+            physical = torch.cat((prefix, *suffixes))
+            signature = hashlib.sha256(physical.numpy().tobytes()).hexdigest()
+            windows.append((
+                prefix, suffixes[0], suffixes[1],
+                (first_row, second_row), fork, start, signature,
+            ))
+        return windows
+
+    # Restrict each logical DP replica to its own disjoint real TQ rows;
+    # select deterministic candidate pairs from each group. Require DP1's
+    # *physical* 160-token tree to differ from DP0's, not just its row IDs.
+    dp0 = candidate_windows(range(0, 4))
+    dp1 = candidate_windows(range(4, 8))
+    if not dp0 or not dp1:
+        raise AssertionError(
+            "recorded TQ lacks divergent sibling pairs with 128 shared + "
+            "32 post-fork real tokens in each of the disjoint DP row groups"
+        )
+    chosen0 = dp0[0]
+    chosen1 = next((w for w in dp1 if w[-1] != chosen0[-1]), None)
+    if chosen1 is None:
+        raise AssertionError(
+            "recorded TQ DP groups have no distinct fork-window physical "
+            "workloads; refuse a false-positive heterogeneous-DP PASS"
+        )
+    chosen = chosen0 if runtime.dp_rank == 0 else chosen1
+    prefix, first, second, selected, fork, start, signature = chosen
+    assert prefix.numel() == prefix_len
+    assert first.numel() == second.numel() == suffix_len
+    assert min(int(torch.min(v).item()) for v in (prefix, first, second)) >= 0
+    assert max(int(torch.max(v).item()) for v in (prefix, first, second)) < 151936
+    return prefix, first, second, selected, fork, start, signature
 
 def _reference(model, prefix, first, second, tp_size):
     model.zero_grad(set_to_none=True)
@@ -202,7 +256,9 @@ def _tpr(model, runtime, prefix, first, second):
 
 def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runtime):
     runtime = parallel_runtime
-    prefix, first, second, selected = _real_tq_two_trajectories(runtime)
+    prefix, first, second, selected, fork, window_start, signature = (
+        _real_tq_two_trajectories(runtime)
+    )
     torch.manual_seed(20261010)
     reference, hf = make_real_qwen3_tp_model(
         runtime, model_path=_QWEN, tp_size=runtime.tp_size
@@ -252,11 +308,24 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
     assert row_sets[0].isdisjoint(row_sets[1]), (
         f"DP replicas received duplicate real TQ logical rows: {row_sets}"
     )
+    # A different original row ID alone is insufficient: the original gate
+    # consumed just the first 160 tokens and both DP groups could process
+    # the identical prompt. Verify two truly distinct physical forests.
+    physical_hash = torch.tensor(
+        [int(signature[:15], 16)], dtype=torch.int64, device=runtime.device
+    )
+    physical_hashes = [torch.empty_like(physical_hash) for _ in range(2)]
+    dist.all_gather(physical_hashes, physical_hash, group=runtime.dp_group)
+    assert physical_hashes[0].item() != physical_hashes[1].item(), (
+        "DP replicas processed physically identical real-token trees"
+    )
 
     if runtime.rank == 0:
         print(
             f"TPR_MODULE_PARALLEL status=PASS tp={runtime.tp_size} dp=2 "
             f"dp_rank={runtime.dp_rank} real_tq_rows={selected} "
+            f"window_start={window_start} true_fork={fork} "
+            f"physical_hash={signature[:12]} "
             f"native_ce={native_loss:.7f} tpr_ce={tpr_loss:.7f} "
             f"grad_rel_l2={relative_l2:.6g} "
             f"full_dp_gradient_sync=NOT_TESTED "
