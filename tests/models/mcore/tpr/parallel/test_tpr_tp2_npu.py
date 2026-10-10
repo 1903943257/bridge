@@ -8,9 +8,11 @@ Run (two visible NPUs):
       tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py
 
 This does NOT claim PPO E2E, TP+SP, TP+CP or TP+DP correctness.
-It verifies the actual Engine TPR thin entry, local vocab-sharded
-native CE and PPO logprobs, gradients, and an optimizer step against two
-independent full-trajectory forwards, with authentic TP2-sharded HF weights.
+It verifies actual TPR Engine TP2 scheduling, local vocab-sharded native
+CE and PPO logprobs, gradients, and an optimizer step against independent
+full-trajectory forwards. Attention uses the established *controlled CANN
+square-causal reference* (not unmodified MindSpeed ScaledMaskedSoftmax)
+with authentic TP2-sharded HF weights.
 The token trajectories are deterministic test data, but the model is the
 real 28-layer Qwen3-1.7B checkpoint, not a synthetic/random Tiny GPT.
 """
@@ -325,6 +327,22 @@ def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
         data, tpr_trajectory_keys=["task_trace_0", "task_trace_1"],
         dp_size=1, batch_num_tokens=2 * response_len,
     )
+    # Independently verify the real PPO input contract *before* executing
+    # the Radix/Forest parser. Both rows are constructed by cat(prefix, suffix);
+    # the response suffix is necessarily identical. Check on CPU so a
+    # corrupted/asynchronously failed NPU context is not mistaken for a tree
+    # parser bug after a prior device-side attention-kernel failure.
+    for row, suffix in enumerate((first_suffix, second_suffix)):
+        actual_input_tail = data["input_ids"][row, -response_len:].detach().cpu()
+        actual_response = data["responses"][row].detach().cpu()
+        assert torch.equal(actual_response, suffix.cpu()), (
+            f"TP2 test input construction lost response row {row}"
+        )
+        assert torch.equal(actual_input_tail, actual_response), (
+            f"TP2 test data disagrees before Forest: row={row}, "
+            f"input_tail={actual_input_tail[:8].tolist()}, "
+            f"responses={actual_response[:8].tolist()}"
+        )
 
     # Test only TP orchestration and PPO token/grad ownership here; this is
     # the token-mean negative-logprob specialization, not clipped PPO training.
