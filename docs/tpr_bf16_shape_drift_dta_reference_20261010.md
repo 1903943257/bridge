@@ -334,3 +334,79 @@ This oracle does not execute autograd.backward, KV/logprob/entropy/fork-logit
 gradient injections, loss scaling, or optimizer updates.
 Full backward requires a separate correctness project.
 Actual Ascend NPU results for this new training path are pending.
+
+
+## 9. Full DTA Backward / PPO-step gradient experiment and GEMM interventions
+
+Code added directly to `main` (test-only, does not modify VERL or
+production TPR):
+
+- `tests/models/mcore/tpr/correctness/_qwen17_areal_native_dta_backward.py`:
+  Apache-2.0 original DTAEngine body pinned at
+  `areal-project/AReaL feat/dta a5b0b4811a3ef7bf58f0270abcd81d7154f03ce6`,
+  including real `torch.autograd.backward`, KV gradient relays, fork logits,
+  saved logprob and entropy gradient relays, `pop_byblock`, `build_cache`,
+  and `cut_f1_tail`. **Explicit HF-only numerical API adaptation:** AReaL's
+  original `gather_logprobs_entropy(logits=[1,B,V], labels=[1,B-1])` sites
+  have mismatched label sequence lengths when fed unmodified Transformers
+  HF logits. Local helper uses `logits[:, :-1]` for next-token logprobs
+  and all B positions for entropy. It does not change the backward relay.
+- `tests/models/mcore/tpr/unit/test_qwen17_areal_native_backward.py`:
+  differentiable two-layer causal-KV toy with prefix K/V influencing output;
+  checks per-token PPO-like loss, every parameter gradient, post-SGD weights,
+  true prefix K/V nonzero gradients; 6 block sizes × cut-tail on/off.
+- `tests/models/mcore/tpr/correctness/test_qwen3_1_7b_areal_backward_ppo_npu.py`:
+  BF16 Qwen3-1.7B eight cropped real SWE trajectories; reference:
+  eight independent HF Full trajectories. DTA: original per-Pop
+  `DTAEngine.backward`. Both use one single *identical* clipped-PPO
+  surrogate loss, entropy coefficient, advantage, old logprob, and a
+  fresh identical AdamW optimizer; make one actual optimizer step.
+  Report pre-step PPO loss, per-token logprobs, clip fraction, full
+  parameter gradient relative-L2 / cosine / worst parameters, and selected
+  post-AdamW parameter-change mismatch.
+- `tests/models/mcore/tpr/correctness/run_qwen17_areal_full_backward_ppo.sh`:
+  one-shot CPU gate + NPU experiment from Docker VERL root.
+
+Ablations apply to DTA model for this first controlled comparison:
+`native` (unmodified BF16), `m_split` (chunk Linear M dimension,
+default tile=32), `fp32_linear` (FP32 GEMM of Linear inputs/weights/bias,
+cast output back to BF16), and optional `m_split_fp32`.
+Parameter storage, attention, RMSNorm, KV and loss remain in the original
+configured dtypes. These modes do NOT amount to end-to-end FP32 training.
+The baseline is identical unpatched BF16 HF Full and reused for all DTA
+modes. The script records the number of patched Linear modules.
+The sampled BF16 optimizer-step mismatch is affected by weight rounding;
+gradient metrics remain separately reported.
+
+**Important PPO source contract:** `advantages` and `old_log_probs` are
+read from the TQ TensorDict only when present as exact `[8,64]` tensors.
+If either field is missing, the result is labeled `PPO_PROXY`: missing
+advantages are deterministic signed values; missing old logprobs are
+current-checkpoint HF Full. They are not claimed to be real rollout GAE or
+old policy data. Set `TPR_PPO_REQUIRE_RECORDED=1` to fail rather than use
+proxy data. This is a one-step controlled PPO objective experiment, NOT a
+full UniAgent rollout/reward/critic/advantage pipeline.
+
+Run, after syncing host `bridge/main` to the Docker-mounted bridge tree
+and rsync to Docker's `/workspace/uni-agent/verl/tests/models/mcore/tpr/`:
+
+    cd /workspace/uni-agent/verl
+    export TPR_REAL_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
+    export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
+    TPR_DTA_BWD_MODES=native,m_split,fp32_linear \
+      bash tests/models/mcore/tpr/correctness/run_qwen17_areal_full_backward_ppo.sh
+
+Start by setting `TPR_DTA_BWD_MODES=native` if memory is limited, then
+run `m_split` and `fp32_linear` separately with the same checkpoint/data.
+
+**No result claims before NPU**: merging scripts/tests does not establish
+gradient parity or reduction of numerical error. The runner prints
+`numerical_parity=DIAGNOSTIC_ONLY`; CPU and actual NPU gates have not
+been executed on the author's local Ascend host from this environment.
+
+Original AReaL DTA integration check on `feat/dta`
+`tests/experimental/archon/test_dta.py` allows `mean_diff < 0.25`
+in Forward and `grad_norm_rel_gap < 0.25` in train;
+per-parameter update mismatches are logged instead of failing the test.
+These are not exact parity gates and are CUDA-based; do not infer equivalent
+Ascend behavior or claim the paper is invalid from local outliers alone.
