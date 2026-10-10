@@ -95,3 +95,32 @@ def test_sampled_gradient_metric_identity():
     assert abs(m["cosine"]-1)<1e-12
     assert m["count"]==2
     assert m["sample_values"]==5
+
+
+
+def test_clip_branch_flip_is_distinct_from_outside_clip():
+    from ..correctness.test_qwen3_1_7b_tpr_dta_triplet_npu import _clip_branch_disagreement
+    old=torch.zeros(1,4)
+    adv=torch.tensor([[1.,-1.,1.,-1.]])
+    native=torch.tensor([[0.,0.3,-0.3,0.]])
+    # positive A, large positive log-ratio => clipped
+    # negative A, large negative log-ratio => clipped
+    tpr=torch.tensor([[0.3,-0.3,-0.3,0.]])
+    found=_clip_branch_disagreement(native,tpr,old,adv,0.2)
+    assert found["tokens"]==4
+    assert found["full_clipped"]==0
+    assert found["tpr_clipped"]==2
+    assert found["branch_flips"]==2
+    assert found["full_outside"]==2
+    assert found["tpr_outside"]==3
+
+
+def test_nonzero_full_clipping_not_attributed_to_tpr():
+    from ..correctness.test_qwen3_1_7b_tpr_dta_triplet_npu import _clip_branch_disagreement
+    old=torch.zeros(1,2)
+    adv=torch.ones(1,2)
+    native=torch.tensor([[0.3,0.]])
+    tpr=torch.tensor([[0.3,0.]])
+    result=_clip_branch_disagreement(native,tpr,old,adv,0.2)
+    assert result["full_clipped"]==result["tpr_clipped"]==1
+    assert result["branch_flips"]==0
