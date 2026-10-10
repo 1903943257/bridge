@@ -410,3 +410,77 @@ in Forward and `grad_norm_rel_gap < 0.25` in train;
 per-parameter update mismatches are logged instead of failing the test.
 These are not exact parity gates and are CUDA-based; do not infer equivalent
 Ascend behavior or claim the paper is invalid from local outliers alone.
+
+
+## 10. NPU actual DTA Backward diagnostic (2026-10-10)
+
+The user executed the Qwen3-1.7B BF16 Ascend NPU test with 8 real
+128+64 cropped TQ rows, SDPA, DTA Pop block=64, AdamW lr=1e-4,
+and clipped PPO **proxy** (old_log_probs generated from same-model HF
+Full, advantages deterministic rather than recorded).
+
+Reported against unpatched BF16 HF Full:
+
+| DTA mode | response logp mean/max | full-param grad rel-L2/cosine | clip fraction | sampled BF16 step rel-L2 |
+|---|---|---|---|---|
+| native | 0.029684 / 0.458695 | 0.593944 / 0.805095 | 0.09180 | 0.982568 |
+| m_split (tile=32) | 0.036054 / 0.600080 | 0.567760 / 0.882624 | 0.08984 | 0.834743 |
+| fp32_linear | 0.035510 / 0.553312 | 0.533855 / 0.859047 | 0.10742 | 0.869125 |
+
+The full baseline proxy loss was -0.08978709. Native DTA loss was
+-0.09137118; M split -0.08439070; FP32 linear -0.08329321.
+All 311 parameter gradients were present, and AdamW stepped, but
+`numerical_parity=UNVERIFIED`: no strict gradient parity.
+
+**Interpretation caveats:** clip fraction is the ratio-outside-band
+fraction, NOT the percentage of token gradients actually blocked by the
+PPO clipped surrogate. Missing real rollout old policy values means Full
+has ratio=1 and clip=0 by construction; DTA does not. A single BF16
+AdamW step measured on sampled BF16 model weights includes weight-rounding
+and first-step sign effects. Do not extrapolate the sampled ~0.98 step
+relative error to long-horizon training. AReaL original CUDA tests have
+loose gradient-norm gates; the NPU results do not prove the paper wrong.
+
+**New controlled isolation (defaults preserved):**
+- `TPR_DTA_BWD_OBJECTIVE=fixed_logprob` uses a linear loss
+  `-sum(advantage * logprob)/(N*S)`. The logprob derivative per token
+  is identical for Full/DTA, removing PPO clipping and ratio derivative
+  changes. **This is NOT PPO.** With `entropy_coef=0`, it isolates
+  execution/numerical backward drift from changes in the PPO objective.
+- `TPR_DTA_BWD_PAIRED_FULL=1` adds, for M split and FP32 modes, an
+  independent HF Full run patched with the *same* GEMM mode. It reports
+  `PAIRED_FULL grad_rel_l2/grad_cosine/response_logp_mean`.
+  This isolates whether the intervention makes DTA intrinsically more
+  similar to a Full model **at matching precision and GEMM shape policy**,
+  rather than to the original BF16 Full.
+- `effective_clip_frac` counts only PPO-relevant clipped-gradient token
+  cases (positive advantage ratio above upper bound; negative advantage
+  ratio below lower bound).
+- `GRAD_GROUP` aggregates absolute gradient error by functional module,
+  to distinguish high relative error on tiny norm parameters from the
+  contributors to global gradient error.
+- Corrected entropy alignment to query positions `p-1 : p+s-1`; this
+  does not affect the reported run because `entropy_coef=0`.
+
+Recommended **sanity**:
+ 
+    TPR_DTA_BWD_ROWS=1 TPR_DTA_BWD_BLOCK=-1 \
+    TPR_DTA_BWD_MODES=native TPR_DTA_BWD_OBJECTIVE=fixed_logprob \
+    bash tests/models/mcore/tpr/correctness/run_qwen17_areal_full_backward_ppo.sh
+
+This should eliminate all tree-sharing and Pop chunking: both the reference
+Full and the DTA final Pop perform a single 192-token Forward. If gradients
+still significantly disagree, investigate DTA backward/adapter correctness
+rather than BF16 shape drift.
+
+Recommended **isolation**:
+
+    TPR_DTA_BWD_ROWS=8 TPR_DTA_BWD_BLOCK=64 \
+    TPR_DTA_BWD_MODES=native,m_split,fp32_linear \
+    TPR_DTA_BWD_OBJECTIVE=fixed_logprob \
+    TPR_DTA_BWD_PAIRED_FULL=1 \
+    bash tests/models/mcore/tpr/correctness/run_qwen17_areal_full_backward_ppo.sh
+
+Compare this fixed-token-gradient experiment with the prior clipped PPO
+proxy run before attempting more GEMM modes, new optimizer heuristics, or
+precision changes. All new controls remain **NPU unverified** pending run.
