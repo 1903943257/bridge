@@ -409,7 +409,17 @@ def _tpr_ppo_nll_run(
     engine.model_config = SimpleNamespace(mtp=SimpleNamespace(enable=False))
     engine.enable_routing_replay = False
     engine.get_data_parallel_size = lambda: 1
-    engine.get_data_parallel_group = lambda: None
+    # VERL's native forward_backward_batch all-reduces loss_mask.sum() over
+    # get_data_parallel_group(). group=None means the WORLD group, NOT "no
+    # reduction": for TP2/DP1 that incorrectly doubles the 64 logical tokens
+    # to 128 and silently halves the NLL gradient normalization.
+    # Use the actual Megatron DP singleton group. Keeping the test's
+    # token-count assertion at 64 also verifies correct group selection.
+    dp_group = parallel_state.get_data_parallel_group()
+    assert dist.get_world_size(group=dp_group) == 1, (
+        "TP2 Engine route gate requires native Megatron DP=1 group"
+    )
+    engine.get_data_parallel_group = lambda: dp_group
 
     model.zero_grad(set_to_none=True)
     if through_engine:
