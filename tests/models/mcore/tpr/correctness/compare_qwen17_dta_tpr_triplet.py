@@ -40,14 +40,52 @@ def compare(folder):
     }
     if {tuple(t.shape) for t in grids.values()}!={(8,64)}:
         raise AssertionError("three-way comparison requires all 8x64 valid response tokens")
+    old_label=mg.get("meg_old_source","hf_full")
+    shared_old=(old_label=="hf_full" and
+                torch.equal(hf["shared_old_logprobs"],
+                            mg.get("meg_old_logprobs",hf["shared_old_logprobs"])))
     print(
         "P1 TRIPLET CONFIG "
         f"objective={hf['objective']} "
+        f"hf_old_source={hf['old_source']} megatron_old_source={old_label} "
+        f"old_identical_across_backends={shared_old} "
         "checkpoint_family=QWEN3_1_7B data=REAL_TQ_8x192 "
         "backend_pairing=HF_FULL_HF_DTA__MG_FULL_MG_TPR "
         "gradient_cross_framework=NOT_COMPARABLE_WITHOUT_MAPPING",
         flush=True,
     )
+    if old_label=="megatron_native" and shared_old:
+        raise AssertionError("unexpected identical old policy provenance")
+    if "dta_forward_only_old_logprobs" in hf:
+        df=hf["dta_forward_only_old_logprobs"]
+        for label,new in (
+            ("HF_FULL",grids["hf_full"]),
+            ("HF_DTA_TRAIN",grids["hf_dta"]),
+        ):
+            mean,mx,n_gt=_stats(df,new)
+            print(
+                "P1 TRIPLET OLD_SOURCE "
+                f"old=DTA_FORWARD_ONLY current={label} "
+                f"mean_abs={mean:.9g} max_abs={mx:.9g} "
+                f"num_gt_0p2={n_gt} "
+                "meaning=SAME_CHECKPOINT_DIAGNOSTIC_ONLY",
+                flush=True,
+            )
+    if "megatron_native_old_logprobs" in mg:
+        native_old=mg["megatron_native_old_logprobs"]
+        for label,new in (
+            ("MEGATRON_NATIVE",grids["mg_full"]),
+            ("MEGATRON_TPR",grids["mg_tpr"]),
+        ):
+            mean,mx,n_gt=_stats(native_old,new)
+            print(
+                "P1 TRIPLET OLD_SOURCE "
+                f"old=MEGATRON_NATIVE_NO_GRAD current={label} "
+                f"mean_abs={mean:.9g} max_abs={mx:.9g} "
+                f"num_gt_0p2={n_gt} "
+                "meaning=SAME_CHECKPOINT_DIAGNOSTIC_ONLY",
+                flush=True,
+            )
     for label,a,b in (
         ("HF_DTA_VS_HF_FULL","hf_full","hf_dta"),
         ("TPR_VS_MEGATRON_FULL","mg_full","mg_tpr"),
