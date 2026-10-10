@@ -796,3 +796,170 @@ with a documented consistent scorer and repeated evaluation, not
 with the current updated actor. Do not mask real forward drift
 by replacing old with currently computed new.
 **New controls are NOT YET NPU VERIFIED.**
+
+## 15. Untiled Full versus tiled Full: the fixed-M oracle is NOT a production fix (2026-10-10)
+
+### Completed real Ascend NPU measurements
+
+Model: actual Qwen3-1.7B BF16 checkpoint, real SWE TQ cropped tokens,
+P=128, S=64, 28 layers, TP=CP=1, controlled CANN attention.
+The 28-layer `test_real_qwen_full_gpt_vs_single_split` probe executes
+ordinary `Megatron Linear.forward` using different *physical M* sizes.
+It is **forward-only**; the PPO Forest test below has backward but not
+a production optimizer step.
+
+| Observed comparison | Response logprob mean absolute error | Maximum absolute error |
+| --- | ---: | ---: |
+| Untiled Full M192 vs tiled Full M64x3 | 0.0289372448 | 0.484399796 |
+| Untiled Full M192 vs tiled Split M64x2 + M64 | 0.0289372448 | 0.484399796 |
+| Tiled Full vs tiled Split | 0 | 0 |
+
+The 28 decoder layer output tensors of tiled Full and tiled Split were
+bitwise identical, but the final LM-head logits were *not* bitwise identical
+because the LM head was not tiled (logits max_abs 0.125); nevertheless
+the **63 suffix-internal logprobs measured by this test** were bitwise
+identical. The test does NOT include the first response token's
+prefix-last-position query. Untiled Full vs tiled Full final logprob
+max_abs=0.4843998 and relative logprob L2=0.0287255.
+
+**Interpretation: symmetric fixed M does NOT establish that TPR agrees
+with original untiled Full.** It changes the baseline Full too. In fact,
+M64 Full is *as far from untiled Full* as the former untiled Split was at
+the worst measured logprob. A pass for `tiled Full == tiled TPR` must
+not be advertised as normal-native numerical equivalence. It is a
+controlled counterfactual: equal physical GEMM shape suppresses a source
+of otherwise accumulating BF16 rounding differences.
+
+The partial ablation `tile=64, groups=qkv` made L1 QKV and
+attention-core/projection-input captures exactly equal, but L1 projection
+output differed (relative L2 9.0836e-6), and 28-layer output still
+diverged: suffix logprob max_abs 0.2499056. Tiling
+`qkv,proj,fc1,fc2` using unmodified native BF16 Linear on M64 tiles
+made all 28 layer outputs equal. This demonstrates GEMM-M sensitivity is
+not restricted to QKV; a local error does not necessarily grow
+monotonically when one operator family is matched.
+
+### Real multi-branch PPO Forest: numerical *control* with symmetric M64
+
+8 recorded SWE TQ trajectories cropped to 128+64, a real compressed
+multi-level forest with irregular physical segments (including
+[134:158], [158:166], [178:192]), 512 supervised response tokens.
+`TPR_QWEN17_PPO_TILE_GEMM=64` installs the BF16 native Linear
+wrapper on **both** the controlled Native Full and TPR Forest.
+Irregular tail tiles are zero padded ONLY for the Linear GEMM and then
+sliced back; this does not pad Attention, RoPE or KV.
+
+Measured:
+- Native-vs-TPR response logprob mean_abs=3.20784e-08,
+  max_abs=9.53674e-07 over all 512 owned response tokens.
+- Ratio outside [0.8,1.2] = 0/512, effective PPO clip branch flips=0;
+  proxy PPO losses both -0.25.
+- Selected parameter gradient global relative L2=0.012407,
+  cosine=0.99992315. This is **not zero-gradient error**, and the
+  selected-parameter gate (<0.08, cosine>0.997) passed.
+- Sampled first-step **counterfactual** AdamW weight change
+  relative L2=0.109040735 (sampled values; `real_optimizer_step=False`).
+  The relative change of the parameter values themselves was
+  2.57760408e-07, a different denominator/metric.
+- Original historical rollout `old_log_probs` and true advantages
+  were NOT used in this probe: old is same-checkpoint
+  controlled Native and advantages are deterministic diagnostic proxies.
+
+These findings **do not validate** production PPO, untiled Full versus
+untiled TPR parameter-update parity, true rollout-old semantics, or
+long-sequence throughput. The Python-level fixed tile loops are
+expensive: P=16384, tile=64 requires 256 GEMM calls *per Linear family
+per layer*, rather than a single long GEMM kernel.
+
+### 16. Standalone GEMM M-shape root-cause and NPU/CUDA crosscheck
+
+The key question is now not simply whether fixed M makes Full and TPR
+equal, but **which physical-M BF16 output is closer to an independent
+high-precision mathematical reference using identical BF16 operands**.
+
+Standalone script (PyTorch only): `tools/tpr_gemm_mshape_repro.py`.
+It generates synthetic BF16 X[M,K] and W[N,K] by default and computes
+untiled Full M192, Prefix/Suffix M128+64, symmetric M64 blocks,
+plus selected FP64 CPU dot products on actual mismatched elements.
+Both `torch.matmul` and `torch.nn.functional.linear`, in 2D and
+Megatron-like 3D input layout, can be compared. No model/config/TQ
+data/VERL/Megatron/MindSpeed environment is required; `torch_npu`
+is needed only on NPU.
+
+Expected layer-1 QKV geometry on Qwen3-1.7B: M192, K2048,
+N4096 (QKV projected channels); the QKV weight is [N,K]. This is the
+plain dense Linear matrix multiplication **before** applying the
+Q/K normalization and RoPE/Attention. GEMM's M is the token count.
+
+To avoid falsely treating synthetic GEMM outcomes as proof about
+actual pretrained activations, export the **real BF16 L1 QKV inputs,
+weights and original L1 QKV outputs** from the existing NPU test:
+
+```bash
+# Inside the bridge-backed VERL/NPU pytest environment, after updating the
+# test file to the latest bridge source:
+export TPR_RUN_QWEN17_SPLIT=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
+export TPR_QWEN17_SPLIT_P=128
+export TPR_QWEN17_SPLIT_S=64
+export TPR_QWEN17_GPT_TILE_GEMM=64
+export TPR_QWEN17_GPT_TILE_GEMM_GROUPS=qkv,proj,fc1,fc2
+export TPR_QWEN17_GPT_COMPARE_NATIVE_FULL=1
+export TPR_QWEN17_GPT_EXPORT_L1_QKV=/tmp/qwen_l1_qkv_untiled.pt
+unset TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS TPR_QWEN17_GPT_FP32_GEMM
+unset TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS
+unset TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS
+
+python -m pytest -x -s -q \
+  tests/models/mcore/tpr/correctness/test_qwen3_1_7b_split_equivalence_npu.py::test_real_qwen_full_gpt_vs_single_split
+```
+
+The export refuses to overwrite an existing file. Once exported,
+the `.pt` contains only BF16 `x`, `w`, `y_native` and small scalar
+metadata. It does not depend on `transformers` or Qwen tokenizer.
+
+Replay on the NPU server (with just its existing torch/torch_npu):
+
+```bash
+python tools/tpr_gemm_mshape_repro.py --device npu \
+  --input /tmp/qwen_l1_qkv_untiled.pt --tile 64 --audit 16
+```
+
+On the GPU server, transfer only **two files**: the standalone `.py`
+and this exported `.pt` (if permitted by local server policy). With
+an installed CUDA-enabled PyTorch, run:
+
+```bash
+python tpr_gemm_mshape_repro.py --device cuda \
+  --input qwen_l1_qkv_untiled.pt --tile 64 --audit 16
+```
+
+If transfer is impossible, a weaker environment sanity check runs
+with generated operands (the results cannot replace actual QKV replay):
+
+```bash
+python tpr_gemm_mshape_repro.py --device cuda \
+  --m 192 --k 2048 --n 4096 --prefix 128 --tile 64
+```
+
+Read `GEMM_COMPARE SPLIT_VS_FULL`,
+`TILED_FULL_VS_FULL`, `SPLIT_VS_TILED_FULL`,
+`REPLAY_FULL_VS_RECORDED_MEGATRON_QKV`, and
+`GEMM_FP64_SUMMARY`. The recorded-QKV comparison helps detect when
+plain torch GEMM launches do not reproduce the Megatron Linear kernel
+despite having the same BF16 inputs/weights. Use `--op matmul` and
+`--op linear`, `--layout 3d` and `--layout 2d` to distinguish dispatch.
+If GPU is stable for these operands and NPU is not, this supports a
+backend-specific implementation sensitivity; if both differ, this
+supports a more general low-precision M-shape property. In neither
+case does finite-precision shape sensitivity alone demonstrate a
+hardware defect; use the FP64 oracle to assess per-element accuracy,
+and vendor kernel diagnostics if an actual supported-precision
+guarantee is violated.
+
+This portable root-cause test is **not a speed benchmark**, does not
+perform Backward or PPO, and does not promise bitwise equality.
+Do NOT promote fixed M64, FP32 projection or grouped-GEMM
+patches into production based solely on the diagnostic.
+
