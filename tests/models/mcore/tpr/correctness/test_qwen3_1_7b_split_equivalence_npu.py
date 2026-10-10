@@ -954,26 +954,81 @@ def test_real_qwen_full_gpt_vs_single_split():
     # It is a diagnostic readout, never a training-time override.
     original_full_tail = None
     original_full_lp = None
-    if os.environ.get("TPR_QWEN17_GPT_COMPARE_NATIVE_FULL", "0") == "1":
+    qkv_export_path = os.environ.get("TPR_QWEN17_GPT_EXPORT_L1_QKV", "").strip()
+    compare_native_full = os.environ.get("TPR_QWEN17_GPT_COMPARE_NATIVE_FULL", "0") == "1"
+    if qkv_export_path and not compare_native_full:
+        raise AssertionError(
+            "TPR_QWEN17_GPT_EXPORT_L1_QKV requires "
+            "TPR_QWEN17_GPT_COMPARE_NATIVE_FULL=1"
+        )
+    if compare_native_full:
         if not tiled_spec:
             raise AssertionError("Native-vs-tiled Full probe requires BF16 fixed GEMM tile")
         if fp32_groups or os.environ.get("TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS"):
             raise AssertionError("Native-vs-tiled Full probe requires no other GEMM override")
         if os.environ.get("TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS"):
             raise AssertionError("Native-vs-tiled Full probe does not support layer-input replay")
-        with torch.no_grad():
-            native_positions = torch.arange(p+s, device="npu").unsqueeze(0)
-            native_logits = model(
-                tokens[None, :], native_positions, attention_mask=None
+        # Optional portable one-GEMM replay: record the *actual* unmodified
+        # layer-1 QKV operands before installing any fixed-M wrappers. The
+        # resulting .pt contains BF16 tensors only; replay needs plain PyTorch.
+        qkv_capture = {}
+        qkv_hook_handle = None
+        if qkv_export_path:
+            export_file = Path(qkv_export_path)
+            if export_file.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite QKV replay data: {export_file}"
+                )
+            l1_qkv = model.decoder.layers[0].self_attention.linear_qkv
+
+            def capture_native_qkv(module, args, kwargs, result):
+                x = kwargs.get("hidden_states", args[0] if args else None)
+                y = result[0] if isinstance(result, tuple) else result
+                if not isinstance(x, torch.Tensor) or not isinstance(y, torch.Tensor):
+                    raise AssertionError("Layer1 QKV capture expected tensor inputs/outputs")
+                if x.ndim != 3 or x.shape[0] != p+s or x.shape[1] != 1:
+                    raise AssertionError(f"Layer1 QKV input mismatch: {tuple(x.shape)}")
+                if "x" in qkv_capture:
+                    raise AssertionError("Layer1 QKV hook executed more than once")
+                qkv_capture["x"] = x.detach().reshape(-1, x.shape[-1]).cpu().contiguous()
+                qkv_capture["w"] = module.weight.detach().cpu().contiguous()
+                qkv_capture["y_native"] = y.detach().reshape(-1, y.shape[-1]).cpu().contiguous()
+
+            qkv_hook_handle = l1_qkv.register_forward_hook(
+                capture_native_qkv, with_kwargs=True
             )
-            original_full_tail = (
-                native_logits[0, p:p+s].detach().float().cpu().clone()
+        try:
+            with torch.no_grad():
+                native_positions = torch.arange(p+s, device="npu").unsqueeze(0)
+                native_logits = model(
+                    tokens[None, :], native_positions, attention_mask=None
+                )
+                original_full_tail = (
+                    native_logits[0, p:p+s].detach().float().cpu().clone()
+                )
+                native_labels = tokens[p+1:p+s]
+                original_full_lp = vocab_parallel_log_probs_from_logits(
+                    original_full_tail[:-1].to("npu"), native_labels
+                ).detach().float().cpu()
+                del native_logits
+        finally:
+            if qkv_hook_handle is not None:
+                qkv_hook_handle.remove()
+        if qkv_export_path:
+            if set(qkv_capture) != {"x", "w", "y_native"}:
+                raise AssertionError("Layer1 native QKV was not captured")
+            qkv_capture["p"] = p
+            qkv_capture["s"] = s
+            qkv_capture["note"] = "Original unpatched Megatron L1 QKV BF16 operands"
+            export_file.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(qkv_capture, export_file)
+            print(
+                "QWEN SPLIT GPT NATIVE_L1_QKV_EXPORTED "
+                f"path={export_file} x={tuple(qkv_capture['x'].shape)} "
+                f"w={tuple(qkv_capture['w'].shape)} "
+                f"y={tuple(qkv_capture['y_native'].shape)}",
+                flush=True,
             )
-            native_labels = tokens[p+1:p+s]
-            original_full_lp = vocab_parallel_log_probs_from_logits(
-                original_full_tail[:-1].to("npu"), native_labels
-            ).detach().float().cpu()
-            del native_logits
         print(
             "QWEN SPLIT GPT NATIVE_FULL_CONTROL "
             f"untiled_full_M={p+s} tiled_M={tiled_spec} "
