@@ -256,9 +256,16 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
             _,response_lp=_native_response_logprobs(
                 native,ids.to(device),prompt_length=p,temperature=1.0)
             native_initial_logp.append(response_lp.detach().float().cpu())
-    # Old policy is shared byte-for-byte with HF Full and HF DTA,
-    # not recomputed in the Megatron implementation.
-    old=list(old_cpu)
+    # BASELINE: old policy is captured by HF Full; that may produce
+    # numerical bias before the first parameter update in Megatron.
+    # EXPERIMENT ONLY: use Megatron Native no_grad as its own old-logprob
+    # source to quantify how much cross-framework bias explains clipping.
+    # NEVER overwrite old_log_probs captured from real rollout in training.
+    old_variant=os.getenv("TPR_TRIPLET_MEGATRON_OLD_SOURCE","hf_full")
+    if old_variant not in ("hf_full","megatron_native"):
+        pytest.fail("TPR_TRIPLET_MEGATRON_OLD_SOURCE must be hf_full or megatron_native")
+    old=(list(native_initial_logp) if old_variant=="megatron_native"
+         else list(old_cpu))
     batch["old_log_probs"]=_as_jagged(old)
     full_floor=(torch.stack(native_initial_logp)-hf["full_response_logprobs"]).abs()
     print(
@@ -266,8 +273,10 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
         f"hf_vs_megatron_full_max={float(full_floor.max()):.9g} "
         f"hf_vs_megatron_full_mean={float(full_floor.mean()):.9g} "
         f"old_source={hf['old_source']} "
+        f"meg_old_source={old_variant} "
         f"adv_source={hf['adv_source']} "
-        "shared_old=True shared_advantages=True shared_tokens=True",
+        f"shared_old_across_backends={old_variant=='hf_full'} "
+        "shared_advantages=True shared_tokens=True",
         flush=True)
     native.zero_grad(set_to_none=True)
     captured_native=[]
@@ -294,6 +303,15 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
     native_after=_weight_samples(native)
     native_step={k:native_after[k]-v for k,v in native_before.items()}
     native_lp=torch.stack(captured_native)
+    native_repeat=(native_lp-torch.stack(native_initial_logp)).abs()
+    print(
+        "P1 TPR_TRIPLET NATIVE_REPEAT "
+        f"mean_abs={float(native_repeat.mean()):.9g} "
+        f"max_abs={float(native_repeat.max()):.9g} "
+        f"num_gt_0p2={int((native_repeat>0.2).sum())} "
+        "comparison=NATIVE_NOGRAD_VS_NATIVE_GRAD_FORWARD",
+        flush=True,
+    )
     print("P1 TPR_TRIPLET NATIVE "
           f"objective={objective} loss={total_loss:.9g} "
           f"num_grad_parameters={len(native_grads)} "
@@ -337,6 +355,32 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
     step=_compare_snapshots(native_step,tpr_step)
     advantage=adv_cpu.float()
     clip=float(os.getenv("TPR_DTA_BWD_PPO_CLIP","0.2"))
+    # Counterfactual ratio/clipping readout under BOTH baseline old sources
+    # uses *the same measured* new Native and TPR logprobs; no losses
+    # or gradients are silently recomputed with changed old policy.
+    for candidate_name,old_candidate in (
+        ("hf_full",old_cpu),
+        ("megatron_native",torch.stack(native_initial_logp)),
+    ):
+        c=_clip_branch_disagreement(
+            native_lp,tpr_lp,old_candidate,advantage,clip)
+        native_residual=(native_lp-old_candidate).float()
+        tpr_residual=(tpr_lp-old_candidate).float()
+        print(
+            "P1 TPR_TRIPLET OLD_SOURCE_COUNTERFACTUAL "
+            f"old_source={candidate_name} "
+            f"native_delta_mean_abs={float(native_residual.abs().mean()):.9g} "
+            f"native_delta_max_abs={float(native_residual.abs().max()):.9g} "
+            f"tpr_delta_mean_abs={float(tpr_residual.abs().mean()):.9g} "
+            f"tpr_delta_max_abs={float(tpr_residual.abs().max()):.9g} "
+            f"native_clipped={c['full_clipped']} "
+            f"tpr_clipped={c['tpr_clipped']} "
+            f"branch_flips={c['branch_flips']} "
+            f"native_outside={c['full_outside']} "
+            f"tpr_outside={c['tpr_outside']} "
+            "objective_replay=METRICS_ONLY",
+            flush=True,
+        )
     outside,effective=_clip_metrics(tpr_lp,torch.stack(old),advantage,clip)
     clip_branches=_clip_branch_disagreement(
         native_lp,tpr_lp,torch.stack(old),advantage,clip)
@@ -351,12 +395,14 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
         f"tpr_outside={clip_branches['tpr_outside']} "
         f"native_old_ratio_max_deviation={clip_branches['full_ratio_max_delta']:.9g} "
         f"active_under_objective={objective=='ppo'} "
-        "old_policy=SHARED_HF_FULL",
+        f"old_policy={old_variant} "
+        f"shared_across_backends={old_variant=='hf_full'}",
         flush=True,
     )
     print(
         "P1 TPR_TRIPLET SUMMARY backend=MEGATRON "
         f"objective={objective} rows=8 p=128 s=64 "
+        f"meg_old_source={old_variant} "
         f"response_logp_max={float(diff.max()):.9g} "
         f"response_logp_mean={float(diff.mean()):.9g} "
         f"response_logp_gt0p2={int((diff>0.2).sum())} "
@@ -395,8 +441,14 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
             "tpr_loss_delta":tpr_loss-total_loss,
             "tpr_step_sample_rel_l2":step["rel_l2"],
             "tpr_gradient_scope":"SAMPLED_PER_PARAMETER",
-        "old_source":hf["old_source"],
-        "adv_source":hf["adv_source"],
+            "old_source":hf["old_source"],
+            "meg_old_source":old_variant,
+            "adv_source":hf["adv_source"],
+            "meg_old_logprobs":torch.stack(old),
+            "megatron_native_old_logprobs":torch.stack(native_initial_logp),
+            "native_nograd_grad_response_logprob_delta_mean":float(native_repeat.mean()),
+            "native_nograd_grad_response_logprob_delta_max":float(native_repeat.max()),
+
         }
         path=dest/"megatron_full_tpr.pt"
         torch.save(artifact,path)
