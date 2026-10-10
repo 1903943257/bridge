@@ -297,3 +297,169 @@ def test_two_rank_native_tp2_full_trajectory_vs_tpr_engine(tp2_runtime):
             flush=True,
         )
     dist.barrier(group=runtime.tp_group)
+
+
+def _native_response_nll_reference(model, prefix, first_suffix, second_suffix):
+    """Native TP2 local-vocab logprobs, full independent trajectories."""
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+
+    model.zero_grad(set_to_none=True)
+    p = prefix.numel()
+    total = first_suffix.numel() + second_suffix.numel()
+    objective = None
+    for suffix in (first_suffix, second_suffix):
+        sequence = torch.cat((prefix, suffix)).to(next(model.parameters()).device)
+        logits = model(
+            input_ids=sequence.unsqueeze(0),
+            position_ids=torch.arange(
+                sequence.numel(), device=sequence.device
+            ).unsqueeze(0),
+            attention_mask=None,
+        )
+        assert logits.shape[-1] == 1024, "expected TP2 vocab shard"
+        positions = torch.arange(
+            p - 1, sequence.numel() - 1, device=sequence.device
+        )
+        logp = vocab_parallel_log_probs_from_logits(
+            logits[0].index_select(0, positions),
+            sequence[p:],
+        )
+        term = -logp.float().sum() / total
+        term.backward()
+        objective = term.detach() if objective is None else objective + term.detach()
+    return objective, _parameter_gradients(model)
+
+
+def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
+    """Exercise the real PPO Forest adapter/TP2 dispatch with a known NLL loss."""
+    from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+    from verl.utils import tensordict_utils as tu
+
+    rows = [
+        torch.cat((prefix, first_suffix)),
+        torch.cat((prefix, second_suffix)),
+    ]
+    response_len = first_suffix.numel()
+    assert response_len == second_suffix.numel()
+    device = runtime.device
+    data = TensorDict(
+        {
+            "input_ids": torch.stack(rows).to(device),
+            "responses": torch.stack(
+                (first_suffix, second_suffix)
+            ).to(device),
+            "response_mask": torch.ones(
+                (2, response_len), dtype=torch.bool, device=device
+            ),
+            "old_log_probs": torch.zeros(
+                (2, response_len), dtype=torch.float32, device=device
+            ),
+            "advantages": torch.ones(
+                (2, response_len), dtype=torch.float32, device=device
+            ),
+        },
+        batch_size=[2], device=device,
+    )
+    tu.assign_non_tensor(
+        data, tpr_trajectory_keys=["task_trace_0", "task_trace_1"],
+        dp_size=1, batch_num_tokens=2 * response_len,
+    )
+
+    # Test only TP orchestration and PPO token/grad ownership here; this is
+    # the token-mean negative-logprob specialization, not clipped PPO training.
+    def loss_function(*, model_output, data, dp_group):
+        packed = model_output["log_probs"]
+        active = data["response_mask"].sum(dim=1).tolist()
+        cursor = 0
+        total = packed.new_zeros((), dtype=torch.float32)
+        for row, count in enumerate(active):
+            total = total - (
+                packed[cursor:cursor + count].float()
+                * data["advantages"][row, :count].float()
+            ).sum()
+            cursor += count + 1  # One unused dummy logit for each fake row.
+        assert cursor == packed.numel()
+        normalizer = tu.get_non_tensor_data(
+            data, key="batch_num_tokens"
+        )
+        return total / normalizer, {}
+
+    calls = {"finalize": 0}
+    def finalize(chunks, tokens, *, force_all_reduce=False, **kwargs):
+        calls["finalize"] += 1
+        assert chunks == [model] and tokens is None and force_all_reduce
+
+    model.config.no_sync_func = nullcontext
+    model.config.grad_scale_func = lambda value: value
+    model.config.finalize_model_grads_func = finalize
+    model.config.calculate_per_token_loss = False
+
+    from verl.workers.engine.megatron.transformer_impl import MegatronEngine
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.module = [model]
+    engine.tf_config = model.config
+    engine.engine_config = SimpleNamespace(
+        tpr_enabled=True,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        dynamic_context_parallel=False,
+        tpr_cp_backend=None,
+        override_transformer_config={},
+        use_fused_kernels=False,
+    )
+    engine.model_config = SimpleNamespace(mtp=SimpleNamespace(enable=False))
+    engine.enable_routing_replay = False
+    engine.get_data_parallel_size = lambda: 1
+    engine.get_data_parallel_group = lambda: None
+
+    model.zero_grad(set_to_none=True)
+    output = run_tpr_forward_backward_batch(
+        engine, data, loss_function, forward_only=False
+    )
+    assert calls["finalize"] == 1
+    assert "tpr/forest_trees" in output["metrics"]
+    return output, _parameter_gradients(model)
+
+
+def test_tp2_real_ppo_forest_native_vocab_logprobs_and_gradients(tp2_runtime):
+    runtime = tp2_runtime
+    torch.manual_seed(926034)
+    reference = _tiny_model(runtime)
+    torch.manual_seed(926034)
+    candidate = _tiny_model(runtime)
+    candidate.load_state_dict(reference.state_dict(), strict=True)
+
+    prefix = torch.arange(21, 85, dtype=torch.long)
+    suffix1 = torch.arange(1401, 1433, dtype=torch.long)
+    suffix2 = torch.arange(1521, 1553, dtype=torch.long)
+    dist.barrier(group=runtime.tp_group)
+    reference_loss, reference_grad = _native_response_nll_reference(
+        reference, prefix, suffix1, suffix2
+    )
+    output, tpr_grad = _tpr_ppo_nll_run(
+        candidate, runtime, prefix, suffix1, suffix2
+    )
+    actual = output["loss"]
+    assert abs(actual - reference_loss.item()) < 0.02
+    assert reference_grad.keys() == tpr_grad.keys()
+    numerator = sum(
+        (reference_grad[key] - tpr_grad[key]).square().sum().item()
+        for key in reference_grad
+    )
+    denominator = sum(
+        ref.square().sum().item() for ref in reference_grad.values()
+    )
+    relative_l2 = (numerator / max(denominator, 1e-24)) ** 0.5
+    assert relative_l2 < 0.05, (
+        f"TP2 PPO Forest vs native rank-local vocab gradient error: {relative_l2}"
+    )
+    if runtime.rank == 0:
+        print(
+            f"TPR_TP2_PPO native_nll={reference_loss.item():.7f} "
+            f"tpr_nll={actual:.7f} grad_rel_l2={relative_l2:.6g}",
+            flush=True,
+        )
+    dist.barrier(group=runtime.tp_group)
