@@ -70,7 +70,7 @@ def digest_forest_plan(forest: "ForestExecutionPlan") -> str:
     for executable in forest.trees:
         tree = executable.tree
         hasher.update(
-            json.dumps((tree.key, list(tree.member_rows), tree.root_id),
+            json.dumps((tree.uid, tree.tree_index, list(tree.member_rows), tree.root_id),
                        separators=(",", ":")).encode()
         )
         for node in tree.nodes.values():
