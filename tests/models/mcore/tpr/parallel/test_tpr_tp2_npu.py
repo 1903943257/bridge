@@ -126,6 +126,13 @@ def _tiny_model(runtime):
         apply_rope_fusion=False,
         bias_dropout_fusion=False,
     )
+    # The native reference calls Megatron/MindSpeed SelfAttention, unlike
+    # TPR's rectangular-attention branch. MindSpeed's causal-mask adaptor
+    # requires use_flash_attn=True, or else micro_batch_size plus seq_length
+    # and other mask-generation fields absent from this tiny TransformerConfig.
+    # Use its standard Flash Attention reference instead of inventing a
+    # non-FA mask configuration or patching the native implementation.
+    cfg.use_flash_attn = True
     spec = replace_self_attention_with_tpr(
         get_gpt_decoder_block_spec(
             cfg, use_transformer_engine=False, pp_rank=0
