@@ -270,3 +270,67 @@ Interpret these as measured numerical differences; all tests remain
 diagnostic-only, with no automatic strict parity gate or NPU execution claim.
 CPU fake-cache tests for the forward plan and both ordering modes: 5 passed
 locally on CPU (not a substitute for real BF16 NPU kernel testing).
+
+
+## 8. Actual AReaL training-schedule loss Forward control (2026-10-10)
+
+The previous oracle covers AReaL `DTAEngine.forward()/push_forward_only()`.
+**It does NOT cover the training-time Forward calls inside
+`DTAEngine.backward()`.** The new test-only numerical oracle now ports
+those Forward calls, while deliberately NOT running backward gradients.
+
+Source pinned to AReaL `feat/dta` commit
+`a5b0b4811a3ef7bf58f0270abcd81d7154f03ce6`:
+
+- `TokenTrie.backward_permute()`: compressed trie, leaf-priority traversal,
+  reverse DFS, plus duplicate/nested-prefix attachment handling.
+- `DTAEngine.backward()`: block-size calculation, `lcp_next`,
+  `cache_len`, and `cut_f1_tail`. Important: cache_len can be below the
+  current start, in which case Push does not call build_cache.
+- `push()/build_cache()`: no_grad, fixed K/V buffers, logits and fork
+  positions at both branch and block boundaries.
+- `pop_byblock()/pop()`: reverse order; reconstruct prefix DynamicCache
+  using detached prefix K/V with requires_grad=True; execute the model
+  in torch.enable_grad() rather than no_grad; concatenate the prefix,
+  fork-token and suffix logprobs seen by the real loss function. The probe
+  detaches those output logprobs and releases the graph without backward.
+- Log provenance traces actual physical **CACHE vs POP** events to the
+  specific row/query token. Any outlier can be linked to event start/M,
+  including fork-connection logits sourced from earlier cache Forward.
+
+Implementation:
+`tests/models/mcore/tpr/correctness/_qwen17_areal_training_forward_reference.py`
+
+NPU diagnostic:
+`tests/models/mcore/tpr/correctness/test_qwen3_1_7b_hf_dta_training_forward_npu.py`
+
+CPU scheduler tests:
+`tests/models/mcore/tpr/unit/test_qwen17_areal_training_forward.py`
+
+One-shot runner:
+`tests/models/mcore/tpr/correctness/run_qwen17_hf_dta_training_forward.sh`
+
+Command from the bridge-backed VERL root:
+
+    export TPR_REAL_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
+    export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
+    TPR_QWEN17_DTA_HF_ATTN=sdpa \
+      bash tests/models/mcore/tpr/correctness/run_qwen17_hf_dta_training_forward.sh
+
+Default block sizes `64,-1` compare blockwise and unchunked Pop.
+The environment `TPR_QWEN17_DTA_TRAIN_BLOCK_SIZES` accepts a comma-separated
+list; `TPR_QWEN17_DTA_TRAIN_CUT_F1_TAIL=1` preserves AReaL's
+backward() default; and `TPR_QWEN17_DTA_TRAIN_MAX_SEQ_LEN` controls
+persistent KV buffer allocation (default 192 for these cropped inputs).
+
+The NPU test keeps the *same HF checkpoint* across HF Full,
+AReaL Forward-only, and AReaL training-Pop Forward, uses model.train()
+with BF16/SDPA, and reports `DTA_TRAIN RESPONSE_SUMMARY`,
+`VS_FWD_ONLY`, `EVENT`, `OUTLIER`, and `TARGET` (row5/query189).
+
+Interpretation: execution=TRAIN_LOSS_FORWARD_CONTROL is **not**
+numeric parity PASS, DTA gradient parity, or complete DTA Backward.
+This oracle does not execute autograd.backward, KV/logprob/entropy/fork-logit
+gradient injections, loss scaling, or optimizer updates.
+Full backward requires a separate correctness project.
+Actual Ascend NPU results for this new training path are pending.
