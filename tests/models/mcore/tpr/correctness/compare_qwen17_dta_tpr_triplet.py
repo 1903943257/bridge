@@ -42,8 +42,8 @@ def compare(folder):
         raise AssertionError("three-way comparison requires all 8x64 valid response tokens")
     old_label=mg.get("meg_old_source","hf_full")
     shared_old=(old_label=="hf_full" and
-                torch.equal(hf["shared_old_logprobs"],
-                            mg.get("meg_old_logprobs",hf["shared_old_logprobs"])))
+                "meg_old_logprobs" in mg and torch.equal(
+                    hf["shared_old_logprobs"],mg["meg_old_logprobs"]))
     print(
         "P1 TRIPLET CONFIG "
         f"objective={hf['objective']} "
@@ -54,8 +54,6 @@ def compare(folder):
         "gradient_cross_framework=NOT_COMPARABLE_WITHOUT_MAPPING",
         flush=True,
     )
-    if old_label=="megatron_native" and shared_old:
-        raise AssertionError("unexpected identical old policy provenance")
     if "dta_forward_only_old_logprobs" in hf:
         df=hf["dta_forward_only_old_logprobs"]
         for label,new in (
