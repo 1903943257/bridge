@@ -278,20 +278,39 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
     tpr_loss, tpr_grad, digest = _tpr(
         model, runtime, prefix, first, second
     )
-    assert abs(native_loss - tpr_loss) < 0.02, (
-        f"dp_rank={runtime.dp_rank}: real TQ CE mismatch "
-        f"reference={native_loss:.7f}, tpr={tpr_loss:.7f}"
-    )
-    assert native_grad.keys() == tpr_grad.keys()
-    norm_ref = sum(g.square().sum().item() for g in native_grad.values())
+    # Do not assert before rank collectives. One TP rank may exceed the
+    # numerical threshold while its peers pass. An early pytest assertion
+    # leaves surviving ranks inside the later DP all_gather, which then
+    # reports misleading HCCL communicator-creation / timeout errors.
+    # Aggregate *diagnostic scalars* before applying the UNCHANGED gates.
+    ce_gap = abs(native_loss - tpr_loss)
+    same_names = native_grad.keys() == tpr_grad.keys()
+    names = set(native_grad) & set(tpr_grad)
+    norm_ref = sum(native_grad[key].square().sum().item() for key in names)
     norm_delta = sum(
-        (native_grad[name] - tpr_grad[name]).square().sum().item()
-        for name in native_grad
+        (native_grad[key] - tpr_grad[key]).square().sum().item()
+        for key in names
     )
     relative_l2 = (norm_delta / max(norm_ref, 1e-24)) ** 0.5
-    assert relative_l2 < 0.05, (
-        f"dp_rank={runtime.dp_rank}: rank-local TP{runtime.tp_size} "
-        f"real TQ gradient rel_l2={relative_l2:.6g} exceeds 5% gate"
+
+    # This is NOT a new gradient collective: only two scalar diagnostics
+    # are added over the existing native TP group, to distinguish a
+    # single-shard >5% result from a model-wide sharded gradient error.
+    tp_norms = torch.tensor(
+        [norm_delta, norm_ref], device=runtime.device, dtype=torch.float32
+    )
+    if runtime.tp_size > 1:
+        dist.all_reduce(tp_norms, op=dist.ReduceOp.SUM, group=runtime.tp_group)
+    tp_global_l2 = (
+        float(tp_norms[0].item()) / max(float(tp_norms[1].item()), 1e-24)
+    ) ** 0.5
+    finite = (
+        torch.isfinite(torch.tensor(
+            [native_loss, tpr_loss, relative_l2, tp_global_l2]
+        )).all().item()
+    )
+    local_ok = (
+        same_names and finite and ce_gap < 0.02 and relative_l2 < 0.05
     )
 
     # Check DIFFERENT original row *ownership* across DP groups. Two
@@ -305,20 +324,76 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
     observed = [torch.empty_like(ownership) for _ in range(2)]
     dist.all_gather(observed, ownership, group=runtime.dp_group)
     row_sets = [set(value.cpu().tolist()) for value in observed]
-    assert row_sets[0].isdisjoint(row_sets[1]), (
-        f"DP replicas received duplicate real TQ logical rows: {row_sets}"
-    )
-    # A different original row ID alone is insufficient: the original gate
-    # consumed just the first 160 tokens and both DP groups could process
-    # the identical prompt. Verify two truly distinct physical forests.
+    ownership_ok = row_sets[0].isdisjoint(row_sets[1])
+
+    # A different original row ID alone is insufficient: verify the
+    # physical 160-token trees differ after real-TQ fork cropping.
     physical_hash = torch.tensor(
         [int(signature[:15], 16)], dtype=torch.int64, device=runtime.device
     )
     physical_hashes = [torch.empty_like(physical_hash) for _ in range(2)]
     dist.all_gather(physical_hashes, physical_hash, group=runtime.dp_group)
-    assert physical_hashes[0].item() != physical_hashes[1].item(), (
-        "DP replicas processed physically identical real-token trees"
+    physical_ok = physical_hashes[0].item() != physical_hashes[1].item()
+    local_ok = local_ok and ownership_ok and physical_ok
+
+    # All ranks have completed forward/backward and native TP/DP collectives.
+    # Explicit WORLD gather is diagnostics-only; *never* use world for
+    # optimizer gradients or loss-token normalization (TP duplicates data).
+    local_metrics = torch.tensor(
+        [
+            float(runtime.dp_rank), float(runtime.rank),
+            native_loss, tpr_loss, ce_gap, relative_l2,
+            tp_global_l2, float(local_ok),
+        ],
+        device=runtime.device, dtype=torch.float32,
     )
+    world_metrics = [torch.empty_like(local_metrics) for _ in range(dist.get_world_size())]
+    dist.all_gather(world_metrics, local_metrics)
+    rows_by_global_rank = [item.detach().cpu().tolist() for item in world_metrics]
+    failures = [
+        (global_rank, row) for global_rank, row in enumerate(rows_by_global_rank)
+        if row[-1] != 1.0
+    ]
+
+    # When the gate fails, rank-local attribution is more useful than
+    # weakening the BF16 tolerance. The score is each parameter's
+    # contribution to the *whole local shard* gradient relative L2.
+    if not local_ok:
+        offenders = []
+        for name in names:
+            error_sq = (
+                native_grad[name] - tpr_grad[name]
+            ).square().sum().item()
+            ref_sq = native_grad[name].square().sum().item()
+            offenders.append((
+                name,
+                (error_sq / max(norm_ref, 1e-24)) ** 0.5,
+                (error_sq / max(ref_sq, 1e-24)) ** 0.5,
+                ref_sq ** 0.5,
+            ))
+        offenders.sort(key=lambda item: item[1], reverse=True)
+        print(
+            f"TPR_MODULE_PARALLEL_DIAG world_rank={dist.get_rank()} "
+            f"tp={runtime.tp_size} dp_rank={runtime.dp_rank} "
+            f"tp_rank={runtime.rank} loss_gap={ce_gap:.8f} "
+            f"shard_grad_rel_l2={relative_l2:.7f} "
+            f"tp_global_grad_rel_l2={tp_global_l2:.7f} "
+            f"param_names_equal={same_names} "
+            f"ownership_ok={ownership_ok} physical_ok={physical_ok} "
+            f"top_contributors={offenders[:8]}",
+            flush=True,
+        )
+    if dist.get_rank() == 0:
+        for global_rank, row in enumerate(rows_by_global_rank):
+            print(
+                f"TPR_MODULE_PARALLEL_RANK world_rank={global_rank} "
+                f"dp_rank={int(row[0])} tp_rank={int(row[1])} "
+                f"native_ce={row[2]:.7f} tpr_ce={row[3]:.7f} "
+                f"ce_gap={row[4]:.7f} shard_grad_rel_l2={row[5]:.7f} "
+                f"tp_global_grad_rel_l2={row[6]:.7f} "
+                f"gate_pass={bool(row[7])}",
+                flush=True,
+            )
 
     if runtime.rank == 0:
         print(
@@ -332,4 +407,11 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
             f"production_trainer_dispatch=NOT_TESTED",
             flush=True,
         )
+    # Always finish every communicator before declaring the global test
+    # failed. This avoids stranding successful peers in HCCL setup.
     dist.barrier()
+    assert not failures, (
+        "TPR real-TQ TP/DP module gradient/loss gate failed on "
+        f"{[(r, int(v[0]), int(v[1]), round(v[5], 7)) for r, v in failures]}; "
+        "see TPR_MODULE_PARALLEL_DIAG above; threshold unchanged"
+    )
