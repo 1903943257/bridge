@@ -621,3 +621,76 @@ validated HF-to-Megatron parameter-gradient mapping.
 
 **New triplet NPU status:** not yet executed. This must not be reported
 as TPR gradient/optimizer numerical parity before physical NPU run.
+
+
+## 13. PPO-gradient amplification vs forward error: actual DTA / real TPR (2026-10-10)
+
+All four branches used the same Qwen3-1.7B checkpoint,
+the cropped 8x(128+64) real TQ rows, deterministic proxy advantages
+and common HF-Full old logprobs.
+
+For DTA, HF Full vs actual train-Pop Forward+Backward:
+- response logprob mean/max 0.0296836 / 0.458695
+- global all-parameter gradients rel-L2:
+  0.0456423 under fixed-logprob,
+  0.1273225 under unclipped PPO ratio,
+  0.5939439 under clipped PPO
+- This does NOT mean the Forward improved when clipping was disabled:
+  its outputs were identical. Only upstream dLoss/dLogprob changed.
+
+For Megatron, actual native versus production-routed TPR Forest, under
+unclipped PPO:
+- response logprob mean/max 0.0328390 / 0.749377
+- sampled parameter gradients rel-L2 0.222722 (586,752 sampled entries
+  across 226 parameter names) and cosine 0.979953
+- no HF-to-Megatron parameter gradient mapping, so HF/DTA
+  all-parameter L2=0.1273 is NOT numerically commensurate with
+  Megatron/TPR sampled L2=0.2227.
+- **Crucial framework floor**: HF Full vs Megatron Full already has
+  mean/max logprob error 0.0324249 / 0.624209 WITHOUT tree execution.
+  Investigate this before attributing HF-to-TPR gap to prefix reuse.
+- The Megatron comparison uses the SAME old policy logprobs that
+  came from HF Full. Hence Megatron Full can itself have ratio != 1
+  and actual clipped PPO branches even at the same model checkpoint.
+  TPR ratio_outside_frac=0.08203125 relative to HF old is NOT
+  solely caused by TPR: baseline Megatron Full must be measured.
+
+NPU single-sequence and block-64 controls:
+- rows=1 block=-1 fixed-logprob: output and all gradients exactly
+  equal, BUT DTA does not split the 192-token physical Forward.
+- rows=1 block=64 fixed-logprob: response mean 0.022037 and
+  full-parameter grad rel-L2 0.0732935. This tests
+  blockwise recomputation and KV/fork/logprob gradient relay together,
+  not each mechanism independently.
+- rows=8 block=-1 fixed-logprob: response mean 0.0259844,
+  grad rel-L2 0.0361715 (tree still has physical shared-prefix
+  chunks despite no arbitrary block-size limit).
+- No result above proves that the DTA gradient relay itself is
+  mathematically wrong; shape-sensitive BF16 Forward/backward can
+  generate differences without a relay bug. Nor does rows=1/no-chunk
+  validate the relay.
+
+**Diagnostic recently added**: the Megatron Native-vs-TPR
+triplet now emits \`P1 TPR_TRIPLET CLIP_BRANCH\` with:
+\`native_clipped\`, \`tpr_clipped\`, \`branch_flips\`,
+\`native_outside\`, \`tpr_outside\`, using the same HF old logprobs
+and advantage signs. CPU tests assert the branch equations. These
+metrics identify how much of the apparent clipping is already present
+without TPR. This is an instrumentation-only addition; no production
+clip ratio/objective has been changed, and NPU test results are pending.
+
+**Root-cause and mitigation order**:
+1. First measure the genuine Native-vs-TPR clipped-policy gradient
+   **branch disagreement**, not just "ratio outside" or max logprob.
+2. Separately test whether rollout-old logprobs and train-new
+   logprobs are being evaluated with compatible physical shape and
+   backend semantics. Do NOT silently replace a historical old policy
+   with the current actor logprobs after policy updates.
+3. Fix leading per-layer shape/numerical drift under matched BF16
+   (including checking the HF/Megatron independent Full baseline)
+   before promoting any FP32 or GEMM-tile precision override.
+4. Only after matched old/new semantics and native-vs-TPR logprob
+   floors have improved, re-run actual clipped PPO gradients and
+   multi-step optimizer tests. Do NOT solve numerical drift by simply
+   disabling PPO clipping or substituting fixed-logprob as production
+   PPO.
