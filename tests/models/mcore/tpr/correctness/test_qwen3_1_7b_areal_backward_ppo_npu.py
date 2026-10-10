@@ -77,10 +77,15 @@ def _ppo_row_loss(logp, entropy, old_lp, advantage, *, p, s, clip_eps, entropy_c
     ent = entropy[p - 1:p + s - 1].float()
     if len(lp) != s or len(ent) != s:
         raise AssertionError("PPO response alignment error")
-    if objective == "ppo":
+    if objective in ("ppo", "ppo_unclipped"):
         ratio = (lp - old_lp).exp()
-        clipped = ratio.clamp(1 - clip_eps, 1 + clip_eps)
-        surrogate = torch.minimum(ratio * advantage, clipped * advantage)
+        if objective == "ppo":
+            clipped = ratio.clamp(1 - clip_eps, 1 + clip_eps)
+            surrogate = torch.minimum(ratio * advantage, clipped * advantage)
+        else:
+            # PPO importance ratio without clipping; derivative retains
+            # exp(logp-old_lp), unlike the fixed-logprob diagnostic.
+            surrogate = ratio * advantage
     elif objective == "fixed_logprob":
         # Identical d(loss)/d(logprob) at every token, regardless of
         # Full/DTA logprob drift. Diagnostic only, not PPO.
@@ -325,6 +330,9 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
         "entropies":tuple(captured_entropy),
         "clip_frac":clip_frac,
         "effective_clip_frac":effective_clip_frac,
+        # Counterfactual: only the clipped PPO objective actually suppresses
+        # gradients beyond the advantage-dependent clipping threshold.
+        "active_clip_frac":effective_clip_frac if objective == "ppo" else 0.0,
         "engine_loss":engine_loss,
         "loss_value":total_loss_value,
         "patched_linear_count":count,
@@ -353,8 +361,8 @@ def test_real_areal_dta_full_backward_ppo_gemm():
     rows=rows[:n_rows]
     block=int(os.getenv("TPR_DTA_BWD_BLOCK","64"))
     objective=os.getenv("TPR_DTA_BWD_OBJECTIVE","ppo")
-    if objective not in ("ppo","fixed_logprob"):
-        pytest.fail("TPR_DTA_BWD_OBJECTIVE must be ppo or fixed_logprob")
+    if objective not in ("ppo","ppo_unclipped","fixed_logprob"):
+        pytest.fail("TPR_DTA_BWD_OBJECTIVE must be ppo, ppo_unclipped, or fixed_logprob")
     paired_full=os.getenv("TPR_DTA_BWD_PAIRED_FULL","0")=="1"
     tile=int(os.getenv("TPR_DTA_BWD_GEMM_M_TILE","32"))
     lr=float(os.getenv("TPR_DTA_BWD_ADAM_LR","1e-4"))
@@ -404,6 +412,7 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         f"matched_grad_count={sum(g is not None for g in reference['grads'].values())} "
         f"ppo_loss={reference['loss_value']:.9g} "
         f"effective_clip_frac={reference['effective_clip_frac']:.9g} "
+        f"active_clip_frac={reference['active_clip_frac']:.9g} "
         "mode=BF16_FULL optimizer_step=EXECUTED",flush=True,
     )
     del model
@@ -462,6 +471,7 @@ def test_real_areal_dta_full_backward_ppo_gemm():
             f"response_logp_gt0p2={response['num_gt_0p2']} "
             f"clip_frac={current['clip_frac']:.9g} "
             f"effective_clip_frac={current['effective_clip_frac']:.9g} "
+            f"active_clip_frac={current['active_clip_frac']:.9g} "
             f"ppo_loss={current['loss_value']:.9g} "
             f"ppo_loss_delta={current['loss_value']-reference['loss_value']:.9g} "
             f"grad_rel_l2={grad_stats['relative_l2']:.9g} "
