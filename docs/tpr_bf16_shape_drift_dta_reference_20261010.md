@@ -204,3 +204,19 @@ old lexical DFS and the exact row5 five-segment comparison remain intact.
   recomputation, Prefix KV/fork-logit gradient relay and PPO/optimizer
   parity remain NOT IMPLEMENTED; success means the probe ran, not parity.
 - New AReaL-faithful NPU numerical results are PENDING user execution.
+
+### Additional two-axis numerical ablation (same checkpoint)
+
+To avoid attributing a schedule change to the KV storage layout, the new
+NPU test also runs AReaL-compatible persistent KV storage *without*
+forward_permute. It prints:
+
+- AREAL_LEXICAL_BUFFER: HF Full vs lexical/leafized persistent-KV mode.
+- AREAL_BUFFER_ABLATION: old lexical last-leaf cache vs lexical persistent KV.
+- AREAL_PERMUTE_ABLATION: lexical persistent KV vs optimized persistent KV.
+- AREAL_SUMMARY and AREAL_RESPONSE_SUMMARY: Full vs optimized persistent KV.
+
+Interpret these as measured numerical differences; all tests remain
+diagnostic-only, with no automatic strict parity gate or NPU execution claim.
+CPU fake-cache tests for the forward plan and both ordering modes: 5 passed
+locally on CPU (not a substitute for real BF16 NPU kernel testing).
