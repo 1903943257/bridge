@@ -45,17 +45,28 @@ has yet been reported.** This is not an E2E PPO or multi-dimensional result.
   stable/different plan hash, different PPO labels and TP mismatch errors.
 - Existing `test_tpr_self_attention.py` already covers stub local-head
   TP2 gradient and explicit SP rejection.
-- New **two-NPU** test
+- New **two-NPU Qwen3-1.7B** test
   `tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py`:
-  `TPR_RUN_TP2=1 torchrun --standalone --nproc_per_node=2 -m pytest -vv -s ...`
+  `TPR_RUN_TP2=1 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29531 -m pytest -vv -s ...`
+    - Uses **real** `/workspace/hf_models/Qwen3-1.7B` checkpoint,
+      28 layers, 2048 hidden, 16 Q / 8 KV heads, 151936 vocab,
+      and **native TP2** sharding. Source checkpoint paths can be set
+      using `TPR_QWEN_1_7B_PATH`.
+    - New `_qwen3_tp_checkpoint.py` loads HF weights into native
+      Megatron GQA-group QKV shards, per-partition SwiGLU gate/up,
+      row-parallel O/MLP down projections and vocabulary-sharded tied
+      embeddings; checks all parameter coverage. This is necessary
+      because the existing real-Qwen CP weight loader assumes TP=1.
     - Native TP2 independent complete trajectories vs TPR TP2 Tree
       `MegatronEngine.forward_backward_batch`: BF16 scalar CE,
-      rank-local parameter gradients, and one SGD step.
+      rank-local parameter gradients, and an SGD update. Vocab labels
+      target **the second TP vocab shard** (global IDs above 75968).
     - Native TP2 vocab-sharded NLL vs TPR PPO Forest objective adapter:
-      the same response-token loss, branch-point query ownership,
-      TP2 vocab-parallel logprob gradients.
-    - These are isolated F/B tests (NLL specialization for PPO adapter),
-      not actual multi-step GRPO/PPO end-to-end training.
+      same response-token loss, branch-point query ownership, TP2
+      vocab-parallel logprob gradients.
+    - Trajectory token IDs are deterministic test inputs; **weights and
+      architecture are genuine pretrained Qwen3-1.7B**. Tests are
+      isolated F/B gates (PPO NLL specialization), not full GRPO E2E.
 
 ## Command on the already-synced Docker runtime
 
@@ -65,7 +76,8 @@ python -m pytest -vv -s \
     tests/models/mcore/tpr/unit/test_tp_validation.py \
     tests/models/mcore/tpr/unit/test_tpr_self_attention.py
 
-TPR_RUN_TP2=1 torchrun --standalone --nproc_per_node=2 \
+TPR_RUN_TP2=1 torchrun --nproc_per_node=2 \
+    --master_addr=127.0.0.1 --master_port=29531 \
     -m pytest -vv -s \
     tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py
 ```
