@@ -135,6 +135,14 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
     # Preserve lexical DFS to isolate the effect of *execution schedule*.
     from ._qwen17_areal_dta_reference import hf_areal_forward_only
     areal = hf_areal_forward_only(model, tokens, DynamicCache)
+    # Same fixed AReaL K/V buffers but without forward_permute:
+    # separate storage/layout effects from changed GEMM M scheduling.
+    lexical_buffer = hf_areal_forward_only(
+        model, tokens, DynamicCache, forward_permute=False,
+    )
+    _, lexical_buffer_full = error_summary(full, lexical_buffer.logprobs)
+    _, buffer_only = error_summary(lcp_dfs.logprobs, lexical_buffer.logprobs)
+    _, permute_only = error_summary(lexical_buffer.logprobs, areal.logprobs)
     areal_rows, areal_summary = error_summary(full, areal.logprobs)
     areal_response = tuple(x[p - 1:p + s - 1] for x in areal.logprobs)
     _, areal_response_summary = error_summary(response_full, areal_response)
@@ -174,6 +182,29 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
         f"p95_abs={areal_response_summary['p95_abs']:.9g} "
         f"num_gt_0p2={areal_response_summary['num_gt_0p2']} "
         "same_HF_checkpoint=True numerical_parity=DIAGNOSTIC_ONLY",
+        flush=True,
+    )
+    print(
+        "P0 DTA_HF AREAL_LEXICAL_BUFFER "
+        f"max_abs={lexical_buffer_full['max_abs']:.9g} "
+        f"mean_abs={lexical_buffer_full['mean_abs']:.9g} "
+        f"p95_abs={lexical_buffer_full['p95_abs']:.9g} "
+        f"physical_m={list(lexical_buffer.physical_m)} "
+        f"physical_starts={list(lexical_buffer.physical_starts)}",
+        flush=True,
+    )
+    print(
+        "P0 DTA_HF AREAL_BUFFER_ABLATION "
+        f"max_abs={buffer_only['max_abs']:.9g} "
+        f"mean_abs={buffer_only['mean_abs']:.9g} "
+        "comparison=LEXICAL_LAST_CACHE_VS_LEXICAL_FIXED_KV",
+        flush=True,
+    )
+    print(
+        "P0 DTA_HF AREAL_PERMUTE_ABLATION "
+        f"max_abs={permute_only['max_abs']:.9g} "
+        f"mean_abs={permute_only['mean_abs']:.9g} "
+        "comparison=LEXICAL_FIXED_KV_VS_OPTIMIZED_FIXED_KV",
         flush=True,
     )
     print(
@@ -321,6 +352,7 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
         f"row={row} query_abs=189 "
         f"hf_full={float(full[row][189]):.9g} "
         f"hf_lexical={float(lcp_dfs.logprobs[row][189]):.9g} "
+        f"hf_lexical_buffer={float(lexical_buffer.logprobs[row][189]):.9g} "
         f"hf_areal={float(areal.logprobs[row][189]):.9g} "
         f"hf_fixed={float(fixed[189]):.9g} "
         f"areal_abs={float((full[row][189]-areal.logprobs[row][189]).abs()):.9g} "
