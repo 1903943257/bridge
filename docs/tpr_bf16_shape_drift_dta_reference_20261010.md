@@ -484,3 +484,62 @@ Recommended **isolation**:
 Compare this fixed-token-gradient experiment with the prior clipped PPO
 proxy run before attempting more GEMM modes, new optimizer heuristics, or
 precision changes. All new controls remain **NPU unverified** pending run.
+
+
+## 11. Fixed-logprob gradient isolation on real Ascend NPU (2026-10-10)
+
+Two independent cases were supplied by the user:
+
+**Single full 192-token sequence, block_size=-1, objective=fixed_logprob:**
+All 311 parameter gradients bitwise aligned with HF Full
+(global grad relative L2 = 0, cosine = 1); logprob drift 0 and sampled
+AdamW parameter step drift 0. This checks the native DTA no-sharing
+full-Forward/Backward path, **not** prefix reuse or KV relay under forks.
+
+**Eight real trajectories, block_size=64, objective=fixed_logprob:**
+- Native BF16: grad relative L2 **0.0456423**, cosine **0.998987**,
+  response logprob mean **0.0296836**, max **0.458695**,
+  sampled BF16 AdamW step relative L2 **0.301296**.
+- BF16 M split, tile=32: global grad relative L2 vs original BF16 Full
+  **0.0536512**, cosine **0.998732**; vs **equivalently M-split Full**
+  grad relative L2 **0.0218131**, cosine **0.999769**,
+  response logprob mean **0.0104654**.
+- FP32 Linear: vs original BF16 Full global grad relative L2
+  **0.0704752**, cosine **0.997905**; vs equivalently FP32-Linear Full
+  relative L2 **0.0536680**, cosine **0.998666**,
+  response logprob mean **0.0219767**.
+
+Comparison to the preceding clipped-PPO-proxy run in the same native
+configuration: gradient relative L2 fell from **0.593944** to
+**0.0456423**, while response logprob drift was unchanged.
+**Important:** `fixed_logprob` removes both PPO clipping AND
+importance-ratio reweighting. It cannot identify clipping as the sole
+source of the additional gradient mismatch.
+
+Added an intermediate `TPR_DTA_BWD_OBJECTIVE=ppo_unclipped` to isolate:
+- `ppo`: `-min(ratio * advantage, clamp(ratio)*advantage)`
+- `ppo_unclipped`: `-ratio * advantage`
+- `fixed_logprob`: `-logprob * advantage`
+
+The `effective_clip_frac` still reports which tokens would be
+clipped under PPO; `active_clip_frac` is set to zero for the latter
+two objectives and reflects actual clipping only under `ppo`.
+
+Suggested next runs after the usual host bridge git pull and Docker rsync:
+
+    TPR_DTA_BWD_ROWS=8 TPR_DTA_BWD_BLOCK=64 \
+    TPR_DTA_BWD_MODES=native TPR_DTA_BWD_OBJECTIVE=ppo_unclipped \
+    bash tests/models/mcore/tpr/correctness/run_qwen17_areal_full_backward_ppo.sh
+
+    TPR_DTA_BWD_ROWS=1 TPR_DTA_BWD_BLOCK=64 \
+    TPR_DTA_BWD_MODES=native TPR_DTA_BWD_OBJECTIVE=fixed_logprob \
+    bash tests/models/mcore/tpr/correctness/run_qwen17_areal_full_backward_ppo.sh
+
+    TPR_DTA_BWD_ROWS=8 TPR_DTA_BWD_BLOCK=-1 \
+    TPR_DTA_BWD_MODES=native TPR_DTA_BWD_OBJECTIVE=fixed_logprob \
+    bash tests/models/mcore/tpr/correctness/run_qwen17_areal_full_backward_ppo.sh
+
+The first distinguishes ratio reweighting from clipping; the second
+isolates chunked Pop on a single logical sequence; the third tests
+shared-prefix paths with the last full-sequence Pop unchunked.
+These new modes are NPU UNVERIFIED until executed.
