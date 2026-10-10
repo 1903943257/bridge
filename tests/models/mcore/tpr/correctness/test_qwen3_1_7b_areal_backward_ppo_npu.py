@@ -206,6 +206,7 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
         optimizer=torch.optim.AdamW(model.parameters(),lr=lr,weight_decay=0.0,
                                     foreach=False)
         optimizer.zero_grad(set_to_none=True)
+        total_loss_value=0.0
         captured=[None]*n_rows
         captured_entropy=[None]*n_rows
         if block_size is None:
@@ -219,6 +220,7 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
                 captured_entropy[i]=ent.detach().clone()
                 loss=_ppo_row_loss(lp,ent,old[i],adv[i],p=p,s=s,
                                    clip_eps=clip_eps,entropy_coef=entropy_coef,n_rows=n_rows)
+                total_loss_value+=float(loss.detach())
                 loss.backward()
             engine_loss=None
         else:
@@ -243,6 +245,7 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
                                      n_rows=n_rows)
             engine_loss=engine.backward(
                 model,trie,loss_fn,block_size=block_size,cut_f1_tail=True)
+            total_loss_value=float(engine_loss)
             del engine, trie
         if any(x is None for x in captured) or any(x is None for x in captured_entropy):
             raise AssertionError("PPO loss did not receive all trajectory outputs")
@@ -255,8 +258,6 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
         updates={k:after[k]-v for k,v in before.items()}
         del optimizer
     with torch.no_grad():
-        _,summary=error_summary(tuple(x[p-1:p+s-1] for x in old),
-                                tuple(x[p-1:p+s-1] for x in captured)) if False else (None,None)
         ratios=torch.cat([
             (lp[p-1:p+s-1].float().cpu()-old[i].cpu()).exp()
             for i,lp in enumerate(captured)
@@ -273,6 +274,7 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
         "entropies":tuple(captured_entropy),
         "clip_frac":clip_frac,
         "engine_loss":engine_loss,
+        "loss_value":total_loss_value,
         "patched_linear_count":count,
     }
 
@@ -305,6 +307,8 @@ def test_real_areal_dta_full_backward_ppo_gemm():
     max_seq_len=int(os.getenv("TPR_DTA_BWD_MAX_SEQ_LEN","192"))
     if max_seq_len<192: pytest.fail("DTA max_seq_len must >=192")
     adv_cpu,old_cpu=_recorded_ppo_data(tq,8,s)
+    recorded_adv=adv_cpu is not None
+    recorded_old=old_cpu is not None
     if adv_cpu is not None: adv_cpu=adv_cpu[:n_rows]
     if old_cpu is not None: old_cpu=old_cpu[:n_rows]
     if os.getenv("TPR_PPO_REQUIRE_RECORDED")=="1" and (adv_cpu is None or old_cpu is None):
@@ -321,14 +325,13 @@ def test_real_areal_dta_full_backward_ppo_gemm():
                 for x in rows
             ])
     old=tuple(x.to(device) for x in old_cpu)
-    source=("RECORDED" if _recorded_ppo_data(tq,8,s)[0] is not None
-            and _recorded_ppo_data(tq,8,s)[1] is not None else "PPO_PROXY")
+    source="RECORDED" if recorded_adv and recorded_old else "PPO_PROXY"
     print(
         "P1 DTA_BACKWARD CONFIG "
         f"checkpoint={checkpoint} rows={n_rows} p={p} s={s} block={block} "
         f"modes={list(mode_list)} tile_m={tile} attention={attn} "
-        f"old_source={'RECORDED' if _recorded_ppo_data(tq,8,s)[1] is not None else 'HF_FULL_CURRENT_MODEL'} "
-        f"adv_source={'RECORDED' if _recorded_ppo_data(tq,8,s)[0] is not None else 'DETERMINISTIC_PROXY'} "
+        f"old_source={'RECORDED' if recorded_old else 'HF_FULL_CURRENT_MODEL'} "
+        f"adv_source={'RECORDED' if recorded_adv else 'DETERMINISTIC_PROXY'} "
         f"ppo_source={source} optimizer=AdamW lr={lr} clip={eps} entropy_coef={entropy_coef} "
         "grad_relay=KV_FORK_LOGPROBS_ENTROPY actual_backward=True "
         "adapter=HF_SHIFTED_LOGITS_B_MINUS_1",
@@ -341,6 +344,7 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         "P1 DTA_BACKWARD FULL "
         f"clip_frac={reference['clip_frac']:.9g} "
         f"matched_grad_count={sum(g is not None for g in reference['grads'].values())} "
+        f"ppo_loss={reference['loss_value']:.9g} "
         "mode=BF16_FULL optimizer_step=EXECUTED",flush=True,
     )
     del model
@@ -372,6 +376,8 @@ def test_real_areal_dta_full_backward_ppo_gemm():
             f"response_logp_mean={response['mean_abs']:.9g} "
             f"response_logp_gt0p2={response['num_gt_0p2']} "
             f"clip_frac={current['clip_frac']:.9g} "
+            f"ppo_loss={current['loss_value']:.9g} "
+            f"ppo_loss_delta={current['loss_value']-reference['loss_value']:.9g} "
             f"grad_rel_l2={grad_stats['relative_l2']:.9g} "
             f"grad_cosine={grad_stats['cosine']:.9g} "
             f"param_step_sample_rel_l2={step_rel_l2:.9g} "
