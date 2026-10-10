@@ -8,9 +8,10 @@ Run (two visible NPUs):
       tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py
 
 This does NOT claim PPO E2E, TP+SP, TP+CP or TP+DP correctness.
-It verifies actual TPR Engine TP2 scheduling, local vocab-sharded native
+It verifies TPR's *thin adapter* TP2 schedule, local vocab-sharded native
 CE and PPO logprobs, gradients, and an optimizer step against independent
-full-trajectory forwards. Attention uses the established *controlled CANN
+full-trajectory forwards. Full VERL MegatronEngine interception and
+complete PPO/GRPO E2E are NOT exercised by this test. Attention uses the established *controlled CANN
 square-causal reference* (not unmodified MindSpeed ScaledMaskedSoftmax)
 with authentic TP2-sharded HF weights.
 The token trajectories are deterministic test data, but the model is the
@@ -185,10 +186,16 @@ def _tpr_engine_run(model, runtime, plan):
     engine.enable_routing_replay = False
     engine.get_data_parallel_size = lambda: 1
     request = TPRForwardBackwardRequest(plan)
-    data = TensorDict({}, batch_size=[])
-    tu.assign_non_tensor(data, **{TPR_REQUEST_KEY: request})
-    output = engine.forward_backward_batch(
-        data, loss_function=None, forward_only=False
+    # The deployed VERL MegatronEngine currently reads data["loss_mask"]
+    # before it can route a TPR request. A request-only TensorDict therefore
+    # fails in the *native* batching preamble before reaching our adapter.
+    # This test is specifically the TP2 correctness gate for the explicit
+    # TPR thin entry. Full Engine interception is a SEPARATE integration
+    # gate; do not mislabel this as an E2E engine-routing success.
+    from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward
+
+    output = run_tpr_forward_backward(
+        engine, request, forward_only=False
     )
     assert calls == {"finalize": 1}
     return output, _parameter_gradients(model)
@@ -359,8 +366,10 @@ def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
             cursor += count + 1  # One unused dummy logit for each fake row.
         assert cursor == packed.numel()
         normalizer = tu.get_non_tensor_data(
-            data, key="batch_num_tokens"
+            data, key="batch_num_tokens", default=None
         )
+        if normalizer is None or normalizer <= 0:
+            raise ValueError("TP2 PPO test requires a positive batch_num_tokens")
         return total / normalizer, {}
 
     calls = {"finalize": 0}
