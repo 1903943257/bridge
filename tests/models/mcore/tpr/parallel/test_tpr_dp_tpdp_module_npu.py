@@ -17,8 +17,9 @@ Then combined native TP2 x DP2 = 4 NPUs:
       -m pytest -vv -s tests/models/mcore/tpr/parallel/test_tpr_dp_tpdp_module_npu.py
 
 The module runs TPR and independent full-trajectory references for each
-DP replica. DP replicas intentionally get *different* real TQ rows; within a
-replica TP peers must execute the *same* plan. The DP-group all-reduce below
+DP replica. In DP2, replicas intentionally receive different real-TQ fork
+windows; TP peers share an identical plan. The optional DP1 two-NPU control
+runs the *same* failing TP2xDP2 DP1 data without cross-DP topology. The DP-group diagnostic gather below
 is a tiny control-plane handshake only, NOT a replacement for Megatron
 distributed optimizer/gradient finalization. Runtime DP training stays gated.
 """
@@ -65,10 +66,15 @@ _QWEN = Path(os.getenv("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B"))
 @pytest.fixture(scope="module")
 def parallel_runtime():
     tp_size = int(os.getenv("TPR_MODULE_TP_SIZE", "1"))
+    dp_size = int(os.getenv("TPR_MODULE_DP_SIZE", "2"))
     assert tp_size in (1, 2)
+    assert dp_size in (1, 2), "DP=1 is only for isolated TP2 same-token control"
+    if dp_size == 1 and tp_size != 2:
+        raise ValueError("isolated DP1 control requires TP2")
     world_size = int(os.getenv("WORLD_SIZE", "1"))
-    assert world_size == tp_size * 2, (
-        f"DP2 module test expects world_size=TP*2={tp_size * 2}, got {world_size}"
+    assert world_size == tp_size * dp_size, (
+        f"parallel module test expects world_size=TP*DP="
+        f"{tp_size * dp_size}, got {world_size}"
     )
     import torch_npu  # noqa: F401
 
@@ -108,12 +114,12 @@ def parallel_runtime():
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     dp_rank = parallel_state.get_data_parallel_rank()
     assert dist.get_world_size(group=tp_group) == tp_size
-    assert dist.get_world_size(group=dp_group) == 2
-    assert dp_rank in (0, 1)
+    assert dist.get_world_size(group=dp_group) == dp_size
+    assert 0 <= dp_rank < dp_size
     runtime = SimpleNamespace(
         rank=tp_rank, dp_rank=dp_rank, device=torch.device("npu", local_rank),
         tp_group=tp_group, dp_group=dp_group, cp_group=cp_group,
-        pp_group=pp_group, tp_size=tp_size,
+        pp_group=pp_group, tp_size=tp_size, dp_size=dp_size,
     )
     yield runtime
     dist.barrier()
@@ -194,7 +200,16 @@ def _real_tq_two_trajectories(runtime):
             "recorded TQ DP groups have no distinct fork-window physical "
             "workloads; refuse a false-positive heterogeneous-DP PASS"
         )
-    chosen = chosen0 if runtime.dp_rank == 0 else chosen1
+    # DP1 control deliberately reuses the same *recorded DP1 fork window*
+    # that failed under TP2xDP2; this changes only ProcessGroup topology,
+    # not TPR scheduling, model data, threshold or BF16 kernel choices.
+    selected_workload = (
+        int(os.getenv("TPR_MODULE_TQ_PAIR", "1"))
+        if runtime.dp_size == 1 else runtime.dp_rank
+    )
+    if selected_workload not in (0, 1):
+        raise ValueError("TPR_MODULE_TQ_PAIR must be 0 or 1")
+    chosen = chosen0 if selected_workload == 0 else chosen1
     prefix, first, second, selected, fork, start, signature = chosen
     assert prefix.numel() == prefix_len
     assert first.numel() == second.numel() == suffix_len
@@ -313,27 +328,27 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
         same_names and finite and ce_gap < 0.02 and relative_l2 < 0.05
     )
 
-    # Check DIFFERENT original row *ownership* across DP groups. Two
-    # physically identical token forests may legitimately be assigned to
-    # different DP replicas; comparing only the segment-token SHA256 would
-    # incorrectly mark that valid assignment as a failure. This test sends
-    # only two int64 row IDs, NOT KV or parameter gradients.
-    ownership = torch.tensor(
-        selected, device=runtime.device, dtype=torch.int64
-    )
-    observed = [torch.empty_like(ownership) for _ in range(2)]
-    dist.all_gather(observed, ownership, group=runtime.dp_group)
-    row_sets = [set(value.cpu().tolist()) for value in observed]
-    ownership_ok = row_sets[0].isdisjoint(row_sets[1])
+    # On DP2, verify disjoint original rows AND physical tokens across
+    # replicas; on the DP1 control there is no inter-replica assignment.
+    # Both paths preserve the exact original recorded tokens and math.
+    if runtime.dp_size == 2:
+        ownership = torch.tensor(
+            selected, device=runtime.device, dtype=torch.int64
+        )
+        observed = [torch.empty_like(ownership) for _ in range(2)]
+        dist.all_gather(observed, ownership, group=runtime.dp_group)
+        row_sets = [set(value.cpu().tolist()) for value in observed]
+        ownership_ok = row_sets[0].isdisjoint(row_sets[1])
 
-    # A different original row ID alone is insufficient: verify the
-    # physical 160-token trees differ after real-TQ fork cropping.
-    physical_hash = torch.tensor(
-        [int(signature[:15], 16)], dtype=torch.int64, device=runtime.device
-    )
-    physical_hashes = [torch.empty_like(physical_hash) for _ in range(2)]
-    dist.all_gather(physical_hashes, physical_hash, group=runtime.dp_group)
-    physical_ok = physical_hashes[0].item() != physical_hashes[1].item()
+        physical_hash = torch.tensor(
+            [int(signature[:15], 16)], dtype=torch.int64, device=runtime.device
+        )
+        physical_hashes = [torch.empty_like(physical_hash) for _ in range(2)]
+        dist.all_gather(physical_hashes, physical_hash, group=runtime.dp_group)
+        physical_ok = physical_hashes[0].item() != physical_hashes[1].item()
+    else:
+        assert runtime.dp_size == 1
+        ownership_ok, physical_ok = True, True
     local_ok = local_ok and ownership_ok and physical_ok
 
     # All ranks have completed forward/backward and native TP/DP collectives.
@@ -374,7 +389,7 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
         offenders.sort(key=lambda item: item[1], reverse=True)
         print(
             f"TPR_MODULE_PARALLEL_DIAG world_rank={dist.get_rank()} "
-            f"tp={runtime.tp_size} dp_rank={runtime.dp_rank} "
+            f"tp={runtime.tp_size} dp_size={runtime.dp_size} dp_rank={runtime.dp_rank} "
             f"tp_rank={runtime.rank} loss_gap={ce_gap:.8f} "
             f"shard_grad_rel_l2={relative_l2:.7f} "
             f"tp_global_grad_rel_l2={tp_global_l2:.7f} "
@@ -397,7 +412,7 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
 
     if runtime.rank == 0 and not failures:
         print(
-            f"TPR_MODULE_PARALLEL status=PASS tp={runtime.tp_size} dp=2 "
+            f"TPR_MODULE_PARALLEL status=PASS tp={runtime.tp_size} dp={runtime.dp_size} "
             f"dp_rank={runtime.dp_rank} real_tq_rows={selected} "
             f"window_start={window_start} true_fork={fork} "
             f"physical_hash={signature[:12]} "
