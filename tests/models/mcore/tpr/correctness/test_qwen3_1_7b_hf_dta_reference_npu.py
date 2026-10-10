@@ -1,0 +1,201 @@
+"""Opt-in independent HF Qwen3-1.7B vs DTA-style DynamicCache BF16 control.
+
+Same Ascend device, HF model object, HF checkpoint, and real TQ token rows:
+  HF Full (single cache-enabled forward)
+  HF DTA-style sorted LCP/DFS cached suffix forward
+  HF fixed 5-chunk row5 control with the same TPR physical boundaries
+
+This is NOT production TPR, and not DTA backward training. The comparison
+never attributes HF-vs-Megatron numerical differences to prefix reuse.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+import torch
+
+from ._qwen17_dta_style_reference import (
+    hf_full_logprobs,
+    hf_cached_chunk_logprobs,
+    hf_dta_lcp_forward,
+    error_summary,
+)
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("TPR_RUN_QWEN17_DTA_REF") != "1",
+    reason="Set TPR_RUN_QWEN17_DTA_REF=1 for real HF DTA-style NPU control",
+)
+
+
+def _real_cropped_rows(path: Path, *, p: int, s: int):
+    if not path.is_file():
+        pytest.fail(f"missing real TQ dump: {path}")
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    td = data["tensordict"]
+    prompts, responses, originals = (
+        list(td[key]) for key in ("prompts", "responses", "input_ids")
+    )
+    if not (len(prompts) == len(responses) == len(originals) == 8):
+        pytest.fail("DTA-style control expects the recorded 8 real SWE trajectories")
+    rows = []
+    for i, (prompt, response, original) in enumerate(
+        zip(prompts, responses, originals, strict=True)
+    ):
+        if len(prompt) < p or len(response) < s:
+            pytest.fail(f"real TQ row{i} shorter than requested crop")
+        if not torch.equal(
+            torch.cat((prompt, response)), original
+        ):
+            pytest.fail(f"row{i} TQ prompt/response boundary inconsistent")
+        rows.append(torch.cat((prompt[-p:], response[:s])).long())
+    return rows
+
+
+def _single_v_capture(model, tokens, cache_factory, *, length):
+    """Capture v_proj pre-input and output at the first HF model layer."""
+    if not hasattr(model.model.layers[0].self_attn, "v_proj"):
+        raise AssertionError("Expected Qwen3 first-layer self_attn.v_proj")
+    result = {}
+    def hook(_module, args, _output):
+        if result:
+            raise AssertionError("HF first-layer V projection called twice")
+        if not args or not isinstance(args[0], torch.Tensor):
+            raise AssertionError("Expected positional HF v_proj input")
+        result["input"] = args[0].detach().cpu().float().clone()
+        result["v"] = _output.detach().cpu().float().clone()
+    h = model.model.layers[0].self_attn.v_proj.register_forward_hook(hook)
+    try:
+        hf_full_logprobs(model, tokens[:length], cache_factory)
+    finally:
+        h.remove()
+    if set(result) != {"input", "v"}:
+        raise AssertionError("HF first-layer V capture missing")
+    return result
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="Requires physical Ascend NPU and torch_npu",
+)
+def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
+    from transformers import AutoModelForCausalLM, DynamicCache
+    import transformers
+
+    tq_path = Path(os.environ["TPR_REAL_TQ_BATCH"])
+    checkpoint = Path(os.environ["TPR_QWEN_1_7B_PATH"])
+    if not checkpoint.is_dir():
+        pytest.fail(f"Missing Qwen3-1.7B checkpoint: {checkpoint}")
+    p = int(os.environ.get("TPR_QWEN17_DTA_PROMPT", "128"))
+    s = int(os.environ.get("TPR_QWEN17_DTA_RESPONSE", "64"))
+    if p != 128 or s != 64:
+        pytest.fail(
+            "first DTA diagnostic must use same 128+64 crop as Megatron baseline"
+        )
+    attn = os.environ.get("TPR_QWEN17_DTA_HF_ATTN", "sdpa")
+    if attn not in ("sdpa", "eager"):
+        pytest.fail("TPR_QWEN17_DTA_HF_ATTN must be sdpa or eager")
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+    tokens = [
+        x.to(device).contiguous()
+        for x in _real_cropped_rows(tq_path, p=p, s=s)
+    ]
+    print(
+        "P0 DTA_HF CONFIG "
+        f"checkpoint={checkpoint} model=HF_QWEN3_1_7B "
+        f"torch={torch.__version__} transformers={transformers.__version__} "
+        f"device={device} dtype=BF16 attention={attn} "
+        f"lengths={[x.numel() for x in tokens]} "
+        "input=CROPPED_REAL_TQ backward=False "
+        "baseline=HF_FULL_WITH_EMPTY_DYNAMIC_CACHE",
+        flush=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        str(checkpoint),
+        torch_dtype=torch.bfloat16,
+        attn_implementation=attn,
+    ).to(device).eval()
+    if next(model.parameters()).dtype != torch.bfloat16:
+        raise AssertionError("HF Qwen3 was not loaded in BF16")
+
+    # Three modes operate on SAME HF model/weights, not Megatron replicas.
+    full = tuple(hf_full_logprobs(model, x, DynamicCache) for x in tokens)
+    lcp_dfs = hf_dta_lcp_forward(model, tokens, DynamicCache)
+    row_metrics, summary = error_summary(full, lcp_dfs.logprobs)
+    for item in row_metrics:
+        print(
+            "P0 DTA_HF DFS_ROW "
+            f"row={item['row']} tokens={item['count']} "
+            f"max_abs={item['max_abs']:.9g} "
+            f"mean_abs={item['mean_abs']:.9g} "
+            f"worst_query_abs={item['worst_query']}",
+            flush=True,
+        )
+    print(
+        "P0 DTA_HF DFS_SUMMARY "
+        f"num_tokens={summary['num_tokens']} "
+        f"max_abs={summary['max_abs']:.9g} "
+        f"mean_abs={summary['mean_abs']:.9g} "
+        f"p95_abs={summary['p95_abs']:.9g} "
+        f"num_gt_0p2={summary['num_gt_0p2']} "
+        f"physical_m={list(lcp_dfs.physical_m)} "
+        f"physical_starts={list(lcp_dfs.physical_starts)} "
+        f"saved_forward_tokens={lcp_dfs.dense_tokens-lcp_dfs.total_processed_tokens} "
+        "parity=DIAGNOSTIC_ONLY",
+        flush=True,
+    )
+    row = int(os.environ.get("TPR_QWEN17_DTA_TRACE_ROW", "5"))
+    if not 0 <= row < len(tokens):
+        pytest.fail("DTA HF target row out of range")
+    boundaries = (0, 134, 158, 166, 189, 192)
+    if tokens[row].numel() != boundaries[-1]:
+        raise AssertionError("Fixed path is valid only for 192-token rows")
+    fixed = hf_cached_chunk_logprobs(
+        model, tokens[row], boundaries, DynamicCache
+    )
+    fixed_rows, fixed_summary = error_summary((full[row],), (fixed,))
+    v_full = _single_v_capture(
+        model, tokens[row], DynamicCache, length=192
+    )
+    v_root = _single_v_capture(
+        model, tokens[row], DynamicCache, length=134
+    )
+    if not torch.equal(v_full["input"][:, :134], v_root["input"]):
+        raise AssertionError(
+            "HF full/root first-layer V GEMM inputs differ; invalid M-only control"
+        )
+    v_delta = (
+        v_full["v"][:, :134].double() - v_root["v"].double()
+    ).abs()
+    diff_tokens = v_delta.reshape(134, -1).amax(-1) > 0 if v_delta.ndim == 2 else (
+        v_delta.squeeze(0).reshape(134, -1).amax(-1) > 0
+    )
+    print(
+        "P0 DTA_HF ROOT_V_SHAPE "
+        "full_M=192 root_M=134 input_max_abs=0 "
+        f"v_max_abs={float(v_delta.max()):.9g} "
+        f"v_rel_l2={float(torch.linalg.vector_norm(v_delta) / torch.linalg.vector_norm(v_full['v'][:, :134].double()).clamp_min(1e-24)):.9g} "
+        f"v_changed_tokens={int(diff_tokens.sum())}/134",
+        flush=True,
+    )
+    print(
+        "P0 DTA_HF FIXED_PATH "
+        f"row={row} boundaries={list(boundaries)} "
+        f"max_abs={fixed_summary['max_abs']:.9g} "
+        f"mean_abs={fixed_summary['mean_abs']:.9g} "
+        f"p95_abs={fixed_summary['p95_abs']:.9g} "
+        f"num_gt_0p2={fixed_summary['num_gt_0p2']} "
+        f"worst_query_abs={fixed_rows[0]['worst_query']} "
+        f"query189_abs={float((full[row][189]-fixed[189]).abs()):.9g}",
+        flush=True,
+    )
+    # A pass means measurements were completed, NOT numeric equivalence.
+    assert summary["num_tokens"] == 8 * 191
+    print(
+        "P0 DTA_HF RESULT status=PASS execution=FORWARD_CONTROL "
+        "numerical_parity=UNVERIFIED dta_backward=NOT_IMPLEMENTED "
+        "cross_framework_mixed_compare=FORBIDDEN",
+        flush=True,
+    )
