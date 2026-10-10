@@ -152,3 +152,53 @@ Optional `TPR_QWEN17_DTA_HF_ATTN=eager` rerun if the specific transformers/torch
 - `status=PASS execution=FORWARD_CONTROL` means the probe completed, **not** a strong tolerance gate.
 
 **Not implemented:** AReaL's `backward_permute`, `pop_byblock`, suffix recompute, KV/logprob/fork-logit gradient relay, and full AdamW/ppo training. The current port is intentionally **Phase 1 (forward)**. A full DTA training comparison will need separate CPU unit gates and same-checkpoint NPU gradient tests. Current session cannot run the user's NPU or HF checkpoint, so no claim of observed HF DTA numerical results is made.
+
+
+## 6. **NPU result 2026-10-10: independent HF DTA-style forward run succeeded, not parity**
+
+Real user run, HF Qwen3-1.7B, 8×192 cropped real TQ rows, same NPU/checkpoint/weights **within** HF; compare with previously recorded Megatron TPR results (which have different framework/controlled FA). Log: `/tmp/tpr_qwen17_hf_dta.h1VmOo/hf_dta.log` on user's host.
+
+| Metric (shifted response tokens) | Megatron Full vs TPR Forest | HF Full vs HF DTA-style LCP/DFS |
+|---|---:|---:|
+| Number of response tokens | 512 | 512 |
+| Mean absolute logprob delta | **0.032839** | **0.0309696756** |
+| Max absolute logprob delta | **0.74937677** | **0.445066452** |
+| p95 absolute delta | not recorded in previous report | **0.24168916** |
+| Tokens with abs delta > 0.2 | not recorded here | **50 / 512** |
+
+Full HF DFS logprob comparison including prompt positions: 1528 comparisons, max `0.445066452`, mean `0.0103772739`, p95 `0.0411890894`, >0.2 count 50. Per-row maxes: row0 `0.25`, row1 `0.370897293`, row2 `0.445066452`, row3 `0.445066452`, **row4 `0`**, row5 `0.25`, row6/7 `0.254723549`. Some duplicate rows naturally share outcomes.
+
+**Important:** The independently written HF-DTA-style DFS forward shows meaningful numerical drift; it is **false** that changing physical M with BF16 prefix reuse cannot cause significant output drift. But the experiment is a forward-only approximation of DTA, **not a full reproduction of the original AReaL DTA training schedule or a GPU-vs-NPU parity claim**.
+
+DFS execution, as implemented in this reference:
+- `physical_m=[192,58,34,14,26,3]`
+- `physical_starts=[0,134,158,178,166,189]`
+- Saved forward token processing: 1209 vs independent dense forwards, in this input-specific sorted traversal.
+
+**Critical schedule distinction:** Our **forward-only** HF DFS initializes the cache by forwarding the entire *first* trajectory with `M=192` (row4, which is exact by construction). The tested TPR path stores Root cache after `M=134`. Actual AReaL `DTAEngine.backward()` uses `push(..., cache_len=...)`, `build_cache()`, and `pop_byblock()`, which can compute the first Root with `M=134` instead. Do not label the current HF DFS schedule equivalent to **DTA's training execution**. This matters more than whether each path uses DynamicCache.
+
+### Same-M root triple, HF vs Megatron
+
+HF first-layer `v_proj`: identical input in all comparisons. `M192` Full vs `M134` Root: `V max_abs=0.001953125`, relative L2 `3.73479061e-5`, 20/134 changed tokens. `M134` Native cutoff vs `M134` DTA fixed-path root: **V max_abs=0**.
+
+Megatron TPR corresponding `linear_qkv` full M192 vs cutoff/root M134: `V max_abs=0.0009765625`, 34/134 changed tokens; cutoff vs TPR root: **0**.
+
+**Grounded conclusion:** BF16 GEMM physical-M dependence reproduces in both HF and Megatron. It is not evidence of uniquely faulty TPR root KV storage. This does not prove full-model/TQ equivalence.
+
+### **Critical unresolved difference: row5, query189**
+
+Same fixed physical TPR root-to-leaf path `[0,134,158,166,189,192]` reproduced using independent HF `DynamicCache`:
+- HF Full vs HF fixed path (row5): max logprob delta **0.249992371**, mean **0.0335460231**, p95 **0.124519587**; 5 positions above 0.2; worst logical query **179**.
+- At **query189**, HF Full vs HF fixed path delta **0**.
+- Earlier Megatron Full vs TPR Forest, corresponding `row5 query189` logprob delta **0.749376774**.
+
+Therefore **the overall mean drift being similar does not explain the particular outlier**. The same physical five-chunk boundaries give exact logprob at query189 in HF, but a serious discrepancy in the Megatron TPR tree. This could be caused by different HF/Megatron model+kernel numerical paths or another TPR-specific effect; current evidence cannot discriminate. Do not claim the 0.749 error is proven to be inevitable BF16 amplification.
+
+### Exact next experiments
+
+1. **DTA training-shape forward schedule** (priority): port AReaL's `backward_permute()` + `push(cache_len)` + `build_cache` + `pop_byblock` *forward computation* while holding the same HF Qwen3 weights and BF16. Compare this output with HF Full, HF DFS-forward-only and the fixed path, logging physical M for every Push and Pop and token logprob drift. The current sorted DFS of `forward_permute` semantics can differ from actual backward. Do not equate the two.
+2. **Strict within-Megatron 5-segment reference**: physically split the same Native checkpoint via HF-style KV-cache semantics but without the existing TPR tree scheduler, if feasible. Compare precisely query189 and per-layer outputs to separate schedule/state issues from native kernel shape sensitivity. Keep **same model/checkpoint/attention backend**.
+3. **Full AReaL DTA training port** if needed after step1: actual KV/logprob/entropy/fork-logit gradient accumulation, parameter gradients, independent AdamW and PPO clip checks; no backward gradient or optimizer parity has yet been demonstrated for HF-style reference.
+4. For every experiment, preserve **response-only** max/mean/p95 and especially `row5 query189`; no artificial FP32/padded GEMM interventions until causal attribution is complete.
+
+**Handoff verdict:** Independent HF DTA-style forward shows BF16 shape drift of comparable *average* magnitude, falsifying “only our TPR numerical path drifts”. Nevertheless the unexplained `query189: HF fixed path 0 vs Megatron TPR 0.749` is still a material blocker to claiming TPR parity, and the official DTA training algorithm has not yet been reproduced.
