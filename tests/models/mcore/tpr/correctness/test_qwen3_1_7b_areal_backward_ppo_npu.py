@@ -70,14 +70,21 @@ def _proxy_advantages(n_rows: int, s: int):
             + 0.4 * torch.cos(pos * 0.13 - row * 0.27)).contiguous()
 
 
-def _ppo_row_loss(logp, entropy, old_lp, advantage, *, p, s, clip_eps, entropy_coef, n_rows):
+def _ppo_row_loss(logp, entropy, old_lp, advantage, *, p, s, clip_eps, entropy_coef, n_rows, objective="ppo"):
     lp = logp[p - 1:p + s - 1].float()
     ent = entropy[p:p + s].float()
     if len(lp) != s or len(ent) != s:
         raise AssertionError("PPO response alignment error")
-    ratio = (lp - old_lp).exp()
-    clipped = ratio.clamp(1 - clip_eps, 1 + clip_eps)
-    surrogate = torch.minimum(ratio * advantage, clipped * advantage)
+    if objective == "ppo":
+        ratio = (lp - old_lp).exp()
+        clipped = ratio.clamp(1 - clip_eps, 1 + clip_eps)
+        surrogate = torch.minimum(ratio * advantage, clipped * advantage)
+    elif objective == "fixed_logprob":
+        # Identical d(loss)/d(logprob) at every token, regardless of
+        # Full/DTA logprob drift. Diagnostic only, not PPO.
+        surrogate = lp * advantage
+    else:
+        raise ValueError(f"unsupported objective: {objective}")
     return (-surrogate.sum() - entropy_coef * ent.sum()) / (n_rows * s)
 
 
@@ -204,7 +211,7 @@ def _load_model(path, attention, device):
 
 
 def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
-              entropy_coef,lr,block_size,tile_m, max_seq_len):
+              entropy_coef,lr,block_size,tile_m, max_seq_len,objective="ppo"):
     n_rows=len(rows)
     with _linear_ablation(model,mode,tile_m) as count:
         optimizer=torch.optim.AdamW(model.parameters(),lr=lr,weight_decay=0.0,
@@ -223,7 +230,8 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
                 captured[i]=lp.detach().clone()
                 captured_entropy[i]=ent.detach().clone()
                 loss=_ppo_row_loss(lp,ent,old[i],adv[i],p=p,s=s,
-                                   clip_eps=clip_eps,entropy_coef=entropy_coef,n_rows=n_rows)
+                                   clip_eps=clip_eps,entropy_coef=entropy_coef,n_rows=n_rows,
+                                   objective=objective)
                 total_loss_value+=float(loss.detach())
                 loss.backward()
             engine_loss=None
@@ -246,7 +254,7 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
                 captured_entropy[i]=entropy.detach().clone()
                 return _ppo_row_loss(lp,entropy,old[i],adv[i],p=p,s=s,
                                      clip_eps=clip_eps,entropy_coef=entropy_coef,
-                                     n_rows=n_rows)
+                                     n_rows=n_rows,objective=objective)
             engine_loss=engine.backward(
                 model,trie,loss_fn,block_size=block_size,cut_f1_tail=True)
             total_loss_value=float(engine_loss)
@@ -270,6 +278,12 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
         if not ratios_finite:
             raise AssertionError("nonfinite PPO ratios")
         clip_frac=float(((ratios>1+clip_eps)|(ratios<1-clip_eps)).float().mean())
+        # PPO's min surrogate clips the derivative only for
+        # positive-advantage upper-bound or negative-advantage lower-bound.
+        signed_adv=torch.cat([x.float().cpu() for x in adv])
+        effective_clip=(((signed_adv>0)&(ratios>1+clip_eps))|
+                        ((signed_adv<0)&(ratios<1-clip_eps)))
+        effective_clip_frac=float(effective_clip.float().mean())
     return {
         "grads":grads,
         "updated":after,
@@ -277,6 +291,7 @@ def _one_step(model, mode, rows, cache_factory, old, adv, *, p,s,clip_eps,
         "logprobs":tuple(captured),
         "entropies":tuple(captured_entropy),
         "clip_frac":clip_frac,
+        "effective_clip_frac":effective_clip_frac,
         "engine_loss":engine_loss,
         "loss_value":total_loss_value,
         "patched_linear_count":count,
@@ -304,6 +319,10 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         pytest.fail("invalid TPR_DTA_BWD_ROWS")
     rows=rows[:n_rows]
     block=int(os.getenv("TPR_DTA_BWD_BLOCK","64"))
+    objective=os.getenv("TPR_DTA_BWD_OBJECTIVE","ppo")
+    if objective not in ("ppo","fixed_logprob"):
+        pytest.fail("TPR_DTA_BWD_OBJECTIVE must be ppo or fixed_logprob")
+    paired_full=os.getenv("TPR_DTA_BWD_PAIRED_FULL","0")=="1"
     tile=int(os.getenv("TPR_DTA_BWD_GEMM_M_TILE","32"))
     lr=float(os.getenv("TPR_DTA_BWD_ADAM_LR","1e-4"))
     eps=float(os.getenv("TPR_DTA_BWD_PPO_CLIP","0.2"))
@@ -334,6 +353,7 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         "P1 DTA_BACKWARD CONFIG "
         f"checkpoint={checkpoint} rows={n_rows} p={p} s={s} block={block} "
         f"modes={list(mode_list)} tile_m={tile} attention={attn} "
+        f"objective={objective} paired_full={paired_full} "
         f"old_source={'RECORDED' if recorded_old else 'HF_FULL_CURRENT_MODEL'} "
         f"adv_source={'RECORDED' if recorded_adv else 'DETERMINISTIC_PROXY'} "
         f"ppo_source={source} optimizer=AdamW lr={lr} clip={eps} entropy_coef={entropy_coef} "
@@ -343,12 +363,14 @@ def test_real_areal_dta_full_backward_ppo_gemm():
     )
     reference=_one_step(model,"native",rows,DynamicCache,old,adv,p=p,s=s,
                         clip_eps=eps,entropy_coef=entropy_coef,lr=lr,
-                        block_size=None,tile_m=tile,max_seq_len=max_seq_len)
+                        block_size=None,tile_m=tile,max_seq_len=max_seq_len,
+                        objective=objective)
     print(
         "P1 DTA_BACKWARD FULL "
         f"clip_frac={reference['clip_frac']:.9g} "
         f"matched_grad_count={sum(g is not None for g in reference['grads'].values())} "
         f"ppo_loss={reference['loss_value']:.9g} "
+        f"effective_clip_frac={reference['effective_clip_frac']:.9g} "
         "mode=BF16_FULL optimizer_step=EXECUTED",flush=True,
     )
     del model
@@ -358,8 +380,34 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         model=_load_model(checkpoint,attn,device)
         current=_one_step(model,mode,rows,DynamicCache,old,adv,p=p,s=s,
                           clip_eps=eps,entropy_coef=entropy_coef,lr=lr,
-                          block_size=block,tile_m=tile,max_seq_len=max_seq_len)
+                          block_size=block,tile_m=tile,max_seq_len=max_seq_len,
+                          objective=objective)
         grad_stats=_metrics(reference["grads"],current["grads"])
+        paired=None
+        if paired_full and mode!="native":
+            paired_model=_load_model(checkpoint,attn,device)
+            paired=_one_step(
+                paired_model,mode,rows,DynamicCache,old,adv,p=p,s=s,
+                clip_eps=eps,entropy_coef=entropy_coef,lr=lr,
+                block_size=None,tile_m=tile,max_seq_len=max_seq_len,
+                objective=objective)
+            paired_grad=_metrics(paired["grads"],current["grads"])
+            _,paired_forward=error_summary(
+                tuple(x[p-1:p+s-1] for x in paired["logprobs"]),
+                tuple(x[p-1:p+s-1] for x in current["logprobs"]))
+            print(
+                "P1 DTA_BACKWARD PAIRED_FULL "
+                f"mode={mode} objective={objective} "
+                f"grad_rel_l2={paired_grad['relative_l2']:.9g} "
+                f"grad_cosine={paired_grad['cosine']:.9g} "
+                f"response_logp_mean={paired_forward['mean_abs']:.9g} "
+                f"response_logp_max={paired_forward['max_abs']:.9g} "
+                f"full_patched_linear_count={paired['patched_linear_count']} "
+                "comparison=SAME_ABLATION_FULL_VS_DTA",
+                flush=True)
+            del paired,paired_model
+            gc.collect()
+            torch.npu.empty_cache()
         _,loss_stats=error_summary(reference["logprobs"],current["logprobs"])
         rp=tuple(x[p-1:p+s-1] for x in reference["logprobs"])
         cp=tuple(x[p-1:p+s-1] for x in current["logprobs"])
@@ -373,13 +421,14 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         print(
             "P1 DTA_BACKWARD SUMMARY "
             f"mode={mode} patched_linear_count={current['patched_linear_count']} "
-            f"ppo_source={source} block={block} "
+            f"ppo_source={source} block={block} objective={objective} "
             f"all_logp_max={loss_stats['max_abs']:.9g} "
             f"all_logp_mean={loss_stats['mean_abs']:.9g} "
             f"response_logp_max={response['max_abs']:.9g} "
             f"response_logp_mean={response['mean_abs']:.9g} "
             f"response_logp_gt0p2={response['num_gt_0p2']} "
             f"clip_frac={current['clip_frac']:.9g} "
+            f"effective_clip_frac={current['effective_clip_frac']:.9g} "
             f"ppo_loss={current['loss_value']:.9g} "
             f"ppo_loss_delta={current['loss_value']-reference['loss_value']:.9g} "
             f"grad_rel_l2={grad_stats['relative_l2']:.9g} "
