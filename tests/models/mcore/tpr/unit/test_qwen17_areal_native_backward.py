@@ -170,3 +170,27 @@ def test_dta_gradients_nonzero_from_shared_prefix():
     assert torch.linalg.vector_norm(model.embed.weight.grad[1:4]).item()>0
     assert torch.linalg.vector_norm(model.k[0].weight.grad).item()>0
     assert torch.linalg.vector_norm(model.v[0].weight.grad).item()>0
+
+
+@pytest.mark.parametrize("mode", ("native","m_split","fp32_linear","m_split_fp32"))
+def test_linear_ablation_is_autograd_safe_and_restored(mode):
+    from ..correctness.test_qwen3_1_7b_areal_backward_ppo_npu import _linear_ablation
+    class OneLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn=torch.nn.Module()
+            self.self_attn.q_proj=torch.nn.Linear(4,4,bias=False)
+        def forward(self,x):
+            return self.self_attn.q_proj(x)
+    net=OneLayer().bfloat16()
+    x=torch.arange(32,dtype=torch.float32).reshape(1,8,4).bfloat16().requires_grad_(True)
+    original=net.self_attn.q_proj.forward
+    with _linear_ablation(net,mode,tile_m=3) as count:
+        y=net(x)
+        assert y.shape==(1,8,4)
+        assert torch.isfinite(y.float()).all()
+        y.float().square().mean().backward()
+        assert x.grad is not None and torch.isfinite(x.grad.float()).all()
+        assert net.self_attn.q_proj.weight.grad is not None
+        assert count == (0 if mode=="native" else 1)
+    assert net.self_attn.q_proj.forward==original
