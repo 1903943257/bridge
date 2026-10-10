@@ -28,7 +28,7 @@ python -m pytest -x -q -s --tb=short "$npu_file" > "$log_dir/npu.log" 2>&1 || {
   tail -150 "$log_dir/npu.log" >&2
   exit 1
 }
-grep -E '^P1 DTA_BACKWARD (CONFIG|FULL|SUMMARY|WORST_GRAD|ROW|RESULT)' "$log_dir/npu.log"
+grep -E '^P1 DTA_BACKWARD (CONFIG|FULL|SUMMARY|PAIRED_FULL|GRAD_GROUP|WORST_GRAD|ROW|RESULT)' "$log_dir/npu.log"
 grep -q '^P1 DTA_BACKWARD RESULT status=PASS backward=EXECUTED' "$log_dir/npu.log" || {
   echo "P1 DTA_BACKWARD missing completion marker" >&2
   exit 1
