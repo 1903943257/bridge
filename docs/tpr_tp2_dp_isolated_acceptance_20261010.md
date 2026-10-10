@@ -180,3 +180,40 @@ accept 128, because that would silently halve the NLL gradient scaling.
 This is solely a test-double Engine group-wiring error, not evidence
 that VERL's real MegatronEngine implements a world-group token reduction.
 The correction has been committed; **NPU rerun pending**.
+
+
+## 2026-10-10 NPU results — TP2 Engine and real-TQ DP planning
+
+User's accepted output:
+
+```
+TPR_TP2_ENGINE_ROUTE status=PASS dispatch_hits=2 optimizer_steps=2
+losses=[12.637715339660645, 7.607739448547363]
+PASSED / PASSED
+
+TPR_DP_REAL_TQ_PLACEMENT status=PASS rows=8 dp=2
+per_dp_rows=[5,3] tree_costs=[59767,44228]
+global_tree_tokens=86402 duplication=17593 equal_rows=False
+trainer_dispatch=NOT_WIRED
+PASSED
+```
+
+Thus A (Engine route, two controlled SGD steps) and B1 (real-TQ
+DP2 offline placement) are PASS. B1's 5/3 rows violate VERL's
+current equal-cardinality dispatch; do **not** wire this plan into
+Trainer as-is. If later enabling real DP2, use a balanced native-UID
+policy or a compatible equal-row/mini-batch policy.
+
+First B2 isolated DP2 module attempt raised:
+
+```
+ValueError: cp_group must contain more than one rank, got 1
+```
+
+This was a **test harness only** issue: the new module test passed
+Megatron's CP=1 singleton ProcessGroup to `SegmentExecutor`, but its
+`cp_group` argument enables distributed CP and must be `None`
+for CP=1. Fixed the test to assert the native CP group has size 1
+while **passing `cp_group=None` to SegmentExecutor**. The production
+executor's explicit CP group contract remains unchanged. B2 NPU
+rerun pending; C (TP2×DP2) awaits B2 PASS.
