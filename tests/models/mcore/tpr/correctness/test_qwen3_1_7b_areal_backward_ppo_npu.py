@@ -507,6 +507,13 @@ def test_real_areal_dta_full_backward_ppo_gemm():
                 "prompt_length":p,
                 "response_length":s,
                 "checkpoint":str(checkpoint),
+                "token_rows":torch.stack([x.detach().cpu().long() for x in rows]),
+                "shared_old_logprobs":torch.stack(
+                    [x.detach().float().cpu() for x in old]),
+                "shared_advantages":torch.stack(
+                    [x.detach().float().cpu() for x in adv]),
+                "old_source":"RECORDED" if recorded_old else "HF_FULL_CURRENT_MODEL",
+                "adv_source":"RECORDED" if recorded_adv else "DETERMINISTIC_PROXY",
                 "full_response_logprobs":torch.stack(
                     [x[p-1:p+s-1].detach().float().cpu()
                      for x in reference["logprobs"]]),
