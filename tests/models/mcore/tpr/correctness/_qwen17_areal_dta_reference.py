@@ -23,8 +23,10 @@ class _Node:
     child_ids: list[int] = field(default_factory=list)
 
 
-def _areal_forward_order(lens: list[int], lcps: list[int]) -> list[int]:
-    """Port of AReaL CompressedTrie.get_order_forward (not lexical order)."""
+def _areal_forward_order(
+    lens: list[int], lcps: list[int], *, backward: bool = False
+) -> list[int]:
+    """AReaL CompressedTrie priority DFS, including backward reversal."""
     if len(lcps) != max(len(lens) - 1, 0):
         raise ValueError("invalid LCP shape")
     nodes = [_Node(depth=0)]
@@ -50,6 +52,9 @@ def _areal_forward_order(lens: list[int], lcps: list[int]) -> list[int]:
         nodes[stack[-1][0]].child_ids.append(child)
 
     def child_order(idx):
+        if backward:
+            return sorted(nodes[idx].child_ids, key=lambda j: (
+                1 if nodes[j].child_ids else 0, nodes[j].chain_tail_depth))
         return sorted(nodes[idx].child_ids, key=lambda j: nodes[j].chain_tail_depth)
     def chain(idx):
         node = nodes[idx]
@@ -71,7 +76,7 @@ def _areal_forward_order(lens: list[int], lcps: list[int]) -> list[int]:
     visit(0)
     if sorted(order) != list(range(len(lens))):
         raise AssertionError("CompressedTrie omitted or duplicated leaves")
-    return order
+    return order[::-1] if backward else order
 
 
 @dataclass(frozen=True)
