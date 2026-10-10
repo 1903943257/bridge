@@ -45,7 +45,7 @@ python -m pytest -x -q -s --tb=short "$tpr_test" > "$log_dir/tpr.log" 2>&1 || {
   tail -160 "$log_dir/tpr.log" >&2
   exit 1
 }
-grep -E '^P1 TPR_TRIPLET (FRAMEWORK_FLOOR|NATIVE|SUMMARY|MEGATRON_ARTIFACT|RESULT)' "$log_dir/tpr.log"
+grep -E '^P1 TPR_TRIPLET (FRAMEWORK_FLOOR|NATIVE|CLIP_BRANCH|SUMMARY|MEGATRON_ARTIFACT|RESULT)' "$log_dir/tpr.log"
 if [[ ! -f "$log_dir/hf_full_dta.pt" || ! -f "$log_dir/megatron_full_tpr.pt" ]]; then
   echo "P1 TRIPLET missing aligned HF/Megatron artifacts in $log_dir" >&2
   exit 1
