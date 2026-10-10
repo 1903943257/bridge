@@ -694,3 +694,105 @@ clip ratio/objective has been changed, and NPU test results are pending.
    multi-step optimizer tests. Do NOT solve numerical drift by simply
    disabling PPO clipping or substituting fixed-logprob as production
    PPO.
+
+
+## 14. Isolate unexpected old/new logprob offset before changing PPO (2026-10-10)
+
+User's actual clipped-PPO three-way run (shared HF Full old logprobs,
+P=128/S=64, 8 real SWE-TQ rows, same checkpoint and synthetic proxy
+advantages):
+
+- HF Full vs AReaL train-DTA: mean/max logprob abs 0.0296836/0.458695;
+  all-parameter clipped gradient relative L2 **0.593944**, cosine 0.805095.
+- Megatron Native vs real TPR Forest: mean/max logprob abs
+  0.032839/0.749377; sampled-gradient relative L2 **0.292677**,
+  cosine 0.959500.
+- HF Full vs Megatron Native, with neither Prefix Reuse nor DTA:
+  mean/max abs **0.0324249/0.624209**.
+- **Crucial:** the old values were sourced from HF Full. Megatron Native
+  itself had 16 advantage-aware clipped tokens; TPR had 21; their
+  actual branch-disagreement count was **19/512**. Thus:
+  native-only=7, TPR-only=12, shared-clipped=9. Their mere
+  ratio-outside counts were Native=36 and TPR=42.
+- For HF, old=HF Full gives Full clip count=0. This asymmetry makes
+  across-backend raw PPO gradient errors inappropriate as a TPR-vs-DTA
+  ranking.
+
+Non-negotiable interpretation:
+\`mean_abs(logprob)=0.03\` is an absolute NATURAL-LOG unit, **not** a 3%
+gradient error or uniform 3% probability error. A single +0.25 logprob
+shift implies exp(+0.25)=1.284 in the PPO ratio at identical old value,
+and with positive advantage this may toggle the clipped surrogate
+derivative to zero.
+
+### New experimental old-source controls (test only)
+
+Code under \`tests/models/mcore/tpr/correctness/\`:
+
+- In HF DTA backward test, compute \`hf_areal_forward_only\` no_grad
+  **before** any optimizer update, on the same checkpoint. Print
+  \`DTA_FORWARD_VS_POP\` and
+  \`DTA_BACKWARD OLD_SOURCE_COUNTERFACTUAL\` for both the
+  actual/old HF Full or recorded source, and DTA \`forward_permute\`
+  inference-style Forward source. This directly probes the different
+  DTA forward_permute versus backward_permute+Pop physical shapes.
+  \`TPR_DTA_BWD_OLD_SOURCE=dta_forward_only\` explicitly re-runs
+  controlled clipped PPO with the *alternative* same-checkpoint
+  Forward-only old source; default remains
+  \`recorded_or_hf_full\`. Logs and artifact expose the source.
+- In Megatron Native/TPR triplet, capture Native no_grad logprobs
+  from the exact same checkpoint *before* any optimizer step; print
+  \`FRAMEWORK_FLOOR\`, \`NATIVE_REPEAT\` (no_grad vs grad-enabled
+  same Native Forward), and \`OLD_SOURCE_COUNTERFACTUAL\`
+  (HF-old vs Megatron-Native-old) with mean/max old-new delta,
+  effective clipped token counts and **branch flips**.
+  \`TPR_TRIPLET_MEGATRON_OLD_SOURCE=megatron_native\`
+  explicitly reruns the Megatron Native/TPR PPO objective using
+  the matched Megatron Native no_grad old values, leaving HF
+  unchanged, with labels warning the old sources now differ across
+  frameworks. Default remains \`hf_full\`.
+- \`LOGPROB_KERNEL\` compares Megatron's native
+  \`vocab_parallel_log_probs_from_logits\` and FP32
+  \`log_softmax\` on the **same unmodified native Megatron logits**,
+  first real row's 64 query positions, under no_grad. This
+  distinguishes a difference in last-mile logprob reduction from a
+  model-forward numerical difference. Enabled by default for this
+  diagnostic; set \`TPR_TRIPLET_PROBE_LOGPROB_KERNEL=0\` to skip.
+- Triplet combined summary shows \`OLD_SOURCE\` comparisons, and
+  emits whether the old source is identical across backends.
+
+Run A (original fixed HF old source, instrumentation only):
+
+    TPR_DTA_BWD_OBJECTIVE=ppo \
+      bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
+
+Run B (diagnostic only: Megatron native-old instead of HF-old):
+
+    TPR_DTA_BWD_OBJECTIVE=ppo \
+    TPR_TRIPLET_MEGATRON_OLD_SOURCE=megatron_native \
+      bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
+
+Run C (diagnostic only: DTA forward-only old values):
+
+    TPR_DTA_BWD_OBJECTIVE=ppo \
+    TPR_DTA_BWD_OLD_SOURCE=dta_forward_only \
+      bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
+
+Each run invokes real backward/AdamW in the HF and Megatron paths.
+Run B and C **change the PPO old value**, and therefore are causal
+diagnostic contrasts, NOT a valid modification to a historical
+rollout policy. The user-provided TQ data has no usable exact
+[8,64] recorded actor advantages or behavior logprobs in the
+current tests, and the code labels the results PPO_PROXY.
+
+Important design principle: production PPO must preserve historical
+behavior-policy probabilities for the sampled actions. For future
+rollouts, capture source inference backend, scoring temperature,
+policy checkpoint/version, exact input/response indices, and old
+logprobs as immutable rollout metadata. If teacher-forcing old
+logprobs need re-evaluation for a training scorer, do so at the
+**frozen rollout policy version before any optimizer updates**,
+with a documented consistent scorer and repeated evaluation, not
+with the current updated actor. Do not mask real forward drift
+by replacing old with currently computed new.
+**New controls are NOT YET NPU VERIFIED.**
