@@ -81,7 +81,7 @@ class ARealForwardPlan:
     lcp_lens: tuple[int, ...]
 
 
-def areal_forward_plan(rows) -> ARealForwardPlan:
+def areal_forward_plan(rows, *, forward_permute: bool = True) -> ARealForwardPlan:
     """Port of AReaL TokenTrie leafization and forward_permute."""
     rows = tuple(rows)
     if not rows or any(x.ndim != 1 or x.numel() < 2 for x in rows):
@@ -102,7 +102,8 @@ def areal_forward_plan(rows) -> ARealForwardPlan:
             if i < len(sorted_rows) - 1:
                 leaf_lcps.append(lcps[i])
             fork = i
-    order = _areal_forward_order([len(t) for t in leaves], leaf_lcps)
+    order = (_areal_forward_order([len(t) for t in leaves], leaf_lcps)
+             if forward_permute else list(range(len(leaves))))
     sequences = [leaves[i] for i in order]
     return ARealForwardPlan(
         sequences=tuple(sequences),
@@ -125,10 +126,12 @@ class ARealForwardResult:
 
 
 @torch.no_grad()
-def hf_areal_forward_only(model, token_rows, cache_factory) -> ARealForwardResult:
+def hf_areal_forward_only(
+    model, token_rows, cache_factory, *, forward_permute: bool = True
+) -> ARealForwardResult:
     """DTAEngine.forward + push_forward_only, including persistent KV views."""
     rows = tuple(token_rows)
-    plan = areal_forward_plan(rows)
+    plan = areal_forward_plan(rows, forward_permute=forward_permute)
     config = model.config
     layers = int(config.num_hidden_layers)
     heads = int(config.num_key_value_heads)
