@@ -379,7 +379,10 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         pytest.fail("actual rollout advantages and old_log_probs missing: refusing to claim real PPO")
     if adv_cpu is None: adv_cpu=_proxy_advantages(n_rows,s)
     adv=tuple(x.to(device) for x in adv_cpu)
-    # Missing recorded behavior logprobs: use same-checkpoint HF Full, explicitly label proxy.
+    # Old logprobs in a *real* PPO update must come from the rollout.
+    # The extra no-grad DTA Forward is only a same-checkpoint numerical
+    # probe, since AReaL DTA training runs a DIFFERENT backward_permute
+    # and Pop shape schedule.
     model=_load_model(checkpoint,attn,device)
     if old_cpu is None:
         with torch.no_grad():
@@ -388,14 +391,29 @@ def test_real_areal_dta_full_backward_ppo_gemm():
                                           use_cache=True).logits,x)[0][p-1:p+s-1].cpu()
                 for x in rows
             ])
-    old=tuple(x.to(device) for x in old_cpu)
-    source="RECORDED" if recorded_adv and recorded_old else "PPO_PROXY"
+    actual_old_source="RECORDED" if recorded_old else "HF_FULL_CURRENT_MODEL"
+    experimental_old=os.getenv("TPR_DTA_BWD_OLD_SOURCE","recorded_or_hf_full")
+    if experimental_old not in ("recorded_or_hf_full","dta_forward_only"):
+        pytest.fail("TPR_DTA_BWD_OLD_SOURCE: expected recorded_or_hf_full or dta_forward_only")
+    dta_forward_old=hf_areal_forward_only(model,rows,DynamicCache)
+    dta_forward_old_cpu=torch.stack([
+        x[p-1:p+s-1].detach().float().cpu()
+        for x in dta_forward_old.logprobs
+    ])
+    selected_old_cpu=(dta_forward_old_cpu if experimental_old=="dta_forward_only"
+                      else old_cpu)
+    old=tuple(x.to(device) for x in selected_old_cpu)
+    active_old_source=("DTA_FORWARD_ONLY_CURRENT_MODEL"
+                       if experimental_old=="dta_forward_only" else actual_old_source)
+    source=("RECORDED" if recorded_adv and recorded_old and
+            experimental_old=="recorded_or_hf_full" else "PPO_PROXY")
     print(
         "P1 DTA_BACKWARD CONFIG "
         f"checkpoint={checkpoint} rows={n_rows} p={p} s={s} block={block} "
         f"modes={list(mode_list)} tile_m={tile} attention={attn} "
         f"objective={objective} paired_full={paired_full} "
-        f"old_source={'RECORDED' if recorded_old else 'HF_FULL_CURRENT_MODEL'} "
+        f"old_source={active_old_source} "
+        f"experimental_old_source={experimental_old} "
         f"adv_source={'RECORDED' if recorded_adv else 'DETERMINISTIC_PROXY'} "
         f"ppo_source={source} optimizer=AdamW lr={lr} clip={eps} entropy_coef={entropy_coef} "
         "grad_relay=KV_FORK_LOGPROBS_ENTROPY actual_backward=True "
@@ -454,6 +472,47 @@ def test_real_areal_dta_full_backward_ppo_gemm():
         rp=tuple(x[p-1:p+s-1] for x in reference["logprobs"])
         cp=tuple(x[p-1:p+s-1] for x in current["logprobs"])
         _,response=error_summary(rp,cp)
+        if mode=="native":
+            candidate_lp=torch.stack([
+                x.detach().float().cpu() for x in cp
+            ])
+            full_baseline=torch.stack([
+                x.detach().float().cpu() for x in rp
+            ])
+            adv_matrix=torch.stack([x.detach().float().cpu() for x in adv])
+            clip_lo=1-eps;clip_hi=1+eps
+            for label,candidate_old in (
+                (actual_old_source,old_cpu),
+                ("DTA_FORWARD_ONLY_CURRENT_MODEL",dta_forward_old_cpu),
+            ):
+                def _clipstatus(logp):
+                    ratio=(logp-candidate_old).exp()
+                    active=((adv_matrix>0)&(ratio>clip_hi))|(
+                            (adv_matrix<0)&(ratio<clip_lo))
+                    return ratio,active
+                full_r,full_c=_clipstatus(full_baseline)
+                dta_r,dta_c=_clipstatus(candidate_lp)
+                discrepancy=(candidate_lp-candidate_old).abs()
+                print(
+                    "P1 DTA_BACKWARD OLD_SOURCE_COUNTERFACTUAL "
+                    f"old_source={label} "
+                    f"mean_abs_delta={float(discrepancy.mean()):.9g} "
+                    f"max_abs_delta={float(discrepancy.max()):.9g} "
+                    f"full_clipped={int(full_c.sum())} "
+                    f"dta_clipped={int(dta_c.sum())} "
+                    f"branch_flips={int((full_c^dta_c).sum())} "
+                    "objective_replay=METRICS_ONLY same_checkpoint=True",
+                    flush=True,
+                )
+            between_forward_and_pop=(candidate_lp-dta_forward_old_cpu).abs()
+            print(
+                "P1 DTA_BACKWARD DTA_FORWARD_VS_POP "
+                f"mean_abs={float(between_forward_and_pop.mean()):.9g} "
+                f"max_abs={float(between_forward_and_pop.max()):.9g} "
+                "forward_schedule=FORWARD_PERMUTE "
+                "training_schedule=BACKWARD_PERMUTE_POP",
+                flush=True,
+            )
         step_ref=reference["updated"]; step_cur=current["updated"]
         d2=0.; b2=0.
         for name in step_ref:
@@ -512,7 +571,10 @@ def test_real_areal_dta_full_backward_ppo_gemm():
                     [x.detach().float().cpu() for x in old]),
                 "shared_advantages":torch.stack(
                     [x.detach().float().cpu() for x in adv]),
-                "old_source":"RECORDED" if recorded_old else "HF_FULL_CURRENT_MODEL",
+                "old_source":active_old_source,
+                "old_source_experiment":experimental_old,
+                "dta_forward_only_old_logprobs":dta_forward_old_cpu,
+                "hf_or_recorded_old_logprobs":old_cpu,
                 "adv_source":"RECORDED" if recorded_adv else "DETERMINISTIC_PROXY",
                 "full_response_logprobs":torch.stack(
                     [x[p-1:p+s-1].detach().float().cpu()
