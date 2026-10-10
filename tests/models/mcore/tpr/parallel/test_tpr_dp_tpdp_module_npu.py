@@ -181,10 +181,16 @@ def _tpr(model, runtime, prefix, first, second):
 
     model.zero_grad(set_to_none=True)
     layers = tuple(range(1, model.config.num_layers + 1))
+    # A Megatron CP=1 process group exists, but TPR's cp_group argument
+    # means "enable distributed CP" and must be None for CP=1. Passing
+    # the singleton group incorrectly asks SegmentExecutor to construct a
+    # CP backend and fails before the first real TQ forward. DP topology
+    # is independent of this choice: TP1xDP2 and TP2xDP2 both use CP=1.
+    assert dist.get_world_size(group=runtime.cp_group) == 1
     executor = SegmentExecutor(
         model, plan,
         expected_layer_numbers=layers,
-        cp_group=runtime.cp_group,
+        cp_group=None,
     )
     result = FixedTopologyScheduler(plan, executor).run()
     return float(result.normalized_loss.item()), {
