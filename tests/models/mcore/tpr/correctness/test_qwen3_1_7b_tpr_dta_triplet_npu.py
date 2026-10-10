@@ -69,10 +69,11 @@ def _loss_adapter(*, model_output, data, dp_group=None):
             raise AssertionError("response mask is outside current packed row")
         indices=positions.to(logits.device)+offset+prompt_len-1
         new=logits.index_select(0,indices).float()
+        response_indices=positions.to(new.device)
         old=data["old_log_probs"][i].to(new.device).index_select(
-            0,positions.to(data["old_log_probs"][i].device)).float()
+            0,response_indices).float()
         adv=data["advantages"][i].to(new.device).index_select(
-            0,positions.to(data["advantages"][i].device)).float()
+            0,response_indices).float()
         numerator=numerator+_loss_terms(new,old,adv,objective,clip).sum()
         offset+=valid_len
     if offset!=logits.numel():
