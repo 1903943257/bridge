@@ -124,6 +124,11 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
     full = tuple(hf_full_logprobs(model, x, DynamicCache) for x in tokens)
     lcp_dfs = hf_dta_lcp_forward(model, tokens, DynamicCache)
     row_metrics, summary = error_summary(full, lcp_dfs.logprobs)
+    # Match the 512 shifted response positions of the cropped weak PPO
+    # comparison; prompt-token drift must not dilute actor-response errors.
+    response_full = tuple(x[p - 1:p + s - 1] for x in full)
+    response_dta = tuple(x[p - 1:p + s - 1] for x in lcp_dfs.logprobs)
+    _, response_summary = error_summary(response_full, response_dta)
     for item in row_metrics:
         print(
             "P0 DTA_HF DFS_ROW "
@@ -144,6 +149,16 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
         f"physical_starts={list(lcp_dfs.physical_starts)} "
         f"saved_forward_tokens={lcp_dfs.dense_tokens-lcp_dfs.total_processed_tokens} "
         "parity=DIAGNOSTIC_ONLY",
+        flush=True,
+    )
+    print(
+        "P0 DTA_HF RESPONSE_SUMMARY "
+        f"num_tokens={response_summary['num_tokens']} "
+        f"max_abs={response_summary['max_abs']:.9g} "
+        f"mean_abs={response_summary['mean_abs']:.9g} "
+        f"p95_abs={response_summary['p95_abs']:.9g} "
+        f"num_gt_0p2={response_summary['num_gt_0p2']} "
+        "shifted_response_positions=True same_checkpoint=True",
         flush=True,
     )
     row = int(os.environ.get("TPR_QWEN17_DTA_TRACE_ROW", "5"))
@@ -224,6 +239,7 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
     )
     # A pass means measurements were completed, NOT numeric equivalence.
     assert summary["num_tokens"] == 8 * 191
+    assert response_summary["num_tokens"] == 8 * 64
     print(
         "P0 DTA_HF RESULT status=PASS execution=FORWARD_CONTROL "
         "numerical_parity=UNVERIFIED dta_backward=NOT_IMPLEMENTED "
