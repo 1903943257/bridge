@@ -18,6 +18,7 @@ import pytest
 
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
+from verl.models.mcore.tpr.module_spec import _get_layer_specs
 from verl.models.mcore.tpr import (
     TPRSelfAttention,
     make_tpr_module_spec_provider,
@@ -218,3 +219,20 @@ def test_tpr_spec_provider_forwards_vp_stage():
 
     assert calls == [("config", 3)]
     assert _attention_spec(converted).module is TPRSelfAttention
+
+
+def test_tp2_qwen_core_attention_spec_traversal_supports_block_submodules():
+    """Regression: get_gpt_decoder_block_spec may return block submodules directly.
+
+    Neither this fixture nor replace_self_attention_with_tpr should assume
+    block_submodules.submodules exists.
+    """
+    layers = [_layer_spec(), _layer_spec()]
+    block_submodules = SimpleNamespace(layer_specs=layers)
+    assert _get_layer_specs(block_submodules) is layers
+
+    nested_block = ModuleSpec(module=_TransformerBlock, submodules=block_submodules)
+    assert _get_layer_specs(nested_block) is layers
+
+    single = _layer_spec()
+    assert _get_layer_specs(single) == [single]
