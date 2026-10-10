@@ -871,7 +871,7 @@ long-sequence throughput. The Python-level fixed tile loops are
 expensive: P=16384, tile=64 requires 256 GEMM calls *per Linear family
 per layer*, rather than a single long GEMM kernel.
 
-### 16. Standalone GEMM M-shape root-cause and NPU/CUDA crosscheck
+## 16. Standalone GEMM M-shape root-cause and NPU/CUDA crosscheck
 
 The key question is now not simply whether fixed M makes Full and TPR
 equal, but **which physical-M BF16 output is closer to an independent
