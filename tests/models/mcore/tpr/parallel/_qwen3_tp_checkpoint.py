@@ -165,8 +165,12 @@ def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int
     gc.collect()
 
 
-def make_real_qwen3_tp2_model(runtime, *, model_path: Path):
-    """Construct a genuine 28-layer Qwen3-1.7B in native Megatron TP2."""
+def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool = True):
+    """Construct Qwen3-1.7B with real native TP2 layout.
+
+    When load_weights=False, the caller MUST load the already-sharded
+    state_dict of a checkpoint-loaded peer BEFORE performing any forward.
+    """
     hf = load_qwen3_1_7b_config(model_path)
     config = hf_to_mcore_config_dense(
         hf, torch.bfloat16,
@@ -210,9 +214,10 @@ def make_real_qwen3_tp2_model(runtime, *, model_path: Path):
         if getattr(module, "tp_group", "missing") is None:
             module.tp_group = runtime.tp_group
 
-    load_hf_qwen3_tp_shards(
-        model, hf, model_path, tp_rank=runtime.rank, tp_size=2
-    )
+    if load_weights:
+        load_hf_qwen3_tp_shards(
+            model, hf, model_path, tp_rank=runtime.rank, tp_size=2
+        )
     assert model.config.num_layers == 28
     assert model.config.tensor_model_parallel_size == 2
     assert model.config.sequence_parallel is False
