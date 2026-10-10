@@ -86,7 +86,8 @@ def assert_full_parity(sequences):
 
 def test_compressed_forward_order():
     assert _areal_forward_order([5], []) == [0]
-    assert sorted(_areal_forward_order([5, 4, 3, 2], [3, 2, 1])) == [0, 1, 2, 3]
+    # Explicit upstream CompressedTrie forward-priority order for a depth-skewed tree.
+    assert _areal_forward_order([5, 4, 3, 2], [3, 2, 1]) == [3, 2, 1, 0]
     assert_full_parity((row([1, 2, 3, 4, 5]),))
 
 
