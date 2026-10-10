@@ -16,6 +16,11 @@ Then combined native TP2 x DP2 = 4 NPUs:
       torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29534 \
       -m pytest -vv -s tests/models/mcore/tpr/parallel/test_tpr_dp_tpdp_module_npu.py
 
+Isolate the *same DP1 real-TQ token window* from TP2xDP2 on only 2 NPUs:
+    TPR_RUN_MODULE_DP=1 TPR_MODULE_TP_SIZE=2 TPR_MODULE_DP_SIZE=1 TPR_MODULE_TQ_PAIR=1 \
+      torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29536 \
+      -m pytest -vv -s tests/models/mcore/tpr/parallel/test_tpr_dp_tpdp_module_npu.py
+
 The module runs TPR and independent full-trajectory references for each
 DP replica. In DP2, replicas intentionally receive different real-TQ fork
 windows; TP peers share an identical plan. The optional DP1 two-NPU control
@@ -390,7 +395,9 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
         print(
             f"TPR_MODULE_PARALLEL_DIAG world_rank={dist.get_rank()} "
             f"tp={runtime.tp_size} dp_size={runtime.dp_size} dp_rank={runtime.dp_rank} "
-            f"tp_rank={runtime.rank} loss_gap={ce_gap:.8f} "
+            f"tp_rank={runtime.rank} real_tq_rows={selected} "
+            f"window_start={window_start} true_fork={fork} "
+            f"physical_hash={signature[:12]} loss_gap={ce_gap:.8f} "
             f"shard_grad_rel_l2={relative_l2:.7f} "
             f"tp_global_grad_rel_l2={tp_global_l2:.7f} "
             f"param_names_equal={same_names} "
