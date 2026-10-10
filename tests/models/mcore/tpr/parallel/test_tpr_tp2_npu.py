@@ -1,6 +1,6 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
-"""Real native Megatron TP2 vs TPR TP2, dense 2-layer GPT, Ascend NPU.
+"""Real native Megatron TP2 vs TPR TP2 on pretrained Qwen3-1.7B, Ascend NPU.
 
 Run (two visible NPUs):
     TPR_RUN_TP2=1 torchrun --standalone --nproc_per_node=2 \
@@ -8,15 +8,18 @@ Run (two visible NPUs):
       tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py
 
 This does NOT claim PPO E2E, TP+SP, TP+CP or TP+DP correctness.
-It *does* check the actual Engine TPR thin entry, local vocab-sharded
-native CE, gradients, and one optimizer step against two independent
-full-trajectory forwards at identical TP2 sharded weights.
+It verifies the actual Engine TPR thin entry, local vocab-sharded
+native CE and PPO logprobs, gradients, and an optimizer step against two
+independent full-trajectory forwards, with authentic TP2-sharded HF weights.
+The token trajectories are deterministic test data, but the model is the
+real 28-layer Qwen3-1.7B checkpoint, not a synthetic/random Tiny GPT.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -26,18 +29,14 @@ import torch.distributed as dist
 from tensordict import TensorDict
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.transformer.transformer_config import TransformerConfig
-
 from verl.models.mcore.tpr import (
     TPR_REQUEST_KEY,
     TPRForwardBackwardRequest,
-    replace_self_attention_with_tpr,
 )
 from verl.utils import tensordict_utils as tu
 
 from ._tpr_cp_test_utils import _equivalence_tpr_plan
+from ._qwen3_tp_checkpoint import make_real_qwen3_tp2_model
 
 
 pytestmark = pytest.mark.skipif(
@@ -100,65 +99,18 @@ def tp2_runtime():
     dist.destroy_process_group()
 
 
-def _tiny_model(runtime):
-    cfg = TransformerConfig(
-        num_layers=2,
-        hidden_size=128,
-        ffn_hidden_size=256,
-        num_attention_heads=4,
-        num_query_groups=2,
-        kv_channels=32,
-        normalization="RMSNorm",
-        layernorm_epsilon=1e-6,
-        attention_dropout=0.0,
-        hidden_dropout=0.0,
-        add_bias_linear=False,
-        use_cpu_initialization=True,
-        params_dtype=torch.bfloat16,
-        pipeline_dtype=torch.bfloat16,
-        autocast_dtype=torch.bfloat16,
-        bf16=True,
-        tensor_model_parallel_size=2,
-        pipeline_model_parallel_size=1,
-        context_parallel_size=1,
-        expert_model_parallel_size=1,
-        sequence_parallel=False,
-        apply_rope_fusion=False,
-        bias_dropout_fusion=False,
+_QWEN3_1_7B_PATH = Path(
+    os.getenv("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B")
+)
+
+
+def _real_model(runtime, *, load_weights=True):
+    model, hf = make_real_qwen3_tp2_model(
+        runtime, model_path=_QWEN3_1_7B_PATH, load_weights=load_weights
     )
-    # The native reference calls Megatron/MindSpeed SelfAttention, unlike
-    # TPR's rectangular-attention branch. MindSpeed's causal-mask adaptor
-    # requires use_flash_attn=True, or else micro_batch_size plus seq_length
-    # and other mask-generation fields absent from this tiny TransformerConfig.
-    # Use its standard Flash Attention reference instead of inventing a
-    # non-FA mask configuration or patching the native implementation.
-    cfg.use_flash_attn = True
-    spec = replace_self_attention_with_tpr(
-        get_gpt_decoder_block_spec(
-            cfg, use_transformer_engine=False, pp_rank=0
-        )
-    )
-    pg = SimpleNamespace(
-        tp=runtime.tp_group, cp=runtime.cp_group,
-        pp=runtime.pp_group, embd=None,
-    )
-    model = GPTModel(
-        config=cfg,
-        transformer_layer_spec=spec,
-        vocab_size=2048,
-        max_sequence_length=256,
-        pre_process=True,
-        post_process=True,
-        parallel_output=True,  # MUST keep vocab shards for native TP CE.
-        share_embeddings_and_output_weights=False,
-        position_embedding_type="rope",
-        pg_collection=pg,
-    ).to(device=runtime.device, dtype=torch.bfloat16)
-    model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.to(runtime.device)
-    for module in model.modules():
-        if getattr(module, "tp_group", "missing") is None:
-            module.tp_group = runtime.tp_group
-    model.train()
+    assert hf.vocab_size == 151936
+    assert model.config.num_layers == 28
+    assert model.embedding.word_embeddings.weight.shape == (75968, 2048)
     return model
 
 
@@ -186,7 +138,7 @@ def _full_reference(model, first, second):
         )
         # Full (not TP-sharded) sequence, TP-sharded vocabulary. CE is native.
         assert logits.shape[:2] == (1, seq_len)
-        assert logits.shape[-1] == 1024
+        assert logits.shape[-1] == 75968
         per_token = model.compute_language_model_loss(
             token_ids[1:].unsqueeze(0),
             logits[0, :-1, :].unsqueeze(1),
@@ -244,16 +196,16 @@ def test_two_rank_native_tp2_full_trajectory_vs_tpr_engine(tp2_runtime):
     runtime = tp2_runtime
     seed = 918423
     torch.manual_seed(seed)
-    reference_model = _tiny_model(runtime)
+    reference_model = _real_model(runtime)
     torch.manual_seed(seed)
-    tpr_model = _tiny_model(runtime)
+    tpr_model = _real_model(runtime, load_weights=False)
     tpr_model.load_state_dict(reference_model.state_dict(), strict=True)
 
     prefix = torch.arange(17, 81, dtype=torch.long)
-    # Use target IDs from the *second* vocab shard so the test detects
-    # accidental comparison against logits.shape[-1] (the local vocab size).
-    first_suffix = torch.arange(1401, 1433, dtype=torch.long)
-    second_suffix = torch.arange(1521, 1545, dtype=torch.long)
+    # Authentic 151936-word Qwen vocab; second TP vocab shard begins at
+    # global token ID 75968. This specifically tests native TP CE labels.
+    first_suffix = torch.arange(80101, 80133, dtype=torch.long)
+    second_suffix = torch.arange(100201, 100225, dtype=torch.long)
     plan = _equivalence_tpr_plan(prefix, first_suffix, second_suffix)
     first = torch.cat((prefix, first_suffix))
     second = torch.cat((prefix, second_suffix))
@@ -325,7 +277,7 @@ def _native_response_nll_reference(model, prefix, first_suffix, second_suffix):
             ).unsqueeze(0),
             attention_mask=None,
         )
-        assert logits.shape[-1] == 1024, "expected TP2 vocab shard"
+        assert logits.shape[-1] == 75968, "expected Qwen3-1.7B TP2 vocab shard"
         positions = torch.arange(
             p - 1, sequence.numel() - 1, device=sequence.device
         )
@@ -436,14 +388,14 @@ def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
 def test_tp2_real_ppo_forest_native_vocab_logprobs_and_gradients(tp2_runtime):
     runtime = tp2_runtime
     torch.manual_seed(926034)
-    reference = _tiny_model(runtime)
+    reference = _real_model(runtime)
     torch.manual_seed(926034)
-    candidate = _tiny_model(runtime)
+    candidate = _real_model(runtime, load_weights=False)
     candidate.load_state_dict(reference.state_dict(), strict=True)
 
     prefix = torch.arange(21, 85, dtype=torch.long)
-    suffix1 = torch.arange(1401, 1433, dtype=torch.long)
-    suffix2 = torch.arange(1521, 1553, dtype=torch.long)
+    suffix1 = torch.arange(80101, 80133, dtype=torch.long)
+    suffix2 = torch.arange(100201, 100233, dtype=torch.long)
     dist.barrier(group=runtime.tp_group)
     reference_loss, reference_grad = _native_response_nll_reference(
         reference, prefix, suffix1, suffix2
