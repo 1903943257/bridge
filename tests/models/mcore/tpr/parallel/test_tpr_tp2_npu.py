@@ -3,7 +3,7 @@
 """Real native Megatron TP2 vs TPR TP2 on pretrained Qwen3-1.7B, Ascend NPU.
 
 Run (two visible NPUs):
-    TPR_RUN_TP2=1 torchrun --standalone --nproc_per_node=2 \
+    TPR_RUN_TP2=1 torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29531 \
       -m pytest -vv -s \
       tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py
 
@@ -299,8 +299,15 @@ def _native_response_nll_reference(model, prefix, first_suffix, second_suffix):
     return objective, _parameter_gradients(model)
 
 
-def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
-    """Exercise the real PPO Forest adapter/TP2 dispatch with a known NLL loss."""
+def _tpr_ppo_nll_run(
+    model, runtime, prefix, first_suffix, second_suffix, *, through_engine=False
+):
+    """Test TP2 Forest with NLL, optionally through the real Engine dispatcher.
+
+    The through_engine=True route MUST enter via MegatronEngine.forward_backward_batch,
+    including its native loss_mask/token-count preamble. It is NOT equivalent to
+    merely invoking run_tpr_forward_backward_batch directly.
+    """
     from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
 
     rows = [
@@ -324,6 +331,9 @@ def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
             ),
             "advantages": torch.ones(
                 (2, response_len), dtype=torch.float32, device=device
+            ),
+            "loss_mask": torch.ones(
+                (2, response_len), dtype=torch.bool, device=device
             ),
         },
         batch_size=[2], device=device,
@@ -402,9 +412,45 @@ def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
     engine.get_data_parallel_group = lambda: None
 
     model.zero_grad(set_to_none=True)
-    output = run_tpr_forward_backward_batch(
-        engine, data, loss_function, forward_only=False
-    )
+    if through_engine:
+        # This must be the *real* installed VERL Engine method. A missing
+        # Phase-4 patch is a test FAILURE, not a skip or silent fallback to
+        # the direct TPR adapter.
+        from unittest.mock import patch
+        from verl.models.mcore.tpr import megatron_adapter
+
+        hits = {"route": 0}
+        original = megatron_adapter.run_tpr_forward_backward_batch
+
+        def observed_route(*args, **kwargs):
+            hits["route"] += 1
+            assert args[0] is engine
+            assert args[1] is data
+            return original(*args, **kwargs)
+
+        with patch.object(
+            megatron_adapter, "run_tpr_forward_backward_batch", observed_route
+        ):
+            output = engine.forward_backward_batch(
+                data, loss_function=loss_function, forward_only=False
+            )
+        assert hits["route"] == 1, (
+            "TP2 tpr_enabled=True did not reach Phase-4 TPR dispatch from "
+            "MegatronEngine.forward_backward_batch; inspect installed "
+            "verl/workers/engine/megatron/transformer_impl.py"
+        )
+        native_tokens = tu.get_non_tensor_data(
+            data, key="batch_num_tokens", default=None
+        )
+        native_dp = tu.get_non_tensor_data(data, key="dp_size", default=None)
+        assert native_tokens == 2 * response_len, (
+            f"native Engine global token count mismatch: {native_tokens}"
+        )
+        assert native_dp == 1, f"native Engine dp_size mismatch: {native_dp}"
+    else:
+        output = run_tpr_forward_backward_batch(
+            engine, data, loss_function, forward_only=False
+        )
     assert calls["finalize"] == 1
     assert "tpr/forest_trees" in output["metrics"]
     return output, _parameter_gradients(model)
@@ -464,3 +510,48 @@ def test_tp2_real_ppo_forest_native_vocab_logprobs_and_gradients(tp2_runtime):
             flush=True,
         )
     dist.barrier(group=runtime.tp_group)
+
+
+def test_tp2_real_qwen_engine_phase4_route_two_updates(tp2_runtime):
+    """TP2 acceptance of *real* MegatronEngine forwarding into TPR.
+
+    A separate single-model, two-update smoke: uses genuine pretrained
+    Qwen3-1.7B, native TP2, existing NLL test objective ONLY as a controlled
+    route/gradient-lifecycle signal. This is NOT production PPO/GRPO E2E
+    and intentionally avoids ratio/clip/advantage numerical experiments.
+    """
+    runtime = tp2_runtime
+    model = _real_model(runtime)
+    prefix = torch.arange(21, 85, dtype=torch.long)
+    first = torch.arange(80101, 80133, dtype=torch.long)
+    second = torch.arange(100201, 100233, dtype=torch.long)
+    optim = torch.optim.SGD(model.parameters(), lr=0.25)
+    metrics = []
+    observed_update = False
+    for step in range(2):
+        # The actual callback is invoked through native
+        # MegatronEngine.forward_backward_batch; an absent patch MUST fail.
+        output, grads = _tpr_ppo_nll_run(
+            model, runtime, prefix, first, second, through_engine=True
+        )
+        assert len(output["loss"]) == 1
+        assert torch.isfinite(torch.tensor(output["loss"][0])).item()
+        assert all(torch.isfinite(g).all().item() for g in grads.values())
+        assert len(grads) > 0
+        before = next(model.parameters()).detach().clone()
+        optim.step()
+        observed_update |= bool(
+            torch.any(next(model.parameters()).detach() != before).item()
+        )
+        metrics.append(float(output["loss"][0]))
+        dist.barrier(group=runtime.tp_group)
+    assert observed_update, (
+        "No parameter changed in two real Engine TP2 updates; optimizer "
+        "or TP gradient-finalization hook may be disconnected"
+    )
+    if runtime.rank == 0:
+        print(
+            f"TPR_TP2_ENGINE_ROUTE status=PASS dispatch_hits=2 "
+            f"optimizer_steps=2 losses={metrics}",
+            flush=True,
+        )
