@@ -1,0 +1,299 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# SPDX-License-Identifier: Apache-2.0
+"""Real native Megatron TP2 vs TPR TP2, dense 2-layer GPT, Ascend NPU.
+
+Run (two visible NPUs):
+    TPR_RUN_TP2=1 torchrun --standalone --nproc_per_node=2 \
+      -m pytest -vv -s \
+      tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py
+
+This does NOT claim PPO E2E, TP+SP, TP+CP or TP+DP correctness.
+It *does* check the actual Engine TPR thin entry, local vocab-sharded
+native CE, gradients, and one optimizer step against two independent
+full-trajectory forwards at identical TP2 sharded weights.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+from tensordict import TensorDict
+
+from megatron.core import parallel_state
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+from verl.models.mcore.tpr import (
+    TPR_REQUEST_KEY,
+    TPRForwardBackwardRequest,
+    replace_self_attention_with_tpr,
+)
+from verl.utils import tensordict_utils as tu
+
+from ._tpr_cp_test_utils import _equivalence_tpr_plan
+
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("TPR_RUN_TP2") != "1",
+    reason="set TPR_RUN_TP2=1 for two-rank NPU TP2 correctness",
+)
+
+
+@pytest.fixture(scope="module")
+def tp2_runtime():
+    if int(os.getenv("WORLD_SIZE", "1")) != 2:
+        pytest.skip("requires torchrun --nproc_per_node=2")
+    import torch_npu  # noqa: F401
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="hccl")
+
+    # Same bootstrap convention as existing real Engine CP NPU tests, only
+    # model parallel dimensions differ. Do NOT enable Megatron SP.
+    argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = argv
+
+    repatch({
+        "tensor_model_parallel_size": 2,
+        "context_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "sequence_parallel": False,
+    })
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    model_parallel_cuda_manual_seed(260910)
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    cp_group = parallel_state.get_context_parallel_group()
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+    assert dist.get_world_size(group=tp_group) == 2
+    assert dist.get_world_size(group=cp_group) == 1
+    runtime = SimpleNamespace(
+        rank=dist.get_rank(group=tp_group),
+        device=torch.device("npu", local_rank),
+        tp_group=tp_group,
+        cp_group=cp_group,
+        pp_group=pp_group,
+    )
+    yield runtime
+    dist.barrier(group=tp_group)
+    parallel_state.destroy_model_parallel()
+    dist.destroy_process_group()
+
+
+def _tiny_model(runtime):
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=32,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-6,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        autocast_dtype=torch.bfloat16,
+        bf16=True,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        sequence_parallel=False,
+        apply_rope_fusion=False,
+        bias_dropout_fusion=False,
+    )
+    spec = replace_self_attention_with_tpr(
+        get_gpt_decoder_block_spec(
+            cfg, use_transformer_engine=False, pp_rank=0
+        )
+    )
+    pg = SimpleNamespace(
+        tp=runtime.tp_group, cp=runtime.cp_group,
+        pp=runtime.pp_group, embd=None,
+    )
+    model = GPTModel(
+        config=cfg,
+        transformer_layer_spec=spec,
+        vocab_size=2048,
+        max_sequence_length=256,
+        pre_process=True,
+        post_process=True,
+        parallel_output=True,  # MUST keep vocab shards for native TP CE.
+        share_embeddings_and_output_weights=False,
+        position_embedding_type="rope",
+        pg_collection=pg,
+    ).to(device=runtime.device, dtype=torch.bfloat16)
+    model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.to(runtime.device)
+    for module in model.modules():
+        if getattr(module, "tp_group", "missing") is None:
+            module.tp_group = runtime.tp_group
+    model.train()
+    return model
+
+
+def _parameter_gradients(model):
+    return {
+        name: param.grad.detach().float().clone()
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    }
+
+
+def _full_reference(model, first, second):
+    model.zero_grad(set_to_none=True)
+    denominator = first.numel() + second.numel() - 2
+    loss = None
+    for seq in (first, second):
+        token_ids = seq.to(device=next(model.parameters()).device)
+        seq_len = token_ids.numel()
+        logits = model(
+            input_ids=token_ids.unsqueeze(0),
+            position_ids=torch.arange(
+                seq_len, device=token_ids.device
+            ).unsqueeze(0),
+            attention_mask=None,
+        )
+        # Full (not TP-sharded) sequence, TP-sharded vocabulary. CE is native.
+        assert logits.shape[:2] == (1, seq_len)
+        assert logits.shape[-1] == 1024
+        per_token = model.compute_language_model_loss(
+            token_ids[1:].unsqueeze(0),
+            logits[0, :-1, :].unsqueeze(1),
+        ).reshape(-1)
+        term = per_token.float().sum() / denominator
+        term.backward()
+        loss = term.detach() if loss is None else loss + term.detach()
+    return loss, _parameter_gradients(model)
+
+
+def _tpr_engine_run(model, runtime, plan):
+    from verl.workers.engine.megatron.transformer_impl import MegatronEngine
+
+    calls = {"finalize": 0}
+
+    def finalize(chunks, tokens, *, force_all_reduce=False, **kwargs):
+        calls["finalize"] += 1
+        assert chunks == [model]
+        assert tokens is None and force_all_reduce is True
+
+    model.zero_grad(set_to_none=True)
+    model.config.no_sync_func = nullcontext
+    model.config.grad_scale_func = lambda tensor: tensor
+    model.config.finalize_model_grads_func = finalize
+    model.config.calculate_per_token_loss = False
+
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.module = [model]
+    engine.tf_config = model.config
+    engine.engine_config = SimpleNamespace(
+        tpr_enabled=True,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        dynamic_context_parallel=False,
+        tpr_cp_backend=None,
+        override_transformer_config={},
+    )
+    engine.model_config = SimpleNamespace(mtp=SimpleNamespace(enable=False))
+    engine.enable_routing_replay = False
+    engine.get_data_parallel_size = lambda: 1
+    request = TPRForwardBackwardRequest(plan)
+    data = TensorDict({}, batch_size=[])
+    tu.assign_non_tensor(data, **{TPR_REQUEST_KEY: request})
+    output = engine.forward_backward_batch(
+        data, loss_function=None, forward_only=False
+    )
+    assert calls == {"finalize": 1}
+    return output, _parameter_gradients(model)
+
+
+def test_two_rank_native_tp2_full_trajectory_vs_tpr_engine(tp2_runtime):
+    runtime = tp2_runtime
+    seed = 918423
+    torch.manual_seed(seed)
+    reference_model = _tiny_model(runtime)
+    torch.manual_seed(seed)
+    tpr_model = _tiny_model(runtime)
+    tpr_model.load_state_dict(reference_model.state_dict(), strict=True)
+
+    prefix = torch.arange(17, 81, dtype=torch.long)
+    first_suffix = torch.arange(401, 433, dtype=torch.long)
+    second_suffix = torch.arange(651, 675, dtype=torch.long)
+    plan = _equivalence_tpr_plan(prefix, first_suffix, second_suffix)
+    first = torch.cat((prefix, first_suffix))
+    second = torch.cat((prefix, second_suffix))
+
+    dist.barrier(group=runtime.tp_group)
+    reference_loss, ref_grad = _full_reference(reference_model, first, second)
+    output, tpr_grad = _tpr_engine_run(tpr_model, runtime, plan)
+    tpr_loss = output["loss"]
+
+    assert abs(tpr_loss - reference_loss.item()) < 0.02
+    assert ref_grad.keys() == tpr_grad.keys()
+    total_diff_sq = sum(
+        (ref_grad[name] - tpr_grad[name]).square().sum().item()
+        for name in ref_grad
+    )
+    total_ref_sq = sum(
+        ref_grad[name].square().sum().item() for name in ref_grad
+    )
+    relative_l2 = (total_diff_sq / max(total_ref_sq, 1e-24)) ** 0.5
+    assert relative_l2 < 0.05, f"native TP2 vs TPR gradient relative_l2={relative_l2}"
+
+    # One complete optimizer step on the *same rank-local TP parameter shards*.
+    before_ref = {
+        name: param.detach().float().clone()
+        for name, param in reference_model.named_parameters()
+    }
+    before_tpr = {
+        name: param.detach().float().clone()
+        for name, param in tpr_model.named_parameters()
+    }
+    assert before_ref.keys() == before_tpr.keys()
+    optimizer_ref = torch.optim.SGD(reference_model.parameters(), lr=0.05)
+    optimizer_tpr = torch.optim.SGD(tpr_model.parameters(), lr=0.05)
+    optimizer_ref.step()
+    optimizer_tpr.step()
+    update_diff_sq = 0.0
+    update_ref_sq = 0.0
+    for name, ref_param in reference_model.named_parameters():
+        ref_delta = ref_param.detach().float() - before_ref[name]
+        tpr_delta = dict(tpr_model.named_parameters())[name].detach().float() - before_tpr[name]
+        update_diff_sq += (ref_delta - tpr_delta).square().sum().item()
+        update_ref_sq += ref_delta.square().sum().item()
+    assert (update_diff_sq / max(update_ref_sq, 1e-24)) ** 0.5 < 0.1
+
+    if runtime.rank == 0:
+        print(
+            f"TPR_TP2_NPU native_loss={reference_loss.item():.7f} "
+            f"tpr_loss={tpr_loss:.7f} grad_rel_l2={relative_l2:.6g} "
+            f"param_tensors={len(ref_grad)}",
+            flush=True,
+        )
+    dist.barrier(group=runtime.tp_group)
