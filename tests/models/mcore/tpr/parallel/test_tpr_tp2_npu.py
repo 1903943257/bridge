@@ -428,8 +428,23 @@ def test_tp2_real_ppo_forest_native_vocab_logprobs_and_gradients(tp2_runtime):
     output, tpr_grad = _tpr_ppo_nll_run(
         candidate, runtime, prefix, suffix1, suffix2
     )
-    actual = output["loss"]
-    assert abs(actual - reference_loss.item()) < 0.02
+    # VERL's postprocess contract uses list-valued loss contributions, even
+    # when the TPR Forest adapter has a single *logical* minibatch loss.
+    # Compare the sole scalar contribution; do NOT change the production
+    # adapter to return float and break downstream VERL metric processing.
+    loss_contributions = output["loss"]
+    assert isinstance(loss_contributions, list), (
+        f"expected VERL loss contributions list, got {type(loss_contributions).__name__}"
+    )
+    assert len(loss_contributions) == 1, (
+        f"TP2 PPO Forest must return one logical minibatch loss, got "
+        f"{len(loss_contributions)} contributions"
+    )
+    actual = float(loss_contributions[0])
+    assert abs(actual - reference_loss.item()) < 0.02, (
+        f"TP2 PPO Forest NLL mismatch: TPR={actual:.8f}, "
+        f"full_reference={reference_loss.item():.8f}"
+    )
     assert reference_grad.keys() == tpr_grad.keys()
     numerator = sum(
         (reference_grad[key] - tpr_grad[key]).square().sum().item()
