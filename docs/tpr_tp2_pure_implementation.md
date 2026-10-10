@@ -115,3 +115,30 @@ precision debugging by avoiding modifications to native kernels.
    that previously hit E89999 as an independent clean GPU/NPU validation.
 
 TP2 accuracy remains UNVERIFIED until real two-rank Qwen3-1.7B tests pass.
+
+
+## 2026-10-10 — TP2 thin-entry test routing and PPO metadata fixes
+
+The last two errors were in the **test harness**, prior to completed
+numerical comparison, not TP2/TPR gradient mismatches:
+
+- `KeyError: loss_mask`: `_tpr_engine_run` previously passed a
+  request-only TensorDict into `MegatronEngine.forward_backward_batch`.
+  The installed upstream native method accesses `data["loss_mask"]`
+  in its global-token-count preamble. Because the bridge branch does not
+  contain the deployed VERL Engine override, injecting a dummy
+  `loss_mask` would only push the error further into native batch
+  preparation, and would **not prove TPR dispatch**. The controlled TP2
+  correctness gate now calls the existing
+  `megatron_adapter.run_tpr_forward_backward(engine, request,
+  forward_only=False)` directly. It still executes the real Megatron
+  Qwen3-1.7B TP2 model/TP collectives/TPR F+B, but **does not certify
+  `MegatronEngine.forward_backward_batch` automatic interception**.
+  The real production VERL routing test needs to be completed separately
+  using the exact installed Engine version.
+- `TypeError: get_non_tensor_data() missing default`: fixed the
+  `_tpr_ppo_nll_run` nested NLL callback by passing
+  `default=None` and verifying positive `batch_num_tokens`.
+  No changes to the real VERL loss function or PPO semantics.
+
+After these changes, the two-NPU numerical gate still needs to run.
