@@ -171,6 +171,19 @@ def _clip_branch_disagreement(full,new,old,adv,clip):
     }
 
 
+def _choose_megatron_old(hf_old,meg_native_no_grad,source):
+    """Numerical experiment only. Never substitute for rollout old policy."""
+    if source not in ("hf_full","megatron_native"):
+        raise ValueError("source must be hf_full or megatron_native")
+    if not isinstance(hf_old,torch.Tensor) or not isinstance(meg_native_no_grad,torch.Tensor):
+        raise TypeError("old-logprob alternatives must be tensors")
+    if hf_old.shape!=meg_native_no_grad.shape or hf_old.ndim!=2:
+        raise ValueError("old-logprob grids are not aligned")
+    if not bool(torch.isfinite(hf_old).all()) or not bool(torch.isfinite(meg_native_no_grad).all()):
+        raise ValueError("old-logprob candidate contains nonfinite values")
+    return (hf_old if source=="hf_full" else meg_native_no_grad).detach().float().cpu().clone()
+
+
 def _engine(model):
     from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
     engine=MegatronEngineWithLMHead.__new__(MegatronEngineWithLMHead)
@@ -264,8 +277,9 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
     old_variant=os.getenv("TPR_TRIPLET_MEGATRON_OLD_SOURCE","hf_full")
     if old_variant not in ("hf_full","megatron_native"):
         pytest.fail("TPR_TRIPLET_MEGATRON_OLD_SOURCE must be hf_full or megatron_native")
-    old=(list(native_initial_logp) if old_variant=="megatron_native"
-         else list(old_cpu))
+    old_grid=_choose_megatron_old(
+        old_cpu,torch.stack(native_initial_logp),old_variant)
+    old=list(old_grid.unbind())
     batch["old_log_probs"]=_as_jagged(old)
     full_floor=(torch.stack(native_initial_logp)-hf["full_response_logprobs"]).abs()
     print(
