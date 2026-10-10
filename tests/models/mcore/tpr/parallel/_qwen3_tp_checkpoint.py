@@ -237,6 +237,15 @@ def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool =
             model, hf, model_path, tp_rank=runtime.rank, tp_size=2
         )
     assert model.config.num_layers == 28
+    # Both the native full-trajectory reference (no active TPR context)
+    # and TPR's tree branch must use the expected CANN attention operator.
+    # If a future MindSpeed/Megatron spec bypasses our replacement, fail
+    # here rather than entering an incompatible ScaledMaskedSoftmax kernel.
+    if not all(
+        isinstance(layer.self_attention.core_attention, _ProfileFusedCausalAttention)
+        for layer in model.decoder.layers
+    ):
+        raise AssertionError("TP2 Qwen requires controlled CANN square-causal core attention")
     assert model.config.tensor_model_parallel_size == 2
     assert model.config.sequence_parallel is False
     assert model.embedding.word_embeddings.weight.shape == (75968, 2048)
