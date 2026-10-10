@@ -152,9 +152,28 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
     boundaries = (0, 134, 158, 166, 189, 192)
     if tokens[row].numel() != boundaries[-1]:
         raise AssertionError("Fixed path is valid only for 192-token rows")
-    fixed = hf_cached_chunk_logprobs(
-        model, tokens[row], boundaries, DynamicCache
+    # Capture the *actual* first root chunk inside the segmented HF run,
+    # rather than assuming a separate cutoff forward is representative.
+    dta_root = {}
+    def first_root_v(_module, args, result):
+        if dta_root:
+            return  # later physical chunks are intentionally not captured
+        if not args or not isinstance(args[0], torch.Tensor):
+            raise AssertionError("HF segmented root V lacked input tensor")
+        dta_root["input"] = args[0].detach().cpu().float().clone()
+        dta_root["v"] = result.detach().cpu().float().clone()
+
+    root_handle = model.model.layers[0].self_attn.v_proj.register_forward_hook(
+        first_root_v
     )
+    try:
+        fixed = hf_cached_chunk_logprobs(
+            model, tokens[row], boundaries, DynamicCache
+        )
+    finally:
+        root_handle.remove()
+    if set(dta_root) != {"input", "v"}:
+        raise AssertionError("HF DTA root v_proj not captured")
     fixed_rows, fixed_summary = error_summary((full[row],), (fixed,))
     v_full = _single_v_capture(
         model, tokens[row], DynamicCache, length=192
@@ -166,6 +185,18 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
         raise AssertionError(
             "HF full/root first-layer V GEMM inputs differ; invalid M-only control"
         )
+    if not torch.equal(v_root["input"], dta_root["input"]):
+        raise AssertionError("HF Native cutoff and DTA root V GEMM inputs differ")
+    root_to_dta_v = (
+        v_root["v"].double() - dta_root["v"].double()
+    ).abs()
+    print(
+        "P0 DTA_HF ROOT_CUTOFF_TO_DTA "
+        f"root_M=134 input_max_abs=0 "
+        f"v_max_abs={float(root_to_dta_v.max()):.9g} "
+        "same_HF_model=True",
+        flush=True,
+    )
     v_delta = (
         v_full["v"][:, :134].double() - v_root["v"].double()
     ).abs()
