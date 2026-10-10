@@ -607,12 +607,17 @@ Run from Docker VERL root after host bridge git pull / Docker rsync:
     TPR_DTA_BWD_OBJECTIVE=ppo_unclipped \
       bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
-Default Pop block=64 and HF DTA mode=native. Both use a fresh same
-checkpoint PPO proxy (HF old from HF Full; Megatron old from Megatron
-Native), and both use deterministic signed advantages if the TQ dump
-does not provide exact [8,64] rollout advantages. Thus paired gradients
-are valid within each backend; cross-backend raw ratio/step numbers are
-not intrinsically directly comparable.
+Default Pop block=64 and HF DTA mode=native. The HF subprocess
+exports exact input tokens, old logprobs and advantages; the Megatron
+Native/TPR subprocess REUSES these values and explicitly rejects
+mismatches. If TQ lacks exact [8,64] rollout fields, the same
+deterministic signed proxy advantages and HF Full old logprobs are used
+across ALL four paths. The objective is truly matched; separate
+HF-Full/Megatron-Native Forward divergence is still reported as a
+framework/weight-conversion floor. Cross-backend raw ratios are now
+relative to the SAME old policy, but cross-backend parameter gradients
+and optimizer steps are still NOT directly comparable without a
+validated HF-to-Megatron parameter-gradient mapping.
 
 **New triplet NPU status:** not yet executed. This must not be reported
 as TPR gradient/optimizer numerical parity before physical NPU run.
