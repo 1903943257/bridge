@@ -129,6 +129,83 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
     response_full = tuple(x[p - 1:p + s - 1] for x in full)
     response_dta = tuple(x[p - 1:p + s - 1] for x in lcp_dfs.logprobs)
     _, response_summary = error_summary(response_full, response_dta)
+
+    # Higher-fidelity AReaL-DTA forward: TokenTrie leafization, optimized
+    # CompressedTrie.forward_permute, and persistent KV buffers/views.
+    # Preserve lexical DFS to isolate the effect of *execution schedule*.
+    from ._qwen17_areal_dta_reference import hf_areal_forward_only
+    areal = hf_areal_forward_only(model, tokens, DynamicCache)
+    areal_rows, areal_summary = error_summary(full, areal.logprobs)
+    areal_response = tuple(x[p - 1:p + s - 1] for x in areal.logprobs)
+    _, areal_response_summary = error_summary(response_full, areal_response)
+    _, areal_vs_lexical = error_summary(lcp_dfs.logprobs, areal.logprobs)
+    assert areal_summary["num_tokens"] == 8 * 191
+    assert areal_response_summary["num_tokens"] == 8 * 64
+    for item in areal_rows:
+        i, q = item["row"], item["worst_query"]
+        owner = areal.token_owner[i][q]
+        print(
+            "P0 DTA_HF AREAL_ROW "
+            f"row={i} max_abs={item['max_abs']:.9g} "
+            f"mean_abs={item['mean_abs']:.9g} worst_query_abs={q} "
+            f"owner_visit={owner} owner_start={areal.physical_starts[owner]} "
+            f"owner_M={areal.physical_m[owner]}",
+            flush=True,
+        )
+    print(
+        "P0 DTA_HF AREAL_SUMMARY "
+        f"num_tokens={areal_summary['num_tokens']} "
+        f"max_abs={areal_summary['max_abs']:.9g} "
+        f"mean_abs={areal_summary['mean_abs']:.9g} "
+        f"p95_abs={areal_summary['p95_abs']:.9g} "
+        f"num_gt_0p2={areal_summary['num_gt_0p2']} "
+        f"leaves={areal.n_leaves} physical_m={list(areal.physical_m)} "
+        f"physical_starts={list(areal.physical_starts)} "
+        f"physical_attached_rows={list(areal.physical_rows)} "
+        f"saved_forward_tokens={areal.dense_tokens - areal.total_processed_tokens} "
+        "scheduler=AREAL_FORWARD_PERMUTE buffer=PERSISTENT_KV forward_only=True",
+        flush=True,
+    )
+    print(
+        "P0 DTA_HF AREAL_RESPONSE_SUMMARY "
+        f"num_tokens={areal_response_summary['num_tokens']} "
+        f"max_abs={areal_response_summary['max_abs']:.9g} "
+        f"mean_abs={areal_response_summary['mean_abs']:.9g} "
+        f"p95_abs={areal_response_summary['p95_abs']:.9g} "
+        f"num_gt_0p2={areal_response_summary['num_gt_0p2']} "
+        "same_HF_checkpoint=True numerical_parity=DIAGNOSTIC_ONLY",
+        flush=True,
+    )
+    print(
+        "P0 DTA_HF AREAL_VS_LEXICAL "
+        f"max_abs={areal_vs_lexical['max_abs']:.9g} "
+        f"mean_abs={areal_vs_lexical['mean_abs']:.9g} "
+        f"p95_abs={areal_vs_lexical['p95_abs']:.9g} "
+        "scope=EXECUTION_ORDER_PLUS_KV_BUFFER",
+        flush=True,
+    )
+    # Identify *response* outliers with actual optimized-DFS owning M.
+    outliers = sorted(
+        (
+            (float(error), i, p - 1 + offset)
+            for i, (dense, segmented) in enumerate(
+                zip(response_full, areal_response, strict=True)
+            )
+            for offset, error in enumerate(
+                (dense.float() - segmented.float()).abs().cpu().tolist()
+            )
+        ), reverse=True
+    )[:12]
+    for diff, i, query in outliers:
+        owner = areal.token_owner[i][query]
+        print(
+            "P0 DTA_HF AREAL_OUTLIER "
+            f"row={i} response_offset={query - (p - 1)} "
+            f"query_abs={query} abs_delta={diff:.9g} "
+            f"owner_visit={owner} owner_start={areal.physical_starts[owner]} "
+            f"owner_M={areal.physical_m[owner]}",
+            flush=True,
+        )
     for item in row_metrics:
         print(
             "P0 DTA_HF DFS_ROW "
@@ -235,6 +312,19 @@ def test_real_qwen3_hf_full_vs_dta_style_dynamic_cache():
         f"num_gt_0p2={fixed_summary['num_gt_0p2']} "
         f"worst_query_abs={fixed_rows[0]['worst_query']} "
         f"query189_abs={float((full[row][189]-fixed[189]).abs()):.9g}",
+        flush=True,
+    )
+    # The existing Megatron TPR row5/query189 had ~0.749 forward drift:
+    # do not silently substitute some other worst HF token.
+    print(
+        "P0 DTA_HF AREAL_TARGET "
+        f"row={row} query_abs=189 "
+        f"hf_full={float(full[row][189]):.9g} "
+        f"hf_lexical={float(lcp_dfs.logprobs[row][189]):.9g} "
+        f"hf_areal={float(areal.logprobs[row][189]):.9g} "
+        f"hf_fixed={float(fixed[189]):.9g} "
+        f"areal_abs={float((full[row][189]-areal.logprobs[row][189]).abs()):.9g} "
+        f"fixed_abs={float((full[row][189]-fixed[189]).abs()):.9g}",
         flush=True,
     )
     # A pass means measurements were completed, NOT numeric equivalence.
