@@ -269,6 +269,43 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
             _,response_lp=_native_response_logprobs(
                 native,ids.to(device),prompt_length=p,temperature=1.0)
             native_initial_logp.append(response_lp.detach().float().cpu())
+    # Compare the two *logprob kernels on the same Megatron logits*.
+    # This separates the vocab-parallel CE numerical path from model
+    # Forward/weight-conversion/kernel differences, without forcing a
+    # different implementation into the real TPR PPO objective.
+    if os.getenv("TPR_TRIPLET_PROBE_LOGPROB_KERNEL","1")=="1":
+        from verl.utils.megatron.tensor_parallel import (
+            vocab_parallel_log_probs_from_logits,
+        )
+        import torch.nn.functional as F
+        with torch.no_grad():
+            ids=rows[0].to(device)
+            pos=torch.arange(ids.numel(),device=device).unsqueeze(0)
+            logits=native(
+                input_ids=ids.unsqueeze(0),
+                position_ids=pos,
+                attention_mask=None,
+            )
+            subset=logits[0,p-1:p+s-1,:].contiguous()
+            labels=ids[p:p+s].contiguous()
+            native_ce=vocab_parallel_log_probs_from_logits(
+                subset.clone(),labels).detach().float().cpu()
+            float_lp=F.log_softmax(subset.float(),dim=-1).gather(
+                1,labels[:,None]).squeeze(-1).detach().float().cpu()
+            d=(native_ce-float_lp).abs()
+            repeat_delta=(native_ce-native_initial_logp[0]).abs()
+            hf_floor=(float_lp-hf["full_response_logprobs"][0]).abs()
+            print(
+                "P1 TPR_TRIPLET LOGPROB_KERNEL "
+                f"same_megatron_logits_mean_abs={float(d.mean()):.9g} "
+                f"same_megatron_logits_max_abs={float(d.max()):.9g} "
+                f"native_ce_repeat_mean_abs={float(repeat_delta.mean()):.9g} "
+                f"native_ce_repeat_max_abs={float(repeat_delta.max()):.9g} "
+                f"float_lp_vs_hf_full_mean_abs={float(hf_floor.mean()):.9g} "
+                f"float_lp_vs_hf_full_max_abs={float(hf_floor.max()):.9g} "
+                "scope=ROW0_64_RESPONSE_TOKENS",flush=True,
+            )
+            del logits,subset,native_ce,float_lp
     # BASELINE: old policy is captured by HF Full; that may produce
     # numerical bias before the first parameter update in Megatron.
     # EXPERIMENT ONLY: use Megatron Native no_grad as its own old-logprob
