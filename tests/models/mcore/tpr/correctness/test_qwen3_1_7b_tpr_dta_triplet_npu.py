@@ -138,6 +138,39 @@ def _clip_metrics(new,old,adv,clip):
     return float(outside.float().mean()),float(effective.float().mean())
 
 
+def _clip_branch_disagreement(full,new,old,adv,clip):
+    """Measure PPO's actual advantage-aware zero-gradient branch changes.
+
+    With old sourced from HF Full, Megatron Native may already fall
+    outside the clip window. Therefore do NOT attribute all TPR clipping
+    to prefix reuse without measuring the Native baseline.
+    """
+    full=full.detach().float().cpu()
+    new=new.detach().float().cpu()
+    old=old.detach().float().cpu()
+    adv=adv.detach().float().cpu()
+    if not (full.shape==new.shape==old.shape==adv.shape):
+        raise AssertionError("clip branch comparison requires equal token grids")
+    r_full=(full-old).exp()
+    r_new=(new-old).exp()
+    def status(r):
+        active=(adv!=0)
+        return active & (((adv>0)&(r>1+clip))|
+                         ((adv<0)&(r<1-clip)))
+    full_branch=status(r_full)
+    new_branch=status(r_new)
+    flips=full_branch^new_branch
+    return {
+        "tokens":int(full.numel()),
+        "full_clipped":int(full_branch.sum()),
+        "tpr_clipped":int(new_branch.sum()),
+        "branch_flips":int(flips.sum()),
+        "full_outside":int(((r_full<1-clip)|(r_full>1+clip)).sum()),
+        "tpr_outside":int(((r_new<1-clip)|(r_new>1+clip)).sum()),
+        "full_ratio_max_delta":float((r_full-1).abs().max()),
+    }
+
+
 def _engine(model):
     from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
     engine=MegatronEngineWithLMHead.__new__(MegatronEngineWithLMHead)
@@ -305,6 +338,22 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
     advantage=adv_cpu.float()
     clip=float(os.getenv("TPR_DTA_BWD_PPO_CLIP","0.2"))
     outside,effective=_clip_metrics(tpr_lp,torch.stack(old),advantage,clip)
+    clip_branches=_clip_branch_disagreement(
+        native_lp,tpr_lp,torch.stack(old),advantage,clip)
+    print(
+        "P1 TPR_TRIPLET CLIP_BRANCH "
+        f"objective={objective} "
+        f"tokens={clip_branches['tokens']} "
+        f"native_clipped={clip_branches['full_clipped']} "
+        f"tpr_clipped={clip_branches['tpr_clipped']} "
+        f"branch_flips={clip_branches['branch_flips']} "
+        f"native_outside={clip_branches['full_outside']} "
+        f"tpr_outside={clip_branches['tpr_outside']} "
+        f"native_old_ratio_max_deviation={clip_branches['full_ratio_max_delta']:.9g} "
+        f"active_under_objective={objective=='ppo'} "
+        "old_policy=SHARED_HF_FULL",
+        flush=True,
+    )
     print(
         "P1 TPR_TRIPLET SUMMARY backend=MEGATRON "
         f"objective={objective} rows=8 p=128 s=64 "
