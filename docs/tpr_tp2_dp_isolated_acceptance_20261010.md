@@ -217,3 +217,58 @@ for CP=1. Fixed the test to assert the native CP group has size 1
 while **passing `cp_group=None` to SegmentExecutor**. The production
 executor's explicit CP group contract remains unchanged. B2 NPU
 rerun pending; C (TP2×DP2) awaits B2 PASS.
+
+
+## 2026-10-10 DP2 / TP2xDP2 first NPU runs: thresholded PASS, data diversity caveat
+
+User's **first** real Qwen3-1.7B + real-TQ tests:
+
+```
+TPR_MODULE_PARALLEL status=PASS tp=1 dp=2 dp_rank=1
+ real_tq_rows=(4,5) native_ce=5.7495232 tpr_ce=5.7314186
+ grad_rel_l2=0.0445543
+TPR_MODULE_PARALLEL status=PASS tp=1 dp=2 dp_rank=0
+ real_tq_rows=(0,1) native_ce=5.7495232 tpr_ce=5.7314186
+ grad_rel_l2=0.0445543
+
+TPR_MODULE_PARALLEL status=PASS tp=2 dp=2 dp_rank=1
+ real_tq_rows=(4,5) native_ce=5.7632203 tpr_ce=5.7735643
+ grad_rel_l2=0.0322185
+TPR_MODULE_PARALLEL status=PASS tp=2 dp=2 dp_rank=0
+ real_tq_rows=(0,1) native_ce=5.7632203 tpr_ce=5.7735643
+ grad_rel_l2=0.0322185
+PASSED x4
+```
+
+Both CP1 standalone TPR module paths pass the current 5%-rel-L2
+numerical gate. Important: the two DP replicas produced **exactly the same
+loss and gradient-difference values**. Audit found the first test sliced
+*only the first 128+32 tokens* of every chosen trajectory and confirmed
+**only that different logical row IDs** were assigned, not that the
+physical 160-token training windows differed. Real UniAgent TQ rows may
+share those initial prompt tokens. Thus the first PASS validates separate
+native DP process-group membership and local TP/TPR execution, **not a
+demonstration of two different physical DP workloads**.
+
+Committed strengthening, **NPU rerun needed**:
+- On each DP replica, select from its disjoint real-TQ row range
+  (`0..3` vs `4..7`) a pair of siblings with a **real first token
+  divergence** (recorded full-token LCP) and >=128 shared prior tokens
+  plus 32 post-divergence tokens.
+- Use a genuine 160-token window around that actual first branch point,
+  without invented token IDs or model parameters.
+- Deterministically pick physically distinct fork windows across DP0/DP1
+  and assert different SHA256 physical-token signatures using the native
+  DP ProcessGroup. Fail explicitly if this recorded TQ does not contain
+  qualifying physically distinct windows.
+- Print `real_tq_rows`, `window_start`, `true_fork` and
+  `physical_hash` as reproducible provenance. **This local window
+  restarts position IDs from 0; it is an isolated short-context module
+  test, NOT equivalence to full long-context original TQ training.**
+- Keep existing 0.02 CE loss difference and 5% gradient-rel-L2
+  gates unchanged; do not edit the BF16/PPO numerics.
+- DP gradient synchronization and Trainer dispatch remain NOT_TESTED.
+
+The existing 5/3 DTA offline placement plan is **not used by** this
+TP/DP module test (which picks two local siblings per DP replica). It is
+still not legal for native equal-row Trainer dispatch.
