@@ -23,6 +23,7 @@ from verl.models.mcore.config_converter import (
     hf_to_mcore_config_dense,
 )
 from verl.models.mcore.tpr import replace_self_attention_with_tpr
+from verl.models.mcore.tpr.module_spec import _get_layer_specs
 from ..profiling.test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
 
 from ..correctness.test_tpr_qwen3_compatibility_npu import (
@@ -200,11 +201,11 @@ def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool =
             config, use_transformer_engine=False, pp_rank=0
         )
     )
-    layer_specs = (
-        spec.submodules.layer_specs
-        if getattr(spec.submodules, "layer_specs", None) is not None
-        else [spec]
-    )
+    # get_gpt_decoder_block_spec returns TransformerBlockSubmodules
+    # (with .layer_specs) in this Megatron version, NOT necessarily a
+    # ModuleSpec (with .submodules.layer_specs). Use the same tested
+    # resolver as replace_self_attention_with_tpr above.
+    layer_specs = _get_layer_specs(spec)
     for layer_spec in layer_specs:
         layer_spec.submodules.self_attention.submodules.core_attention = (
             _ProfileFusedCausalAttention
