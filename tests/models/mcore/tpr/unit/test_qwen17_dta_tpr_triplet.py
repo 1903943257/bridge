@@ -136,7 +136,7 @@ def test_megatron_same_checkpoint_old_source_diagnostic():
     old_meg=_choose_megatron_old(hf,meg,"megatron_native")
     torch.testing.assert_close(old_hf,hf,rtol=0,atol=0)
     torch.testing.assert_close(old_meg,meg,rtol=0,atol=0)
-    adv=torch.tensor([[1.,1.,-1.,1.]])
+    adv=torch.tensor([[1.,1.,1.,1.]])
     baseline=_clip_branch_disagreement(meg,meg,old_hf,adv,0.2)
     matched=_clip_branch_disagreement(meg,meg,old_meg,adv,0.2)
     assert baseline["full_clipped"]==1
