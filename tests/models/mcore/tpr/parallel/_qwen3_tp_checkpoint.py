@@ -63,8 +63,8 @@ def load_qwen3_1_7b_config(path: Path):
 def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int = 2):
     """Load every parameter from checkpoint; assert shape and full coverage."""
     state = _load_hf_state_dict(path)
-    if tp_size != 2 or not 0 <= tp_rank < tp_size:
-        raise ValueError("Qwen3-1.7B initial TP gate requires TP2")
+    if tp_size not in (1, 2) or not 0 <= tp_rank < tp_size:
+        raise ValueError("Qwen3-1.7B isolated parallel tests require TP=1 or TP=2")
     if hf.num_key_value_heads % tp_size or hf.vocab_size % tp_size:
         raise AssertionError("invalid Qwen TP group or vocab divisibility")
 
@@ -167,8 +167,10 @@ def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int
     gc.collect()
 
 
-def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool = True):
-    """Construct Qwen3-1.7B with real native TP2 layout.
+def make_real_qwen3_tp_model(
+    runtime, *, model_path: Path, tp_size: int = 2, load_weights: bool = True
+):
+    """Construct Qwen3-1.7B with real native TP=1 or 2 layout.
 
     When load_weights=False, the caller MUST load the already-sharded
     state_dict of a checkpoint-loaded peer BEFORE performing any forward.
@@ -176,7 +178,7 @@ def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool =
     hf = load_qwen3_1_7b_config(model_path)
     config = hf_to_mcore_config_dense(
         hf, torch.bfloat16,
-        tensor_model_parallel_size=2,
+        tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         expert_model_parallel_size=1,
@@ -235,7 +237,7 @@ def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool =
 
     if load_weights:
         load_hf_qwen3_tp_shards(
-            model, hf, model_path, tp_rank=runtime.rank, tp_size=2
+            model, hf, model_path, tp_rank=runtime.rank, tp_size=tp_size
         )
     assert model.config.num_layers == 28
     # Both the native full-trajectory reference (no active TPR context)
@@ -247,11 +249,20 @@ def make_real_qwen3_tp2_model(runtime, *, model_path: Path, load_weights: bool =
         for layer in model.decoder.layers
     ):
         raise AssertionError("TP2 Qwen requires controlled CANN square-causal core attention")
-    assert model.config.tensor_model_parallel_size == 2
+    assert model.config.tensor_model_parallel_size == tp_size
     assert model.config.sequence_parallel is False
-    assert model.embedding.word_embeddings.weight.shape == (75968, 2048)
+    assert model.embedding.word_embeddings.weight.shape == (151936 // tp_size, 2048)
     assert model.output_layer.weight is None
     assert len(model.decoder.layers) == 28
-    assert model.decoder.layers[0].self_attention.linear_qkv.weight.shape == (2048, 2048)
+    assert model.decoder.layers[0].self_attention.linear_qkv.weight.shape == (4096 // tp_size, 2048)
     model.train()
     return model, hf
+
+
+def make_real_qwen3_tp2_model(
+    runtime, *, model_path: Path, load_weights: bool = True
+):
+    """Backward-compatible strict TP2 entry for existing correctness gates."""
+    return make_real_qwen3_tp_model(
+        runtime, model_path=model_path, tp_size=2, load_weights=load_weights
+    )
