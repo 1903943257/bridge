@@ -68,12 +68,23 @@ def run_tpr_forward_backward(
         "EP": engine.engine_config.expert_model_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
-    unsupported_sizes = {name: size for name, size in parallel_sizes.items() if size != 1}
-    if unsupported_sizes:
+    # Pure TP may be used alongside the existing TPR schedule. Keep TP
+    # entirely native to Megatron: both peers execute identical SegmentPlans
+    # and each retains only its local-head Prefix KV/dKV.
+    unsupported_sizes = {
+        name: size for name, size in parallel_sizes.items()
+        if name != "TP" and size != 1
+    }
+    tp_size = parallel_sizes["TP"]
+    if tp_size not in (1, 2) or unsupported_sizes:
         raise NotImplementedError(
-            "TPR formal CP entry currently requires TP/PP/EP/DP=1, "
-            f"got {unsupported_sizes}"
+            "TPR thin entry currently supports TP=1/2 with PP=EP=DP=1, "
+            f"got {parallel_sizes}"
         )
+    if tp_size > 1 and engine.engine_config.context_parallel_size != 1:
+        raise NotImplementedError("TPR TP2 first phase requires CP=1")
+    if tp_size > 1 and getattr(engine.engine_config, "sequence_parallel", False):
+        raise NotImplementedError("TPR TP2 first phase requires sequence_parallel=False")
     if engine.engine_config.virtual_pipeline_model_parallel_size is not None:
         raise NotImplementedError("TPR MVP does not support virtual pipeline parallelism")
     if engine.model_config.mtp.enable:
@@ -84,6 +95,8 @@ def run_tpr_forward_backward(
     wrapped_model = engine.module[0]
     model = unwrap_model(wrapped_model)
     config = get_model_config(wrapped_model)
+    if tp_size > 1 and getattr(config, "sequence_parallel", False):
+        raise NotImplementedError("TPR TP2 first phase requires sequence_parallel=False")
     restrictions = {
         "calculate_per_token_loss": getattr(config, "calculate_per_token_loss", False),
         "activation recomputation": getattr(config, "recompute_granularity", None) is not None,
@@ -112,6 +125,13 @@ def run_tpr_forward_backward(
         cp_backend=cp_runtime.backend,
     )
     scheduler = FixedTopologyScheduler(request.plan, executor, events=request.events)
+    if tp_size > 1:
+        from .tp_validation import assert_tp_plan_agreement, digest_segment_plan
+
+        assert_tp_plan_agreement(
+            digest_segment_plan(request.plan, scheduler.events),
+            tp_size=tp_size,
+        )
 
     no_sync_func = getattr(config, "no_sync_func", None)
     if isinstance(no_sync_func, list):
@@ -205,7 +225,7 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    PP=TP=EP=CP=DP=1, vanilla token-mean PPO; no native Megatron /M schedule
+    TP=1/2, PP=EP=CP=DP=1 (SP off for TP2), token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
     import torch
@@ -233,8 +253,13 @@ def run_tpr_forward_backward_batch(
         "CP": engine.engine_config.context_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
-    if any(size != 1 for size in sizes.values()):
-        raise NotImplementedError(f"TPR PPO phase-4 is single-rank only, got {sizes}")
+    if sizes["TP"] not in (1, 2) or any(
+        size != 1 for name, size in sizes.items() if name != "TP"
+    ):
+        raise NotImplementedError(
+            f"TPR PPO pure-TP phase requires TP=1/2, CP=PP=EP=DP=1, got {sizes}"
+        )
+    tp_size = sizes["TP"]
     if engine.engine_config.virtual_pipeline_model_parallel_size not in (None, 1):
         raise NotImplementedError("TPR PPO does not support virtual PP")
     if engine.model_config.mtp.enable or engine.enable_routing_replay:
@@ -243,6 +268,8 @@ def run_tpr_forward_backward_batch(
     wrapped_model = engine.module[0]
     model = unwrap_model(wrapped_model)
     config = get_model_config(wrapped_model)
+    if tp_size > 1 and getattr(config, "sequence_parallel", False):
+        raise NotImplementedError("TPR TP2 PPO requires sequence_parallel=False")
     if not model.training:
         raise RuntimeError("TPR PPO requires model.train()")
     unsupported = {
@@ -270,9 +297,22 @@ def run_tpr_forward_backward_batch(
         raise ValueError("Engine must attach positive batch_num_tokens and dp_size=1 before TPR routing")
 
     keys = _trajectory_keys_from_minibatch(data)
-    forest = build_tree_execution_plans(keys, data)
+    # Opt-in *only* to a different CPU topology constructor. The downstream
+    # SegmentPlan, PPO objective, gradient relay and native optimizer remain
+    # exactly the same. Radix is the default; use TPR_TREE_BUILDER=legacy
+    # only for regression comparison with the previous CPU builder.
+    import os
+
+    builder = os.environ.get("TPR_TREE_BUILDER", "radix").strip().lower()
+    forest = build_tree_execution_plans(keys, data, tree_builder=builder)
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
+    if tp_size > 1:
+        from .tp_validation import assert_tp_plan_agreement, digest_forest_plan
+
+        # Fail before entering Megatron projection/vocab-parallel collectives
+        # if TP peers accidentally received different rows or DFS schedules.
+        assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
     objective = SegmentPPOObjectiveAdapter(
         data, loss_function, dp_group=engine.get_data_parallel_group()
     )

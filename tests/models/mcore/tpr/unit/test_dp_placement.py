@@ -1,0 +1,172 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# SPDX-License-Identifier: Apache-2.0
+"""CPU placement-contract tests; these do not enable distributed training."""
+
+from itertools import combinations
+
+import pytest
+
+from verl.models.mcore.tpr.dp_placement import (
+    _tree_token_cost,
+    plan_dta_dfs,
+    plan_tpr_dta_dp,
+    plan_verl_uid,
+)
+
+
+def _assert_exact_coverage(plan, n, k):
+    assert len(plan.partitions) == k
+    assert sorted(i for group in plan.partitions for i in group) == list(range(n))
+    assert all(plan.partitions)
+
+
+def test_dta_balances_shared_prefix_tree_cost_not_raw_token_sum():
+    sequences = [
+        [1, 2, 3, 4],
+        [1, 2, 3, 5],
+        [9, 8, 7],
+        [9, 8, 6],
+    ]
+    plan = plan_dta_dfs(sequences, 2)
+    _assert_exact_coverage(plan, 4, 2)
+    assert plan.equal_rows_per_rank
+    assert plan.global_tree_tokens == 9
+    assert plan.max_tree_tokens == 5
+    assert plan.duplicated_tree_tokens == 0
+
+
+def test_dta_uneven_partitions_are_offline_only():
+    # The 20-token sample forces DTA's optimal 1-vs-3 assignment.
+    sequences = [list(range(20)), [40, 41], [50, 51], [60, 61]]
+    offline = plan_dta_dfs(sequences, 2, enforce_equal_rows=False)
+    _assert_exact_coverage(offline, 4, 2)
+    assert sorted(map(len, offline.partitions)) == [1, 3]
+    assert not offline.equal_rows_per_rank
+    assert offline.max_tree_tokens == 20
+    with pytest.raises(ValueError, match="unequal per-DP row counts"):
+        plan_dta_dfs(sequences, 2)
+
+
+def test_dta_duplicate_trajectories_remain_distinct_rows():
+    sequences = [[1, 2, 3]] * 4
+    plan = plan_dta_dfs(sequences, 2)
+    _assert_exact_coverage(plan, 4, 2)
+    assert tuple(map(len, plan.partitions)) == (2, 2)
+    assert plan.equal_rows_per_rank
+    assert plan.global_tree_tokens == 3
+    assert plan.tree_tokens_by_rank == (3, 3)
+    assert plan.duplicated_tree_tokens == 3
+
+
+
+def test_dta_duplicate_ties_choose_equal_rows_for_three_replicas():
+    sequences = [[11, 22, 33]] * 6
+    plan = plan_dta_dfs(sequences, 3)
+    _assert_exact_coverage(plan, 6, 3)
+    assert tuple(map(len, plan.partitions)) == (2, 2, 2)
+    assert plan.tree_tokens_by_rank == (3, 3, 3)
+    assert plan.duplicated_tree_tokens == 6
+
+def test_dta_minimax_matches_exhaustive_small_case():
+    sequences = [
+        [1, 2, 3, 4, 5],
+        [1, 2, 3, 9],
+        [1, 2, 4],
+        [6, 7],
+        [6, 8, 9],
+        [9, 0],
+    ]
+    plan = plan_dta_dfs(sequences, 3, enforce_equal_rows=False)
+    ordered = sorted(map(tuple, sequences))
+    brute_force = min(
+        max(_tree_token_cost(ordered[a:b]) for a, b in zip((0, *cuts), (*cuts, len(ordered))))
+        for cuts in combinations(range(1, len(ordered)), 2)
+    )
+    assert plan.max_tree_tokens == brute_force
+
+
+def test_dta_rejects_invalid_inputs():
+    with pytest.raises(ValueError, match="dp_size"):
+        plan_dta_dfs([[1]], 0)
+    with pytest.raises(ValueError, match=">="):
+        plan_dta_dfs([[1]], 2)
+    with pytest.raises(ValueError, match="empty"):
+        plan_dta_dfs([[]], 1)
+    with pytest.raises(TypeError, match="nonnegative"):
+        plan_dta_dfs([[-1]], 1)
+
+
+def test_native_uid_checks_contiguity_even_on_dp1():
+    with pytest.raises(ValueError, match="contiguous"):
+        plan_verl_uid([[1], [2], [3]], ["a", "b", "a"], 1)
+
+
+def test_native_uid_dp1_preserves_every_row_without_importing_verl_balancer():
+    plan = plan_verl_uid([[1, 2], [1, 3], [9]], ["a", "a", "b"], 1)
+    assert plan.partitions == ((0, 1, 2),)
+    assert plan.equal_rows_per_rank
+    assert plan.policy == "verl_uid"
+
+
+def test_native_uid_delegates_to_verl_balancer(monkeypatch):
+    from verl.utils import seqlen_balancing
+
+    captured = {}
+
+    def fake_partition(*, seqlen_list, uid_list, k_partitions):
+        captured.update(seqlen_list=seqlen_list, uid_list=uid_list, k=k_partitions)
+        return [[0, 1], [2, 3]]
+
+    monkeypatch.setattr(seqlen_balancing, "get_group_balanced_partitions", fake_partition)
+    plan = plan_verl_uid([[1, 2], [1, 3], [9, 8], [9, 7]], ["a", "a", "b", "b"], 2)
+    assert plan.partitions == ((0, 1), (2, 3))
+    assert captured == {
+        "seqlen_list": [2, 2, 2, 2],
+        "uid_list": ["a", "a", "b", "b"],
+        "k": 2,
+    }
+
+
+def test_native_uid_rejects_unequal_rows_from_upstream(monkeypatch):
+    from verl.utils import seqlen_balancing
+
+    monkeypatch.setattr(
+        seqlen_balancing, "get_group_balanced_partitions",
+        lambda **kw: [[0], [1, 2, 3]],
+    )
+    with pytest.raises(ValueError, match="unequal per-DP row counts"):
+        plan_verl_uid([[1], [2], [3], [4]], ["a", "a", "b", "b"], 2)
+
+
+
+def test_tpr_dp_uid_scoped_cost_matches_existing_tpr_semantics():
+    # Token-identical trajectories from different UIDs are NOT coalesced by
+    # our existing build_trajectory_trees. DTA's global trie would say 5,
+    # but the actual TPR forest has two independent 4-token paths.
+    sequences = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 3, 4]]
+    keys = ["uidA_rollout_0", "uidA_rollout_1", "uidB_rollout_0"]
+    plan = plan_tpr_dta_dp(sequences, keys, dp_size=1)
+    assert plan.policy == "tpr_dta"
+    assert plan.global_tree_tokens == 9
+    assert plan.tree_tokens_by_rank == (9,)
+    assert _tree_token_cost(sequences) == 5
+
+
+def test_tpr_dp_keeps_duplicate_logical_rows_and_equal_cardinality():
+    sequences = [[1, 2, 3, 4]] * 4
+    keys = [f"uidA_rollout_{i}" for i in range(4)]
+    plan = plan_tpr_dta_dp(sequences, keys, dp_size=2)
+    _assert_exact_coverage(plan, 4, 2)
+    assert tuple(map(len, plan.partitions)) == (2, 2)
+    assert plan.global_tree_tokens == 4
+    assert plan.tree_tokens_by_rank == (4, 4)
+    assert plan.duplicated_tree_tokens == 4
+
+
+def test_tpr_dp_key_contract():
+    with pytest.raises(ValueError, match="equal lengths"):
+        plan_tpr_dta_dp([[1]], [], 1)
+    with pytest.raises(ValueError, match="unique"):
+        plan_tpr_dta_dp([[1], [1]], ["a_b_0", "a_b_0"], 1)
+    with pytest.raises(ValueError, match="trajectory key"):
+        plan_tpr_dta_dp([[1]], ["invalid"], 1)
