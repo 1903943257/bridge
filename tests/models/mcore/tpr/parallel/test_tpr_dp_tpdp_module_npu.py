@@ -232,15 +232,19 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
         f"real TQ gradient rel_l2={relative_l2:.6g} exceeds 5% gate"
     )
 
-    # Check DIFFERENT execution plans across DP groups with the native DP
-    # process group. This sends only 8 bytes per rank; it does not attempt
-    # to synchronize the model's gradients outside native Megatron DDP.
-    word = int(digest[:8], 16)
-    local = torch.tensor([word], device=runtime.device, dtype=torch.int64)
-    observed = [torch.empty_like(local) for _ in range(2)]
-    dist.all_gather(observed, local, group=runtime.dp_group)
-    assert observed[0].item() != observed[1].item(), (
-        "DP replicas unexpectedly received the same TPR tree / real TQ rows"
+    # Check DIFFERENT original row *ownership* across DP groups. Two
+    # physically identical token forests may legitimately be assigned to
+    # different DP replicas; comparing only the segment-token SHA256 would
+    # incorrectly mark that valid assignment as a failure. This test sends
+    # only two int64 row IDs, NOT KV or parameter gradients.
+    ownership = torch.tensor(
+        selected, device=runtime.device, dtype=torch.int64
+    )
+    observed = [torch.empty_like(ownership) for _ in range(2)]
+    dist.all_gather(observed, ownership, group=runtime.dp_group)
+    row_sets = [set(value.cpu().tolist()) for value in observed]
+    assert row_sets[0].isdisjoint(row_sets[1]), (
+        f"DP replicas received duplicate real TQ logical rows: {row_sets}"
     )
 
     if runtime.rank == 0:
