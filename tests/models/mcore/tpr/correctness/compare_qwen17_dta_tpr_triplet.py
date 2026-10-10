@@ -28,6 +28,10 @@ def compare(folder):
             raise AssertionError(
                 f"HF and Megatron experiments do not have identical {key}: "
                 f"{hf[key]} vs {mg[key]}")
+    if Path(hf["checkpoint"]) != Path(mg["checkpoint"]):
+        raise AssertionError(
+            f"HF and Megatron checkpoint paths do not match: "
+            f"{hf['checkpoint']} vs {mg['checkpoint']}")
     grids={
         "hf_full":hf["full_response_logprobs"],
         "hf_dta":hf["dta_response_logprobs"],
