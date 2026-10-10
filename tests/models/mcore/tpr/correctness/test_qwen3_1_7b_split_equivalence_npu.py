@@ -947,6 +947,39 @@ def test_real_qwen_full_gpt_vs_single_split():
     # tile, preserving BF16 kernel behavior while controlling GEMM M.
     # It has heavy Python/kernel-launch overhead; not a production schedule.
     tiled_spec = os.environ.get("TPR_QWEN17_GPT_TILE_GEMM", "").strip()
+    # Three-way numerical attribution: (A) original untiled Full,
+    # (C) BF16-tiled Full, (D) BF16-tiled Split. A->C is NOT
+    # implied by the observed C==D. Capture A before patching any
+    # Linear, with precisely the same weights and real TQ tokens.
+    # It is a diagnostic readout, never a training-time override.
+    original_full_tail = None
+    original_full_lp = None
+    if os.environ.get("TPR_QWEN17_GPT_COMPARE_NATIVE_FULL", "0") == "1":
+        if not tiled_spec:
+            raise AssertionError("Native-vs-tiled Full probe requires BF16 fixed GEMM tile")
+        if fp32_groups or os.environ.get("TPR_QWEN17_GPT_PREFIX_QKV_FIXED_M_LAYERS"):
+            raise AssertionError("Native-vs-tiled Full probe requires no other GEMM override")
+        if os.environ.get("TPR_QWEN17_GPT_REPLAY_FULL_LAYER_INPUTS"):
+            raise AssertionError("Native-vs-tiled Full probe does not support layer-input replay")
+        with torch.no_grad():
+            native_positions = torch.arange(p+s, device="npu").unsqueeze(0)
+            native_logits = model(
+                tokens[None, :], native_positions, attention_mask=None
+            )
+            original_full_tail = (
+                native_logits[0, p:p+s].detach().float().cpu().clone()
+            )
+            native_labels = tokens[p+1:p+s]
+            original_full_lp = vocab_parallel_log_probs_from_logits(
+                original_full_tail[:-1].to("npu"), native_labels
+            ).detach().float().cpu()
+            del native_logits
+        print(
+            "QWEN SPLIT GPT NATIVE_FULL_CONTROL "
+            f"untiled_full_M={p+s} tiled_M={tiled_spec} "
+            "tokens=63_suff_internal diagnostic_only=True",
+            flush=True,
+        )
     if not tiled_spec and os.environ.get("TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS"):
         raise AssertionError(
             "Grouped GEMM probe requires TPR_QWEN17_GPT_TILE_GEMM"
@@ -1614,6 +1647,27 @@ def test_real_qwen_full_gpt_vs_single_split():
             split_tail[:-1].to("npu"), labels
         ).detach().float().cpu()
         _, max_lp = _stats("GPT_SUFFIX_LOGPROBS", split_lp, ref_lp)
+        if original_full_lp is not None:
+            _stats(
+                "GPT_TILED_FULL_VS_NATIVE_FULL_SUFFIX_LOGITS",
+                full_tail, original_full_tail,
+            )
+            _stats(
+                "GPT_TILED_FULL_VS_NATIVE_FULL_SUFFIX_LOGPROBS",
+                ref_lp, original_full_lp,
+            )
+            native_diff = (ref_lp-original_full_lp).abs()
+            split_native_diff = (split_lp-original_full_lp).abs()
+            print(
+                "QWEN SPLIT GPT NATIVE_FULL_REFERENCE "
+                f"tiled_full_mean_abs={float(native_diff.mean()):.9g} "
+                f"tiled_full_max_abs={float(native_diff.max()):.9g} "
+                f"tiled_split_mean_abs={float(split_native_diff.mean()):.9g} "
+                f"tiled_split_max_abs={float(split_native_diff.max()):.9g} "
+                f"tiled_full_ratio_max_deviation={float(((ref_lp-original_full_lp).exp()-1).abs().max()):.9g} "
+                "tokens=63 diagnostic_only=True",
+                flush=True,
+            )
         max_ratio_error = float((torch.exp(split_lp-ref_lp)-1).abs().max())
         print(f"QWEN SPLIT GPT PPO_RATIO_MAX_DEVIATION={max_ratio_error:.8g}", flush=True)
         # This is intentionally stricter than the broad legacy per-element
