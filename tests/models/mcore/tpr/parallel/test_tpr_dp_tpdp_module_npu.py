@@ -395,7 +395,7 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
                 flush=True,
             )
 
-    if runtime.rank == 0:
+    if runtime.rank == 0 and not failures:
         print(
             f"TPR_MODULE_PARALLEL status=PASS tp={runtime.tp_size} dp=2 "
             f"dp_rank={runtime.dp_rank} real_tq_rows={selected} "
