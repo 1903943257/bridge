@@ -33,7 +33,6 @@ from tensordict import TensorDict
 
 from megatron.core import parallel_state
 from verl.models.mcore.tpr import (
-    TPR_REQUEST_KEY,
     TPRForwardBackwardRequest,
 )
 from verl.utils import tensordict_utils as tu
@@ -201,7 +200,7 @@ def _tpr_engine_run(model, runtime, plan):
     return output, _parameter_gradients(model)
 
 
-def test_two_rank_native_tp2_full_trajectory_vs_tpr_engine(tp2_runtime):
+def test_two_rank_qwen3_tp2_full_trajectory_vs_tpr_thin_entry(tp2_runtime):
     runtime = tp2_runtime
     seed = 918423
     torch.manual_seed(seed)
@@ -303,7 +302,6 @@ def _native_response_nll_reference(model, prefix, first_suffix, second_suffix):
 def _tpr_ppo_nll_run(model, runtime, prefix, first_suffix, second_suffix):
     """Exercise the real PPO Forest adapter/TP2 dispatch with a known NLL loss."""
     from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
-    from verl.utils import tensordict_utils as tu
 
     rows = [
         torch.cat((prefix, first_suffix)),
