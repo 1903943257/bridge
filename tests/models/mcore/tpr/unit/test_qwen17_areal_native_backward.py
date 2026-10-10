@@ -194,3 +194,39 @@ def test_linear_ablation_is_autograd_safe_and_restored(mode):
         assert net.self_attn.q_proj.weight.grad is not None
         assert count == (0 if mode=="native" else 1)
     assert net.self_attn.q_proj.forward==original
+
+
+def test_fixed_logprob_objective_has_identical_token_gradient_despite_drift():
+    """Controlled logprob coefficient must not change due to PPO clipping."""
+    from ..correctness.test_qwen3_1_7b_areal_backward_ppo_npu import _ppo_row_loss
+    adv=torch.tensor([1.0,-2.0,0.75],dtype=torch.float32)
+    old=torch.tensor([-3.,-4.,-5.])
+    entropy=torch.zeros(4)
+    grads=[]
+    for logp_values in ([-3.,-4.,-5.],[-1.,-6.,-4.]):
+        lp=torch.tensor(logp_values,requires_grad=True)
+        loss=_ppo_row_loss(lp,entropy,old,adv,p=1,s=3,clip_eps=0.2,
+                           entropy_coef=0.0,n_rows=1,objective="fixed_logprob")
+        loss.backward()
+        grads.append(lp.grad.detach().clone())
+    torch.testing.assert_close(grads[0],grads[1],rtol=0,atol=0)
+    torch.testing.assert_close(grads[0],-adv/3,rtol=0,atol=0)
+
+
+def test_clipped_ppo_objective_differs_from_fixed_logprob():
+    """Confirms objective switch tests a real upstream gradient mechanism."""
+    from ..correctness.test_qwen3_1_7b_areal_backward_ppo_npu import _ppo_row_loss
+    old=torch.tensor([0.,0.])
+    adv=torch.tensor([1.,-1.])
+    entropy=torch.zeros(3)
+    lp=torch.tensor([0.4,-0.4],requires_grad=True)
+    for mode in ("ppo","fixed_logprob"):
+        lp.grad=None
+        loss=_ppo_row_loss(lp,entropy,old,adv,p=1,s=2,clip_eps=0.2,
+                           entropy_coef=0.0,n_rows=1,objective=mode)
+        loss.backward()
+        actual=lp.grad.detach().clone()
+        if mode=="ppo":
+            torch.testing.assert_close(actual,torch.zeros_like(actual),atol=0,rtol=0)
+        else:
+            torch.testing.assert_close(actual,-adv/2,atol=0,rtol=0)
