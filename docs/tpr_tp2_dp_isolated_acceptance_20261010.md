@@ -65,7 +65,7 @@ enable the controller/worker DP dispatch.
   separate full-trajectory same-checkpoint reference.
 - Check local CE loss, local parameter grads (current 5% relative L2
   gate), native DP group membership, and unequal DP execution-tree
-  signatures. **No production Trainer, no native DDP optimizer sync.**
+  row ownership. **No production Trainer, no native DDP optimizer sync.**
 
 ### Gate C — TP2×DP2 module F/B on real NPU4
 
@@ -75,7 +75,8 @@ Same test file with `TPR_MODULE_TP_SIZE=2`:
   and identical SegmentPlan digest; its Megatron native TP projection/
   vocab collectives run inside its own TP group.
 - **Different DP replicas** receive disjoint rows, independent Prefix
-  KV/gradient lifetime and distinct tree digest. Never compare tree
+  KV/gradient lifetime and disjoint original row IDs. Token-identical
+  trees can exist in different DP groups; never require distinct tree
   digests across all 4 world ranks, or move Prefix KV across DP.
 - Check local CE and gradients against native independent full
   trajectories on the same TP-sharded real checkpoint.
