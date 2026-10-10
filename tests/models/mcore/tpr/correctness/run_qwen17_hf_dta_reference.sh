@@ -31,7 +31,7 @@ python -m pytest -x -q -s --tb=short "$test_file" > "$log_dir/hf_dta.log" 2>&1 |
   tail -100 "$log_dir/hf_dta.log" >&2
   exit 1
 }
-grep -E '^P0 DTA_HF (CONFIG|DFS_ROW|DFS_SUMMARY|FIXED_PATH|ROOT_V_SHAPE|RESULT)' "$log_dir/hf_dta.log"
+grep -E '^P0 DTA_HF (CONFIG|DFS_ROW|DFS_SUMMARY|FIXED_PATH|ROOT_V_SHAPE|ROOT_CUTOFF_TO_DTA|RESULT)' "$log_dir/hf_dta.log"
 if ! grep -q '^P0 DTA_HF RESULT status=PASS execution=FORWARD_CONTROL' "$log_dir/hf_dta.log"; then
   echo "DTA HF reference did not complete: $log_dir/hf_dta.log" >&2
   exit 1
