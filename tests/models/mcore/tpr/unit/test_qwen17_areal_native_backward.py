@@ -230,3 +230,28 @@ def test_clipped_ppo_objective_differs_from_fixed_logprob():
             torch.testing.assert_close(actual,torch.zeros_like(actual),atol=0,rtol=0)
         else:
             torch.testing.assert_close(actual,-adv/2,atol=0,rtol=0)
+
+
+
+def test_unclipped_importance_ratio_keeps_ratio_gradient_without_clipping():
+    """Three objectives differ in their dL/dlogp under the same old policy."""
+    from ..correctness.test_qwen3_1_7b_areal_backward_ppo_npu import _ppo_row_loss
+    old=torch.zeros(2)
+    adv=torch.tensor([1., -1.])
+    entropy=torch.zeros(3)
+    lp=torch.tensor([0.4, -0.4], requires_grad=True)
+    found={}
+    for objective in ("ppo", "ppo_unclipped", "fixed_logprob"):
+        lp.grad=None
+        value=_ppo_row_loss(
+            lp, entropy, old, adv, p=1, s=2, clip_eps=0.2,
+            entropy_coef=0.0, n_rows=1, objective=objective)
+        value.backward()
+        found[objective]=lp.grad.detach().clone()
+    torch.testing.assert_close(found["ppo"],torch.zeros(2),rtol=0,atol=0)
+    torch.testing.assert_close(
+        found["ppo_unclipped"],torch.tensor([
+            -math.exp(0.4)/2, math.exp(-0.4)/2,
+        ]),rtol=1e-6,atol=1e-6)
+    torch.testing.assert_close(
+        found["fixed_logprob"],torch.tensor([-0.5,0.5]),rtol=0,atol=0)
