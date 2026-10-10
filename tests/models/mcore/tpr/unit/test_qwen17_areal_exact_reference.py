@@ -122,3 +122,22 @@ def test_fork_logits_and_kv_buffer_reuse():
     result = assert_full_parity(sequences)
     assert result.total_processed_tokens < result.dense_tokens
     assert result.logprobs[0].shape == (5,)
+
+
+def test_lexical_fixed_kv_ablation_has_identical_toy_outputs():
+    sequences = (
+        row([1, 2, 3, 4, 5]), row([1, 2, 3, 6, 7]),
+        row([1, 2, 8, 7, 6]), row([9, 2, 1, 0]),
+    )
+    model = FakeModel().eval()
+    dense = tuple(hf_full_logprobs(model, seq, FakeDynamicCache) for seq in sequences)
+    lexical = hf_areal_forward_only(
+        model, sequences, FakeDynamicCache, forward_permute=False
+    )
+    optimized = hf_areal_forward_only(
+        model, sequences, FakeDynamicCache, forward_permute=True
+    )
+    for baseline, a, b in zip(dense, lexical.logprobs, optimized.logprobs, strict=True):
+        assert torch.equal(baseline, a)
+        assert torch.equal(baseline, b)
+    assert lexical.total_processed_tokens <= lexical.dense_tokens
