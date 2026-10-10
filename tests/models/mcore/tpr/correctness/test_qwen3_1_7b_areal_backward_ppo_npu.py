@@ -72,7 +72,9 @@ def _proxy_advantages(n_rows: int, s: int):
 
 def _ppo_row_loss(logp, entropy, old_lp, advantage, *, p, s, clip_eps, entropy_coef, n_rows, objective="ppo"):
     lp = logp[p - 1:p + s - 1].float()
-    ent = entropy[p:p + s].float()
+    # Entropy belongs to the query position that predicts each response
+    # token; like shifted logprob, this starts at p-1, not p.
+    ent = entropy[p - 1:p + s - 1].float()
     if len(lp) != s or len(ent) != s:
         raise AssertionError("PPO response alignment error")
     if objective == "ppo":
@@ -193,6 +195,37 @@ def _metrics(ref, cand, *, top_k=5):
         "missing":missing,
         "matched_params":len(ranked),
     }
+
+
+def _gradient_groups(ref, cand):
+    """Group gradient drift by functional module, not just worst relative layer."""
+    groups={}
+    for name,a in ref.items():
+        b=cand.get(name)
+        if a is None or b is None:
+            continue
+        if ".self_attn." in name:
+            family="attn."+name.split(".self_attn.",1)[1].split(".",1)[0]
+        elif ".mlp." in name:
+            family="mlp."+name.split(".mlp.",1)[1].split(".",1)[0]
+        elif "norm" in name:
+            family="other_norm"
+        elif "embed_tokens" in name:
+            family="embedding"
+        elif "lm_head" in name:
+            family="lm_head"
+        else:
+            family="other"
+        ref2,diff2,matched=groups.get(family,(0.,0.,0))
+        af=a.float().double()
+        df=b.float().double()-af
+        groups[family]=(ref2+float(af.square().sum()),
+                        diff2+float(df.square().sum()),matched+1)
+    return tuple(sorted(
+        ((family,sqrt(d2)/max(sqrt(r2),1e-30),sqrt(r2),sqrt(d2),matched)
+         for family,(r2,d2,matched) in groups.items()),
+        key=lambda x:x[3],reverse=True,
+    ))
 
 
 def _full_logp_entropy(logits, tokens):
@@ -433,12 +466,22 @@ def test_real_areal_dta_full_backward_ppo_gemm():
             f"ppo_loss_delta={current['loss_value']-reference['loss_value']:.9g} "
             f"grad_rel_l2={grad_stats['relative_l2']:.9g} "
             f"grad_cosine={grad_stats['cosine']:.9g} "
+            f"full_grad_norm={grad_stats['reference_norm']:.9g} "
+            f"dta_grad_norm={grad_stats['candidate_norm']:.9g} "
             f"param_step_sample_rel_l2={step_rel_l2:.9g} "
             f"matched_grad_params={grad_stats['matched_params']} "
             f"missing_grads={len(grad_stats['missing'])} "
             "optimizer_step=EXECUTED numerical_parity=DIAGNOSTIC_ONLY",
             flush=True,
         )
+        for family,rel,norm,diff,count in _gradient_groups(reference["grads"],current["grads"]):
+            print(
+                "P1 DTA_BACKWARD GRAD_GROUP "
+                f"mode={mode} family={family} rel_l2={rel:.9g} "
+                f"full_norm={norm:.9g} diff_norm={diff:.9g} "
+                f"param_count={count}",
+                flush=True,
+            )
         for name, rel, norm, diff in grad_stats["worst"]:
             print(
                 "P1 DTA_BACKWARD WORST_GRAD "
