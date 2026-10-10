@@ -189,10 +189,26 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
     if valid_tokens!=512 or any(not bool(x.bool().all()) for x in response_masks):
         pytest.fail("same HF experiment uses all 8x64 response tokens; "
                     "TPR response_mask differs, cannot make three-way claim")
-    from .test_qwen3_1_7b_areal_backward_ppo_npu import _recorded_ppo_data
-    adv_cpu,recorded_old=_recorded_ppo_data(Path(os.environ["TPR_REAL_TQ_BATCH"]),8,s)
-    if adv_cpu is None:
-        adv_cpu=_proxy_advantages(8,s)
+    # HF/DTA subprocess has already exported the exact old policy,
+    # advantages and input IDs. Use these values across all FOUR paths:
+    # HF Full, HF DTA, Megatron Native and the actual Megatron TPR.
+    triplet_dir=os.getenv("TPR_DTA_TRIPLET_DIR")
+    if not triplet_dir:
+        pytest.fail("TPR_DTA_TRIPLET_DIR must point to matched HF artifact")
+    hf_path=Path(triplet_dir)/"hf_full_dta.pt"
+    if not hf_path.is_file():
+        pytest.fail(f"matched HF control missing: {hf_path}")
+    hf=torch.load(hf_path,map_location="cpu",weights_only=True)
+    if hf["objective"]!=objective or hf["n_rows"]!=8 or (hf["prompt_length"],hf["response_length"])!=(p,s):
+        pytest.fail("HF/DTA objective, row count or crop does not match Megatron TPR")
+    if Path(hf["checkpoint"])!=Path(target.path):
+        pytest.fail("HF and Megatron checkpoint paths mismatch")
+    if not torch.equal(hf["token_rows"],torch.stack([x.detach().cpu().long() for x in rows])):
+        pytest.fail("HF and Megatron TQ token rows differ")
+    adv_cpu=hf["shared_advantages"]
+    old_cpu=hf["shared_old_logprobs"]
+    if tuple(adv_cpu.shape)!=(8,64) or tuple(old_cpu.shape)!=(8,64):
+        pytest.fail("HF shared advantages/old logprob shapes must be [8,64]")
     batch["advantages"]=_as_jagged(list(adv_cpu))
     os.environ["TPR_TRIPLET_TOTAL_VALID_TOKENS"]=str(valid_tokens)
 
@@ -200,13 +216,25 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
     device=torch.device("npu")
     native=fixture._make_qwen_model(device,tpr=False,max_sequence_length=192)
     num_params=target.assert_model_scale(native)
-    old=[]
+    native_initial_logp=[]
     with torch.no_grad():
         for ids in rows:
             _,response_lp=_native_response_logprobs(
                 native,ids.to(device),prompt_length=p,temperature=1.0)
-            old.append(response_lp.detach().float().cpu())
+            native_initial_logp.append(response_lp.detach().float().cpu())
+    # Old policy is shared byte-for-byte with HF Full and HF DTA,
+    # not recomputed in the Megatron implementation.
+    old=list(old_cpu)
     batch["old_log_probs"]=_as_jagged(old)
+    full_floor=(torch.stack(native_initial_logp)-hf["full_response_logprobs"]).abs()
+    print(
+        "P1 TPR_TRIPLET FRAMEWORK_FLOOR "
+        f"hf_vs_megatron_full_max={float(full_floor.max()):.9g} "
+        f"hf_vs_megatron_full_mean={float(full_floor.mean()):.9g} "
+        f"old_source={hf['old_source']} "
+        f"adv_source={hf['adv_source']} "
+        "shared_old=True shared_advantages=True shared_tokens=True",
+        flush=True)
     native.zero_grad(set_to_none=True)
     captured_native=[]
     total_loss=0.
@@ -317,6 +345,8 @@ def test_real_megatron_tpr_matches_full_and_hf_reference():
             "tpr_loss_delta":tpr_loss-total_loss,
             "tpr_step_sample_rel_l2":step["rel_l2"],
             "tpr_gradient_scope":"SAMPLED_PER_PARAMETER",
+        "old_source":hf["old_source"],
+        "adv_source":hf["adv_source"],
         }
         path=dest/"megatron_full_tpr.pt"
         torch.save(artifact,path)
