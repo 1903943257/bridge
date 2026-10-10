@@ -124,3 +124,44 @@ def test_nonzero_full_clipping_not_attributed_to_tpr():
     result=_clip_branch_disagreement(native,tpr,old,adv,0.2)
     assert result["full_clipped"]==result["tpr_clipped"]==1
     assert result["branch_flips"]==0
+
+
+
+def test_megatron_same_checkpoint_old_source_diagnostic():
+    from ..correctness.test_qwen3_1_7b_tpr_dta_triplet_npu import (
+        _choose_megatron_old,_clip_branch_disagreement)
+    hf=torch.tensor([[-3.,-3.,-3.,-3.]])
+    meg=torch.tensor([[-2.70,-3.00,-3.25,-3.00]])
+    old_hf=_choose_megatron_old(hf,meg,"hf_full")
+    old_meg=_choose_megatron_old(hf,meg,"megatron_native")
+    torch.testing.assert_close(old_hf,hf,rtol=0,atol=0)
+    torch.testing.assert_close(old_meg,meg,rtol=0,atol=0)
+    adv=torch.tensor([[1.,1.,-1.,1.]])
+    baseline=_clip_branch_disagreement(meg,meg,old_hf,adv,0.2)
+    matched=_clip_branch_disagreement(meg,meg,old_meg,adv,0.2)
+    assert baseline["full_clipped"]==1
+    assert matched["full_clipped"]==0
+    assert baseline["branch_flips"]==matched["branch_flips"]==0
+    with pytest.raises(ValueError):
+        _choose_megatron_old(hf,meg,"unknown")
+    with pytest.raises(ValueError):
+        _choose_megatron_old(hf,meg[:,:2],"hf_full")
+    with pytest.raises(ValueError):
+        bad=meg.clone()
+        bad[0,0]=float("nan")
+        _choose_megatron_old(hf,bad,"megatron_native")
+
+
+def test_changing_old_policy_not_equivalent_to_fixing_forward():
+    from ..correctness.test_qwen3_1_7b_tpr_dta_triplet_npu import (
+        _choose_megatron_old,)
+    hf=torch.tensor([[-2.5,-2.0]])
+    meg=torch.tensor([[-2.2,-2.1]])
+    tpr=torch.tensor([[-2.0,-2.3]])
+    for source in ("hf_full","megatron_native"):
+        _=_choose_megatron_old(hf,meg,source)
+        # Neither the native nor the TPR computed logits change because
+        # no model is rerun as a result of selecting the old-policy tensor.
+        torch.testing.assert_close((meg-tpr).abs(),
+                                   torch.tensor([[0.2,0.2]]),
+                                   atol=1e-6,rtol=0)
