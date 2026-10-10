@@ -963,3 +963,79 @@ perform Backward or PPO, and does not promise bitwise equality.
 Do NOT promote fixed M64, FP32 projection or grouped-GEMM
 patches into production based solely on the diagnostic.
 
+
+## 17. Cross-device BF16 GEMM M-shape experiment: A100 vs Ascend (2026-10-10)
+
+**Actually executed by the user** on Ascend 910B2C with torch
+2.9.0+cpu/torch_npu and NVIDIA A100-SXM4-80GB with PyTorch 2.11.0+cu129.
+Both use `tools/tpr_gemm_mshape_repro.py`, synthetic BF16
+`X=[192,2048]`, `W=[4096,2048]`, `seed=20261010`, `tile=64`,
+`p=128` / `s=64`, x_scale=1.0, w_scale=0.02, TF32/HF32
+matmul toggles disabled. **The SHA256 of BF16 X concatenated with W is
+identical on both machines**:
+`517e1e19268d6fdde7da22a3d754779b3482d3481d2c15d3d75d7c69819e23f1`.
+This removes the random-input mismatch confounder; these are identical
+BF16 operands, not the original exported pretrained-Qwen layer-1
+activations and weights.
+
+All four tested invocation variants (`matmul`/`linear` x
+2D/`[T,1,H]` 3D) returned the same device-specific summary:
+
+| Same-input BF16 comparison | Ascend 910B2C | NVIDIA A100 |
+| --- | ---: | ---: |
+| Split M128+64 vs Full M192: non-bitwise outputs | 100 / 786432 | 182 / 786432 |
+| Split vs Full: max absolute difference | 0.0078125 | 0.015625 |
+| Split vs Full: relative L2 | 2.47753396e-05 | 4.4051907e-05 |
+| Fixed M64x3 vs Full M192: non-bitwise outputs | 100 / 786432 | 506 / 786432 |
+| Fixed M64x3 vs Full: relative L2 | 2.47753396e-05 | 7.37990704e-05 |
+| Split M128+64 vs fixed M64x3: non-bitwise outputs | 0 | 324 / 786432 |
+
+Thus **GEMM result sensitivity to physical M is reproduced on both
+Ascend NPU and NVIDIA A100 GPU with byte-identical operands**.
+On this synthetic matrix A100 displays MORE (not fewer)
+Full-vs-Split BF16 disagreements than the NPU. Therefore "M-sensitive
+BF16 GEMM" is **not evidence by itself** of a unique Ascend hardware
+defect, and cannot explain a framework-specific bug without other data.
+Do not interpret this as proof the NPU and GPU always behave similarly,
+because kernel algorithm dispatch and CUDA/torch_npu versions differ.
+
+The oracle uses CPU FP64 dot products at **selected differing
+coordinates**, not a random representative sample or a full reference
+matrix. For the 16 printed samples comparing Full vs M64:
+- NPU: `full_closer=5`, `tile_closer=11`,
+  `full_correct_round=6`, `tile_correct_round=9`.
+- A100: `full_closer=0`, `tile_closer=16`,
+  `full_correct_round=0`, `tile_correct_round=15`.
+These observations suggest potential shape-dependent GEMM accumulation
+or kernel selection, but **do not establish population-wide accuracy**
+or a backend bug. The script preferentially audits the largest
+disagreement plus first divergent coordinates, so samples are biased.
+On GPU Split M128+64 and M64x3 also disagree, while on this NPU
+matrix they are equal: matching Split boundaries alone does NOT
+guarantee equal arithmetic across all M sizes.
+
+### Practical next checks
+
+1. **Independent more exhaustive FP64 comparison without model data:**
+   rerun each device using the SAME current synthetic operands with
+   `--op linear --layout 3d --audit 600`, redirect output to a file
+   and grep `GEMM_FP64_SUMMARY` (600 exceeds the observed 506
+   M192-vs-M64 divergent coordinates, so these comparisons cover all
+   those entries). This is still conditioned on disagreement; add
+   random agreeing coordinates before making global accuracy claims.
+2. For real-Qwen-specific root cause, export layer-1 BF16 QKV
+   X/W/y_native in the original NPU environment, and replay on NPU.
+   Without cross-server data transfer, synthetic tests can compare
+   *the existence of a phenomenon*, not the actual model's errors.
+3. If escalation is necessary, capture kernel dispatch/precision mode
+   with each backend profiler. A change in shape often changes the
+   selected implementation; the above outputs alone do not identify
+   actual accumulation instructions.
+4. Keep production BF16 Full M=P+S as the unchanged actor baseline.
+   The Python M64 loop is ONLY a symmetric numerical counterfactual,
+   not the engineering solution and not an efficient training kernel.
+
+**Result status:** synthetic identical-operands A100/Ascend cross-device
+reproduction is verified, but real layer-1 QKV replay, full FP64
+population accuracy, GEMM backward, and production PPO stability
+remain unverified by this cross-device experiment.
