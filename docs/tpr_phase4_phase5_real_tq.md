@@ -1,5 +1,10 @@
 # TPR Phase 4/5: VERL native PPO and real Qwen3-1.7B
 
+> **Current 2026-10-10 numerical root-cause handoff + AReaL-DTA comparison:**
+> [TPR BF16 shape drift and independent DTA-style reference](tpr_bf16_shape_drift_dta_reference_20261010.md).
+> Strict Native/TPR gradient/logprob parity is still **NOT PASS**; do not
+> mistake an executed optimizer step for numerical equivalence.
+
 ### Numerical gate status: REAL-TQ AdamW PASS, numerical parity NOT PASS (2026-10-09)
 
 Second independent NPU run (same real TQ rows, P=128/S=64, 1.7B):
