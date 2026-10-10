@@ -326,3 +326,51 @@ ongoing single-DP E2E work. If failures track rank/shard ownership or
 incorrectly synchronized replicated parameters, check Megatron TP2
 reference and TPR gradient finalization contracts. Do not infer the
 cause without the attribution output.
+
+
+## 2026-10-10 repeatability and dedicated TP2×DP1 same-input control
+
+The improved collective-safe TP2×DP2 test reproduced **exactly** the
+same failure on global ranks 2 and 3, the two TP ranks of DP1:
+`grad_rel_l2=0.0566149` (TP0), `0.0739336` (TP1);
+both above the **unchanged 0.05 gate**.
+Both saw **native CE 3.3734765 vs TPR CE 3.3696692**,
+difference 0.0038073 (passes the 0.02 CE gate).
+The unified failure path completed communication without a new HCCL
+timeout, so the earlier HCCL event was plausibly a side effect of
+premature rank-local assertions. This does **not** prove or disprove
+a TP×DP implementation issue.
+
+**Next isolating experiment** (test-only):
+Run **exactly the same DP1 real-TQ fork window** (rows 4,5,
+`true_fork=17489`, `window_start=17361`) with the original native TP2
+group but **DP=1 (2 NPUs)**. New optional
+`TPR_MODULE_DP_SIZE=1 TPR_MODULE_TQ_PAIR=1` reuses the same
+`_reference`, `_tpr`, checkpoint/weights, segment plan, scalar
+aggregation and rank-local 0.05 gradient gate. Only the number of
+DP replica groups changes; the singleton DP group performs no
+inter-replica ownership check.
+
+```bash
+TPR_RUN_MODULE_DP=1 TPR_MODULE_TP_SIZE=2 \
+TPR_MODULE_DP_SIZE=1 TPR_MODULE_TQ_PAIR=1 \
+torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29536 \
+  -m pytest -vv -s \
+  tests/models/mcore/tpr/parallel/test_tpr_dp_tpdp_module_npu.py
+```
+
+- If TP2×DP1 on **identical real-token input** also reproduces
+  the >5% gradient discrepancy, the excess error does **not require**
+  DP2 topology and may be a TP2 + BF16 segmented-kernel numerical
+  issue; inspect `TPR_MODULE_PARALLEL_DIAG top_contributors` to isolate
+  parameters instead of weakening the threshold.
+- If TP2×DP1 passes while TP2×DP2 reproducibly fails on the
+  same input and checkpoint, inspect TP/DP group mapping, process
+  initialization and rank-specific gradient assumptions; do not
+  immediately blame numerical shape sensitivity.
+- This **new control is not a full production E2E test** and carries no
+  claim of any NPU result until actually run. Neither TP2×DP2 nor
+  strict numerical parity is accepted yet.
+
+The original `TPR_MODULE_DP_SIZE` default stays **2** for existing
+two- and four-NPU DP2 tests.
