@@ -202,3 +202,71 @@ Therefore **the overall mean drift being similar does not explain the particular
 4. For every experiment, preserve **response-only** max/mean/p95 and especially `row5 query189`; no artificial FP32/padded GEMM interventions until causal attribution is complete.
 
 **Handoff verdict:** Independent HF DTA-style forward shows BF16 shape drift of comparable *average* magnitude, falsifying “only our TPR numerical path drifts”. Nevertheless the unexplained `query189: HF fixed path 0 vs Megatron TPR 0.749` is still a material blocker to claiming TPR parity, and the official DTA training algorithm has not yet been reproduced.
+
+## 7. More faithful AReaL-DTA forward control (2026-10-10 follow-up)
+
+**Motivation:** Original HF lexical DFS reproduced material BF16 forward drift, but
+was missing the optimized AReaL forward order and fixed KV storage. Both the
+old lexical DFS and the exact row5 five-segment comparison remain intact.
+
+### Observed in the previous real NPU run (NOT the new oracle)
+
+- HF lexical DFS response (512 values): max_abs=0.445066452,
+  mean_abs=0.0309696756, p95_abs=0.24168916, 50 values above 0.2.
+- Lexical physical starts=[0,134,158,178,166,189],
+  M=[192,58,34,14,26,3], saved_forward_tokens=1209.
+- Full M192 to Root M134 HF first-layer V max_abs=0.001953125,
+  with 20/134 changed token positions; cutoff M134 to fixed-path DTA root
+  M134 V difference exactly zero.
+- Most important: HF fixed-path row5 query189 abs logprob error=0 while
+  Megatron Native Full vs TPR Forest at the same logical position was
+  0.749377. The HF result does NOT explain the Megatron tail.
+
+### New isolated implementation
+
+- _qwen17_areal_dta_reference.py: ports AReaL feat/dta a5b0b4811a3ef7bf58f0270abcd81d7154f03ce6
+  forward-only TokenTrie sorted leafization (duplicates and prefix
+  attachments), CompressedTrie chain-priority forward_permute, persistent
+  per-layer fixed K/V buffers, rebuilding DynamicCache from prefix buffer
+  views, and storing fork logits with shifted token labels.
+- unit/test_qwen17_areal_exact_reference.py: CPU fake HF coverage of
+  duplicate/nested prefix, no sharing, fork labels and KV buffer overwrite.
+- Existing HF NPU driver now compares four modes on the same HF BF16 model:
+  HF_FULL, HF_LCP_DFS (lexical), HF_AREAL_FORWARD (optimized + persistent
+  buffers), and HF_FIXED_PATH (five chunks for row5).
+- New logs: AREAL_ROW, AREAL_SUMMARY, AREAL_RESPONSE_SUMMARY,
+  AREAL_VS_LEXICAL, AREAL_OUTLIER (response token and actual visit/M),
+  AREAL_TARGET (row5 query189 all four HF values).
+- All existing ROOT_V_SHAPE and ROOT_CUTOFF_TO_DTA controls remain.
+
+### NPU run from the bridge-backed VERL checkout
+
+    export TPR_REAL_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
+    export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
+    TPR_QWEN17_DTA_HF_ATTN=sdpa bash tests/models/mcore/tpr/correctness/run_qwen17_hf_dta_reference.sh
+
+### Interpretation and limitations
+
+- Compare within HF, using each path's difference from the same HF Full.
+- The AReaL-style mode changes both optimized traversal order AND fixed KV
+  buffer layout. These must be separated by further ablations if drift changes.
+- This is a forward-only oracle. DTA backward_permute, pop_byblock, suffix
+  recomputation, Prefix KV/fork-logit gradient relay and PPO/optimizer
+  parity remain NOT IMPLEMENTED; success means the probe ran, not parity.
+- New AReaL-faithful NPU numerical results are PENDING user execution.
+
+### Additional two-axis numerical ablation (same checkpoint)
+
+To avoid attributing a schedule change to the KV storage layout, the new
+NPU test also runs AReaL-compatible persistent KV storage *without*
+forward_permute. It prints:
+
+- AREAL_LEXICAL_BUFFER: HF Full vs lexical/leafized persistent-KV mode.
+- AREAL_BUFFER_ABLATION: old lexical last-leaf cache vs lexical persistent KV.
+- AREAL_PERMUTE_ABLATION: lexical persistent KV vs optimized persistent KV.
+- AREAL_SUMMARY and AREAL_RESPONSE_SUMMARY: Full vs optimized persistent KV.
+
+Interpret these as measured numerical differences; all tests remain
+diagnostic-only, with no automatic strict parity gate or NPU execution claim.
+CPU fake-cache tests for the forward plan and both ordering modes: 5 passed
+locally on CPU (not a substitute for real BF16 NPU kernel testing).
