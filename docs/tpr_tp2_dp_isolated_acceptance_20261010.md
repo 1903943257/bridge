@@ -272,3 +272,57 @@ Committed strengthening, **NPU rerun needed**:
 The existing 5/3 DTA offline placement plan is **not used by** this
 TP/DP module test (which picks two local siblings per DP replica). It is
 still not legal for native equal-row Trainer dispatch.
+
+
+## 2026-10-10 heterogeneous real-TQ NPU result: DP2 passes, TP2×DP2 FAIL
+
+User confirmed **TP1×DP2** physically disjoint real-token branches:
+- DP0 rows (0,1): `window_start=17385`, `true_fork=17513`,
+  hash `99804e90b786`, native CE 3.5415483, TPR 3.5555313,
+  param grad rel-L2 **0.0406615** (<0.05, PASS).
+- DP1 rows (4,5): `window_start=17361`, `true_fork=17489`,
+  hash `43a848652718`, native CE 3.3814220, TPR 3.3785036,
+  param grad rel-L2 **0.0410661** (<0.05, PASS).
+
+So different DP replicas actually processed **different physical input
+tokens**, as checked by recorded fork positions and hashes.
+
+**TP2×DP2**, same heterogeneous TQ windows, is **NOT ACCEPTED**:
+different TP ranks of DP1 produced two gradient relative L2
+failures **0.0739336** and **0.0566149**, both strictly greater than
+the existing 5% gate. Full four-rank result cannot be marked PASS.
+We have **no grounded evidence yet** whether their excess error is
+BF16 shape/GEMM sensitivity, local TP sharding/grad reduction, or a
+specific layer/parameter problem. Do not weaken the threshold.
+
+The later HCCL `hcclCommInitRootInfoConfig` connectivity timeout is
+likely a **secondary collective-order failure**, not proof of a broken
+physical cluster: the old test asserted rank-local gradient tolerance
+**before** a native DP-group `all_gather` that surviving peers still
+tried to execute. Early failure could strand the latter ranks waiting
+for a communicator peer. A separate fresh run is still appropriate
+if HCCL errors occur without early Python assertions.
+
+**Test-only fix, no numerical arithmetic change:**
+- Delay all loss / gradient threshold assertions until all native TP
+  and DP communications finish and WORLD diagnostic metrics are
+  exchanged. Use a common global failure decision on every rank.
+- Record rank-local grad relative L2 and proper **TP-shard weighted**
+  relative L2 (`sqrt(sum(error_sq)/sum(ref_sq))`) separately.
+  Retain the original `relative_l2 < 0.05` **per-rank** acceptance gate.
+  Aggregated TP metrics are diagnostics, NOT a replacement criterion.
+- On failed ranks, print 8 largest per-parameter contributions to the
+  total local error, with each parameter's own relative L2 and norm.
+- Print a four-rank result matrix before the unified FAIL, so the other
+  TP/DP ranks are not hidden by the first crashing rank.
+- The test does NOT add TP/DP gradient synchronization, alter
+  `SegmentExecutor`, change native VERL training, or touch PPO/GEMM.
+
+Rerun **only TP2×DP2** after syncing
+`tests/models/mcore/tpr/parallel/test_tpr_dp_tpdp_module_npu.py`.
+If the same DP1 parameter groups dominate across both TP shards,
+investigate numerical shape sensitivity there *separately* from the
+ongoing single-DP E2E work. If failures track rank/shard ownership or
+incorrectly synchronized replicated parameters, check Megatron TP2
+reference and TPR gradient finalization contracts. Do not infer the
+cause without the attribution output.
