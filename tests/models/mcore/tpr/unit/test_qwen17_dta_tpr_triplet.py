@@ -35,9 +35,36 @@ def test_compact_two_rows_shifted_ppo(monkeypatch,objective):
         expected=-((actual-old).exp()*adv).sum()/4
     else:
         expected=-(actual*adv).sum()/4
-    torch.testing.assert_close(loss,expected,rtol=0,atol=0)
+    # The production adapter accumulates separate physical-segment
+    # reductions, while this independent oracle reduces all four tokens
+    # at once. The FP32 summation order differs by one ULP (5.96e-8).
+    # This tolerance applies ONLY to the scalar CPU test; it does not
+    # relax any NPU logprob/gradient/optimizer parity diagnostics.
+    torch.testing.assert_close(
+        loss, expected, rtol=0, atol=torch.finfo(torch.float32).eps
+    )
     loss.backward()
-    assert lp.grad is not None and lp.grad[2].item()==0 and lp.grad[5].item()==0
+    assert lp.grad is not None
+    # Independently verify the complete token-level derivative, including
+    # active PPO clipping; dummy/padded logits must receive exactly zero.
+    expected_grad = torch.zeros_like(lp)
+    ratios = (actual.detach() - old).exp()
+    if objective == "fixed_logprob":
+        token_grad = -adv / 4
+    elif objective == "ppo_unclipped":
+        token_grad = -adv * ratios / 4
+    else:
+        active_clip = ((adv > 0) & (ratios > 1.2)) | (
+            (adv < 0) & (ratios < 0.8)
+        )
+        token_grad = torch.where(
+            active_clip, torch.zeros_like(adv), -adv * ratios / 4
+        )
+    expected_grad[[0, 1, 3, 4]] = token_grad
+    torch.testing.assert_close(
+        lp.grad, expected_grad, rtol=2e-7, atol=1e-7
+    )
+    assert lp.grad[2].item() == 0 and lp.grad[5].item() == 0
 
 
 def test_native_prompt_query_offset(monkeypatch):
