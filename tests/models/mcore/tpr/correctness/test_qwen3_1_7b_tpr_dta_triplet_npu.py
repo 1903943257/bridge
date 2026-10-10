@@ -50,8 +50,6 @@ def _loss_adapter(*, model_output, data, dp_group=None):
     The actual per-row packed length is attention_mask.sum, never the
     maximum padded response length.
     """
-    from .test_qwen3_1_7b_areal_backward_ppo_npu import _proxy_advantages
-    del _proxy_advantages  # objective data must be carried in data, not rebuilt
     objective=os.environ.get("TPR_DTA_BWD_OBJECTIVE","ppo")
     clip=float(os.environ.get("TPR_DTA_BWD_PPO_CLIP","0.2"))
     logits=model_output["log_probs"]
