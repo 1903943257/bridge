@@ -543,3 +543,76 @@ The first distinguishes ratio reweighting from clipping; the second
 isolates chunked Pop on a single logical sequence; the third tests
 shared-prefix paths with the last full-sequence Pop unchunked.
 These new modes are NPU UNVERIFIED until executed.
+
+
+## 12. PPO ratio, Pop chunking, and triplet Full/DTA/TPR (2026-10-10)
+
+New NPU observations from the real cropped SWE-TQ batch (8x192,
+Qwen3-1.7B BF16, SDPA):
+
+| AReaL DTA Pop | Objective | Response mean abs | Param gradient rel L2 | cosine |
+|---|---|---:|---:|---:|
+| 8 rows, block=64 | fixed_logprob | 0.029684 | 0.0456423 | 0.998987 |
+| 8 rows, block=64 | ppo_unclipped | 0.029684 | 0.127322 | 0.992397 |
+| 8 rows, block=64 | ppo | 0.029684 | 0.593944 | 0.805095 |
+| 1 row, block=-1 | fixed_logprob | 0 | 0 | 1 |
+| 1 row, block=64 | fixed_logprob | 0.022037 | 0.0732935 | 0.997724 |
+| 8 rows, block=-1 | fixed_logprob | 0.025984 | 0.0361715 | 0.999371 |
+
+These establish: fixed_logprob **does not repair Forward logprobs**;
+it replaces the PPO derivative with a constant -advantage per token.
+The unclipped ratio retains its logprob-dependent derivative and
+increases gradient differences; active clipping further increases them.
+The error percentages cannot be decomposed additively. The old-policy
+logprobs here equal *HF Full same-checkpoint*, which sets Full ratio=1,
+making this a strong numerical sensitivity test but not a real rollout
+old policy measurement.
+
+### Actual Megatron TPR third arm
+
+To avoid conflating HF model/backends with Megatron, the new three-way
+runner executes separate processes with exactly the same batch and
+objective. It compares:
+
+1. HF Full vs independent AReaL-DTA real full backward (all-parameter
+   gradient metrics).
+2. Megatron Native vs the **real** TPR Forest routed through
+   \`MegatronEngineWithLMHead.forward_backward_batch\`
+   (all named trainable parameters, first 4096 flattened gradient
+   entries per parameter + actual BF16 AdamW step).
+3. HF Full vs Megatron Native RESPONSE logprob before attempting any
+   cross-framework TPR attribution. It also displays raw HF Full vs
+   Megatron TPR gap, explicitly labeled as including framework drift.
+
+\`tests/models/mcore/tpr/correctness/test_qwen3_1_7b_tpr_dta_triplet_npu.py\`
+implements the TPR path using the same
+\`_load_real_tq_probe(prompt_length=128,response_length=64)\`,
+\`_make_qwen_model\`, \`_native_response_logprobs\`, and
+\`SegmentPPOObjectiveAdapter\` as the existing production-routed TPR
+PPO correctness test. A single custom loss callable supports both packed
+native and compact segment-local query positions:
+\`fixed_logprob\`, \`ppo_unclipped\`, \`ppo\`. No production changes.
+
+\`tests/models/mcore/tpr/correctness/compare_qwen17_dta_tpr_triplet.py\`
+rejects mismatched objective, shapes, or model checkpoint paths and prints
+clearly scoped comparison lines. **Do not equate** the all-parameter HF
+gradient relative L2 with the sampled Megatron relative L2. No HF-to-
+Megatron gradient parameter mapping is claimed.
+
+Run from Docker VERL root after host bridge git pull / Docker rsync:
+
+    cd /workspace/uni-agent/verl
+    export TPR_REAL_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
+    export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
+    TPR_DTA_BWD_OBJECTIVE=ppo_unclipped \
+      bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
+
+Default Pop block=64 and HF DTA mode=native. Both use a fresh same
+checkpoint PPO proxy (HF old from HF Full; Megatron old from Megatron
+Native), and both use deterministic signed advantages if the TQ dump
+does not provide exact [8,64] rollout advantages. Thus paired gradients
+are valid within each backend; cross-backend raw ratio/step numbers are
+not intrinsically directly comparable.
+
+**New triplet NPU status:** not yet executed. This must not be reported
+as TPR gradient/optimizer numerical parity before physical NPU run.
