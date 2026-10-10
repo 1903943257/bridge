@@ -243,8 +243,10 @@ def test_two_rank_native_tp2_full_trajectory_vs_tpr_engine(tp2_runtime):
     tpr_model.load_state_dict(reference_model.state_dict(), strict=True)
 
     prefix = torch.arange(17, 81, dtype=torch.long)
-    first_suffix = torch.arange(401, 433, dtype=torch.long)
-    second_suffix = torch.arange(651, 675, dtype=torch.long)
+    # Use target IDs from the *second* vocab shard so the test detects
+    # accidental comparison against logits.shape[-1] (the local vocab size).
+    first_suffix = torch.arange(1401, 1433, dtype=torch.long)
+    second_suffix = torch.arange(1521, 1545, dtype=torch.long)
     plan = _equivalence_tpr_plan(prefix, first_suffix, second_suffix)
     first = torch.cat((prefix, first_suffix))
     second = torch.cat((prefix, second_suffix))
