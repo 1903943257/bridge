@@ -84,7 +84,7 @@ def main():
         for j, event in enumerate(x["events"], start=1):
             if event["step"] != j or event["row"] != x["schedule"][j - 1]:
                 raise ValueError(f"CP{x['cp']} wrong step / row scheduling")
-            for field in ("train_loss", "grad_norm", "master_update_norm"):
+            for field in ("train_loss", "grad_norm", "estimated_master_update_norm"):
                 if not math.isfinite(event[field]):
                     raise ValueError(f"CP{x['cp']} nonfinite {field} at step {j}")
         if x is not ref:
