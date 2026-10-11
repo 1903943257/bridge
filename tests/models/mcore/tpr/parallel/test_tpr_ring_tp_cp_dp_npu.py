@@ -292,7 +292,7 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
     grad_rel_l2 = (grad_delta_sq / max(grad_ref_sq, 1e-24)) ** 0.5
 
     # CP source semantics: independent full-sequence visits vs shared tree's
-    # Push(P), Visit(S1), Visit(S2), Pop(P) (no extra prefix recompute).
+    # Push(P), Visit(S1), Visit(S2), Pop(P) (Prefix is recomputed at Pop).
     trace_ok = (
         len(ref_trace) == 2 and len(actual_trace) == 4
         and actual_trace[0][0] == "push" and actual_trace[-1][0] == "pop"
@@ -328,7 +328,7 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
                 f"reference_ce={row[3]:.7f} tpr_ce={row[4]:.7f} "
                 f"loss_gap={row[5]:.7f} logprob_rel_l2={row[6]:.7f} "
                 f"grad_rel_l2={row[7]:.7f} "
-                f"layout_ok={bool(row[8])} dp_workloads_distinct={bool(row[9])} "
+                f"plan_groups_aligned={bool(row[8])} dp_workloads_distinct={bool(row[9])} "
                 f"loss_ownership_ok={bool(row[10])} tree_trace_ok={bool(row[11])} "
                 f"ring_kernel_ok={bool(row[12])} gate_pass={bool(row[13])}",
                 flush=True,
