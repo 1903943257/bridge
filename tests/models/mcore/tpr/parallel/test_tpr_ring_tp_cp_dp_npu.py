@@ -39,8 +39,6 @@ from verl.models.mcore.tpr.parallel import ring_attention
 from verl.models.mcore.tpr.tp_validation import (
     assert_tp_plan_agreement, digest_segment_plan,
 )
-from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
-
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from ._tpr_cp_test_utils import (
     _equivalence_tpr_plan,
@@ -171,12 +169,14 @@ def _run_ring_forest(model, plans, runtime, logical_indices, logical_count):
                         [term.target_token_id for term in terms],
                         device=runtime.device, dtype=torch.long,
                     )
-                    # Megatron owns TP-vocab softmax collectives. A plain local
-                    # F.log_softmax would be incorrect for TP2's vocab shard.
+                    # Use GPTModel's native Megatron vocab-parallel cross
+                    # entropy (logprob == -CE). F.log_softmax on the local
+                    # TP vocab shard would produce incorrect token logprobs.
                     with torch.no_grad():
                         token_logits = logits[0].index_select(0, offsets).detach()
-                        token_logprobs = vocab_parallel_log_probs_from_logits(
-                            token_logits, labels,
+                        token_logprobs = -model.compute_language_model_loss(
+                            labels.unsqueeze(0),
+                            token_logits.unsqueeze(1),
                         ).reshape(-1).float()
                         logical = torch.tensor(
                             [logical_indices[(

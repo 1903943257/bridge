@@ -11,9 +11,11 @@ HF weight into a shard or randomly initializing is NOT a TP correctness test.
 from __future__ import annotations
 
 import gc
+import math
 from pathlib import Path
 
 import torch
+from megatron.core.transformer.module import MegatronModule
 from transformers import AutoConfig
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
@@ -30,6 +32,42 @@ from ..correctness.test_tpr_qwen3_compatibility_npu import (
     _load_hf_state_dict,
     _validate_checkpoint_files,
 )
+
+
+class _RingCPOnlyCoreAttention(MegatronModule):
+    """CP>1 TPR test sentinel: actual attention MUST run via Ring CP.
+
+    The CP1 square-CANN reference subclasses DotProductAttention, whose
+    Megatron initializer intentionally forbids CP>1. Overriding forward
+    does NOT remove that constructor guard. Do not bypass upstream guards
+    or silently use single-rank square attention on CP-sharded tokens.
+    This lightweight module only carries the native softmax scale consumed
+    by TPRSelfAttention._tree_forward's existing Ring CP dispatch.
+    """
+
+    def __init__(
+        self, config, layer_number, attn_mask_type, attention_type,
+        attention_dropout=None, softmax_scale=None, cp_comm_type=None,
+        pg_collection=None,
+    ):
+        super().__init__(config=config)
+        if getattr(config, "apply_query_key_layer_scaling", False):
+            raise NotImplementedError(
+                "CP Ring test sentinel does not cover query-key layer scaling"
+            )
+        self.layer_number = max(1, layer_number)
+        self.attn_mask_type = attn_mask_type
+        self.attention_type = attention_type
+        self.softmax_scale = (
+            1.0 / math.sqrt(config.kv_channels)
+            if softmax_scale is None else float(softmax_scale)
+        )
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "CP>1 Qwen TPR test requires active Ring CP attention; "
+            "the square-causal fallback cannot consume CP-sharded QKV"
+        )
 
 
 def load_qwen3_1_7b_config(path: Path):
@@ -204,6 +242,14 @@ def make_real_qwen3_tp_model(
             config, use_transformer_engine=False, pp_rank=0
         )
     )
+    # For CP>1, the ordinary square-CANN reference core is invalid because
+    # its DotProductAttention parent constructor only supports CP=1.
+    # Every reference and TPR segment in the Ring-combination test must
+    # execute inside SegmentExecutor's explicit Ring attention context.
+    core_attention_cls = (
+        _ProfileFusedCausalAttention if cp_size == 1
+        else _RingCPOnlyCoreAttention
+    )
     # get_gpt_decoder_block_spec returns TransformerBlockSubmodules
     # (with .layer_specs) in this Megatron version, NOT necessarily a
     # ModuleSpec (with .submodules.layer_specs). Use the same tested
@@ -211,7 +257,7 @@ def make_real_qwen3_tp_model(
     layer_specs = _get_layer_specs(spec)
     for layer_spec in layer_specs:
         layer_spec.submodules.self_attention.submodules.core_attention = (
-            _ProfileFusedCausalAttention
+            core_attention_cls
         )
     from types import SimpleNamespace
     pg = SimpleNamespace(
@@ -246,10 +292,13 @@ def make_real_qwen3_tp_model(
     # If a future MindSpeed/Megatron spec bypasses our replacement, fail
     # here rather than entering an incompatible ScaledMaskedSoftmax kernel.
     if not all(
-        isinstance(layer.self_attention.core_attention, _ProfileFusedCausalAttention)
+        isinstance(layer.self_attention.core_attention, core_attention_cls)
         for layer in model.decoder.layers
     ):
-        raise AssertionError("TP2 Qwen requires controlled CANN square-causal core attention")
+        raise AssertionError(
+            "Qwen attention core is not the expected CP-compatible reference "
+            f"adapter for CP={cp_size}"
+        )
     assert model.config.tensor_model_parallel_size == tp_size
     assert model.config.context_parallel_size == cp_size
     assert model.config.sequence_parallel is sequence_parallel
