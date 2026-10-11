@@ -268,6 +268,10 @@ def test_native_cp_multistep_real_tq_nll():
         train, val, skipped, data_sha = _load_real_tq_rows(path, model.vocab_size)
         named, masters, optimizer = _make_optimizer(model, lr)
         initial_sha = _rank_consensus(named, runtime)
+        train_trajectory_ids = sorted({x["trajectory_id"] for x in train})
+        val_trajectory_ids = sorted({x["trajectory_id"] for x in val})
+        if set(train_trajectory_ids) & set(val_trajectory_ids):
+            raise AssertionError("Real TQ trajectory leaked between training and validation")
         checkpoints = {}
         schedule = [train[i % len(train)]["id"] for i in range(steps)]
         stream_sha = hashlib.sha256(
@@ -295,7 +299,10 @@ def test_native_cp_multistep_real_tq_nll():
         if runtime.rank == 0:
             print(f"P0_B cp={cp} start steps={steps} train_rows={[x['id'] for x in train]} "
                   f"val_rows={[x['id'] for x in val]} skipped={skipped} "
-                  f"grad_reduce={grad_reduce} lr={lr} low_diversity={len(train)<64}",
+                  f"grad_reduce={grad_reduce} lr={lr} "
+                  f"train_trajectories={train_trajectory_ids} "
+                  f"val_trajectories={val_trajectory_ids} "
+                  f"low_independent_trajectory_count={len(train_trajectory_ids)<64}",
                   flush=True)
         for step in range(1, steps + 1):
             data = train[(step - 1) % len(train)]
@@ -324,6 +331,8 @@ def test_native_cp_multistep_real_tq_nll():
                         "seq_len": SEQ_LEN, "response_len": RESPONSE_LEN,
                         "train_row_ids": [x["id"] for x in train],
                         "val_row_ids": [x["id"] for x in val],
+                        "train_trajectory_ids": train_trajectory_ids,
+                        "val_trajectory_ids": val_trajectory_ids,
                         "skipped_rows": skipped, "data_sha": data_sha,
                         "stream_sha": stream_sha, "schedule": schedule,
                         "initial_weights_sha": initial_sha,
