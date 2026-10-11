@@ -250,7 +250,9 @@ def test_real_tq_full_vs_tpr_fifty_steps():
         milestones = sorted({m for m in MILESTONES if m <= steps} | {steps})
 
         def persist(step):
-            if step not in checkpoints:
+            # Snapshots are keyed by STRING step IDs for stable torch-save /
+            # comparator lookup; callers pass an integer training step.
+            if str(step) not in checkpoints:
                 raise AssertionError(f"Cannot persist missing checkpoint {step}")
             outdir.mkdir(parents=True, exist_ok=True)
             payload = {
