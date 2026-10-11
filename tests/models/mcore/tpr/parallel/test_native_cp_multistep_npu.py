@@ -220,7 +220,7 @@ def _step(model, runtime, row, named, masters, optimizer, grad_reduce, clip_norm
         if runtime.cp > 1:
             dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=runtime.group)
         m.grad = reduced.float()
-    preclip_norm = torch.nn.utils.clip_grad_norm_(masters, max_norm=clip_norm)
+    preclip_norm = torch.nn.utils.clip_grad_norm_(masters, max_norm=clip_norm, foreach=False)
     if not bool(torch.isfinite(preclip_norm).item()):
         raise AssertionError(f"nonfinite native CP FP32 master grad norm: {preclip_norm}")
     # Avoid a full ~7 GiB clone of all FP32 master weights on every step:
