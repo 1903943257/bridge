@@ -199,10 +199,9 @@ def _step(model, runtime, row, named, masters, optimizer, grad_reduce, clip_norm
             bias1 = 1.0 - 0.9 ** step
             bias2 = 1.0 - 0.95 ** step
             denom = state["exp_avg_sq"].sqrt() / (bias2 ** 0.5) + 1e-8
-            estimated_delta = (lr := optimizer.param_groups[0]["lr"]) / bias1 * (
-                state["exp_avg"] / denom
-            )
-            total_update_sq += estimated_delta.double().square().sum()
+            lr_now = optimizer.param_groups[0]["lr"]
+            estimated_delta = (lr_now / bias1) * (state["exp_avg"] / denom)
+            total_update_sq += estimated_delta.square().sum(dtype=torch.float64)
             p.copy_(m.to(dtype=p.dtype))
     model.zero_grad(set_to_none=True)
     return {
