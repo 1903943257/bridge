@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # P0-1: run native MindSpeed CP=1/2/4 in the old /workspace/uni-agent/verl
 # environment after rsyncing bridge/tests/models/mcore/tpr/ into it.
-# Update code only in /workspace/bridge. NEVER git pull in the old VERL tree.
+# HOST ONLY: cd /workspace/bridge && git pull --ff-only.
+# INSIDE DOCKER ONLY: rsync -av /workspace/bridge/tests/models/mcore/tpr/ \
+#   /workspace/uni-agent/verl/tests/models/mcore/tpr/
+# INSIDE DOCKER: run this launcher from /workspace/uni-agent/verl.
+# NEVER git pull inside Docker / old UniAgent.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

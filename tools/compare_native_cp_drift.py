@@ -3,9 +3,9 @@
 After CP=1/2/4 have run from /workspace/uni-agent/verl:
     python /workspace/bridge/tools/compare_native_cp_drift.py /tmp/tpr_p0_native_cp
 
-Source is pulled into /workspace/bridge; only tests/models/mcore/tpr/ is
-rsynced into the old VERL checkout. The launcher in that synced tests tree
-invokes this comparator by absolute bridge path.
+The HOST pulls into /workspace/bridge. INSIDE DOCKER the updated
+tests/models/mcore/tpr/ is rsynced to /workspace/uni-agent/verl/tests/.
+The Docker test launcher invokes this comparator by absolute bridge path.
 """
 from __future__ import annotations
 

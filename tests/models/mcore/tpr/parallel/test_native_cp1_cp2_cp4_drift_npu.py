@@ -3,8 +3,9 @@
 Run ONLY from the synced /workspace/uni-agent/verl test runtime:
     bash tests/models/mcore/tpr/parallel/run_native_cp_drift.sh
 
-Update and pull source in /workspace/bridge, rsync its tests/models/mcore/tpr/
-tree to the old VERL tests directory. The launcher uses explicit
+On the HOST, git pull in /workspace/bridge. Then INSIDE DOCKER, rsync its
+tests/models/mcore/tpr/ tree to /workspace/uni-agent/verl/tests/models/mcore/tpr/.
+The launcher uses explicit
 --master_addr=127.0.0.1 and --master_port=29561/29562/29564, then invokes
 the comparator from /workspace/bridge/tools/compare_native_cp_drift.py.
 Numerical diagnostic, NOT a production Megatron-DDP optimizer benchmark.
@@ -79,8 +80,10 @@ def _runtime(cp: int):
         "use_flash_attn": True,
         "attention_mask_type": "causal",
     })
-    from megatron.training import get_args
-    args = get_args()
+    # Match the existing bridge CP fixtures: this runtime may provide only
+    # Megatron-Core, without the optional megatron.training package.
+    # MindSpeed's get_full_args() falls back to its own args singleton.
+    args = get_full_args()
     if args.context_parallel_size != cp or args.context_parallel_algo != "megatron_cp_algo":
         raise AssertionError("MindSpeed did not apply the requested native Ring CP configuration")
     if not getattr(args, "use_flash_attn", False):
