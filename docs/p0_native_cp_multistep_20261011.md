@@ -294,6 +294,56 @@ Outputs: `/tmp/tpr_p0_attn_replay/native_cp1_attention_oracle.pt`
 plus `native_cp2_attention_replay.json` and
 `native_cp4_attention_replay.json`.
 
+## P0-2B first NPU run: harness device mismatch (2026-10-11)
+
+The first CP1 capture/replay failed during **metrics only**, not during
+the native Attention kernel, with:
+
+```text
+RuntimeError: Expected all tensors to be on the same device
+test_native_attention_qkv_replay_npu.py: _metric
+delta = (val - ref).double()
+```
+
+The captured CP1 reference is saved on CPU; new CP1/CP2/CP4 replay
+outputs are NPU tensors. `_metric` now verifies exact shapes and
+moves **both detached operands to CPU float32**, then computes diagnostic
+float64 deltas on CPU. This does not affect actual BF16 forward/backward,
+native Ring, dO, or gradient synchronization. NPU replay results are
+**not yet observed**; retry the same launcher after host pull and
+Docker rsync.
+
+### Interpretation of P0-2A for TPR
+
+P0-2A fixes a real CP1 X/W/dY and replays the same Linear module at
+1024/512/256 rows. The observed **Y/dX relative L2 only ~1.7e-5 to
+4.3e-5** is much smaller than the *end-to-end* CP logprob discrepancy
+(~0.03 mean absolute logprob). The comparison has different metrics
+and tensor semantics; do not infer a direct upper bound from their
+numerical ratio.
+
+Critically, this is **not** a reproduction of the physical TPR
+Prefix/Suffix tree shapes (e.g., `P=134`, `S=58`,
+different cached-KV owners, parent/child gradient relay). One
+fixed-operands single Linear replay also excludes (a) 28-layer
+propagation through nonlinear blocks and Attention, (b) real
+Prefix/Suffix rectangular causal Attention and ancestor KV
+lifetimes, and (c) tree-style accumulation of shared-prefix gradient
+contributions. Therefore:
+
+- P0-2A **establishes** a small local M-shape effect for the measured
+  CP sharding layouts, not a sufficient explanation of native CP drift.
+- P0-2B next measures how much native Attention/Ring alone contributes
+  for identical real Q/K/V/dO, before considering full-model error.
+- If P0-2B also shows small local differences, perform a **TPR-specific
+  matched Prefix/Suffix single-path replay** (same real rows and
+  actual tree cut locations) with per-layer QKV/Attention/MLP/KV-root
+  traces. Compare Full-vs-segment at the same logical token owner,
+  and follow the **first layer/token** where errors amplify.
+- Maintain a separate TPR gradient-relay gate to ensure ancestor dKV
+  from each child is accumulated exactly once. Do not assume CP
+  correct semantics prove this tree-specific backward behavior.
+
 ## Deferred: direct TPR vs Full 50-step training comparison
 
 **Not started and not implemented here.** After P0-2B is measured,
