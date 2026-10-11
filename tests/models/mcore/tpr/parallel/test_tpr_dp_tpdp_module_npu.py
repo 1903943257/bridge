@@ -72,6 +72,11 @@ _QWEN = Path(os.getenv("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B"))
 def parallel_runtime():
     tp_size = int(os.getenv("TPR_MODULE_TP_SIZE", "1"))
     dp_size = int(os.getenv("TPR_MODULE_DP_SIZE", "2"))
+    # Opt-in for the independent TP2+SPxDP2 gate. Existing TP/DP tests
+    # remain SP=False unless the runner explicitly requests native SP.
+    sequence_parallel = os.getenv("TPR_MODULE_SP", "0") == "1"
+    if sequence_parallel and tp_size != 2:
+        raise ValueError("native sequence parallel module gate requires TP=2")
     assert tp_size in (1, 2)
     assert dp_size in (1, 2), "DP=1 is only for isolated TP2 same-token control"
     if dp_size == 1 and tp_size != 2:
@@ -100,7 +105,7 @@ def parallel_runtime():
         "tensor_model_parallel_size": tp_size,
         "context_parallel_size": 1,
         "pipeline_model_parallel_size": 1,
-        "sequence_parallel": False,
+        "sequence_parallel": sequence_parallel,
     })
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
@@ -125,6 +130,7 @@ def parallel_runtime():
         rank=tp_rank, dp_rank=dp_rank, device=torch.device("npu", local_rank),
         tp_group=tp_group, dp_group=dp_group, cp_group=cp_group,
         pp_group=pp_group, tp_size=tp_size, dp_size=dp_size,
+        sequence_parallel=sequence_parallel,
     )
     yield runtime
     dist.barrier()
@@ -281,12 +287,14 @@ def test_real_qwen_module_dp2_and_tp2dp2_local_forest_correctness(parallel_runti
     )
     torch.manual_seed(20261010)
     reference, hf = make_real_qwen3_tp_model(
-        runtime, model_path=_QWEN, tp_size=runtime.tp_size
+        runtime, model_path=_QWEN, tp_size=runtime.tp_size,
+        sequence_parallel=runtime.sequence_parallel,
     )
     assert hf.vocab_size == 151936
     torch.manual_seed(20261010)
     model, _ = make_real_qwen3_tp_model(
-        runtime, model_path=_QWEN, tp_size=runtime.tp_size, load_weights=False
+        runtime, model_path=_QWEN, tp_size=runtime.tp_size, load_weights=False,
+        sequence_parallel=runtime.sequence_parallel,
     )
     model.load_state_dict(reference.state_dict(), strict=True)
 
