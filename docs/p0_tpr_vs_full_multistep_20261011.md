@@ -133,7 +133,7 @@ unsuccessful mode rather than repeating the completed 50 optimizer steps:
 
 ```bash
 # TPR-only retry; Full artifact remains untouched:
-TPR_P0_TPR50_STEPS=50 TPR_P0_TPR50_RUN_MODES=tpr \\
+TPR_P0_TPR50_STEPS=50 TPR_P0_TPR50_RUN_MODES=tpr \
   bash tests/models/mcore/tpr/parallel/run_real_tq_tpr_full_multistep.sh
 # Or run Full alone with TPR_P0_TPR50_RUN_MODES=full.
 ```
