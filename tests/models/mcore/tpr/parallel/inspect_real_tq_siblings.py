@@ -16,12 +16,13 @@ def _rows(data, key):
     return list(x) if isinstance(x, (list, tuple)) else list(x.unbind())
 
 
-def inspect(path, *, siblings=2):
+def inspect(path, *, siblings=2, require_ppo=False):
     if not path.is_file():
         raise FileNotFoundError(f"Original TQ data not found: {path}")
     # This is the original trusted local actor checkpoint/tensordict dump.
     raw = torch.load(path, map_location="cpu", weights_only=False)
     data = raw["tensordict"]
+    source_stage = raw.get("capture_stage", "tq_rollout")
     keys = tuple(raw["keys"])
     fields = tuple(sorted(str(x) for x in data.keys()))
     print(f"P0_5 DATA source={path} original_trajectories={len(keys)} fields={fields}", flush=True)
@@ -37,7 +38,46 @@ def inspect(path, *, siblings=2):
               f"old_field={old_field} advantages=True "
               "on_policy_actor_provenance=NOT_VERIFIED", flush=True)
 
+    if require_ppo:
+        if source_stage != "actor_update_mini_batch":
+            raise AssertionError(
+                "ACTUAL_PPO_REQUIRED: this is a rollout TQ dump, not an "
+                "actor_update_mini_batch capture; capture after advantages "
+                "and old_log_probs are ready, before train_batch"
+            )
+        if not old_field or not has_adv or "loss_mask" not in data or "temperature" not in data:
+            raise AssertionError(
+                "ACTUAL_PPO_REQUIRED: original actor capture must contain "
+                "old_log_probs, advantages, loss_mask and temperature"
+            )
+        if len(keys) != len(set(keys)) or not all(isinstance(k, str) and k for k in keys):
+            raise AssertionError("Actor capture requires exact unique trajectory keys")
+        temperature = data["temperature"].detach().cpu().float()
+        if not bool(torch.isfinite(temperature).all() and (temperature == 1).all()):
+            raise AssertionError(
+                "P0-5 current PPO replay requires exact temperature=1"
+            )
     rows = {k: _rows(data,k) for k in ("prompts","responses","input_ids","response_mask")}
+    if require_ppo:
+        for name in ("old_log_probs" if old_field == "old_log_probs" else "old_logprobs",
+                     "advantages", "loss_mask"):
+            fields = _rows(data, name)
+            if len(fields) != len(keys):
+                raise AssertionError(f"Actor PPO field {name} row count mismatch")
+            for i, tensor in enumerate(fields):
+                tensor = tensor.detach().cpu()
+                response_len = int(rows["responses"][i].numel())
+                full_len = int(rows["input_ids"][i].numel())
+                if name == "loss_mask":
+                    mask = tensor.bool()
+                    if mask.numel() == full_len:
+                        if bool(mask[:full_len-response_len].any()):
+                            raise AssertionError(f"Actor loss_mask covers prompt row={i}")
+                        mask = mask[-response_len:]
+                    if not torch.equal(mask, rows["response_mask"][i].detach().cpu().bool()):
+                        raise AssertionError(f"Actor response/loss mask mismatch row={i}")
+                elif tensor.numel() != response_len or not bool(torch.isfinite(tensor.float()).all()):
+                    raise AssertionError(f"Actor PPO field invalid: {name} row={i}")
     groups = {}
     for idx in range(len(keys)):
         p=rows["prompts"][idx].detach().cpu().long()
@@ -83,5 +123,7 @@ if __name__ == "__main__":
     p=argparse.ArgumentParser()
     p.add_argument("path",type=Path)
     p.add_argument("--siblings",type=int,default=2)
+    p.add_argument("--require-ppo",action="store_true",
+                   help="Reject rollout dump and incomplete actor-update PPO fields")
     args=p.parse_args()
-    inspect(args.path,siblings=args.siblings)
+    inspect(args.path,siblings=args.siblings,require_ppo=args.require_ppo)
