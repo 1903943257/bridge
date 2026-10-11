@@ -391,7 +391,9 @@ def test_native_cp_1_2_4_numerical_reference():
                 "denominator": total_supervised, "batch_module": batch_module,
                 "native_ring_calls_rank0": native_ring_calls[0],
                 "local_m": SEQ_LEN // cp, "linear_m": shapes,
-                "torch": torch.__version__, "versions": versions,
+                # Serialize as a plain built-in str; torch.__version__ is a
+                # TorchVersion subclass and breaks weights_only=True loads.
+                "torch": str(torch.__version__), "versions": versions,
                 "loss": float(loss_global.item()),
                 "logprobs": logprob.cpu(), "gradients": grads,
                 "full_gradients_saved": full,

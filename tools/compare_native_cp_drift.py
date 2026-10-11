@@ -14,6 +14,19 @@ import math
 from pathlib import Path
 
 import torch
+from torch.torch_version import TorchVersion
+
+
+def _load_native_cp_evidence(path: Path):
+    """Load locally generated CP evidence with weights-only unpickling.
+
+    Historical P0-1 artifacts serialized torch.__version__ as TorchVersion.
+    It is a str subclass rejected by weights_only=True unless explicitly
+    allowlisted. Only permit this one standard-library-of-PyTorch type;
+    never downgrade to unsafe weights_only=False.
+    """
+    with torch.serialization.safe_globals([TorchVersion]):
+        return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def _summary(reference, actual):
@@ -105,7 +118,7 @@ def main():
     missing = [str(path) for path in files if not path.is_file()]
     if missing:
         p.error(f"Missing CP evidence, refusing partial comparison: {missing}")
-    data = [torch.load(path, map_location="cpu", weights_only=True) for path in files]
+    data = [_load_native_cp_evidence(path) for path in files]
     if [x["cp"] for x in data] != [1, 2, 4]:
         raise ValueError("wrong CP metadata")
     for other in data[1:]:

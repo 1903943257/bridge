@@ -39,6 +39,12 @@ if [[ ! -f "$compare_script" ]]; then
 fi
 
 mkdir -p "$TPR_P0_CP_OUTPUT_DIR"
+if [[ "${TPR_P0_CP_COMPARE_ONLY:-0}" == "1" ]]; then
+  # Preserve already successful NPU evidence after a comparator-only failure.
+  echo "P0-1 comparison only: reusing native_cp1.pt/native_cp2.pt/native_cp4.pt" >&2
+  python "$compare_script" "$TPR_P0_CP_OUTPUT_DIR"
+  exit 0
+fi
 for cp in 1 2 4; do
   port=$((port_base + cp))
   # Prevent comparison against stale outputs from a previous incomplete run.

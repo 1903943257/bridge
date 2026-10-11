@@ -79,6 +79,30 @@ Megatron-Core without `megatron.training`. This P0-1 test now uses
 the same MindSpeed parameter interface and does not import
 `megatron.training` directly.
 
+### Recovering existing P0-1 evidence without rerunning the NPU jobs
+
+If CP=1/2/4 each printed `P0_NATIVE_CP ...` but comparison failed on
+`torch.torch_version.TorchVersion`, **do not rerun the distributed tests**:
+the three `.pt` artifacts are already valid and saved. The comparator now
+keeps `weights_only=True` and only allowlists the PyTorch `TorchVersion`
+str subclass needed to read earlier artifacts. New captures save the version
+as plain `str`.
+
+After pulling bridge on the **host**, execute inside **Docker**:
+
+```bash
+cd /workspace/uni-agent/verl
+python /workspace/bridge/tools/compare_native_cp_drift.py /tmp/tpr_p0_native_cp
+```
+
+Or, after syncing the updated test launcher into Docker with the same rsync
+command as above, set `TPR_P0_CP_COMPARE_ONLY=1` to skip CP=1/2/4 and
+preserve prior artifacts:
+
+```bash
+TPR_P0_CP_COMPARE_ONLY=1 bash tests/models/mcore/tpr/parallel/run_native_cp_drift.sh
+```
+
 All jobs run BF16 Qwen3-1.7B, exactly 1024 tokens, one trajectory,
 TP=PP=DP=1, dropout=0, 512-token suffix next-token NLL objective.
 The first response token is predicted at the last prompt query position (511),
