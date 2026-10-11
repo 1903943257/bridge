@@ -31,50 +31,86 @@ _MILESTONES = (0, 1, 2, 5, 10, 20, 30, 40, 50)
 
 
 def _load_real_tq_rows(path: Path, vocab_size: int):
-    """No fabricated tokens: use prompt tail + response head and real loss mask."""
+    """Make contiguous 1024-token REAL windows with disjoint trajectory IDs.
+
+    Every window is [512 previous REAL context tokens, 512 next REAL response
+    tokens], with response_mask inherited exactly. No fabricated examples,
+    no rolling labels over a Zigzag partition, and no train/val trajectory leak.
+    """
     if not path.is_file():
         raise FileNotFoundError(f"real TQ batch required; no synthetic fallback: {path}")
-    # The recorded TQ dump is an internal trusted local artifact.
     from ..correctness.test_qwen3_1_7b_real_tq_ppo_npu import _rows
     dump = torch.load(path, map_location="cpu", weights_only=False)
     data = dump["tensordict"]
     prompts, responses = _rows(data, "prompts"), _rows(data, "responses")
-    masks = _rows(data, "response_mask")
-    fulls = _rows(data, "input_ids")
+    masks, fulls = _rows(data, "response_mask"), _rows(data, "input_ids")
     if not (len(prompts) == len(responses) == len(masks) == len(fulls)):
         raise AssertionError("TQ prompt/response/mask/input_ids row counts disagree")
-    rows, skipped = [], []
+    max_windows = int(os.getenv("TPR_P0_B_MAX_WINDOWS_PER_TRAJECTORY", "16"))
+    if not 1 <= max_windows <= 64:
+        raise AssertionError("max real windows per trajectory must be within [1,64]")
+    grouped, skipped = [], []
     for i, (p, r, m, full) in enumerate(zip(prompts, responses, masks, fulls, strict=True)):
-        p, r, m = p.detach().cpu().long(), r.detach().cpu().long(), m.detach().cpu().bool()
-        if not torch.equal(full.detach().cpu().long(), torch.cat((p, r))):
-            raise AssertionError(f"TQ row {i} input_ids is inconsistent with prompt/response")
-        if m.numel() != r.numel():
-            raise AssertionError(f"TQ row {i} response mask length differs")
+        p = p.detach().cpu().long()
+        r = r.detach().cpu().long()
+        m = m.detach().cpu().bool()
+        entire = full.detach().cpu().long()
+        if not torch.equal(entire, torch.cat((p, r))) or m.numel() != r.numel():
+            raise AssertionError(f"TQ row {i} prompt/response/full/mask disagreement")
         if p.numel() < 512 or r.numel() < RESPONSE_LEN:
             skipped.append(i)
             continue
-        tokens = torch.cat((p[-512:], r[:RESPONSE_LEN])).contiguous()
-        mask = m[:RESPONSE_LEN].contiguous()
-        if not mask.any():
+        windows = []
+        for w in range(min(max_windows, r.numel() // RESPONSE_LEN)):
+            offset = w * RESPONSE_LEN
+            mask = m[offset:offset + RESPONSE_LEN].contiguous()
+            if not mask.any():
+                continue
+            first_response_global_pos = p.numel() + offset
+            tokens = entire[first_response_global_pos - 512:
+                            first_response_global_pos + RESPONSE_LEN].contiguous()
+            if tokens.numel() != SEQ_LEN:
+                raise AssertionError(f"TQ row {i} window {w} length is not 1024")
+            if int(tokens.min()) < 0 or int(tokens.max()) >= vocab_size:
+                raise AssertionError(f"TQ row {i} window {w} contains out-of-vocab tokens")
+            windows.append({
+                "id": f"{i}:w{w}", "trajectory_id": i, "tokens": tokens,
+                "mask": mask,
+            })
+        if windows:
+            grouped.append((i, windows))
+        else:
             skipped.append(i)
-            continue
-        if int(tokens.min()) < 0 or int(tokens.max()) >= vocab_size:
-            raise AssertionError(f"TQ row {i} token out of vocabulary")
-        rows.append({"id": i, "tokens": tokens, "mask": mask})
-    if len(rows) < 2:
+    if len(grouped) < 2:
         raise AssertionError(
-            f"Need >=2 eligible real TQ rows for separate train/validation; "
-            f"eligible={len(rows)} skipped={skipped}. Supply a richer real TQ batch."
+            f"Need >=2 separate real TQ trajectories for disjoint "
+            f"train/validation; usable={len(grouped)} skipped={skipped}"
         )
-    # Keep the same row order on every CP configuration; hold out the last
-    # quarter of eligible trajectories. Never train on validation rows.
-    val_count = max(1, len(rows) // 4)
-    training, validation = rows[:-val_count], rows[-val_count:]
+    # Trajectory-disjoint holdout: never split windows of the same rollout
+    # between train and validation. Validation samples stay fixed throughout.
+    val_trajectories = max(1, len(grouped) // 4)
+    training_groups, heldout_groups = grouped[:-val_trajectories], grouped[-val_trajectories:]
+    training = [window for _, windows in training_groups for window in windows]
+    val_all = [window for _, windows in heldout_groups for window in windows]
+    # Cap validation at 8 windows to avoid spending most of the 50-step
+    # compute on repeated validation forward calls.
+    if len(val_all) > 8:
+        selection = torch.linspace(0, len(val_all) - 1, steps=8).round().long().tolist()
+        validation = [val_all[i] for i in selection]
+    else:
+        validation = val_all
+    # Fixed random permutation of REAL windows: identical across CP sizes and
+    # spread 50 updates across different trajectories rather than grouped rows.
+    gen = torch.Generator(device="cpu").manual_seed(20261011)
+    perm = torch.randperm(len(training), generator=gen).tolist()
+    training = [training[i] for i in perm]
     sha = hashlib.sha256()
-    for row in rows:
-        sha.update(str(row["id"]).encode())
-        sha.update(row["tokens"].numpy().tobytes())
-        sha.update(row["mask"].to(torch.uint8).numpy().tobytes())
+    for idx, windows in grouped:
+        sha.update(str(idx).encode("ascii"))
+        for row in windows:
+            sha.update(row["id"].encode("ascii"))
+            sha.update(row["tokens"].numpy().tobytes())
+            sha.update(row["mask"].to(torch.uint8).numpy().tobytes())
     return training, validation, skipped, sha.hexdigest()
 
 
