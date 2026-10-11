@@ -202,6 +202,7 @@ def _full(model, siblings, kind, clip, *, backwards):
     total = sum(int(r["mask"].sum()) for r in siblings)
     device = next(model.parameters()).device
     losses, lps, clipfracs = [], {}, []
+    ratio_outside_clip_count = 0.0
     positions = torch.arange(1024, device=device).unsqueeze(0)
     for row in siblings:
         tokens = row["tokens"].to(device=device)
@@ -213,7 +214,9 @@ def _full(model, siblings, kind, clip, *, backwards):
         losses.append(float(term.detach().cpu()))
         lps[str(row["row"])] = lp.detach().float().cpu().clone()
         clipfracs.append(clipfrac)
+        ratio_outside_clip_count += clipfrac * int(row["mask"].sum())
     return {"loss": sum(losses), "logprobs": lps, "clipfracs": clipfracs,
+            "ratio_outside_clip_frac": ratio_outside_clip_count / total,
             "supervised": total}
 
 
@@ -237,6 +240,7 @@ def _tpr(model, siblings, kind, clip):
     counts = {0: root_count, **masks}
     callback_count = {i: 0 for i in counts}
     captured, root_loss, child_losses, clipfracs = {}, None, [], []
+    ratio_outside_clip_count = [0.0]
     byid = {i + 1: row for i, row in enumerate(siblings)}
 
     def segment_loss(segment, logits):
@@ -265,6 +269,7 @@ def _tpr(model, siblings, kind, clip):
                 term, clipfrac = _objective(value.reshape(1), one, total, kind, clip)
                 terms.append(term)
                 clipfracs.append(clipfrac)
+                ratio_outside_clip_count[0] += clipfrac
             objective = torch.stack(terms).sum()
             root_loss = float(objective.detach().cpu())
         else:
@@ -281,6 +286,7 @@ def _tpr(model, siblings, kind, clip):
             objective, clipfrac = _objective(lp, one, total, kind, clip)
             child_losses.append(float(objective.detach().cpu()))
             clipfracs.append(clipfrac)
+            ratio_outside_clip_count[0] += clipfrac * int(one["mask"].sum())
         callback_count[sid] += 1
         return objective, {}
 
@@ -365,7 +371,9 @@ def _tpr(model, siblings, kind, clip):
             raise AssertionError(f"Sibling {rid} response logits not fully captured")
     return {
         "loss": float(sum(child_losses) + (root_loss or 0.0)),
-        "logprobs": lps, "clipfracs": clipfracs, "supervised": total,
+        "logprobs": lps, "clipfracs": clipfracs,
+        "ratio_outside_clip_frac": ratio_outside_clip_count[0] / total,
+        "supervised": total,
         "root_forward_count": 1, "leaf_backward_count": len(siblings),
         "root_backward_count": 1, "prefix_relay_layers": 28,
         "audited_prefix_kv_sibling_accumulations": 28 * len(siblings),
@@ -471,6 +479,7 @@ def test_true_real_tq_multisibling_branch():
                 "response_logprobs": evidence["logprobs"],
                 "training_grad_samples": grads,
                 "training_clipfracs": evidence["clipfracs"],
+                "ratio_outside_clip_frac": evidence["ratio_outside_clip_frac"],
                 "supervised": evidence["supervised"],
                 "tpr_execution": {
                     k: evidence[k] for k in (
