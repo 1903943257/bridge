@@ -17,6 +17,12 @@ Diagnostic controls preserving the exact numerical gates and Ring math:
   TPR_RUN_RING_COMBO=cp_control TPR_RING_CONTROL_DATASET=1 \
     torchrun --nproc_per_node=2 -m pytest -s -vv -x \
     tests/models/mcore/tpr/parallel/test_tpr_ring_tp_cp_dp_npu.py
+  # Switch only the isolated diagnostic CP2 test to the existing
+  # AllGather CP backend; never switch tp_cp/dp_cp acceptance cases.
+  TPR_RUN_RING_COMBO=cp_control TPR_RING_CONTROL_DATASET=1 \
+    TPR_CP_CONTROL_BACKEND=allgather torchrun --nproc_per_node=2 \
+    -m pytest -s -vv -x \
+    tests/models/mcore/tpr/parallel/test_tpr_ring_tp_cp_dp_npu.py
 
 The baseline computes two *independent* full trajectories, each using the
 repository's own Ring CP backend. The candidate shares Prefix KV across
@@ -151,7 +157,7 @@ def _count_real_ring_kernel_calls():
         ring_attention._block_attention_backward = original_bwd
 
 
-def _run_ring_forest(model, plans, runtime, logical_indices, logical_count):
+def _run_ring_forest(model, plans, runtime, logical_indices, logical_count, *, cp_backend="ring"):
     """Run independent trajectories or a shared TPR tree with Ring CP.
 
     Only diagnostic logprob ownership and post-backward CP grad aggregation
@@ -166,10 +172,10 @@ def _run_ring_forest(model, plans, runtime, logical_indices, logical_count):
     with _count_real_ring_kernel_calls() as ring_calls:
         for plan in plans:
             executor = SegmentExecutor(
-                model, plan, cp_group=runtime.cp_group, cp_backend="ring",
+                model, plan, cp_group=runtime.cp_group, cp_backend=cp_backend,
                 expected_layer_numbers=tuple(range(1, 29)),
             )
-            assert executor.cp_backend.backend_name == "ring"
+            assert executor.cp_backend.backend_name == cp_backend
             original_loss = executor._compute_loss
 
             def capture_loss(segment, logits):
@@ -235,6 +241,14 @@ def _run_ring_forest(model, plans, runtime, logical_indices, logical_count):
 
 def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
     runtime = ring_combo_runtime
+    # Only the two-rank CP control can opt into existing AllGather CP,
+    # allowing a same-data differential test without changing Ring acceptance.
+    cp_backend = (
+        os.getenv("TPR_CP_CONTROL_BACKEND", "ring")
+        if _MODE == "cp_control" else "ring"
+    )
+    if cp_backend not in ("ring", "allgather"):
+        raise ValueError(f"unsupported diagnostic CP backend {cp_backend!r}")
     # The original acceptance run is unchanged. Optional controls vary only
     # which of the two already-validated physical token workloads is supplied:
     # no attention algorithm, gradient reduction or numerical gate is altered.
@@ -302,10 +316,16 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
     )
     dist.barrier()
     reference_loss, reference_logp, reference_grad, reference_owners, ref_ring, ref_trace = (
-        _run_ring_forest(reference, independent_plans, runtime, logical_indices, count)
+        _run_ring_forest(
+            reference, independent_plans, runtime, logical_indices, count,
+            cp_backend=cp_backend,
+        )
     )
     actual_loss, actual_logp, actual_grad, actual_owners, actual_ring, actual_trace = (
-        _run_ring_forest(candidate, (plan,), runtime, logical_indices, count)
+        _run_ring_forest(
+            candidate, (plan,), runtime, logical_indices, count,
+            cp_backend=cp_backend,
+        )
     )
     ce_gap = abs(reference_loss - actual_loss)
     logit_rel_l2 = (
@@ -326,9 +346,13 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
         and actual_trace[0][0] == "push" and actual_trace[-1][0] == "pop"
     )
     ring_ok = all(
-        counts["forward"] > 0 and counts["backward"] > 0
+        (counts["forward"] > 0 and counts["backward"] > 0)
+        if cp_backend == "ring"
+        else (counts["forward"] == 0 and counts["backward"] == 0)
         for counts in (ref_ring, actual_ring)
     )
+    # In the AllGather control, lack of Ring kernel calls is EXPECTED,
+    # and executor.cp_backend was asserted to be AllGather above.
     finite = all(math.isfinite(v) for v in (
         reference_loss, actual_loss, logit_rel_l2, grad_rel_l2,
     ))
@@ -376,7 +400,7 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
             for position in worst_positions
         ]
         print(
-            f"TPR_RING_COMBO_DIAG mode={_MODE} "
+            f"TPR_RING_COMBO_DIAG mode={_MODE} cp_backend={cp_backend} "
             f"world_rank={dist.get_rank()} dp_rank={runtime.dp_rank} "
             f"tp_rank={runtime.tp_rank} cp_rank={runtime.cp_rank} "
             f"dataset_id={dataset_id} "
@@ -405,7 +429,7 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
     if dist.get_rank() == 0:
         for global_rank, row in enumerate(observed):
             print(
-                f"TPR_RING_COMBO mode={_MODE} world_rank={global_rank} "
+                f"TPR_RING_COMBO mode={_MODE} cp_backend={cp_backend} world_rank={global_rank} "
                 f"dp_rank={int(row[0])} tp_rank={int(row[1])} cp_rank={int(row[2])} "
                 f"dataset_id={int(row[13])} "
                 f"reference_ce={row[3]:.7f} tpr_ce={row[4]:.7f} "
@@ -413,7 +437,7 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
                 f"grad_rel_l2={row[7]:.7f} "
                 f"plan_groups_aligned={bool(row[8])} dp_workloads_distinct={bool(row[9])} "
                 f"loss_ownership_ok={bool(row[10])} tree_trace_ok={bool(row[11])} "
-                f"ring_kernel_ok={bool(row[12])} gate_pass={bool(row[14])}",
+                f"backend_dispatch_ok={bool(row[12])} gate_pass={bool(row[14])}",
                 flush=True,
             )
     dist.barrier()
