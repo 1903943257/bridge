@@ -107,6 +107,17 @@ class TPRSelfAttention(SelfAttention):
             query, new_key, new_value = qkv
             gate = None
 
+        # Megatron ColumnParallelLinear owns SP all-gather on the QKV input.
+        # The attention kernel and per-layer KVStack still see the *complete*
+        # logical segment sequence, never an SP-local KV fragment.
+        if getattr(self.config, "sequence_parallel", False) and (
+            getattr(self.config, "tensor_model_parallel_size", 1) > 1
+        ) and query.shape[0] != context.local_suffix_length:
+            raise ValueError(
+                "Megatron SP QKV projection must restore the full TPR segment: "
+                f"expected {context.local_suffix_length}, got {query.shape[0]}"
+            )
+
         q_pos_emb, k_pos_emb = _as_rotary_pair(context.suffix_rotary_pos_emb)
         # A sharded backend receives rank-local RoPE that was already sliced
         # by SegmentExecutor; passing cp_group here would shard it a second time.
@@ -171,15 +182,32 @@ class TPRSelfAttention(SelfAttention):
     ) -> None:
         if not self.training:
             raise RuntimeError("TPR external-KV mode is restricted to training")
+        tp_size = getattr(self.config, "tensor_model_parallel_size", 1)
+        if tp_size < 1:
+            raise ValueError(f"invalid tensor_model_parallel_size={tp_size}")
+        sp_enabled = tp_size > 1 and getattr(self.config, "sequence_parallel", False)
+        # Attention receives sequence-sharded hidden activations under native
+        # Megatron SP. ColumnParallelLinear all-gathers them for full-segment
+        # QKV inside get_query_key_value_tensors(); do not shard KV or RoPE.
+        if sp_enabled and context.local_suffix_length % tp_size:
+            raise ValueError(
+                f"TPR segment length {context.local_suffix_length} must be divisible "
+                f"by TP={tp_size} under native sequence parallelism (padding deferred)"
+            )
+        expected_input_len = (
+            context.local_suffix_length // tp_size if sp_enabled
+            else context.local_suffix_length
+        )
         if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
             raise ValueError(
-                "TPR external-KV mode requires hidden_states [suffix, 1, hidden], "
+                "TPR external-KV mode requires hidden_states [sequence, 1, hidden], "
                 f"got {hidden_states.shape}"
             )
-        if hidden_states.shape[0] != context.local_suffix_length:
+        if hidden_states.shape[0] != expected_input_len:
             raise ValueError(
                 f"hidden suffix length ({hidden_states.shape[0]}) does not match "
-                f"TPRAttentionContext local length ({context.local_suffix_length})"
+                f"expected {'SP-local' if sp_enabled else 'CP-local'} length "
+                f"({expected_input_len}) for logical suffix {context.local_suffix_length}"
             )
         if context.suffix_rotary_pos_emb is None:
             raise ValueError("TPRAttentionContext.suffix_rotary_pos_emb is required in TPR mode")
@@ -217,14 +245,6 @@ class TPRSelfAttention(SelfAttention):
         # Megatron's QKV and output projections already own TP collectives.
         # Their attention inputs/outputs are rank-local head shards, so TPR
         # must never all-gather KV along the TP dimension here.
-        tp_size = getattr(self.config, "tensor_model_parallel_size", 1)
-        if tp_size < 1:
-            raise ValueError(f"invalid tensor_model_parallel_size={tp_size}")
-        if tp_size > 1 and getattr(self.config, "sequence_parallel", False):
-            raise NotImplementedError(
-                "TPR TP local-head path has not validated Megatron sequence_parallel; "
-                "set sequence_parallel=False for the TP2 correctness gate"
-            )
         for name in ("pipeline_model_parallel_size", "expert_model_parallel_size"):
             value = getattr(self.config, name, 1)
             if value != 1:

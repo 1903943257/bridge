@@ -172,6 +172,7 @@ def _tpr_engine_run(model, runtime, plan):
     engine.tf_config = model.config
     engine.engine_config = SimpleNamespace(
         tpr_enabled=True,
+        sequence_parallel=model.config.sequence_parallel,
         tensor_model_parallel_size=2,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
@@ -396,6 +397,7 @@ def _tpr_ppo_nll_run(
     engine.tf_config = model.config
     engine.engine_config = SimpleNamespace(
         tpr_enabled=True,
+        sequence_parallel=model.config.sequence_parallel,
         tensor_model_parallel_size=2,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,

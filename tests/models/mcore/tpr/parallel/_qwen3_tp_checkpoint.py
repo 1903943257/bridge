@@ -168,7 +168,8 @@ def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int
 
 
 def make_real_qwen3_tp_model(
-    runtime, *, model_path: Path, tp_size: int = 2, load_weights: bool = True
+    runtime, *, model_path: Path, tp_size: int = 2, load_weights: bool = True,
+    sequence_parallel: bool = False,
 ):
     """Construct Qwen3-1.7B with real native TP=1 or 2 layout.
 
@@ -182,7 +183,7 @@ def make_real_qwen3_tp_model(
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         expert_model_parallel_size=1,
-        sequence_parallel=False,
+        sequence_parallel=sequence_parallel,
         attention_dropout=0.0,
         hidden_dropout=0.0,
         apply_rope_fusion=False,
@@ -250,7 +251,7 @@ def make_real_qwen3_tp_model(
     ):
         raise AssertionError("TP2 Qwen requires controlled CANN square-causal core attention")
     assert model.config.tensor_model_parallel_size == tp_size
-    assert model.config.sequence_parallel is False
+    assert model.config.sequence_parallel is sequence_parallel
     assert model.embedding.word_embeddings.weight.shape == (151936 // tp_size, 2048)
     assert model.output_layer.weight is None
     assert len(model.decoder.layers) == 28
@@ -260,9 +261,11 @@ def make_real_qwen3_tp_model(
 
 
 def make_real_qwen3_tp2_model(
-    runtime, *, model_path: Path, load_weights: bool = True
+    runtime, *, model_path: Path, load_weights: bool = True,
+    sequence_parallel: bool = False,
 ):
     """Backward-compatible strict TP2 entry for existing correctness gates."""
     return make_real_qwen3_tp_model(
-        runtime, model_path=model_path, tp_size=2, load_weights=load_weights
+        runtime, model_path=model_path, tp_size=2, load_weights=load_weights,
+        sequence_parallel=sequence_parallel,
     )

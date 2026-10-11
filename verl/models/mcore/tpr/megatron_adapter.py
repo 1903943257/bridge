@@ -83,8 +83,6 @@ def run_tpr_forward_backward(
         )
     if tp_size > 1 and engine.engine_config.context_parallel_size != 1:
         raise NotImplementedError("TPR TP2 first phase requires CP=1")
-    if tp_size > 1 and getattr(engine.engine_config, "sequence_parallel", False):
-        raise NotImplementedError("TPR TP2 first phase requires sequence_parallel=False")
     if engine.engine_config.virtual_pipeline_model_parallel_size is not None:
         raise NotImplementedError("TPR MVP does not support virtual pipeline parallelism")
     if engine.model_config.mtp.enable:
@@ -95,8 +93,6 @@ def run_tpr_forward_backward(
     wrapped_model = engine.module[0]
     model = unwrap_model(wrapped_model)
     config = get_model_config(wrapped_model)
-    if tp_size > 1 and getattr(config, "sequence_parallel", False):
-        raise NotImplementedError("TPR TP2 first phase requires sequence_parallel=False")
     restrictions = {
         "calculate_per_token_loss": getattr(config, "calculate_per_token_loss", False),
         "activation recomputation": getattr(config, "recompute_granularity", None) is not None,
@@ -225,7 +221,7 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    TP=1/2, PP=EP=CP=DP=1 (SP off for TP2), token-mean PPO; no native /M schedule
+    TP=1/2, PP=EP=CP=DP=1 (native SP supported when TP=2), token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
     import torch
@@ -268,8 +264,6 @@ def run_tpr_forward_backward_batch(
     wrapped_model = engine.module[0]
     model = unwrap_model(wrapped_model)
     config = get_model_config(wrapped_model)
-    if tp_size > 1 and getattr(config, "sequence_parallel", False):
-        raise NotImplementedError("TPR TP2 PPO requires sequence_parallel=False")
     if not model.training:
         raise RuntimeError("TPR PPO requires model.train()")
     unsupported = {
