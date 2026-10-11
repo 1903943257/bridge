@@ -133,6 +133,10 @@ cd /workspace/uni-agent/verl
 # otherwise use the original, unchanged TQ dump:
 # export TPR_REAL_TQ_BATCH=/path/to/tq_batch.pt
 
+# Cheap CPU-only eligibility / real-PPO-field check (no Qwen init):
+python tests/models/mcore/tpr/parallel/inspect_real_tq_siblings.py \
+  "${TPR_REAL_TQ_BATCH:-/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt}"
+
 # First: NLL multi-branch one-step gradient + one real AdamW update:
 TPR_P0_BRANCH_STEPS=1 \
   bash tests/models/mcore/tpr/parallel/run_real_tq_multisibling_prefix.sh
