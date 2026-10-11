@@ -36,7 +36,8 @@ def _summary(reference, actual):
 
 def compare(reference, candidate):
     for field in ("token_sha256", "model", "dtype", "source", "objective",
-                  "denominator", "sequence_length", "response_length"):
+                  "denominator", "sequence_length", "response_length",
+                  "sampled_weight_sha256_rank0"):
         if reference[field] != candidate[field]:
             raise ValueError(f"P0 invalid cross-CP comparison: {field} mismatch: "
                              f"{reference[field]} != {candidate[field]}")
@@ -55,7 +56,7 @@ def compare(reference, candidate):
           f"cp{cp}={candidate['loss']:.9f} abs={abs(reference['loss']-candidate['loss']):.8g}")
     log_ref = reference["logprobs"]
     log_val = candidate["logprobs"]
-    response_begin = reference["sequence_length"] - reference["response_length"]
+    response_begin = reference["sequence_length"] - reference["response_length"] - 1
     for title, a, b in (
         ("ALL_LOGPROB", log_ref, log_val),
         ("RESPONSE_LOGPROB", log_ref[response_begin:], log_val[response_begin:]),

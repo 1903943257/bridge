@@ -286,6 +286,24 @@ def _save_gradients(model, runtime, full):
     return samples
 
 
+def _weight_signature(model) -> str:
+    """Bounded exact-BF16 sampled parameter fingerprint, on rank 0 only."""
+    from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+    digest = hashlib.sha256()
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(param.shape)).encode("ascii"))
+        indices = torch.tensor(
+            exact_sample_indices(param.numel(), 16), dtype=torch.long,
+            device=param.device,
+        )
+        witness = param.detach().flatten().index_select(0, indices).contiguous().cpu()
+        digest.update(witness.numpy().tobytes())
+    return digest.hexdigest()
+
+
 def test_native_cp_1_2_4_numerical_reference():
     cp = int(os.environ["WORLD_SIZE"])
     if cp not in (1, 2, 4):
@@ -294,19 +312,20 @@ def test_native_cp_1_2_4_numerical_reference():
     checkpoint = Path(os.getenv("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B"))
     with _runtime(cp) as runtime:
         model = _model(runtime, checkpoint)
+        weight_sha = _weight_signature(model) if runtime.rank == 0 else None
         tokens, source = _input_tokens(model.vocab_size)
         token_sha = hashlib.sha256(tokens.numpy().tobytes()).hexdigest()
         batch, positions, batch_module = _native_batch(tokens, runtime)
         device_positions = batch["position_ids"][0]
         target_positions = device_positions < SEQ_LEN - 1
-        supervised = target_positions & (device_positions >= SEQ_LEN - RESPONSE_LEN)
+        supervised = target_positions & (device_positions >= SEQ_LEN - RESPONSE_LEN - 1)
         local_supervised = int(supervised.sum().item())
         if local_supervised == 0:
             raise AssertionError("P0 objective requires at least one supervised token per rank")
         supervised_count = torch.tensor(local_supervised, device=runtime.device)
         dist.all_reduce(supervised_count, op=dist.ReduceOp.SUM, group=runtime.group)
         total_supervised = int(supervised_count.item())
-        if total_supervised != RESPONSE_LEN - 1:
+        if total_supervised != RESPONSE_LEN:
             raise AssertionError(f"unexpected global NLL denominator {total_supervised}")
 
         model.zero_grad(set_to_none=True)
@@ -321,7 +340,7 @@ def test_native_cp_1_2_4_numerical_reference():
             labels = tokens.to(runtime.device).index_select(0, query + 1)
             local_logprobs = F.log_softmax(logits[0].index_select(0, selected).float(), dim=-1)
             local_logprobs = local_logprobs.gather(1, labels[:, None]).squeeze(1)
-            local_supervision = query >= SEQ_LEN - RESPONSE_LEN
+            local_supervision = query >= SEQ_LEN - RESPONSE_LEN - 1
             loss = -local_logprobs[local_supervision].sum() / float(total_supervised)
             loss.backward()
         # Reduce only detached scalar and sparse logprob witness values.
@@ -350,8 +369,9 @@ def test_native_cp_1_2_4_numerical_reference():
                 "tag": "P0_NATIVE_RING_CP_DIAGNOSTIC_NOT_PARITY_PASS",
                 "cp": cp, "model": "Qwen3-1.7B", "checkpoint": str(checkpoint),
                 "dtype": "bf16", "source": source, "token_sha256": token_sha,
+                "sampled_weight_sha256_rank0": weight_sha,
                 "sequence_length": SEQ_LEN, "response_length": RESPONSE_LEN,
-                "objective": "last_512_tokens_next_token_nll",
+                "objective": "512_response_targets_including_prompt_boundary_nll",
                 "denominator": total_supervised, "batch_module": batch_module,
                 "native_ring_calls_rank0": native_ring_calls[0],
                 "local_m": SEQ_LEN // cp, "linear_m": shapes,

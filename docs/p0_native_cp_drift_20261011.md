@@ -37,13 +37,13 @@ python tools/compare_native_cp_drift.py "$TPR_P0_CP_OUTPUT_DIR"
 
 All jobs run BF16 Qwen3-1.7B, exactly 1024 tokens, one trajectory,
 TP=PP=DP=1, dropout=0, 512-token suffix next-token NLL objective.
-The last query position has no next-token target, so the common
-denominator is 511. Logical query indices/targets are **global**;
+The first response token is predicted at the last prompt query position (511),
+and the last response token at query 1022. The common denominator is 512. Logical query indices/targets are **global**;
 never roll labels within a Zigzag shard. CP local M is 1024/512/256.
 
 The test saves rank-0 artifacts for CP1/2/4 with all 1023 per-token
 logprobs, objective, Linear M witnesses, native Ring call count, full
-parameter names and strided gradient samples. Gradient synchronization
+parameter names, sampled BF16 weight signature and strided gradient samples. Gradient synchronization
 is a **bare-GPTModel HCCL SUM diagnostic** in the native BF16 grad dtype,
 with global token denominator already applied (no /CP): it is not a
 claim that Megatron DistributedDataParallel or optimizer was run.
@@ -54,7 +54,7 @@ comparisons, `export TPR_P0_CP_SAVE_FULL_GRADS=1` before **all three**
 runs. This writes a large BF16 gradient tensor for every parameter and
 requires substantial CPU RAM and disk (about 3.4 GB per CP run).
 
-The comparator **rejects** mismatched token SHA, model, source, checkpoint
+The comparator **rejects** mismatched token SHA, sampled BF16 model-weight signature, model, source, checkpoint
 path, objective, sequence length or software versions. It prints
 response-only max/mean/p95 logprob drift, sampled/full gradient relL2,
 cosine and worst parameters; no arbitrary PASS tolerance is applied.
