@@ -44,7 +44,13 @@ if [[ "${TPR_P0_TPR50_COMPARE_ONLY:-0}" == "1" ]]; then
   python "$compare_file" "$TPR_P0_TPR50_OUTPUT_DIR" --steps "$TPR_P0_TPR50_STEPS"
   exit 0
 fi
-for mode in full tpr; do
+case "${TPR_P0_TPR50_RUN_MODES:-both}" in
+  both) modes=(full tpr) ;;
+  full) modes=(full) ;;
+  tpr) modes=(tpr) ;;
+  *) echo "TPR_P0_TPR50_RUN_MODES must be both, full or tpr" >&2; exit 2 ;;
+esac
+for mode in "${modes[@]}"; do
   export TPR_P0_TPR50_MODE="$mode"
   if [[ "$mode" == "full" ]]; then
     port=$((base + 1))
@@ -55,4 +61,9 @@ for mode in full tpr; do
   torchrun --master_addr=127.0.0.1 --master_port="$port" --nproc_per_node=1 \
     -m pytest -x -q -s "$test_file"
 done
-python "$compare_file" "$TPR_P0_TPR50_OUTPUT_DIR" --steps "$TPR_P0_TPR50_STEPS"
+if [[ -f "$TPR_P0_TPR50_OUTPUT_DIR/full_train${TPR_P0_TPR50_STEPS}.pt" &&
+      -f "$TPR_P0_TPR50_OUTPUT_DIR/tpr_train${TPR_P0_TPR50_STEPS}.pt" ]]; then
+  python "$compare_file" "$TPR_P0_TPR50_OUTPUT_DIR" --steps "$TPR_P0_TPR50_STEPS"
+else
+  echo "P0-4 one-sided training complete. Run the missing mode and compare." >&2
+fi
