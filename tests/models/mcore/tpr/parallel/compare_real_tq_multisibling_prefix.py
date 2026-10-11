@@ -164,7 +164,9 @@ def main():
             f"loss_gap={b['training_loss']-a['training_loss']:.9g} "
             f"masked_logprobs={forwards} sampled_preclip_grad={grads} "
             f"prefix_kv_sum_verified={b['tpr_execution']['audited_prefix_kv_sample_exact']} "
-            f"clipfrac_full={a['training_clipfracs']} clipfrac_tpr={b['training_clipfracs']}"
+            f"ratio_outside_clip_frac_full={a['ratio_outside_clip_frac']:.9g} "
+            f"ratio_outside_clip_frac_tpr={b['ratio_outside_clip_frac']:.9g} "
+            "ratio_status=OUTSIDE_CLIP_RANGE_NOT_POLICY_SURROGATE_BRANCH_FRACTION"
         )
         if str(step) in full["checkpoints"] and str(step) in tpr["checkpoints"]:
             sa=full["checkpoints"][str(step)]
