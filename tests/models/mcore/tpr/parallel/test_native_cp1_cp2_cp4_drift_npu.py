@@ -79,6 +79,10 @@ def _runtime(cp: int):
         "seq_length": SEQ_LEN,
         "use_flash_attn": True,
         "attention_mask_type": "causal",
+        # Standard non-EOD, non-packed native CP path. The lightweight
+        # MindSpeed args fallback (when megatron.training is absent) does not
+        # always populate this flag, but get_batch_on_this_cp_rank requires it.
+        "reset_attention_mask": False,
     })
     # Match the existing bridge CP fixtures: this runtime may provide only
     # Megatron-Core, without the optional megatron.training package.
@@ -88,6 +92,8 @@ def _runtime(cp: int):
         raise AssertionError("MindSpeed did not apply the requested native Ring CP configuration")
     if not getattr(args, "use_flash_attn", False):
         raise AssertionError("Native MindSpeed CP requires FlashAttention")
+    if args.reset_attention_mask is not False:
+        raise AssertionError("P0 requires native non-EOD CP without attention-mask reset")
 
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1,
