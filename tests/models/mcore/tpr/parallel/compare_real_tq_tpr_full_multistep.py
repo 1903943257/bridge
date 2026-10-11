@@ -144,10 +144,11 @@ def _common_oracle_logprobs(full_snap, tpr_snap):
     return _metrics(torch.cat(lf), torch.cat(lt))
 
 
-def _first_gradient(full, tpr):
-    # First step uses identical pretrained weights and real token row.
-    a = full["checkpoints"].get("first_step_preclip_grads")
-    b = tpr["checkpoints"].get("first_step_preclip_grads")
+def _sampled_grads_at_step(full, tpr, step):
+    # Step1 uses identical pretrained weights. Later steps also capture
+    # parameter/optimizer trajectory differences, not just kernel drift.
+    a = full["preclip_grad_samples_by_step"].get(str(step))
+    b = tpr["preclip_grad_samples_by_step"].get(str(step))
     if a is None or b is None:
         return None
     if a.keys() != b.keys():
@@ -180,14 +181,16 @@ def main():
         parser.error(f"Missing completed Full/TPR evidence: {files}")
     full, tpr = map(_load, files)
     _verify(full, tpr, args.steps)
-    first = _first_gradient(full, tpr)
-    if first is not None:
-        print(f"P0_4 STEP1_GRAD {first}")
     milestones = sorted(
         {int(k) for k in full["checkpoints"] if k.isdigit()}
         & {int(k) for k in tpr["checkpoints"] if k.isdigit()}
     )
     for step in milestones:
+        if step > 0:
+            grad_comparison = _sampled_grads_at_step(full, tpr, step)
+            if grad_comparison is None:
+                raise AssertionError(f"Missing preclip gradient witnesses step={step}")
+            print(f"P0_4 STEP={step} PRECLIP_GRAD {grad_comparison}")
         snap_f = full["checkpoints"][str(step)]
         snap_t = tpr["checkpoints"][str(step)]
         v_f, v_t = snap_f["validation_loss_mean"], snap_t["validation_loss_mean"]
