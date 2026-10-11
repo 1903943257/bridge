@@ -73,8 +73,9 @@ P0-4 adds the missing Full-vs-TPR control.
   shared full oracle as a train-probe.
 - Parameter accuracy: sampled FP32 master
   `delta_theta(step) = theta(step)-theta(initial)`
-  relative L2 and cosine, sampled weight L2, and **first
-  step BF16 gradient** relative L2/cosine. These are
+  relative L2 and cosine, sampled weight L2, and **BF16
+  preclip gradient samples at steps 1,2,5,10,20,30,40,50**,
+  with relative L2/cosine. These are
   **strided sampled values from all 226 parameter names**, not
   all-parameter global L2 or complete optimizer state.
   Each step prints NLL, pre-clip FP32 grad norm and clipping state.
@@ -127,6 +128,16 @@ Both runs write to `/tmp/tpr_p0_tpr50/` by default:
 - `full_train50.pt` — checkpoints, training events, 50 optimizer steps.
 - `tpr_train50.pt` — same schema/schedule, TPR 50 optimizer steps.
 
+If one mode has succeeded and the other fails, rerun **only** the
+unsuccessful mode rather than repeating the completed 50 optimizer steps:
+
+```bash
+# TPR-only retry; Full artifact remains untouched:
+TPR_P0_TPR50_STEPS=50 TPR_P0_TPR50_RUN_MODES=tpr \\
+  bash tests/models/mcore/tpr/parallel/run_real_tq_tpr_full_multistep.sh
+# Or run Full alone with TPR_P0_TPR50_RUN_MODES=full.
+```
+
 At milestones, each saved artifact is an **atomic replacement**.
 It includes `steps_completed`; the comparator refuses incomplete
 runs and checks that data SHA, schedule, checkpoints, sampled initial
@@ -150,7 +161,7 @@ Key comparison lines:
 `P0_4 STEP=50 COMMON_FULL_VALIDATION`,
 `P0_4 STEP=50 HELDOUT_RESPONSE_LOGPROB`,
 `P0_4 STEP=50 MASTER_UPDATE`,
-and `P0_4 STEP1_GRAD`.
+and `P0_4 STEP=50 PRECLIP_GRAD`.
 
 ### How to assess the 50-step result
 
@@ -164,7 +175,7 @@ A small loss gap alone is not enough; compare:
    update-path separation can grow while loss remains similar.
 4. Training NLL (different forward paths, same logical targets)
    and preclip grad norms; clipping events can differ.
-5. Step1 preclip BF16 gradient sampled relative L2/cosine.
+5. Milestone preclip BF16 gradient sampled relative L2/cosine (step1 reflects the initial numerical difference; later steps also include drift from changed parameters).
 
 This 50-step exercise is **a first experimental numerical stability
 gate**. If both paths learn similarly it does not prove TPR is
