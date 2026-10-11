@@ -72,10 +72,22 @@ def patch_model_spec(source: str) -> tuple[str, str]:
     _, method = _class_method(source, "MegatronEngine", "_build_megatron_module")
     lines = source.splitlines(keepends=True)
     body = "".join(lines[method.lineno - 1 : method.end_lineno])
-    if "install_tpr_module_spec" in body:
-        if "install_tpr_module_spec(self.provider)" not in body:
-            raise PatchError("Partial or nonstandard TPR Module Spec hook detected")
+    current_call = "install_tpr_module_spec(self.provider, bridge=self.bridge)"
+    legacy_call = "install_tpr_module_spec(self.provider)"
+    if current_call in body:
+        if body.count(current_call) != 1:
+            raise PatchError("Duplicate TPR Module Spec installation calls")
         return source, "already-patched"
+    if "install_tpr_module_spec" in body:
+        # An existing Uni-Agent-CC installation has already created the
+        # provider-only call. Upgrade only that exact call in the method.
+        if body.count(legacy_call) != 1 or body.count("install_tpr_module_spec") != 2:
+            raise PatchError("Partial or nonstandard TPR Module Spec hook detected")
+        updated = "".join(lines[:method.lineno - 1]) + body.replace(
+            legacy_call, current_call, 1
+        ) + "".join(lines[method.end_lineno:])
+        ast.parse(updated)
+        return updated, "upgraded-vanilla-mbridge"
     calls = [node for node in method.body if isinstance(node, ast.Assign)
              and isinstance(node.value, ast.Call)
              and isinstance(node.value.func, ast.Name)
@@ -92,7 +104,7 @@ def patch_model_spec(source: str) -> tuple[str, str]:
         "        if self.engine_config.tpr_enabled:\n"
         "            from verl.models.mcore.tpr.megatron_adapter import install_tpr_module_spec\n"
         "\n"
-        "            install_tpr_module_spec(self.provider)\n"
+        "            install_tpr_module_spec(self.provider, bridge=self.bridge)\n"
         "\n"
     )
     updated = "".join(lines[:anchor]) + insertion + "".join(lines[anchor:])

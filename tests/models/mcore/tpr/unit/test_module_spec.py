@@ -218,3 +218,49 @@ def test_tpr_spec_provider_forwards_vp_stage():
 
     assert calls == [("config", 3)]
     assert _attention_spec(converted).module is TPRSelfAttention
+
+def test_vanilla_mbridge_spec_wraps_only_one_bridge_instance_and_is_idempotent():
+    from verl.models.mcore.tpr.module_spec import install_tpr_vanilla_mbridge_spec
+
+    class VanillaBridge:
+        def __init__(self):
+            self.native_spec = _layer_spec()
+            self.called = []
+
+        def _get_transformer_layer_spec(self, vp_stage=None):
+            self.called.append(vp_stage)
+            return self.native_spec
+
+    bridge = VanillaBridge()
+    other = VanillaBridge()
+
+    # The real mbridge==0.15.1 model provider invokes this method lazily.
+    install_tpr_vanilla_mbridge_spec(bridge)
+    wrapped = bridge._get_transformer_layer_spec
+    install_tpr_vanilla_mbridge_spec(bridge)
+    assert bridge._get_transformer_layer_spec is wrapped
+
+    result = bridge._get_transformer_layer_spec(vp_stage=2)
+    assert bridge.called == [2]
+    assert _attention_spec(result).module is TPRSelfAttention
+    assert _attention_spec(bridge.native_spec).module is SelfAttention
+    assert _attention_spec(other._get_transformer_layer_spec()).module is SelfAttention
+
+
+def test_vanilla_mbridge_spec_preserves_block_list_and_rejects_bad_bridge():
+    from verl.models.mcore.tpr.module_spec import install_tpr_vanilla_mbridge_spec
+
+    original = SimpleNamespace(layer_specs=[_layer_spec(), _layer_spec()])
+
+    class VanillaBridge:
+        def _get_transformer_layer_spec(self, vp_stage=None):
+            assert vp_stage == 3
+            return original
+
+    bridge = VanillaBridge()
+    install_tpr_vanilla_mbridge_spec(bridge)
+    built = bridge._get_transformer_layer_spec(3)
+    assert all(_attention_spec(layer).module is TPRSelfAttention for layer in built.layer_specs)
+    assert all(_attention_spec(layer).module is SelfAttention for layer in original.layer_specs)
+    with pytest.raises(TypeError, match="_get_transformer_layer_spec"):
+        install_tpr_vanilla_mbridge_spec(SimpleNamespace())
