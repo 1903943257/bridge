@@ -60,10 +60,19 @@ def _get_attention(model, layer):
 
 
 def _metric(reference, actual):
-    ref = reference.detach().float().reshape(-1)
-    val = actual.detach().float().reshape(-1)
-    if ref.shape != val.shape or not torch.isfinite(ref).all() or not torch.isfinite(val).all():
-        raise AssertionError("native Attention shape/finite mismatch")
+    # CP1 artifacts live on CPU, whereas newly replayed native Attention
+    # outputs and gradients live on NPU. Normalize device BEFORE arithmetic.
+    # Metrics are diagnostic only: CPU float64 is not part of any model
+    # forward/backward or MindSpeed Ring communication.
+    if reference.shape != actual.shape:
+        raise AssertionError(
+            f"native Attention shape mismatch: {tuple(reference.shape)} "
+            f"vs {tuple(actual.shape)}"
+        )
+    ref = reference.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    val = actual.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    if not bool(torch.isfinite(ref).all()) or not bool(torch.isfinite(val).all()):
+        raise AssertionError("nonfinite native Attention replay witness")
     delta = (val - ref).double()
     r, v = ref.double(), val.double()
     nr, nv = r.norm(), v.norm()
