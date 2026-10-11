@@ -15,25 +15,55 @@ Canonical MindSpeed method:
 - https://github.com/Ascend/MindSpeed/blob/master/mindspeed/core/context_parallel/dot_product_attention.py
 - https://www.hiascend.com/document/detail/en/MindSpeed/2610/Core/MindSpeed_Core/docs/en/user-guide/megatron_performance_optimization.md
 
-## Running on the NPU host
+## Running on the NPU host (bridge -> rsync -> old UniAgent)
 
-From the **bridge-backed VERL test root**, with 1/2/4 NPUs visible, launch
-each as a **fresh process group**; do not reuse a pre-initialized TPR fixture:
+**Source checkout:** `/workspace/bridge`. Pull **only here**. The actual
+Megatron/VERL test runtime is the older `/workspace/uni-agent/verl`, not
+the bridge checkout. Sync the `tpr/` test subtree exactly as used on the
+server. The native P0 test and its launch script live under this subtree,
+so both arrive at the old runtime via rsync.
 
 ```bash
-cd /workspace/bridge  # replace with the actual bridge checkout root
+# 1. Update source-of-truth bridge repo (never git pull in /workspace/uni-agent/verl).
+cd /workspace/bridge
+git pull --ff-only
+
+# 2. Sync the P0 test AND its launch script into the runnable VERL checkout.
+rsync -av /workspace/bridge/tests/models/mcore/tpr/ /workspace/uni-agent/verl/tests/models/mcore/tpr/
+
+# 3. Run against the old UniAgent/VERL environment, with 1/2/4 visible NPUs.
+cd /workspace/uni-agent/verl
 export TPR_P0_NATIVE_CP=1
 export TPR_QWEN_1_7B_PATH=/workspace/hf_models/Qwen3-1.7B
 export TPR_P0_CP_OUTPUT_DIR=/tmp/tpr_p0_native_cp
-# For reproducible real TQ instead of fixed seeded synthetic tokens, opt in:
-# export TPR_REAL_TQ_BATCH=/workspace/tq_dump/.../tq_batch.pt
-# export TPR_P0_CP_TQ_ROW=0   # requires >=512 prompt and response tokens
-for cp in 1 2 4; do
-  torchrun --standalone --nproc_per_node="$cp" -m pytest -x -q -s \
-    tests/models/mcore/tpr/parallel/test_native_cp1_cp2_cp4_drift_npu.py
-done
-python tools/compare_native_cp_drift.py "$TPR_P0_CP_OUTPUT_DIR"
+bash tests/models/mcore/tpr/parallel/run_native_cp_drift.sh
 ```
+
+The synced launcher invokes `torchrun` separately for CP=1/2/4 using
+`--master_addr=127.0.0.1` and **explicit** `--master_port` values
+`29561/29562/29564`. There is no standalone rendezvous mode.
+To avoid port collisions, set `TPR_P0_CP_MASTER_PORT_BASE` (default
+`29560`; each CP uses base+CP).
+
+For clarity, the actual distributed command run inside the script is:
+
+```bash
+# From /workspace/uni-agent/verl, shown for CP=4:
+torchrun --master_addr=127.0.0.1 --master_port=29564 --nproc_per_node=4 \
+  -m pytest -x -q -s \
+  tests/models/mcore/tpr/parallel/test_native_cp1_cp2_cp4_drift_npu.py
+```
+
+The launcher also executes the comparator from
+`/workspace/bridge/tools/compare_native_cp_drift.py`, since your rsync
+only copies `tests/models/mcore/tpr/` (not `tools/`). That bridge path
+must remain visible in the test environment; if it is mounted elsewhere,
+set `TPR_P0_CP_COMPARE_SCRIPT=/path/to/compare_native_cp_drift.py`.
+For reproducible real TQ instead of the fixed seeded synthetic tokens,
+set `TPR_REAL_TQ_BATCH` to the dump's full path and optionally
+`TPR_P0_CP_TQ_ROW=0` before launching; the selected row needs at least
+512 prompt and 512 response tokens.
+
 
 All jobs run BF16 Qwen3-1.7B, exactly 1024 tokens, one trajectory,
 TP=PP=DP=1, dropout=0, 512-token suffix next-token NLL objective.

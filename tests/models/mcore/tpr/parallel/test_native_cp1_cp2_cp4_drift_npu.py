@@ -1,8 +1,13 @@
 """P0-1: native MindSpeed/Megatron CP=1/2/4, WITHOUT any TPR operators.
 
-Run in three fresh torchrun processes (one, two, four visible NPUs), then
-compare outputs with tools/compare_native_cp_drift.py. Numerical diagnostic,
-NOT a parity-pass claim or a production Megatron-DDP optimizer benchmark.
+Run ONLY from the synced /workspace/uni-agent/verl test runtime:
+    bash tests/models/mcore/tpr/parallel/run_native_cp_drift.sh
+
+Update and pull source in /workspace/bridge, rsync its tests/models/mcore/tpr/
+tree to the old VERL tests directory. The launcher uses explicit
+--master_addr=127.0.0.1 and --master_port=29561/29562/29564, then invokes
+the comparator from /workspace/bridge/tools/compare_native_cp_drift.py.
+Numerical diagnostic, NOT a production Megatron-DDP optimizer benchmark.
 """
 from __future__ import annotations
 
