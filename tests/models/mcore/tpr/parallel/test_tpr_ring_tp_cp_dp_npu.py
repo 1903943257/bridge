@@ -304,11 +304,62 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
     finite = all(math.isfinite(v) for v in (
         reference_loss, actual_loss, logit_rel_l2, grad_rel_l2,
     ))
-    local_ok = (
-        reference_owners and actual_owners and same_names and bool(names)
-        and trace_ok and ring_ok and finite and ce_gap < 0.02
-        and logit_rel_l2 < 0.05 and grad_rel_l2 < 0.05
-    )
+    gates = {
+        "reference_loss_owners": bool(reference_owners),
+        "tpr_loss_owners": bool(actual_owners),
+        "same_parameter_names": bool(same_names),
+        "nonempty_gradients": bool(names),
+        "tree_trace": bool(trace_ok),
+        "real_ring_fwd_bwd": bool(ring_ok),
+        "finite_metrics": bool(finite),
+        "loss_gap_lt_0.02": ce_gap < 0.02,
+        "logprob_rel_l2_lt_0.05": logit_rel_l2 < 0.05,
+        "grad_rel_l2_lt_0.05": grad_rel_l2 < 0.05,
+    }
+    local_ok = all(gates.values())
+    if not local_ok:
+        # Diagnostics are strictly observational and run after the native
+        # Ring forward/backward and CP gradient-oracle collectives complete.
+        # Never relax a threshold or mutate model gradients on a failing DP.
+        contributors = []
+        for name in names:
+            error_sq = (
+                (reference_grad[name] - actual_grad[name]).square().sum().item()
+            )
+            parameter_ref_sq = reference_grad[name].square().sum().item()
+            contributors.append((
+                name,
+                (error_sq / max(grad_ref_sq, 1e-24)) ** 0.5,
+                (error_sq / max(parameter_ref_sq, 1e-24)) ** 0.5,
+                parameter_ref_sq ** 0.5,
+            ))
+        contributors.sort(key=lambda item: item[1], reverse=True)
+        logprob_abs = (actual_logp - reference_logp).abs().reshape(-1)
+        worst_count = min(8, logprob_abs.numel())
+        worst_positions = torch.topk(logprob_abs, worst_count).indices.tolist()
+        logical_lookup = {index: key for key, index in logical_indices.items()}
+        top_logprobs = [
+            (
+                logical_lookup[position],
+                float(reference_logp[position]),
+                float(actual_logp[position]),
+                float(logprob_abs[position]),
+            )
+            for position in worst_positions
+        ]
+        print(
+            f"TPR_RING_COMBO_DIAG mode={_MODE} "
+            f"world_rank={dist.get_rank()} dp_rank={runtime.dp_rank} "
+            f"tp_rank={runtime.tp_rank} cp_rank={runtime.cp_rank} "
+            f"failed_gates={[name for name, ok in gates.items() if not ok]} "
+            f"loss_gap={ce_gap:.8f} logprob_rel_l2={logit_rel_l2:.8f} "
+            f"grad_rel_l2={grad_rel_l2:.8f} "
+            f"reference_grad_norm={grad_ref_sq ** 0.5:.8f} "
+            f"gradient_top_contributors={contributors[:8]} "
+            f"logprob_top_positions={top_logprobs} "
+            f"reference_ring_calls={ref_ring} tpr_ring_calls={actual_ring}",
+            flush=True,
+        )
     metrics = torch.tensor(
         [runtime.dp_rank, runtime.tp_rank, runtime.cp_rank,
          reference_loss, actual_loss, ce_gap, logit_rel_l2, grad_rel_l2,
