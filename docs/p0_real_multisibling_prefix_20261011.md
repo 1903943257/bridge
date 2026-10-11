@@ -189,3 +189,123 @@ Future: use the actual full 8-trajectory tree from
 `build_tree_execution_plans` and a genuine captured actor-update
 batch with verified old-policy provenance, advantages and VERL PPO
 configuration to establish training parity on real multi-level trees.
+
+
+## P0-5 measured real-sibling NLL outcome (user Ascend, 2026-10-11)
+
+**Real siblings [0,1] found**, same original last512 prompt token
+prefix hash `36bc65deeefa00840c6a7201536451a4f3db3e3ad08d99f1682051bd097ed15a`,
+response suffixes first diverge at **offset 30** (so the actual
+maximal common prefix is at least 512+30=542 tokens, while this fixed
+P512 experiment deliberately only reuses 512). There are **966
+supervised response tokens** across two real branches.
+
+Original rollout fields: `has_actual_advantages=False`,
+`has_recorded_old_logprobs=False`. Therefore **real PPO replay
+was not run**. The user's attempted `OBJECTIVE=ppo` correctly
+raised `REAL PPO FIELDS MISSING`. This is an expected DATA
+failure, not a TPR optimizer/attention/gradient failure.
+
+P0-5 NLL **20 actual FP32-master AdamW steps** completed for
+independent Full(2x1024) and TPR Push(512)/Visit(512)x2/Pop(512).
+All 28 layer Prefix dKV updates were observed once per sibling
+and sampled BF16 accumulations matched their contributions
+exactly (`prefix_kv_sum_verified=True` at each reported step).
+
+| Step | Common-Full NLL Full | Common-Full NLL TPR | TPR-Full NLL | Sampled master update rel L2 |
+|---:|---:|---:|---:|---:|
+| 1 | 0.602285936 | 0.606591672 | +0.004305735 | 0.328631988 |
+| 2 | 0.360511988 | 0.363266543 | +0.002754554 | 0.244783621 |
+| 5 | 0.067441724 | 0.076127026 | +0.008685302 | 0.211572911 |
+| 10 | 0.022494603 | 0.030985202 | +0.008490599 | 0.241915577 |
+| 20 | **0.011431768** | **0.008580486** | **-0.002851283** | **0.400043659** |
+
+The two policies successfully trained to very low NLL on the
+**same two repeatedly replayed training trajectories**, not a
+trajectory-disjoint validation set. This is a convergence/schedule
+smoke rather than a generalization claim.
+
+The NLL agreement does NOT guarantee logprob tail or gradient
+equivalence. For example, step10 Full-oracle logprob absolute
+max error 12.44 but p95 only 0.00201: a few extreme token
+outliers dominate an otherwise small upper-95-percentile error.
+At step20 response MAE 0.0031478, max 1.9990 and p95
+0.0010908. The sampled master update rel L2 grows to 40%;
+preclip gradient rel L2 step20 0.9381, cosine 0.3492,
+but at that point the two trained parameter states differ
+and most training token losses are very small. Do NOT read
+that as 94% same-parameter TPR backward error.
+
+**Bounded P0-5 acceptance:** original real sibling extraction,
+the 28-layer graph-free KV relay accumulation count/sampled
+sum, and 20 NLL updates all succeed. Strict Full equivalence,
+real PPO, multi-level maximal trie, heldout generalization and
+actual runtime speedup are separate open gates.
+
+## Actual actor-update mini-batch capture, not rollout TQ
+
+The repository **already contains** the opt-in capture helper
+`verl/models/mcore/tpr/actor_capture.py`, the worker insertion
+helper `patches/apply_tpr_actor_capture.py`, and contract
+`tests/models/mcore/tpr/integration/test_real_actor_update_minibatch_contract.py`.
+Do not attempt to populate PPO fields on the old rollout dump;
+capture the later **actual actor-update mini_batch_td** containing
+advantages, old_log_probs, response_mask and temperature.
+
+On the Docker checkout used to **run actual UniAgent training**:
+
+```bash
+# Check whether the capture patch is installed in this VERL worker source:
+python /workspace/bridge/patches/apply_tpr_actor_capture.py --check \
+  /workspace/uni-agent/verl/verl/workers/engine_workers.py
+
+# Only if the check reports "patched" rather than "already_applied",
+# apply it without --check:
+python /workspace/bridge/patches/apply_tpr_actor_capture.py \
+  /workspace/uni-agent/verl/verl/workers/engine_workers.py
+
+# Make this variable available to the ACTOR WORKER when launching the
+# existing, real UniAgent RL actor-update command:
+export TPR_CAPTURE_ACTOR_MINIBATCH_DIR=/tmp/tpr_actor_real
+```
+
+Run a normal real rollout -> advantage processing -> actor update
+so `TrainingWorker.train_mini_batch` is reached. The capture helper
+writes `actor_update_rank<rank>_batch<batch_idx>.pt`.
+The patch is opt-in; if the environment variable is absent, it
+does nothing. It does not synthesize old logprobs or advantages.
+
+Once a fresh file exists, validate its **actor-update contract**
+before attempting an NPU PPO replay:
+
+```bash
+export TPR_REAL_ACTOR_MINIBATCH=/tmp/tpr_actor_real/actor_update_rank0_batch0.pt
+TPR_RUN_REAL_ACTOR_MINIBATCH_CONTRACT=1 \
+pytest -q -s tests/models/mcore/tpr/integration/test_real_actor_update_minibatch_contract.py
+
+# CPU preflight, including authentic siblings and source PPO fields:
+python tests/models/mcore/tpr/parallel/inspect_real_tq_siblings.py \
+  "$TPR_REAL_ACTOR_MINIBATCH" --siblings 2 --require-ppo
+
+# Only after BOTH checks pass (P0-5 strict recorded-field PPO replay):
+TPR_P0_BRANCH_OBJECTIVE=ppo \
+TPR_REAL_ACTOR_MINIBATCH="$TPR_REAL_ACTOR_MINIBATCH" \
+TPR_P0_BRANCH_STEPS=1 \
+  bash tests/models/mcore/tpr/parallel/run_real_tq_multisibling_prefix.sh
+```
+
+The P0-5 runner automatically uses `TPR_REAL_ACTOR_MINIBATCH`
+as its PPO input and runs the **CPU preflight before model load**.
+If it cannot find 2 genuinely different response suffixes with the
+same 512 prompt tokens in this particular actor minibatch,
+it fails with a data-eligibility error. This is not a TPR failure;
+capture a suitable complete original actor update batch instead
+of manufacturing branches.
+
+**P0-5 actual-PPO-field replay restrictions**: requires provenance
+marker `capture_stage=actor_update_mini_batch`, original unique
+trajectory keys, aligned loss_mask/response_mask and true original
+old_log_probs/advantages; current implementation only supports
+temperature exactly `1.0`. A Qwen3-8B rollout/actor capture
+used to replay Qwen3-1.7B still has an actor-model mismatch
+and cannot be claimed as on-policy PPO training.
