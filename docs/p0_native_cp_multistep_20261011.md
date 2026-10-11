@@ -13,8 +13,10 @@ or changes learning under **actual optimizer steps** on identical real tokens.
   fixed deterministic real-window order and disjoint held-out trajectory IDs.
 - Dataset: the existing `tq_batch.pt` contains **8 SWE trajectories**.
   By default each eligible trajectory is decomposed into up to **16
-  non-overlapping 1024-token REAL windows**: 512 immediately preceding
-  context tokens (prompt or prior response) + 512 actual response tokens,
+  1024-token REAL windows** with non-overlapping 512-token supervised
+  response spans: 512 immediately preceding context tokens (prompt or prior
+  response) + 512 actual response tokens. Neighboring windows intentionally
+  overlap in the CONTEXT half, not in the supervised response half,
   with the corresponding recorded response_mask. This can yield up to
   128 different real-token windows, but **still only 8 independent
   trajectories**. No padding or synthetic filler is used. Trajectories
