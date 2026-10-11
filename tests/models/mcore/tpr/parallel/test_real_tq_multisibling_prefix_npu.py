@@ -80,7 +80,10 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
         mask = rows["response_mask"][i].detach().cpu().bool()
         if not torch.equal(ids, torch.cat((prompt, response))) or mask.numel() != response.numel():
             raise AssertionError(f"Original TQ trajectory {i} prompt/response mismatch")
-        if len(prompt) < 512 or len(response) < 512 or not bool(mask[:512].any()):
+        if (len(prompt) < 512 or len(response) < 512
+                or not bool(mask[0]) or not bool(mask[1:512].any())):
+            # The fixed P512/S512 branch witness requires a true fork
+            # supervision bit and at least one true leaf supervision bit.
             continue
         cropped = torch.cat((prompt[-512:], response[:512])).contiguous()
         if int(cropped.min()) < 0 or int(cropped.max()) >= vocab_size:
