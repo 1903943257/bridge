@@ -246,7 +246,7 @@ def test_real_tq_full_vs_tpr_fifty_steps():
             (source_sha + ":" + str(schedule)).encode("ascii")
         ).hexdigest()
         named, masters, optimizer = _make_optimizer(model, lr)
-        checkpoints, events = {}, []
+        checkpoints, events, grad_snapshots = {}, [], {}
         milestones = sorted({m for m in MILESTONES if m <= steps} | {steps})
 
         def persist(step):
@@ -279,6 +279,7 @@ def test_real_tq_full_vs_tpr_fifty_steps():
                 ),
                 "eval_backend": "SAME_NO_CONTEXT_CONTROLLED_FULL_M1024",
                 "events": events, "checkpoints": checkpoints,
+                "preclip_grad_samples_by_step": grad_snapshots,
             }
             path = outdir / f"{mode}_train{steps}.pt"
             temporary = path.with_suffix(".pt.tmp")
@@ -316,10 +317,10 @@ def test_real_tq_full_vs_tpr_fifty_steps():
                           "prefix_grad_relays": 0}
             else:
                 result = _tpr_loss(model, row)
-            if step == 1:
-                first_grads = _sample_grads(model)
-            else:
-                first_grads = None
+            if step in milestones:
+                # Same real input row at corresponding step across Full/TPR.
+                # At later steps this includes model/optimizer-trajectory drift.
+                grad_snapshots[str(step)] = _sample_grads(model)
             result.update(_optimizer_step(
                 model, named, masters, optimizer, lr, clip_norm,
             ))
@@ -333,10 +334,6 @@ def test_real_tq_full_vs_tpr_fifty_steps():
                 f"clipped={result['was_clipped']}",
                 flush=True,
             )
-            if first_grads is not None:
-                # Write first-step gradient witness even when later training
-                # diverges or is interrupted. It is recorded *before* clipping.
-                checkpoints["first_step_preclip_grads"] = first_grads
             if step in milestones:
                 snapshot(step)
 
