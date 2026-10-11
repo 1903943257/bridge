@@ -88,6 +88,12 @@ def _validate(native_cp1, native_cp2, tpr):
         raise AssertionError("Wrong TPR evidence tag")
     if tpr["tpr_p512s512"]["segment_lengths"] != [512, 512]:
         raise AssertionError("TPR did not physically separate P512 and S512")
+    if "tpr_one_node_m1024" in tpr:
+        one = tpr["tpr_one_node_m1024"]
+        if one.get("segment_lengths") != [1024]:
+            raise AssertionError("TPR one-node oracle must run physical M=1024")
+        if one.get("loss_term_count") != 512 or one.get("prefix_grad_relays") != 0:
+            raise AssertionError("TPR one-node oracle unexpectedly lost/relayed tokens")
     if tpr["tpr_p512s512"]["prefix_grad_relays"] != 28:
         raise AssertionError("TPR ancestor KV-gradient relay was not verified")
     if not (native_cp1["local_m"] == 1024 and native_cp2["local_m"] == 512):
@@ -128,13 +134,25 @@ def main():
         "TPR_CONTROLLED_FULL": tpr["controlled_full"],
         "TPR_P512_S512": tpr["tpr_p512s512"],
     }
-    for ref, candidate in (
+    if "tpr_one_node_m1024" in tpr:
+        evidence["TPR_ONE_NODE_M1024"] = tpr["tpr_one_node_m1024"]
+    else:
+        print("P0_3 ONE_NODE_M1024=MISSING_OLD_ARTIFACT "
+              "rerun P0-3 after test sync for the Attention-path isolation gate")
+    pairs = [
         ("TPR_CONTROLLED_FULL", "TPR_P512_S512"),
         ("NATIVE_CP1", "TPR_CONTROLLED_FULL"),
         ("NATIVE_CP1", "NATIVE_CP2"),
         ("NATIVE_CP1", "TPR_P512_S512"),
         ("NATIVE_CP2", "TPR_P512_S512"),
-    ):
+    ]
+    if "TPR_ONE_NODE_M1024" in evidence:
+        pairs += [
+            ("TPR_CONTROLLED_FULL", "TPR_ONE_NODE_M1024"),
+            ("TPR_ONE_NODE_M1024", "TPR_P512_S512"),
+            ("NATIVE_CP2", "TPR_ONE_NODE_M1024"),
+        ]
+    for ref, candidate in pairs:
         a, b = evidence[ref], evidence[candidate]
         metrics = _stat(a["response_logprobs"], b["response_logprobs"])
         grad = _gradient_stat(a["gradients"], b["gradients"])
