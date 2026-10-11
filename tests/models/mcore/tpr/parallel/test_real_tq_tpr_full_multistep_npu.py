@@ -188,6 +188,7 @@ def _common_full_snapshot(model, train_probe, validation, named, masters):
                 evaluations.append({
                     "row": val["id"], "loss": val_loss,
                     "supervised": supervised,
+                    "response_mask": val["mask"].bool().cpu().clone(),
                     "response_logprobs": logprobs,
                 })
     finally:
@@ -196,6 +197,7 @@ def _common_full_snapshot(model, train_probe, validation, named, masters):
         "train_probe_loss": probe_loss,
         "train_probe_supervised": probe_n,
         "train_probe_response_logprobs": probe_lp,
+        "train_probe_response_mask": train_probe["mask"].bool().cpu().clone(),
         "validation_loss_mean": sum(x["loss"] for x in evaluations) / len(evaluations),
         "validation_by_row": evaluations,
         "sampled_weights": _sample_weights(named, masters),
