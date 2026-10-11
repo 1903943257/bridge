@@ -183,4 +183,120 @@ semantically correct for multi-sibling trees, PPO/GRPO or later
 long-horizon optimizer training; if they diverge, follow up with
 matched-gradient, layer-token and optimizer-state diagnostics.
 
-**Implementation committed, user NPU measurements are pending.**
+## Observed NPU results: complete 50-step Full vs P512/S512 TPR (2026-10-11)
+
+**Measured, not simulated.** User-provided output:
+`P0_4 CONTROL status=PASS identical_initial_weights=True`.
+There were **26 training windows from original trajectories [0..5]**
+and heldout original trajectories **[6,7]**, with **4068 supervised
+validation token logprobs** per milestone. CP=1, original Qwen3-1.7B,
+BF16 model math, FP32-master AdamW, `clip_norm=1`,
+real response_mask, common Full-M1024 evaluation for *both* learned
+models. All 50 optimizer steps completed for each branch.
+
+### Same-backend heldout-validation NLL
+
+| Step | Full NLL | TPR NLL | TPR - Full |
+|---:|---:|---:|---:|
+| 0 | 0.895805299 | 0.895805299 | 0 |
+| 1 | 0.749957465 | 0.750150315 | +0.000192851 |
+| 2 | 0.703529477 | 0.704159990 | +0.000630513 |
+| 5 | 0.667764090 | 0.666939482 | -0.000824608 |
+| 10 | 0.743025258 | 0.742520280 | -0.000504978 |
+| 20 | 0.637367889 | 0.635400288 | -0.001967601 |
+| 30 | 0.576584235 | 0.574091919 | -0.002492316 |
+| 40 | 0.642815270 | 0.644875944 | +0.002060674 |
+| 50 | **0.613095485** | **0.617147543** | **+0.004052058** |
+
+Full heldout NLL improvement `val0-val50=0.282709815`
+(31.56% of its initial NLL), TPR improvement `0.278657757`
+(31.11%). Both improved substantially. On these heldout windows TPR's
+final NLL is 0.004052 higher, approximately **0.66% relative to Full
+final NLL**, and achieved ~1.43% less *absolute NLL improvement*.
+Do not call this a statistical significance estimate: only two
+independent heldout original trajectories, correlated windows, one
+checkpoint and one deterministic training order.
+
+### Parameter, gradient and prediction drift
+
+All `MASTER_UPDATE` and `PRECLIP_GRAD` entries refer to **fixed strided
+samples of up to 512 elements per parameter across 226 parameter names**,
+**not** full-parameter errors. Master update rel L2 compares
+`theta_mode(step)-theta_initial` with Full's update as the denominator.
+Later-step gradient comparisons also include different parameter and
+optimizer histories; **only step1 is a same-initial-weights gradient
+control**.
+
+| Step | Sampled grad rel L2 | Sampled grad cosine | Sampled master update rel L2 | Master update cosine | Shared Full eval response logprob MAE | Logprob max abs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | n/a | n/a | n/a | n/a | 0 | 0 |
+| 1 | 0.146133691 | 0.991007621 | 0.248846856 | 0.969032967 | 0.021116894 | 0.778535 |
+| 2 | 0.113112301 | 0.994308336 | 0.189557474 | 0.982029440 | 0.019914421 | 0.496387 |
+| 5 | 0.178606692 | 0.985311731 | 0.142001972 | 0.989917492 | 0.019759780 | 0.436587 |
+| 10 | 0.112014186 | 0.993916297 | 0.129703733 | 0.991584621 | 0.029003737 | 1.094727 |
+| 20 | 0.413394915 | 0.935090088 | 0.157737747 | 0.987553644 | 0.030930072 | 0.783214 |
+| 30 | 0.251800642 | 0.970540259 | 0.190190046 | 0.981894177 | 0.033486567 | 0.997735 |
+| 40 | 0.223563157 | 0.975948215 | 0.219935542 | 0.975789019 | 0.049198478 | 2.048016 |
+| 50 | **0.421599437** | **0.924154019** | **0.249367389** | **0.968881573** | **0.053906588** | **2.159992** |
+
+At Step50 the shared Full eval response logprob p95 absolute
+difference = `0.266277403`, rel L2 = `0.094000271`,
+cosine = `0.995649409`. Sampling master weights gives an
+absolute vector diff norm of `0.011095521`, Full update sampled norm
+`0.044494674`, and TPR update sampled norm `0.044456427`.
+The update norm magnitudes are similar while the sampled vector
+direction differs; a near-identical norm is not parameter parity.
+
+At step1, sampled preclip gradient rel L2 already differs by 14.61%
+under *identical* initial weights and first example. At step50
+the sampled preclip gradient difference is 42.16%, but it now includes
+different **trained weights**, unlike a fresh same-weight comparison.
+The measured step50 prediction differences are from two different
+learned policies evaluated on the same backend. Do not interpret
+these as step50 same-weight TPR-vs-Full kernel drift.
+
+Training NLL also remained finite with both modes completing.
+Representative step50 current-window training NLL:
+Full `0.155159459`, TPR `0.147678509`. That single training
+window does not replace heldout evaluation and must not be read as
+a general improvement of TPR.
+
+### What this establishes, and what it does not
+
+**Observed:** 50 deterministic matched optimizer steps under
+response-masked NLL do not show a catastrophic or monotonic relative
+degradation in heldout NLL. The two paths do produce meaningfully
+different sampled optimizer update vectors and token-level
+probabilities, with logprob MAE rising from ~0.021 at step1 to
+~0.054 at step50 despite loss similarity.
+
+**Unproven:** TPR has no missing/shared KV gradients, production
+PPO/GRPO reward convergence equivalence, persistent stability for
+hundreds/thousands of steps, or correctness with several children
+sharing a prefix. Likewise this is not a statement that a 25% sampled
+update-direction difference is a tolerable acceptance threshold.
+Native CP2's earlier 50-step sampled parameter update rel L2
+`0.2950` was from a *different CP attention/validation setup*;
+do not use it to declare P0-4 TPR better or worse than official CP.
+
+### Suggested acceptance progression
+
+1. **P0-4 status:** 50-step matched-NLL numerical stability
+   *diagnostic completed*, not strict gradient parity PASS.
+2. **P0-5 next:** fixed true multi-sibling prefix tree:
+   identical training trajectories, response masks, ancestor
+   dK/dV sums, saved roots; compare against independent Full
+   trajectories with same weighted objective and FP32 master updates.
+3. **Then actual PPO replay:** fixed rollout/logprobs/advantages
+   from an identical actor snapshot and identical clip/KL/entropy
+   configuration. Measure PPO policy-loss, clip fraction,
+   importance-ratio outlier rates, KL and common-oracle
+   response logprobs at successive optimizer steps.
+4. For any PPO training divergence, compare a *same-weight*
+   Full vs TPR PPO backward at matching milestones to distinguish
+   numerical/scheduling error from accumulated policy-parameter drift.
+5. Performance and memory benefit analysis should happen only
+   after real shared-prefix workloads are covered; this two-node
+   chain does not quantify actual KV reuse speedup.
+
+**Implementation and 50-step user Ascend NPU measurement complete; broader TPR/PPO training parity remains open.**
