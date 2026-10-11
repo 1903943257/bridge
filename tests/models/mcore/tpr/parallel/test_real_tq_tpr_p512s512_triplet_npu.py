@@ -174,14 +174,12 @@ def test_p512s512_real_tq_tpr_vs_controlled_full():
         from . import test_tpr_qwen3_compatibility_npu as fixture
         checkpoint = Path(os.getenv("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B"))
         fixture.QWEN_MODEL_PATH = checkpoint
-        tokens, source = _input_tokens(151936)
-        if "real_tq" not in source or "row0:" not in source:
-            raise AssertionError("P0-3 requires same real TQ row0 as native P0-1")
         model = fixture._make_qwen_model(
             runtime.device, tpr=True, max_sequence_length=SEQ_LEN,
         )
-        if model.vocab_size <= int(tokens.max()):
-            raise AssertionError("Recorded TQ token exceeds current model vocabulary")
+        tokens, source = _input_tokens(model.vocab_size)
+        if "real_tq" not in source or "row0:" not in source:
+            raise AssertionError("P0-3 requires same real TQ row0 as native P0-1")
         signature = _weight_signature(model)
         controlled = _run_control_full(model, tokens)
         tpr = _run_two_node_tpr(model, tokens)
