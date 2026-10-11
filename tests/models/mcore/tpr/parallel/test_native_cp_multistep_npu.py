@@ -187,21 +187,28 @@ def _step(model, runtime, row, named, masters, optimizer, grad_reduce, clip_norm
     preclip_norm = torch.nn.utils.clip_grad_norm_(masters, max_norm=clip_norm)
     if not bool(torch.isfinite(preclip_norm).item()):
         raise AssertionError(f"nonfinite native CP FP32 master grad norm: {preclip_norm}")
-    # Optimizer update is FP32. Store total norm of actual master parameter
-    # changes rather than large full-parameter checkpoints.
-    previous = [m.detach().clone() for m in masters]
+    # Avoid a full ~7 GiB clone of all FP32 master weights on every step:
+    # estimate AdamW's FP32 update from exp_avg/exp_avg_sq after optimizer.step.
+    # Decoupled weight decay is deliberately zero in this experiment.
     optimizer.step()
     total_update_sq = torch.zeros((), dtype=torch.float64, device=runtime.device)
     with torch.no_grad():
-        for (_, p), m, before in zip(named, masters, previous, strict=True):
-            delta = (m - before).double()
-            total_update_sq += delta.square().sum()
+        for (_, p), m in zip(named, masters, strict=True):
+            state = optimizer.state[m]
+            step = int(state["step"].item())
+            bias1 = 1.0 - 0.9 ** step
+            bias2 = 1.0 - 0.95 ** step
+            denom = state["exp_avg_sq"].sqrt() / (bias2 ** 0.5) + 1e-8
+            estimated_delta = (lr := optimizer.param_groups[0]["lr"]) / bias1 * (
+                state["exp_avg"] / denom
+            )
+            total_update_sq += estimated_delta.double().square().sum()
             p.copy_(m.to(dtype=p.dtype))
     model.zero_grad(set_to_none=True)
     return {
         "train_loss": loss, "supervised": supervised,
         "grad_norm": float(preclip_norm.item()),
-        "master_update_norm": float(total_update_sq.sqrt().item()),
+        "estimated_master_update_norm": float(total_update_sq.sqrt().item()),
     }
 
 
@@ -264,7 +271,7 @@ def test_native_cp_multistep_real_tq_nll():
                 events.append(stat)
                 print(f"P0_B cp={cp} step={step}/{steps} row={data['id']} "
                       f"loss={stat['train_loss']:.8f} grad_norm={stat['grad_norm']:.5f} "
-                      f"update_norm={stat['master_update_norm']:.5f}", flush=True)
+                      f"update_norm={stat['estimated_master_update_norm']:.5f}", flush=True)
             if step in milestones:
                 snapshot(step)
                 # Recover results from interruption without rerunning steps.
