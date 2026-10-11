@@ -169,7 +169,7 @@ def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int
 
 def make_real_qwen3_tp_model(
     runtime, *, model_path: Path, tp_size: int = 2, load_weights: bool = True,
-    sequence_parallel: bool = False,
+    sequence_parallel: bool = False, cp_size: int = 1,
 ):
     """Construct Qwen3-1.7B with real native TP=1 or 2 layout.
 
@@ -181,7 +181,7 @@ def make_real_qwen3_tp_model(
         hf, torch.bfloat16,
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=1,
-        context_parallel_size=1,
+        context_parallel_size=cp_size,
         expert_model_parallel_size=1,
         sequence_parallel=sequence_parallel,
         attention_dropout=0.0,
@@ -251,6 +251,7 @@ def make_real_qwen3_tp_model(
     ):
         raise AssertionError("TP2 Qwen requires controlled CANN square-causal core attention")
     assert model.config.tensor_model_parallel_size == tp_size
+    assert model.config.context_parallel_size == cp_size
     assert model.config.sequence_parallel is sequence_parallel
     assert model.embedding.word_embeddings.weight.shape == (151936 // tp_size, 2048)
     assert model.output_layer.weight is None
