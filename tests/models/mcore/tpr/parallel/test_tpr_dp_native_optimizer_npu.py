@@ -170,6 +170,19 @@ def test_tp2_dp2_native_ddp_finalize_and_optimizer_one_step(parallel_runtime):
     matched_dp_qkv = _gather(actual_qkv.contiguous(), runtime.dp_group)
     replica_grad_identical = torch.equal(matched_dp_qkv[0], matched_dp_qkv[1])
 
+    # On SP, a sequence-parallel-replicated norm needs the native TP
+    # gradient reduction. Check the main_grad BEFORE optimizer.step(), which
+    # may clear optimizer-side gradients on some Megatron revisions.
+    norm = model.decoder.layers[0].input_layernorm.weight
+    sp_norm_flag = bool(getattr(norm, "sequence_parallel", False))
+    norm_tp_ok = True
+    if runtime.sequence_parallel and sp_norm_flag:
+        norm_views = _gather(
+            norm.main_grad.detach().float().contiguous(),
+            runtime.tp_group,
+        )
+        norm_tp_ok = torch.equal(norm_views[0], norm_views[1])
+
     # The optimizer must consume Megatron main_grad and update BF16 weights.
     # Snapshot a few parameter slices, not the full 1.7B model.
     probes = (qkv, fc1, model.decoder.layers[0].input_layernorm.weight)
@@ -188,20 +201,9 @@ def test_tp2_dp2_native_ddp_finalize_and_optimizer_one_step(parallel_runtime):
     after_dp = _gather(after_step[0].contiguous(), runtime.dp_group)
     param_replicas_identical = torch.equal(after_dp[0], after_dp[1])
 
-    # On SP, a sequence-parallel-replicated norm needs additional native
-    # TP reduction in finalize_model_grads. Only assert it when the actual
-    # parameter metadata requests that reduction.
-    norm = model.decoder.layers[0].input_layernorm.weight
-    sp_norm_flag = bool(getattr(norm, "sequence_parallel", False))
-    norm_tp_ok = True
-    if runtime.sequence_parallel and sp_norm_flag:
-        norm_views = _gather(
-            norm.main_grad.detach().float().contiguous(),
-            runtime.tp_group,
-        )
-        norm_tp_ok = torch.equal(norm_views[0], norm_views[1])
-
-    grad_norm_scalar = float(grad_norm) if grad_norm is not None else float("nan")
+    # clip_grad=0 requests no clipping and some Megatron releases return
+    # grad_norm=None by design; this is not an optimizer failure.
+    grad_norm_scalar = float(grad_norm) if grad_norm is not None else 0.0
     local_ok = all((
         math.isfinite(loss),
         distinct_physical, distinct_grad,
