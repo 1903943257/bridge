@@ -67,7 +67,13 @@ To use real TQ tokens rather than the default seeded input, set
 `TPR_P0_CP_TQ_ROW=0` **inside Docker** before launching.
 The chosen trajectory needs at least 512 prompt and 512 response tokens.
 
-**Native batch configuration:** P0 sets `reset_attention_mask=False` explicitly\nfor the normal non-EOD/non-packed `megatron_cp_algo` path. MindSpeed\nlightweight args may omit this field when `megatron.training` is unavailable.\nThe test still calls the official MindSpeed `get_batch_on_this_cp_rank`;\nno local data-sharding implementation or masking override is installed.\n\n**Dependency note:** Existing bridge CP test fixtures use
+**Native batch configuration:** P0 explicitly sets `reset_attention_mask=False`
+for the normal non-EOD/non-packed `megatron_cp_algo` path. Lightweight
+MindSpeed args may omit this field without `megatron.training`. The test
+still calls the official MindSpeed `get_batch_on_this_cp_rank`; there is
+no local data-sharding implementation or masking override.
+
+**Dependency note:** Existing bridge CP test fixtures use
 `mindspeed.args_utils.get_full_args()` because Docker may have
 Megatron-Core without `megatron.training`. This P0-1 test now uses
 the same MindSpeed parameter interface and does not import
