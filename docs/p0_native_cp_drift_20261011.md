@@ -140,3 +140,85 @@ cosine and worst parameters; no arbitrary PASS tolerance is applied.
 - Reproducibility is limited to the recorded software/weights/input:
   this script was authored without access to the user's Ascend host.
   **NPU execution and numerical results are pending.**
+
+
+
+## Observed native CP1/CP2/CP4 results (2026-10-11, user NPU run)
+
+All three **native** runs completed their forward/backward paths:
+Qwen3-1.7B BF16, actual recorded TQ row0 (`prompt_tail512+response_head512`),
+1024 logical tokens, 512 response targets, 226 trainable gradient entries.
+No TPR or custom attention was installed in this control.
+
+| Metric | CP=1 | CP=2 | CP=4 |
+|---|---:|---:|---:|
+| Local physical Linear M (all 28 layers) | 1024 | 512 | 256 |
+| MindSpeed native Ring entry calls on rank0 | 0 | 28 | 28 |
+| NLL loss | 0.956898391 | 0.950917602 | 0.947620749 |
+| Loss delta vs CP1 | — | -0.0059807897 | -0.0092776418 |
+
+| Numeric difference vs CP1 | CP2 | CP4 |
+|---|---:|---:|
+| All logprobs (1023) mean abs | 0.037954772 | 0.036326010 |
+| All logprobs max abs | 0.49981308 | 0.99390936 |
+| Response logprobs (512) mean abs | 0.035687864 | 0.032613402 |
+| Response logprobs p95 abs | 0.245665634 | 0.228623867 |
+| Response logprobs max abs | 0.49981308 | 0.99390936 |
+| Response logprobs rel L2 | 0.03961506 | 0.04343556 |
+| Response logprobs changed (nonzero difference) | 335 / 512 | 345 / 512 |
+| **Strided sampled-only** parameter grad relative L2 | **0.31300916** | **0.11868224** |
+| **Strided sampled-only** parameter grad cosine | 0.95312057 | 0.99295477 |
+
+The output's gradient statistics are **NOT** complete-parameter
+global metrics: each parameter contributes at most 512 deterministic
+strided elements (and some tiny parameters fewer). The 226 group
+counts indicate compared parameter names, not full-gradient coverage.
+Notably CP2's sampled grad rel L2 is larger than CP4's: the drift is
+**non-monotonic** with physical Linear M.
+
+**What is established:** On this model/checkpoint/input, the official
+non-TPR distributed configuration also has material logprob differences
+between CP1 and CP2/4. Neither the CP loss nor the forward/backward
+metrics imply that the TPR tree scheduler or its KV-gradient relay is
+correct. These observations do **not** isolate GEMM as the root cause.
+
+**Confounders verified in the P0-1 source:**
+- CP1 attention uses its normal whole-sequence path; CP2/4 dispatch
+  `mindspeed.core.context_parallel.dot_product_attention.ringattn_context_parallel`
+  28 times (one per layer). The probe checks entry dispatch, not a
+  per-kernel numerical-equivalence proof. Attention decomposition and
+  collective communication change along with Linear M.
+- The bare GPTModel gradients are synchronized after local backward
+  via `dist.all_reduce(parameter.grad, SUM)` **in BF16** for CP>1,
+  while CP1 has no collective. This is a test control, not a
+  verified production Megatron-DDP/main-grad optimizer finalizer.
+  BF16 accumulation/communication may contribute to gradient drift.
+- The `sampled_weight_sha256_rank0` and `token_sha256` equality gates
+  verify bounded BF16 model-weight witnesses and identical tokens,
+  but the former is not a full-checkpoint cryptographic hash.
+- Older TPR results used cropped 128+64 tokens across 8 trajectories,
+  often PPO and a controlled CANN attention path. Similar mean
+  logprob errors (~0.03) are **not apples-to-apples TPR/CP parity**.
+
+**Follow-up control priority (diagnostic only; production kernels unchanged):**
+1. **P0-2 real-operands single-Linear GEMM replay:** capture identical
+   X, W and upstream dY from CP1 real Qwen at the layer1 qkv and MLP
+   projections; compare full M=1024 to sharded M=512/256 (including
+   Zigzag reordering), report Y/dX/dW separately. Do not pad full or
+   install fixed-M GEMM in TPR or native training.
+2. **Attention-only CP isolation:** hold identical Q/K/V, compare CP1
+   whole attention with official CP2/4 Ring, mapping outputs/dQ/dK/dV
+   back to their global token positions. This controls attention
+   transport separately from Linear M.
+3. **Gradient reduction control:** for the same CP2/4 local gradients,
+   compare current BF16 SUM vs an explicitly **diagnostic-only** FP32
+   SUM (without altering model forward/backward). The existing
+   saved strided gradient artifacts do not contain per-rank pre-SUM
+   tensors, so this requires a future test run.
+4. Consider same-shape/same-backend CP-matched TPR vs native control
+   only after attention backend equivalence is established; previous
+   TPR Ring is a separately implemented backend.
+
+This stage is a valid native CP numerical diagnostic, **not** a
+strict correctness PASS and not proof that the non-monotonic sampled
+gradient deltas are expected training behavior.
