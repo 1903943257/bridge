@@ -171,7 +171,7 @@ def test_p512s512_real_tq_tpr_vs_controlled_full():
         raise AssertionError("P0-3 TPR branch is single-rank CP1")
     # MindSpeed bootstrap and official checkpoint mapping reuse P0-1's runtime.
     with _runtime(1) as runtime:
-        from . import test_tpr_qwen3_compatibility_npu as fixture
+        from ..correctness import test_tpr_qwen3_compatibility_npu as fixture
         checkpoint = Path(os.getenv("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B"))
         fixture.QWEN_MODEL_PATH = checkpoint
         model = fixture._make_qwen_model(
