@@ -308,7 +308,9 @@ def _weight_signature(model) -> str:
             device=param.device,
         )
         witness = param.detach().flatten().index_select(0, indices).contiguous().cpu()
-        digest.update(witness.numpy().tobytes())
+        # NumPy cannot represent PyTorch BF16 directly. Reinterpret the CPU
+        # BF16 bits as int16 (no arithmetic cast, no information loss).
+        digest.update(witness.view(torch.int16).numpy().tobytes())
     return digest.hexdigest()
 
 
