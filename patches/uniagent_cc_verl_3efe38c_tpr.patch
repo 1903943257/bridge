@@ -1,0 +1,70 @@
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -207,8 +207,10 @@
+     override_mcore_model_config: dict[str, Any] = field(default_factory=dict)
+     use_mbridge: bool = True
+     vanilla_mbridge: bool = False
+     use_megatron_fsdp: bool = False
++    tpr_enabled: bool = False
++    tpr_cp_backend: Optional[str] = None
+     strategy: str = "megatron"
+     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
+ 
+     def __post_init__(self) -> None:
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -481,8 +481,13 @@
+             use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
+         )
+         override_ddp_config = self._resolve_override_ddp_config()
+ 
++        if self.engine_config.tpr_enabled:
++            from verl.models.mcore.tpr.megatron_adapter import install_tpr_module_spec
++
++            install_tpr_module_spec(self.provider)
++
+         module, updated_tf_config = make_megatron_module(
+             wrap_config=wrap_config,
+             tf_config=self.tf_config,
+             hf_config=self.model_config.hf_config,
+@@ -859,8 +864,18 @@
+                     routed_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+                 )
+             tu.assign_non_tensor(data, routed_num_tokens=routed_num_tokens.item())
+ 
++        # TPR PPO: keep each logical trajectory group together for Forest execution.
++        # Native batch_num_tokens and dp_size are attached above; bypass native
++        # micro-batch packing and DCP scheduling only for explicit TPR training.
++        if self.engine_config.tpr_enabled and not forward_only:
++            from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
++
++            return run_tpr_forward_backward_batch(
++                self, data, loss_function, forward_only=forward_only
++            )
++
+         # BSHD path only: pad every micro-batch to the mini-batch's global max seq_len so the
+         # padded `s_q` is shared -> cuDNN plan built once per shape. Raw (unaligned)
+         # max; TP/CP/FP8 alignment is applied inside preprocess_bshd_engine.
+         pad_bshd_to_minibatch_max = self.engine_config.pad_bshd_to_minibatch_max
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -310,8 +310,16 @@
+                 )
+                 # Name the mini-batch in the trace so each iteration of this otherwise identical
+                 # loop is distinguishable when the whole step is recorded (continuous mode).
+                 with torch.profiler.record_function(f"mini_batch{batch_idx}"):
++                    # TPR P0 real actor-update capture (opt-in; before train_batch)
++                    import os as _tpr_actor_capture_os
++                    _tpr_actor_dir = _tpr_actor_capture_os.environ.get("TPR_CAPTURE_ACTOR_MINIBATCH_DIR")
++                    if _tpr_actor_dir:
++                        from verl.models.mcore.tpr.actor_capture import capture_real_actor_update_minibatch
++                        capture_real_actor_update_minibatch(
++                            mini_batch_td, _tpr_actor_dir, batch_idx=batch_idx
++                        )
+                     actor_output = self.train_batch(mini_batch_td)
+                 # Advance the profiler once per mini-batch. This drives any
+                 # torch.profiler.schedule (the schedule's unit is one update mini-batch) and,
+                 # with no schedule, only labels torch's ProfilerStep#<n> boundary. start()/stop()
