@@ -198,10 +198,17 @@ def test_qwen3_tp2_sp_full_trajectory_vs_tpr_tree(sp_runtime):
         hook.remove()
 
     assert len(native_tail) == 2
-    assert len(tree_tail) == 3, "TPR must visit root and two suffix segments"
+    # DFS makes four model calls, not three: Push(P) runs no_grad to cache KV,
+    # Visit(S1) and Visit(S2) run with gradients, and Pop(P) recomputes the
+    # root with gradients to receive the accumulated Prefix KV gradients.
+    # Only the two leaf calls represent the independently executed trajectories.
+    assert len(tree_tail) == 4, (
+        "TPR must execute Push(P), Visit(S1), Visit(S2), Pop(P) exactly once each"
+    )
+    suffix_tail = tree_tail[1:3]
     logit_diff_sq = sum(
         (ref - actual).square().sum().item()
-        for ref, actual in zip(native_tail, tree_tail[1:], strict=True)
+        for ref, actual in zip(native_tail, suffix_tail, strict=True)
     )
     logit_ref_sq = sum(item.square().sum().item() for item in native_tail)
     logit_rel_l2 = (logit_diff_sq / max(logit_ref_sq, 1e-24)) ** 0.5
