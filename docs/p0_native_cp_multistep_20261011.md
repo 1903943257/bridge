@@ -133,11 +133,11 @@ for FP32 masters and BF16 model copies; rank consensus of model weights.
    isolation controls, and then replay PPO with real old_logprobs and
    advantages.
 
-## Pending P0-2 isolation tests (not yet implemented)
+## P0-2 isolation plan (2A implemented, 2B pending)
 
-- **P0-2A GEMM replay**: capture identical real X/W/dY for QKV and
-  FC1/FC2 and compare M=1024 vs 512/256 Zigzag without modifying
-  training compute or padding it back to full M.
+- **P0-2A GEMM replay**: implemented as real-X/W/dY single-NPU replay
+  using official Megatron Linear and Zigzag shape M=1024/512/256.
+  Runtime measurements are pending.
 - **P0-2B Attention replay**: supply identical global Q/K/V and
   corresponding causal positions to native full attention and official
   MindSpeed CP2/4 Ring, compare restored O/dQ/dK/dV and LSE.
@@ -145,3 +145,68 @@ for FP32 masters and BF16 model copies; rank consensus of model weights.
   *before* attributing the drift to any one kernel family.
 
 **Implementation is committed; execution on the user's Ascend host is pending.**
+
+
+## Stage B measured results (user Ascend, 2026-10-11)
+
+The full 50-step CP1/CP2/CP4 runs completed and the comparator printed
+`P0_B status=DIAGNOSTIC_ONLY`. This is **real measured data**, not
+a simulated curve. Validation uses **each configuration's own CP backend**.
+
+| Metric vs CP1 | CP2 | CP4 |
+|---|---:|---:|
+| Step0 validation NLL gap | -0.00173233449 | -0.000970900059 |
+| Step1 sampled FP32-master update rel L2 | 0.238965762 | 0.228927748 |
+| Step5 sampled FP32-master update rel L2 | 0.143791291 | 0.135750437 |
+| Step20 sampled FP32-master update rel L2 | 0.180051274 | 0.175499841 |
+| Step50 sampled FP32-master update rel L2 | **0.295016591** | **0.323183914** |
+| Step50 sampled FP32-master update cosine | 0.956440711 | 0.947757730 |
+| Step50 validation NLL gap | -0.00103177875 | +0.00134871155 |
+| Step50 validation improvement gap | -0.000700555742 | -0.00231961161 |
+
+`val_improvement_gap` = CP candidate `(val0 - val50)` minus CP1
+`(val0 - val50)`: negative values mean slightly *less improvement*.
+It does not demonstrate CP training correctness, convergence parity,
+PPO clipping parity or TPR correctness. The sampled parameter update
+vectors **do** drift apart over steps 10-50, while the own-backend
+validation NLL gap oscillates near zero, rather than growing monotonically.
+Do not infer a numerical tolerance for TPR from this experiment.
+
+### Immediately next: P0-2A real GEMM decomposition (implemented)
+
+`tests/models/mcore/tpr/parallel/test_native_gemm_m_replay_npu.py`
+captures **actual pretrained Qwen CP1 X and upstream dY** during a true
+masked real-TQ loss/backward. For each target native Megatron QKV/Proj/FC1/FC2
+module it independently replays the SAME module and weight with:
+
+- Full physical `M=1024`;
+- Rank-wise CP2 Zigzag `M=512` and restored global row order;
+- Rank-wise CP4 Zigzag `M=256` and restored global row order.
+
+It logs native forward replay vs originally captured Y, restored Y,
+dX, and full-vs-sharded dW using both diagnostic FP32 and BF16 SUM.
+This **holds upstream dY fixed** and does not change attention,
+training, weight dtype, model weights, or patch native kernels.
+This is a single-GEMM attribution test, **not** proof that all CP drift
+comes from GEMM. Configure `TPR_P0_2A_LAYERS=1,4` for additional layers
+(the default is zero-based layer 1). The result is a JSON artifact, not
+a pass/fail float-tolerance gate.
+
+**HOST:**
+
+```bash
+cd /workspace/bridge && git pull --ff-only
+```
+
+**DOCKER:**
+
+```bash
+rsync -av /workspace/bridge/tests/models/mcore/tpr/ /workspace/uni-agent/verl/tests/models/mcore/tpr/
+cd /workspace/uni-agent/verl
+# Reuse the exact REAL TQ file from stage B if the default location differs:
+# export TPR_REAL_TQ_BATCH=/path/to/tq_batch.pt
+bash tests/models/mcore/tpr/parallel/run_native_gemm_m_replay.sh
+```
+
+P0-2B (native Ring attention Q/K/V and backward isolation) is still
+**not implemented**; it is the next attribution control after P0-2A.
