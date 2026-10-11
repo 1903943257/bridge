@@ -26,7 +26,7 @@ from verl.utils.megatron_utils import unwrap_model
 from .attention import TPRSelfAttention
 from .engine_adapter import TPRForwardBackwardRequest
 from .fixed_topology_scheduler import FixedTopologyScheduler
-from .module_spec import make_tpr_module_spec_provider
+from .module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
 from .parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
 from .segment_executor import SegmentExecutor
 
@@ -34,12 +34,24 @@ if TYPE_CHECKING:
     from verl.workers.engine.megatron.transformer_impl import MegatronEngine
 
 
-def install_tpr_module_spec(provider: Any) -> None:
-    """Install the opt-in TPR SelfAttention spec before model construction."""
+def install_tpr_module_spec(provider: Any, *, bridge: Any = None) -> None:
+    """Install opt-in TPR attention for either supported model provider.
 
+    The NVIDIA Megatron-Bridge path exposes provider.transformer_layer_spec;
+    vanilla mbridge 0.15.1 builds its spec later inside bridge.get_model().
+    Do not modify MBridge globally or change the native path.
+    """
     if provider is None:
-        raise NotImplementedError("TPR model construction requires the non-vanilla Megatron-Bridge provider")
-    provider.transformer_layer_spec = make_tpr_module_spec_provider(provider.transformer_layer_spec)
+        if bridge is None:
+            raise NotImplementedError(
+                "TPR model construction requires a Megatron-Bridge provider "
+                "or a vanilla MBridge instance"
+            )
+        install_tpr_vanilla_mbridge_spec(bridge)
+        return
+    provider.transformer_layer_spec = make_tpr_module_spec_provider(
+        provider.transformer_layer_spec
+    )
 
 
 def run_tpr_forward_backward(

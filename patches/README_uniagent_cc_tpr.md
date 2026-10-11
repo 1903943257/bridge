@@ -57,3 +57,28 @@ No installation command, Git pull, or manual file overwrite is performed.
   uniform recompute. The successful Native Qwen3-8B smoke uses both.
 - Installing these hooks is **not** a TPR optimizer-step or numerical parity
   acceptance. The separate `feat/tpr-tp2-dp-placement-audit` branch is untouched.
+
+## Vanilla MBridge v0.15.1 support (isolated feature branch)
+
+The TPR adapter now accepts `install_tpr_module_spec(provider, bridge=bridge)`.
+When the NVIDIA provider is absent and the local `bridge` is Vanilla MBridge,
+it wraps **only the bridge instance's** `_get_transformer_layer_spec`.
+This is invoked lazily by MBridge's model provider before constructing
+`GPTModel`; a deep-copied Transformer layer/block spec substitutes
+`TPRSelfAttention` without changing MBridge source, its classes, native
+model instances or QKV/MLP kernel precision.
+
+For installations that **already applied** the earlier semantic patch,
+the updated installer upgrades the single provider-only call to
+`install_tpr_module_spec(self.provider, bridge=self.bridge)`.
+Apply the same installer in check mode, then real mode, after copying
+the latest TPR modules from this branch to Uni-Agent-CC:
+
+```bash
+python /workspace/bridge/patches/apply_uniagent_cc_tpr.py --check /workspace/uni-agent-cc/verl
+python /workspace/bridge/patches/apply_uniagent_cc_tpr.py /workspace/uni-agent-cc/verl
+```
+
+Check the resulting source and first verify the built model actually
+contains `TPRSelfAttention` on a single-rank smoke test. This feature does
+**not** add PPO TP4, recompute, or full-length 8B support.

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+from functools import wraps
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, TypeVar
@@ -103,6 +104,32 @@ def make_tpr_module_spec_provider(
         return replace_self_attention_with_tpr(spec)
 
     return tpr_spec_provider
+
+
+def install_tpr_vanilla_mbridge_spec(bridge: Any) -> None:
+    """Wrap only this vanilla MBridge instance's lazily built layer spec.
+
+    In mbridge==0.15.1, LLMBridge._model_provider reads
+    self._get_transformer_layer_spec(vp_stage) before constructing GPTModel.
+    We must intercept that method *before* bridge.get_model is called, rather
+    than changing Megatron or the global MBridge class.
+    """
+    original = getattr(bridge, "_get_transformer_layer_spec", None)
+    if not callable(original):
+        raise TypeError(
+            "Vanilla MBridge TPR requires a callable "
+            "bridge._get_transformer_layer_spec; got "
+            f"{type(original).__name__}"
+        )
+    if getattr(original, "_tpr_vanilla_mbridge_spec", False):
+        return
+
+    @wraps(original)
+    def tpr_layer_spec(*args: Any, **kwargs: Any) -> Any:
+        return replace_self_attention_with_tpr(original(*args, **kwargs))
+
+    tpr_layer_spec._tpr_vanilla_mbridge_spec = True
+    bridge._get_transformer_layer_spec = tpr_layer_spec
 
 
 def _get_layer_specs(transformer_layer_spec: object) -> list[ModuleSpec]:

@@ -69,7 +69,7 @@ def test_check_apply_repeat_preserves_local_worker_changes(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "APPLIED" in result.stdout
     assert "tpr_enabled: bool = False" in files["verl/workers/config/engine.py"].read_text()
-    assert "install_tpr_module_spec(self.provider)" in files["verl/workers/engine/megatron/transformer_impl.py"].read_text()
+    assert "install_tpr_module_spec(self.provider, bridge=self.bridge)" in files["verl/workers/engine/megatron/transformer_impl.py"].read_text()
     assert "run_tpr_forward_backward_batch" in files["verl/workers/engine/megatron/transformer_impl.py"].read_text()
     worker = files["verl/workers/engine_workers.py"].read_text()
     assert "local profiling marker" in worker
@@ -102,3 +102,25 @@ def test_partial_tpr_config_fails_closed(tmp_path):
     assert failed.returncode != 0
     assert "Partial TPR config" in failed.stderr
     assert {name: path.read_text() for name, path in files.items()} == before
+
+def test_upgrade_existing_uniagent_cc_patch_without_rewriting_other_hooks(tmp_path):
+    files = _checkout(tmp_path)
+    engine = files["verl/workers/engine/megatron/transformer_impl.py"]
+    original = engine.read_text()
+    with_legacy = original.replace(
+        "        module, updated_tf_config = make_megatron_module(",
+        "        if self.engine_config.tpr_enabled:\\n"
+        "            from verl.models.mcore.tpr.megatron_adapter import install_tpr_module_spec\\n"
+        "            install_tpr_module_spec(self.provider)\\n"
+        "        module, updated_tf_config = make_megatron_module(",
+    ).replace("\\n", "\n")
+    engine.write_text(with_legacy)
+    first = _run(tmp_path)
+    assert first.returncode == 0, first.stderr
+    patched = engine.read_text()
+    assert "install_tpr_module_spec(self.provider, bridge=self.bridge)" in patched
+    assert "install_tpr_module_spec(self.provider)\n" not in patched
+    assert patched.count("run_tpr_forward_backward_batch") == 2
+    second = _run(tmp_path)
+    assert second.returncode == 0, second.stderr
+    assert engine.read_text() == patched
