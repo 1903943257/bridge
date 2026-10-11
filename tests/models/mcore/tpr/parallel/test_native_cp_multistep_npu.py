@@ -191,7 +191,7 @@ def _step(model, runtime, row, named, masters, optimizer, grad_reduce, clip_norm
     # estimate AdamW's FP32 update from exp_avg/exp_avg_sq after optimizer.step.
     # Decoupled weight decay is deliberately zero in this experiment.
     optimizer.step()
-    total_update_sq = torch.zeros((), dtype=torch.float64, device=runtime.device)
+    total_update_sq = torch.zeros((), dtype=torch.float32, device=runtime.device)
     with torch.no_grad():
         for (_, p), m in zip(named, masters, strict=True):
             state = optimizer.state[m]
@@ -201,7 +201,7 @@ def _step(model, runtime, row, named, masters, optimizer, grad_reduce, clip_norm
             denom = state["exp_avg_sq"].sqrt() / (bias2 ** 0.5) + 1e-8
             lr_now = optimizer.param_groups[0]["lr"]
             estimated_delta = (lr_now / bias1) * (state["exp_avg"] / denom)
-            total_update_sq += estimated_delta.square().sum(dtype=torch.float64)
+            total_update_sq += estimated_delta.square().sum()
             p.copy_(m.to(dtype=p.dtype))
     model.zero_grad(set_to_none=True)
     return {
