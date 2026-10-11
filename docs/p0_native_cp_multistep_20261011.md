@@ -133,18 +133,22 @@ for FP32 masters and BF16 model copies; rank consensus of model weights.
    isolation controls, and then replay PPO with real old_logprobs and
    advantages.
 
-## P0-2 isolation plan (2A implemented, 2B pending)
+## P0-2 isolation plan (2A measured, 2B implemented, NPU pending)
 
-- **P0-2A GEMM replay**: implemented as real-X/W/dY single-NPU replay
-  using official Megatron Linear and Zigzag shape M=1024/512/256.
-  Runtime measurements are pending.
-- **P0-2B Attention replay**: supply identical global Q/K/V and
-  corresponding causal positions to native full attention and official
-  MindSpeed CP2/4 Ring, compare restored O/dQ/dK/dV and LSE.
+- **P0-2A GEMM replay**: real-X/W/dY single-NPU replay using
+  official Megatron Linear and Zigzag M=1024/512/256; **completed on user
+  Ascend** and reported below.
+- **P0-2B Attention replay**: implemented with real pretrained Qwen
+  layer-core Q/K/V and the *same upstream dO*, captured from CP1.
+  Native CP1 core attention is replayed once for a self-consistency gate,
+  then MindSpeed CP2/CP4 official Ring runs with the frozen operands.
+  Outputs and dQ/dK/dV are restored to original global positions.
+  An LSE comparison requires a separate kernel-statistics capture and
+  is not part of the current probe.
 - If the Stage-B 50-step gaps are large, perform both isolation tests
   *before* attributing the drift to any one kernel family.
 
-**Implementation is committed; execution on the user's Ascend host is pending.**
+**Stage B and P0-2A have been run on the user's Ascend host. P0-2B is implemented but pending NPU execution.**
 
 
 ## Stage B measured results (user Ascend, 2026-10-11)
@@ -208,5 +212,109 @@ cd /workspace/uni-agent/verl
 bash tests/models/mcore/tpr/parallel/run_native_gemm_m_replay.sh
 ```
 
-P0-2B (native Ring attention Q/K/V and backward isolation) is still
-**not implemented**; it is the next attribution control after P0-2A.
+P0-2B native Ring attention Q/K/V and backward isolation is now
+**implemented**; see the next section. It has not yet been run on NPU.
+
+
+## P0-2A actual single-Linear GEMM results (user Ascend, 2026-10-11)
+
+**Same real pretrained Qwen X/W/upstream dY** for all shapes; native
+Megatron GEMMs, no TPR, no parameter update, no forced FP32 GEMM.
+
+| Real layer-1 module | M | Y relative L2 | dX relative L2 | dW FP32 SUM rel L2 | dW BF16 SUM rel L2 |
+|---|---:|---:|---:|---:|---:|
+| QKV | 512 | 1.73645e-5 | 3.15012e-5 | 0.00226216 | 0.00280380 |
+| QKV | 256 | 2.72333e-5 | 3.15012e-5 | 0.00216493 | 0.00338855 |
+| Proj | 512 | 1.71770e-5 | 2.31285e-5 | 0.00229084 | 0.00281560 |
+| Proj | 256 | 2.07720e-5 | 2.31285e-5 | 0.00226512 | 0.00357058 |
+| FC1 | 512 | 2.42566e-5 | 4.24973e-5 | 0.00227529 | 0.00285062 |
+| FC1 | 256 | 2.42566e-5 | 4.24973e-5 | 0.00223980 | 0.00354264 |
+| FC2 | 512 | 3.39641e-5 | 2.69217e-5 | 0.00230942 | 0.00281991 |
+| FC2 | 256 | 2.51617e-5 | 2.83232e-5 | 0.00229348 | 0.00358830 |
+
+**Interpretation:** physical M changes produce measurable BF16-native
+GEMM differences at layer1; per-module Y/dX relative L2 is ~1.7e-5
+to 4.3e-5, while **dW differs by ~0.216%-0.231% using FP32 SUM**
+or **~0.280%-0.359% using BF16 SUM**. BF16 aggregation is an
+additional drift contributor on this real operand control.
+
+This is **not a whole-model accumulation bound**: the observed layer1
+single-Linear errors can propagate nonlinearly across 28 layers and
+through attention, and the fixed upstream dY removes feedback coupling.
+The P0-1 CP logprob drift and P0-B 50-step sampled weight divergence
+remain unexplained by a single isolated GEMM.
+
+The P0-2A original output was
+`/tmp/tpr_p0_gemm_replay/p0_2a_gemm_replay.json`
+with 8 measured module/CP reports. No user server environment changes
+are required to inspect this JSON.
+
+## P0-2B native Attention replay: implemented, pending Ascend measurement
+
+The new test
+`tests/models/mcore/tpr/parallel/test_native_attention_qkv_replay_npu.py`
+records CP1's **real Qwen layer core-attention Q/K/V**, actual O and
+upstream dO from a real TQ NLL backward pass. It saves real dQ/dK/dV
+and independently replays the CP1 native Attention with the frozen
+Q/K/V/dO to make sure its reference is self-consistent.
+
+Fresh CP2/4 groups load those exact Q/K/V/dO, apply the validated
+official Zigzag layout and call **the original Megatron/MindSpeed
+`core_attention` module**. The native Ring dispatch must occur
+exactly once per chosen layer on each rank. After backward the test
+restores O/dQ/dK/dV to original global-token indices and reports
+mean/max/p95, relative L2 and cosine. All rank-to-rank gathers are
+disjoint-token restores; there is no GEMM or parameter gradient
+reduction in this replay.
+
+It is a **one-layer Attention causality diagnostic**, not a production
+TPR correctness test. The original native CP1 and CP2/4 backends
+remain unchanged. LSE capture is excluded at this stage.
+
+**HOST:**
+```bash
+cd /workspace/bridge
+git pull --ff-only
+```
+
+**DOCKER:**
+```bash
+rsync -av /workspace/bridge/tests/models/mcore/tpr/ /workspace/uni-agent/verl/tests/models/mcore/tpr/
+cd /workspace/uni-agent/verl
+# export TPR_REAL_TQ_BATCH=/path/to/your/real/tq_batch.pt
+bash tests/models/mcore/tpr/parallel/run_native_attention_qkv_replay.sh
+```
+
+Optional: `TPR_P0_2B_LAYERS=1,4` changes the checked zero-based
+Qwen layers (default 1); `TPR_P0_2B_REUSE_CP1=1` reuses an already
+captured compatible CP1 oracle. Default localhost ports are
+29771, 29772, 29774. No `--standalone`.
+
+Outputs: `/tmp/tpr_p0_attn_replay/native_cp1_attention_oracle.pt`
+plus `native_cp2_attention_replay.json` and
+`native_cp4_attention_replay.json`.
+
+## Deferred: direct TPR vs Full 50-step training comparison
+
+**Not started and not implemented here.** After P0-2B is measured,
+run a CP-matched, data-matched, optimizer-matched 50-step **real TPR vs
+complete-sequence native baseline**. Important controls:
+
+- Same original Qwen checkpoint; same exact physical real trajectories,
+  logical supervised tokens and train/validation split; fixed tree.
+- Identical NLL first (then separately authentic PPO with real old
+  logprobs, advantages and clipping). No reinterpretation of synthetic
+  coefficients as real advantages.
+- Compare (a) CP1 native Full vs TPR CP1 and (b) CP2/CP4 native Full
+  vs TPR at the **same CP**, after official backend/schedule compatibility
+  checks. Do not use cross-CP results as TPR correctness thresholds.
+- Capture train NLL, per-step gradients, FP32 master weights/optimizer
+  state and a **common native CP1 validation oracle**, not solely
+  separate CP-specific evaluations.
+- Do not silently replace reference operators with padding/FP32
+  shape normalization or force tree topology to prompt-root.
+
+The current P0-B replay of independent 1024-token windows is **not yet
+an apples-to-apples TPR tree benefit/equivalence workload**. A later
+tree-aware trajectory scheduler must use the same logical losses while
+preserving genuine shared prefixes and repeated trajectories.
