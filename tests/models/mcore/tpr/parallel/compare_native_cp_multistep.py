@@ -74,7 +74,8 @@ def main():
         raise ValueError("wrong CP labels")
     ref = data[0]
     fields = ("tag", "model", "checkpoint", "data_sha", "data_path", "stream_sha",
-              "schedule", "train_row_ids", "val_row_ids", "steps_requested",
+              "schedule", "train_row_ids", "val_row_ids", "train_trajectory_ids",
+              "val_trajectory_ids", "steps_requested",
               "lr", "clip_norm", "grad_reduce", "optimizer", "betas", "eps",
               "weight_decay", "seq_len", "response_len", "initial_weights_sha",
               "torch", "gradient_aggregation", "validation_backend")
@@ -93,13 +94,16 @@ def main():
                     raise ValueError(f"CP{x['cp']} invalid cross-CP comparison: {field} mismatch")
         start = x["checkpoints"]["0"]["validation_loss_mean"]
         final = x["checkpoints"][str(args.steps)]["validation_loss_mean"]
-        print(f"P0_B CP{x['cp']} train={x['train_row_ids']} val={x['val_row_ids']} "
+        print(f"P0_B CP{x['cp']} train_windows={len(x['train_row_ids'])} "
+              f"val_windows={len(x['val_row_ids'])} "
+              f"train_trajectories={x['train_trajectory_ids']} "
+              f"val_trajectories={x['val_trajectory_ids']} "
               f"steps={args.steps} train_loss_first={x['events'][0]['train_loss']:.9f} "
               f"train_loss_last={x['events'][-1]['train_loss']:.9f} "
               f"val_initial={start:.9f} val_final={final:.9f} "
               f"val_delta={final-start:.9f} "
               f"grad_reduce={x['grad_reduce']} optimizer={x['optimizer']} "
-              f"low_diversity={len(x['train_row_ids'])<64}")
+              f"low_independent_trajectory_count={len(x['train_trajectory_ids'])<64}")
     common = sorted(set.intersection(*(set(x["checkpoints"]) for x in data)), key=int)
     for cand in data[1:]:
         for milestone in common:
