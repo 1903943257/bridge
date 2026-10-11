@@ -10,17 +10,27 @@ or changes learning under **actual optimizer steps** on identical real tokens.
   The CP1/2/4 sharding and model builders reuse
   `test_native_cp1_cp2_cp4_drift_npu.py`.
 - Training: 50 sequential optimizer updates, no invented synthetic tokens,
-  fixed deterministic train row schedule and held-out validation row IDs.
+  fixed deterministic real-window order and disjoint held-out trajectory IDs.
 - Dataset: the existing `tq_batch.pt` contains **8 SWE trajectories**.
-  Cropping keeps prompt tail 512 + response head 512, and consumes the
-  **recorded response_mask**. Rows missing the required token span or
-  with an empty supervised mask are skipped and recorded.
-  The final quarter of eligible rows are held out for validation.
-  If <2 eligible rows remain, the experiment refuses to run.
-- More than 64 eligible, independent real rows are preferred for strong
-  training conclusions. When only 8 real trajectories exist the 50-step
-  run is intentionally marked `LOW_DIVERSITY`: repeated deterministic
-  replay is a stress test, **not** a demonstration of generalization.
+  By default each eligible trajectory is decomposed into up to **16
+  non-overlapping 1024-token REAL windows**: 512 immediately preceding
+  context tokens (prompt or prior response) + 512 actual response tokens,
+  with the corresponding recorded response_mask. This can yield up to
+  128 different real-token windows, but **still only 8 independent
+  trajectories**. No padding or synthetic filler is used. Trajectories
+  with insufficient prompt/response length or all-zero masks are skipped.
+  The final quarter of *original trajectories* is held out entirely,
+  with up to 8 held-out windows selected for efficient validation.
+  If fewer than 2 trajectories are eligible, the test refuses to run.
+  Window order is deterministically shuffled for training and identical
+  across CP=1/2/4. Configure
+  `TPR_P0_B_MAX_WINDOWS_PER_TRAJECTORY` (default 16, maximum 64).
+- More than 64 genuinely **independent trajectories** would be preferred
+  for strong training conclusions. The 50-step run reports
+  `low_independent_trajectory_count=True` with only 8 originals.
+  Distinct 1024-token windows from the same rollout are real training
+  examples but are *not statistically independent* tasks. This is a
+  controlled optimizer-drift experiment, **not** a generalization claim.
 - Loss: masked next-token NLL, *not* PPO/GRPO. The prompt-boundary
   query at global index 511 predicts the first response token; the
   supervision denominator is the global count of true response_mask
@@ -100,7 +110,7 @@ completed training; there is no optimizer-state resume in this P0.
 
 At each step: global train NLL, number of supervised tokens, FP32
 master grad norm before clip, estimated FP32 master update norm,
-step number and real trajectory ID. At milestone: held-out mean NLL
+step number and real trajectory:window ID. At milestone: held-out mean NLL
 and per-row NLL, all model parameter-name-strided sample witnesses
 for FP32 masters and BF16 model copies; rank consensus of model weights.
 
