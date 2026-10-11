@@ -107,10 +107,6 @@ def _validate(full, tpr, steps):
             tpr["checkpoints"]["0"]["sampled_weights"], field)
         if initial["max_abs"] != 0:
             raise AssertionError(f"Initial Full vs TPR model/optimizer values mismatch: {field}")
-    if full["checkpoints"]["0"]["common_eval_logprobs"] != tpr["checkpoints"]["0"]["common_eval_logprobs"]:
-        # Python dict equality of torch tensors is invalid for multielement;
-        # compare each tensor explicitly below.
-        pass
     for key, tensor in full["checkpoints"]["0"]["common_eval_logprobs"].items():
         other=tpr["checkpoints"]["0"]["common_eval_logprobs"][key]
         if not torch.equal(tensor, other):
