@@ -47,6 +47,19 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
     if not path.is_file():
         raise FileNotFoundError(f"No real TQ file: {path}")
     raw = torch.load(path, map_location="cpu", weights_only=False)
+    # Real rollout dumps and actual pre-train actor-update captures share
+    # a TensorDict payload, but only the latter can establish that PPO
+    # old_log_probs/advantages came from the actor-update boundary.
+    source_stage = raw.get("capture_stage", "tq_rollout")
+    if source_stage not in ("tq_rollout", "actor_update_mini_batch"):
+        raise AssertionError(f"Unknown real-TQ/actor capture stage: {source_stage}")
+    if objective == "ppo" and source_stage != "actor_update_mini_batch":
+        raise AssertionError(
+            "Real PPO replay requires the ORIGINAL actor-update mini_batch "
+            "capture (capture_stage=actor_update_mini_batch), NOT the earlier "
+            "tq_batch.pt rollout file. Set TPR_REAL_TQ_BATCH to the actor "
+            "capture path; no fabricated advantages or old_log_probs."
+        )
     data = raw["tensordict"]
     keys = tuple(raw["keys"])
     required = ("prompts", "responses", "input_ids", "response_mask")
@@ -56,6 +69,14 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
     total = len(rows["prompts"])
     if len(keys) != total or any(len(v) != total for v in rows.values()):
         raise AssertionError("TQ trajectory key/row counts differ")
+    if objective == "ppo" and (
+        not all(isinstance(k, str) and bool(k) for k in keys)
+        or len(set(keys)) != len(keys)
+    ):
+        raise AssertionError(
+            "Actor-update PPO replay needs distinct exact trajectory keys, "
+            "not synthetic row-number identities"
+        )
 
     old_key = next((k for k in ("old_log_probs", "old_logprobs") if k in data), None)
     adv_key = "advantages" if "advantages" in data else None
@@ -67,6 +88,33 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
             "logprobs, or recomputed on-policy labels are allowed"
         )
     if objective == "ppo":
+        if "loss_mask" not in data or "temperature" not in data:
+            raise AssertionError(
+                "PPO actor update must provide original loss_mask and temperature"
+            )
+        loss_masks = _rows(data, "loss_mask")
+        if len(loss_masks) != total:
+            raise AssertionError("Actor loss_mask row count mismatch")
+        for i, lm in enumerate(loss_masks):
+            lm = lm.detach().cpu().bool()
+            full_len = int(rows["input_ids"][i].numel())
+            response_len = int(rows["responses"][i].numel())
+            if lm.numel() == full_len:
+                if bool(lm[:full_len - response_len].any()):
+                    raise AssertionError(f"Actor PPO loss_mask supervises prompt row {i}")
+                lm = lm[-response_len:]
+            if not torch.equal(lm, rows["response_mask"][i].detach().cpu().bool()):
+                raise AssertionError(f"Original loss_mask/response_mask mismatch row {i}")
+        temperature = data["temperature"].detach().cpu().float()
+        if not bool(torch.isfinite(temperature).all()):
+            raise AssertionError("Nonfinite actor PPO temperature")
+        # The current Qwen core-logprob helper uses temperature=1; never
+        # silently replay a differently tempered behavior policy.
+        if not bool((temperature == 1).all()):
+            raise AssertionError(
+                "P0-5 replay only supports actor temperature exactly 1; "
+                "temperature-aware reference forward is not implemented"
+            )
         rows["old"] = _rows(data, old_key)
         rows["adv"] = _rows(data, adv_key)
         if len(rows["old"]) != total or len(rows["adv"]) != total:
@@ -158,6 +206,8 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
             source.update(row["adv"].numpy().tobytes())
     info = {
         "selected_original_rows": [r["row"] for r in selected],
+        "source_stage": source_stage,
+        "actor_update_capture": source_stage == "actor_update_mini_batch",
         "selected_keys": [r["key"] for r in selected],
         "first_different_response_offset": first_divergence,
         "prefix_sha256": hashlib.sha256(selected[0]["prefix"].numpy().tobytes()).hexdigest(),
