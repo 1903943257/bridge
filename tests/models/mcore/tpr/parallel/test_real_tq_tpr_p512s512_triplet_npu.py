@@ -6,6 +6,8 @@ vs TPR contiguous Prefix512, Suffix512 + external KV rectangular attention.
 
 Produce two same-process TPR-family results:
   TPR_CONTROL_FULL   one 1024-token GPT forward/backward with no TPR context;
+  TPR_ONE_NODE       one 1024-token SegmentExecutor visit_leaf root: same
+                     tree-mode rectangular Attention but no split/KV relay;
   TPR_SEGMENTED      real SegmentExecutor push(512) -> visit_leaf(512)
                      -> pop(512), with root query 511 predicting response[0].
 
@@ -92,6 +94,59 @@ def _run_control_full(model, tokens):
     }
     model.zero_grad(set_to_none=True)
     return ret
+
+
+def _run_one_node_tpr(model, tokens):
+    """Full M=1024 through TPR tree Attention, with NO Prefix/Suffix split.
+
+    Isolates native-without-context vs TPR rectangular Attention at the
+    *same* physical GEMM M. There is only a root leaf and no cached KV relay.
+    """
+    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec
+    from verl.models.mcore.tpr.attention import TPRSelfAttention
+
+    root = SegmentSpec(
+        0, None, tokens, position_start=0, prefix_length=0,
+    )
+    plan = SegmentPlan((root,), root_id=0, topology_only=True)
+    layers = tuple(sorted(
+        module.layer_number for module in model.modules()
+        if isinstance(module, TPRSelfAttention)
+    ))
+    if len(layers) != 28:
+        raise AssertionError(f"Expected real 28-layer TPR Qwen; got {len(layers)}")
+    snapshots = {}
+    callback_count = [0]
+
+    def loss_fn(segment, logits):
+        if segment.segment_id != 0 or logits.shape[1] != SEQ_LEN:
+            raise AssertionError("One-node TPR oracle is not full-sequence")
+        lp = _response_logprobs(logits, tokens)
+        callback_count[0] += 1
+        snapshots["response_logprobs"] = lp.detach().float().cpu().clone()
+        return -lp.sum() / RESPONSE_LEN, {}
+
+    model.zero_grad(set_to_none=True)
+    executor = SegmentExecutor(
+        model, plan, expected_layer_numbers=layers,
+        segment_loss_fn=loss_fn,
+        segment_loss_term_counts={0: RESPONSE_LEN},
+    )
+    leaf = executor.visit_leaf(0)
+    executor.kv_stack.assert_empty()
+    if callback_count != [1] or leaf.backward.loss_term_count != RESPONSE_LEN:
+        raise AssertionError("TPR one-node full loss ownership mismatch")
+    result = {
+        "loss": float(leaf.backward.normalized_loss.detach().cpu()),
+        "response_logprobs": snapshots["response_logprobs"],
+        "gradients": _sample_grads(model),
+        "segment_lengths": [SEQ_LEN],
+        "loss_term_count": RESPONSE_LEN,
+        "prefix_grad_relays": 0,
+    }
+    model.zero_grad(set_to_none=True)
+    return result
 
 
 def _run_two_node_tpr(model, tokens):
@@ -182,7 +237,19 @@ def test_p512s512_real_tq_tpr_vs_controlled_full():
             raise AssertionError("P0-3 requires same real TQ row0 as native P0-1")
         signature = _weight_signature(model)
         controlled = _run_control_full(model, tokens)
+        tpr_one_node = _run_one_node_tpr(model, tokens)
         tpr = _run_two_node_tpr(model, tokens)
+        backend_gap = controlled["response_logprobs"] - tpr_one_node["response_logprobs"]
+        segmentation_gap = tpr_one_node["response_logprobs"] - tpr["response_logprobs"]
+        print(
+            "P0_3 ONE_NODE_M1024_VS_TWO_NODE_M512 "
+            f"one_node_loss={tpr_one_node['loss']:.9f} "
+            f"split_loss={tpr['loss']:.9f} "
+            f"backend_mean_logprob_abs={float(backend_gap.abs().mean()):.9g} "
+            f"segment_mean_logprob_abs={float(segmentation_gap.abs().mean()):.9g} "
+            f"segment_max_logprob_abs={float(segmentation_gap.abs().max()):.9g}",
+            flush=True,
+        )
         raw = controlled["response_logprobs"] - tpr["response_logprobs"]
         print(
             f"P0_3 P512S512 CONTROLLED_FULL_VS_TPR "
@@ -206,6 +273,7 @@ def test_p512s512_real_tq_tpr_vs_controlled_full():
             "objective": "512_response_targets_including_prompt_boundary_nll",
             "denominator": RESPONSE_LEN,
             "controlled_full": controlled,
+            "tpr_one_node_m1024": tpr_one_node,
             "tpr_p512s512": tpr,
             "note": "CP1 TPR engine SegmentExecutor; controlled full attention is "
                     "not official CP1 core attention; compare separately.",
