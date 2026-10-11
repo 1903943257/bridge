@@ -84,6 +84,12 @@ def _verify(full, tpr, steps):
     ):
         if a0["row"] != b0["row"] or not torch.equal(a0["response_mask"], b0["response_mask"]):
             raise AssertionError("Initial validation rows/masks are not identical")
+        if not torch.equal(a0["response_logprobs"], b0["response_logprobs"]):
+            raise AssertionError(
+                "Step0 common-Full evaluation differs despite identical weights: "
+                f"row={a0['row']} — investigate nondeterminism/backend before "
+                "comparing learned-parameter drift"
+            )
     print(
         "P0_4 CONTROL status=PASS identical_initial_weights=True "
         f"train_windows={len(full['train_row_ids'])} "
