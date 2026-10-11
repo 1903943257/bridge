@@ -17,6 +17,12 @@ export TPR_QWEN_1_7B_PATH="${TPR_QWEN_1_7B_PATH:-/workspace/hf_models/Qwen3-1.7B
 export TPR_REAL_TQ_BATCH="${TPR_REAL_TQ_BATCH:-/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt}"
 export TPR_P0_BRANCH_OUTPUT_DIR="${TPR_P0_BRANCH_OUTPUT_DIR:-/tmp/tpr_p0_real_siblings}"
 export TPR_P0_BRANCH_OBJECTIVE="${TPR_P0_BRANCH_OBJECTIVE:-nll}"
+# Actual PPO fields are produced only at actor-update time, not by the
+# original TQ rollout dump. Set TPR_REAL_ACTOR_MINIBATCH to use that capture.
+if [[ "$TPR_P0_BRANCH_OBJECTIVE" == "ppo" &&
+      -n "${TPR_REAL_ACTOR_MINIBATCH:-}" ]]; then
+  export TPR_REAL_TQ_BATCH="$TPR_REAL_ACTOR_MINIBATCH"
+fi
 export TPR_P0_BRANCH_SIBLINGS="${TPR_P0_BRANCH_SIBLINGS:-2}"
 export TPR_P0_BRANCH_STEPS="${TPR_P0_BRANCH_STEPS:-1}"
 base="${TPR_P0_BRANCH_MASTER_PORT_BASE:-29840}"
@@ -31,6 +37,12 @@ fi
 [[ -d "$TPR_QWEN_1_7B_PATH" ]] || { echo "Checkpoint missing: $TPR_QWEN_1_7B_PATH" >&2; exit 2; }
 mkdir -p "$TPR_P0_BRANCH_OUTPUT_DIR"
 if [[ "${TPR_P0_BRANCH_COMPARE_ONLY:-0}" != "1" ]]; then
+  if [[ "$TPR_P0_BRANCH_OBJECTIVE" == "ppo" ]]; then
+    # Reject missing actor fields BEFORE two expensive Qwen NPU loads.
+    # For a rollout-only dump this is a DATA GATE, not a TPR test failure.
+    python tests/models/mcore/tpr/parallel/inspect_real_tq_siblings.py \
+      "$TPR_REAL_TQ_BATCH" --siblings "$TPR_P0_BRANCH_SIBLINGS" --require-ppo
+  fi
   case "${TPR_P0_BRANCH_RUN_MODES:-both}" in
     both) modes=(full tpr) ;;
     full) modes=(full) ;;
