@@ -2,10 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Isolated real-Qwen3-1.7B TP2+RingCP2 then DP2+RingCP2 module gates.
 
-Two sequential 4-NPU runs (no SP initially):
+Original two 4-NPU runs (no SP):
   TPR_RUN_RING_COMBO=tp_cp torchrun --nproc_per_node=4 -m pytest -s -vv -x \
     tests/models/mcore/tpr/parallel/test_tpr_ring_tp_cp_dp_npu.py
   TPR_RUN_RING_COMBO=dp_cp torchrun --nproc_per_node=4 -m pytest -s -vv -x \
+    tests/models/mcore/tpr/parallel/test_tpr_ring_tp_cp_dp_npu.py
+
+Diagnostic controls preserving the exact numerical gates and Ring math:
+  # Swap the two physical token workloads between DP0 and DP1 (4 NPUs).
+  TPR_RUN_RING_COMBO=dp_cp TPR_RING_SWAP_DP_DATA=1 \
+    torchrun --nproc_per_node=4 -m pytest -s -vv -x \
+    tests/models/mcore/tpr/parallel/test_tpr_ring_tp_cp_dp_npu.py
+  # Reproduce original DP1 tokens on isolated TP1 x RingCP2, DP1 (2 NPUs).
+  TPR_RUN_RING_COMBO=cp_control TPR_RING_CONTROL_DATASET=1 \
+    torchrun --nproc_per_node=2 -m pytest -s -vv -x \
     tests/models/mcore/tpr/parallel/test_tpr_ring_tp_cp_dp_npu.py
 
 The baseline computes two *independent* full trajectories, each using the
@@ -50,21 +60,26 @@ from .test_tpr_tp2_sp_dp2_npu import _distinct_dp_trajectories
 
 _MODE = os.getenv("TPR_RUN_RING_COMBO", "")
 pytestmark = pytest.mark.skipif(
-    _MODE not in ("tp_cp", "dp_cp"),
-    reason="set TPR_RUN_RING_COMBO=tp_cp or dp_cp for 4-NPU Ring CP tests",
+    _MODE not in ("tp_cp", "dp_cp", "cp_control"),
+    reason="set TPR_RUN_RING_COMBO=tp_cp, dp_cp or cp_control for Ring CP tests",
 )
 _QWEN_PATH = Path(os.getenv("TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B"))
 
 
 @pytest.fixture(scope="module")
 def ring_combo_runtime():
-    if int(os.getenv("WORLD_SIZE", "1")) != 4:
-        pytest.skip("TP/DP plus Ring CP requires torchrun --nproc_per_node=4")
+    expected_world_size = 2 if _MODE == "cp_control" else 4
+    if int(os.getenv("WORLD_SIZE", "1")) != expected_world_size:
+        pytest.skip(
+            f"{_MODE} Ring CP requires torchrun --nproc_per_node="
+            f"{expected_world_size}"
+        )
     import torch_npu  # noqa: F401
 
     tp_size = 2 if _MODE == "tp_cp" else 1
     cp_size = 2
-    dp_size = 1 if _MODE == "tp_cp" else 2
+    dp_size = 2 if _MODE == "dp_cp" else 1
+    assert tp_size * cp_size * dp_size == expected_world_size
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
     if not dist.is_initialized():
@@ -220,7 +235,18 @@ def _run_ring_forest(model, plans, runtime, logical_indices, logical_count):
 
 def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
     runtime = ring_combo_runtime
-    prefix, suffix1, suffix2, signature = _distinct_dp_trajectories(runtime.dp_rank)
+    # The original acceptance run is unchanged. Optional controls vary only
+    # which of the two already-validated physical token workloads is supplied:
+    # no attention algorithm, gradient reduction or numerical gate is altered.
+    if _MODE == "cp_control":
+        dataset_id = int(os.getenv("TPR_RING_CONTROL_DATASET", "1"))
+    elif _MODE == "dp_cp" and os.getenv("TPR_RING_SWAP_DP_DATA", "0") == "1":
+        dataset_id = 1 - runtime.dp_rank
+    else:
+        dataset_id = runtime.dp_rank
+    if dataset_id not in (0, 1):
+        raise ValueError(f"TPR_RING dataset_id must be 0 or 1, got {dataset_id}")
+    prefix, suffix1, suffix2, signature = _distinct_dp_trajectories(dataset_id)
     # Ring CP has two zigzag ranges per CP rank; divisible lengths avoid
     # padding and keep both rank-local logical shard lengths equal.
     assert all(x.numel() % (2 * runtime.cp_size) == 0 for x in (prefix, suffix1, suffix2))
@@ -238,7 +264,9 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
         [runtime.dp_rank, runtime.tp_rank, runtime.cp_rank, signature],
         dtype=torch.int64, device=runtime.device,
     )
-    metadata_world = [torch.empty_like(metadata) for _ in range(4)]
+    metadata_world = [
+        torch.empty_like(metadata) for _ in range(dist.get_world_size())
+    ]
     dist.all_gather(metadata_world, metadata)
     rows = [x.cpu().tolist() for x in metadata_world]
     signatures_by_dp = {}
@@ -351,6 +379,7 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
             f"TPR_RING_COMBO_DIAG mode={_MODE} "
             f"world_rank={dist.get_rank()} dp_rank={runtime.dp_rank} "
             f"tp_rank={runtime.tp_rank} cp_rank={runtime.cp_rank} "
+            f"dataset_id={dataset_id} "
             f"failed_gates={[name for name, ok in gates.items() if not ok]} "
             f"loss_gap={ce_gap:.8f} logprob_rel_l2={logit_rel_l2:.8f} "
             f"grad_rel_l2={grad_rel_l2:.8f} "
@@ -365,10 +394,12 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
          reference_loss, actual_loss, ce_gap, logit_rel_l2, grad_rel_l2,
          int(groups_aligned), int(workloads_distinct),
          int(reference_owners and actual_owners), int(trace_ok),
-         int(ring_ok), int(local_ok)],
+         int(ring_ok), int(dataset_id), int(local_ok)],
         dtype=torch.float32, device=runtime.device,
     )
-    summaries = [torch.empty_like(metrics) for _ in range(4)]
+    summaries = [
+        torch.empty_like(metrics) for _ in range(dist.get_world_size())
+    ]
     dist.all_gather(summaries, metrics)
     observed = [m.cpu().tolist() for m in summaries]
     if dist.get_rank() == 0:
@@ -376,12 +407,13 @@ def test_qwen3_native_tp_or_dp_with_ring_cp(ring_combo_runtime):
             print(
                 f"TPR_RING_COMBO mode={_MODE} world_rank={global_rank} "
                 f"dp_rank={int(row[0])} tp_rank={int(row[1])} cp_rank={int(row[2])} "
+                f"dataset_id={int(row[13])} "
                 f"reference_ce={row[3]:.7f} tpr_ce={row[4]:.7f} "
                 f"loss_gap={row[5]:.7f} logprob_rel_l2={row[6]:.7f} "
                 f"grad_rel_l2={row[7]:.7f} "
                 f"plan_groups_aligned={bool(row[8])} dp_workloads_distinct={bool(row[9])} "
                 f"loss_ownership_ok={bool(row[10])} tree_trace_ok={bool(row[11])} "
-                f"ring_kernel_ok={bool(row[12])} gate_pass={bool(row[13])}",
+                f"ring_kernel_ok={bool(row[12])} gate_pass={bool(row[14])}",
                 flush=True,
             )
     dist.barrier()
