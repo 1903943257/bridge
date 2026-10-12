@@ -26,7 +26,7 @@ from verl.utils.megatron_utils import unwrap_model
 from .attention import TPRSelfAttention
 from .engine_adapter import TPRForwardBackwardRequest
 from .fixed_topology_scheduler import FixedTopologyScheduler
-from .module_spec import make_tpr_module_spec_provider
+from .module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
 from .parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
 from .segment_executor import SegmentExecutor
 
@@ -35,17 +35,22 @@ if TYPE_CHECKING:
 
 
 def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None:
-    """Install TPR attention before model construction.
+    """Install the TPR attention spec for the actual model-construction path.
 
-    The optional bridge argument preserves compatibility with Uni-Agent-CC
-    callers. The provider remains the owner of the transformer-layer spec.
+    Non-vanilla uses the provider. Vanilla MBridge builds its layer spec lazily
+    through the bridge instance, so patch that instance before get_model().
     """
     if provider is None:
-        raise NotImplementedError(
-            "TPR model construction requires the non-vanilla Megatron-Bridge provider; "
-            "passing bridge= does not replace a missing provider"
-        )
-    provider.transformer_layer_spec = make_tpr_module_spec_provider(provider.transformer_layer_spec)
+        if bridge is None:
+            raise NotImplementedError(
+                "TPR model construction requires either a non-vanilla provider "
+                "or the vanilla bridge instance"
+            )
+        install_tpr_vanilla_mbridge_spec(bridge)
+        return
+    provider.transformer_layer_spec = make_tpr_module_spec_provider(
+        provider.transformer_layer_spec
+    )
 
 
 def run_tpr_forward_backward(
