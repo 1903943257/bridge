@@ -73,7 +73,10 @@ def patch_model_spec(source: str) -> tuple[str, str]:
     lines = source.splitlines(keepends=True)
     body = "".join(lines[method.lineno - 1 : method.end_lineno])
     if "install_tpr_module_spec" in body:
-        if not any(call in body for call in (\n            "install_tpr_module_spec(self.provider, bridge=self.bridge)",\n            "install_tpr_module_spec(self.provider)",\n        )):
+        if not any(call in body for call in (
+            "install_tpr_module_spec(self.provider, bridge=self.bridge)",
+            "install_tpr_module_spec(self.provider)",
+        )):
             raise PatchError("Partial or nonstandard TPR Module Spec hook detected")
         return source, "already-patched"
     calls = [node for node in method.body if isinstance(node, ast.Assign)
