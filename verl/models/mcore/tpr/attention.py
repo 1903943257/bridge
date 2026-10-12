@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from typing import Optional, Tuple, Union
+import os
 
 import torch
 from torch import Tensor
@@ -94,6 +95,11 @@ class TPRSelfAttention(SelfAttention):
         context: TPRAttentionContext,
     ) -> tuple[Tensor, Tensor | None]:
         # Reuse Megatron's projection, GQA reshaping, and optional Q/K norms.
+        trace_mem = os.getenv("TPR_MEM_TRACE", "0") == "1"
+        def trace(stage):
+            if trace_mem:
+                print(f"TPR_MEM LAYER stage={stage} layer={self.layer_number} suffix={hidden_states.shape[0]} prefix={context.prefix_length} grad={torch.is_grad_enabled()} alloc_gib={torch.npu.memory_allocated() / (1024 ** 3):.3f} reserved_gib={torch.npu.memory_reserved() / (1024 ** 3):.3f}", flush=True)
+        trace("BEFORE_QKV")
         output_gate = getattr(self.config, "attention_output_gate", False)
         qkv = self.get_query_key_value_tensors(
             hidden_states,
@@ -101,6 +107,7 @@ class TPRSelfAttention(SelfAttention):
             split_qkv=True,
             output_gate=output_gate,
         )
+        trace("AFTER_QKV")
         if output_gate:
             query, new_key, new_value, gate = qkv
         else:
@@ -147,12 +154,15 @@ class TPRSelfAttention(SelfAttention):
                 dropout_p=0.0,
             )
 
+        trace("AFTER_ATTENTION")
         # Collect post-RoPE K and raw V without detach/clone, preserving the
         # graph both for descendants and for gradients into an external prefix.
         context.set_new_kv(self.layer_number, new_key, new_value)
         if gate is not None:
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
-        return apply_module(self.linear_proj)(core_attn_out)
+        output = apply_module(self.linear_proj)(core_attn_out)
+        trace("AFTER_PROJ")
+        return output
 
     def _validate_tree_forward(
         self,
