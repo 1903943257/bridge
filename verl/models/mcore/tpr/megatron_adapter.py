@@ -244,8 +244,8 @@ def run_tpr_forward_backward_batch(
         "CP": engine.engine_config.context_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
-    if any(size != 1 for size in sizes.values()):
-        raise NotImplementedError(f"TPR PPO phase-4 is single-rank only, got {sizes}")
+    if any(sizes[name] != 1 for name in ("TP", "PP", "EP", "DP")) or sizes["CP"] not in (1, 2):
+        raise NotImplementedError(f"TPR PPO supports CP=1/2 with TP/PP/EP/DP=1, got {sizes}")
     if engine.engine_config.virtual_pipeline_model_parallel_size not in (None, 1):
         raise NotImplementedError("TPR PPO does not support virtual PP")
     if engine.model_config.mtp.enable or engine.enable_routing_replay:
@@ -284,6 +284,9 @@ def run_tpr_forward_backward_batch(
     forest = build_tree_execution_plans(keys, data)
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
+    cp_runtime = resolve_engine_cp_runtime(engine, config)
+    if cp_runtime.size == 2 and cp_runtime.backend_name != "ring":
+        raise NotImplementedError("TPR PPO CP=2 currently requires Ring backend")
     objective = SegmentPPOObjectiveAdapter(
         data, loss_function, dp_group=engine.get_data_parallel_group()
     )
@@ -301,7 +304,8 @@ def run_tpr_forward_backward_batch(
     metric_lists: dict[str, list[Any]] = {}
 
     def run_one_tree(tree_plan):
-        callback, counts = objective.bind_tree(tree_plan)
+        shard_for_segment = None if cp_runtime.backend is None else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
+        callback, counts = objective.bind_tree(tree_plan, shard_for_segment=shard_for_segment)
         executor = SegmentExecutor(
             model,
             tree_plan.segment_plan,
@@ -309,6 +313,8 @@ def run_tpr_forward_backward_batch(
             loss_scale_func=getattr(config, "grad_scale_func", None),
             segment_loss_fn=callback,
             segment_loss_term_counts=counts,
+            cp_group=cp_runtime.group,
+            cp_backend=cp_runtime.backend,
         )
         result = FixedTopologyScheduler(tree_plan.segment_plan, executor).run()
         if not bool(torch.isfinite(result.normalized_loss).item()):
