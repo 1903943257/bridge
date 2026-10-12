@@ -73,7 +73,7 @@ def patch_model_spec(source: str) -> tuple[str, str]:
     lines = source.splitlines(keepends=True)
     body = "".join(lines[method.lineno - 1 : method.end_lineno])
     if "install_tpr_module_spec" in body:
-        if "install_tpr_module_spec(self.provider)" not in body:
+        if not any(call in body for call in (\n            "install_tpr_module_spec(self.provider, bridge=self.bridge)",\n            "install_tpr_module_spec(self.provider)",\n        )):
             raise PatchError("Partial or nonstandard TPR Module Spec hook detected")
         return source, "already-patched"
     calls = [node for node in method.body if isinstance(node, ast.Assign)
@@ -92,7 +92,7 @@ def patch_model_spec(source: str) -> tuple[str, str]:
         "        if self.engine_config.tpr_enabled:\n"
         "            from verl.models.mcore.tpr.megatron_adapter import install_tpr_module_spec\n"
         "\n"
-        "            install_tpr_module_spec(self.provider)\n"
+        "            install_tpr_module_spec(self.provider, bridge=self.bridge)\n"
         "\n"
     )
     updated = "".join(lines[:anchor]) + insertion + "".join(lines[anchor:])
