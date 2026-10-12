@@ -20,6 +20,7 @@ import copy
 import inspect
 from collections.abc import Callable
 from dataclasses import replace
+from functools import wraps
 from typing import Any, TypeVar
 
 from megatron.core.transformer.attention import SelfAttention
@@ -103,6 +104,31 @@ def make_tpr_module_spec_provider(
         return replace_self_attention_with_tpr(spec)
 
     return tpr_spec_provider
+
+
+
+def install_tpr_vanilla_mbridge_spec(bridge: Any) -> None:
+    """Patch only this vanilla MBridge instance's lazy TransformerLayer spec.
+
+    mbridge 0.15.1 resolves the spec inside _model_provider; install before
+    bridge.get_model() so the constructed model uses TPRSelfAttention.
+    """
+    original = getattr(bridge, "_get_transformer_layer_spec", None)
+    if not callable(original):
+        raise TypeError(
+            "Vanilla MBridge TPR requires callable "
+            "bridge._get_transformer_layer_spec; got "
+            f"{type(original).__name__}"
+        )
+    if getattr(original, "_tpr_vanilla_mbridge_spec", False):
+        return
+
+    @wraps(original)
+    def tpr_layer_spec(*args: Any, **kwargs: Any) -> Any:
+        return replace_self_attention_with_tpr(original(*args, **kwargs))
+
+    tpr_layer_spec._tpr_vanilla_mbridge_spec = True
+    bridge._get_transformer_layer_spec = tpr_layer_spec
 
 
 def _get_layer_specs(transformer_layer_spec: object) -> list[ModuleSpec]:
