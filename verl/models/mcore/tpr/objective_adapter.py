@@ -17,6 +17,7 @@ import torch
 from torch import Tensor
 
 from .segment_plan import SegmentSpec
+from .shard import SequenceShard
 from .tree_plan_builder import SegmentObjectiveRef, TreeExecutionPlan
 
 
@@ -92,7 +93,7 @@ class SegmentPPOObjectiveAdapter:
         self.capture_log_probs = bool(_metadata(batch, "tpr_capture_log_probs", default=False))
         self.debug_new_log_probs: dict[tuple[int, int], float] = {}
 
-    def bind_tree(self, tree_plan: TreeExecutionPlan):
+    def bind_tree(self, tree_plan: TreeExecutionPlan, *, shard_for_segment=None):
         """Bind an executable tree to SegmentExecutor's loss hook.
 
         Return (loss_callback, per_segment_ref_counts). A single adapter can
@@ -107,12 +108,17 @@ class SegmentPPOObjectiveAdapter:
         for ref in tree_plan.objective_refs:
             refs_by_segment[ref.segment_id].append(ref)
 
+        global_count = sum(len(refs) for refs in refs_by_segment.values())
+        if shard_for_segment is not None:
+            for segment_id, refs in refs_by_segment.items():
+                shard = shard_for_segment(tree_plan.segment_plan.get(segment_id))
+                refs_by_segment[segment_id] = [ref for ref in refs if shard.owns(ref.query_offset)]
         counts = {segment_id: len(refs) for segment_id, refs in refs_by_segment.items()}
-        if not sum(counts.values()):
+        if not global_count:
             raise ValueError("tree has no supervised logical response tokens")
 
         def segment_loss_fn(segment: SegmentSpec, logits: Tensor):
-            return self.compute_loss(segment, logits, refs_by_segment[segment.segment_id])
+            return self.compute_loss(segment, logits, refs_by_segment[segment.segment_id], shard=None if shard_for_segment is None else shard_for_segment(segment))
 
         return segment_loss_fn, counts
 
@@ -143,6 +149,8 @@ class SegmentPPOObjectiveAdapter:
         segment: SegmentSpec,
         logits: Tensor,
         refs: Sequence[SegmentObjectiveRef],
+        *,
+        shard: SequenceShard | None = None,
     ) -> tuple[Tensor, dict]:
         """Return a native-normalized scalar and its segment-local metrics.
 
@@ -153,8 +161,9 @@ class SegmentPPOObjectiveAdapter:
         refs = tuple(refs)
         if not refs:
             raise ValueError("no objective refs: use a zero-gradient relay path for this segment")
-        if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] != segment.length:
-            raise ValueError("expected unsharded physical logits [1, segment_length, local_vocab]")
+        expected_length = segment.length if shard is None else shard.local_length
+        if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] != expected_length:
+            raise ValueError("expected physical logits [1, local_length, local_vocab]")
         if _metadata(self.batch, "batch_num_tokens", default=None) is None:
             raise ValueError("PPO global batch_num_tokens is missing; compute it before TPR routing")
         temperatures = self._temperatures(refs)
@@ -169,7 +178,10 @@ class SegmentPPOObjectiveAdapter:
                 raise ValueError("objective ref belongs to another segment")
             if not 0 <= ref.query_offset < segment.length:
                 raise ValueError("objective ref query_offset is outside segment")
-            key = (ref.query_offset, ref.target_token_id, temperature)
+            offset = ref.query_offset if shard is None else shard.global_to_local(ref.query_offset)
+            if offset is None:
+                raise ValueError("PPO ref is not owned by this CP rank")
+            key = (offset, ref.target_token_id, temperature)
             if key not in unique:
                 unique[key] = len(keys)
                 keys.append(key)
