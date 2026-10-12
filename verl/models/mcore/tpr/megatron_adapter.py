@@ -355,6 +355,8 @@ def run_tpr_forward_backward_batch(
         # Explicitly opt-in through tpr_capture_log_probs for numerical gates.
         # Never materialize all per-token logprobs on the host during training.
         engine._tpr_captured_log_probs = dict(objective.debug_new_log_probs)
+    if objective.capture_logit_parts:
+        engine._tpr_captured_logit_parts = dict(objective.debug_logit_parts)
 
     logical_input_tokens = sum(int(row.numel()) for row in data["input_ids"].unbind())
     unique_tree_tokens = sum(
