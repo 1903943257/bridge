@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
+import os
 from typing import Any
 
 import torch
@@ -413,6 +414,8 @@ class SegmentExecutor:
         device = _model_device(self.model)
         shard = self._segment_shard(segment)
         local_token_ids = shard.select(segment.token_ids)
+        if os.getenv("TPR_MEM_TRACE", "0") == "1":
+            print(f"TPR_MEM FORWARD_BEGIN segment={segment.segment_id} parent={segment.parent_id} prefix={segment.prefix_length} length={segment.length} local_length={shard.local_length} no_grad={no_grad} cp={self.cp_size} alloc_gib={torch.npu.memory_allocated() / (1024 ** 3):.3f} reserved_gib={torch.npu.memory_reserved() / (1024 ** 3):.3f}", flush=True)
         input_ids = local_token_ids.to(device=device).unsqueeze(0)
         position_ids = shard.global_indices(device=device).add(segment.position_start).unsqueeze(0)
         attention_backend = None
@@ -480,6 +483,8 @@ class SegmentExecutor:
                         position_ids=position_ids,
                         attention_mask=None,
                     )
+        if os.getenv("TPR_MEM_TRACE", "0") == "1":
+            print(f"TPR_MEM FORWARD_END segment={segment.segment_id} no_grad={no_grad} alloc_gib={torch.npu.memory_allocated() / (1024 ** 3):.3f} reserved_gib={torch.npu.memory_reserved() / (1024 ** 3):.3f}", flush=True)
         if isinstance(logits, _ChunkedLanguageModelOutput):
             if logits.local_sequence_length != shard.local_length:
                 raise RuntimeError(
