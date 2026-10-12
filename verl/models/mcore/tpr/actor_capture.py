@@ -15,21 +15,16 @@ from verl.utils import tensordict_utils as tu
 
 
 def _real_keys(batch) -> tuple[str, ...]:
-    keys = tu.get_non_tensor_data(
-        batch, key="tpr_trajectory_keys", default=None
-    )
-    if keys is not None:
-        return tuple(keys)
-    # Real per-trajectory uid is a supported identity only when genuinely
-    # supplied by the data loader. Never fabricate a row-number identity.
-    if "uid" in batch:
-        value = batch["uid"]
-        if isinstance(value, (list, tuple)):
-            return tuple(str(v) for v in value)
-        if isinstance(value, torch.Tensor):
-            if value.ndim == 1:
-                return tuple(str(v.item()) for v in value)
-    return ()
+    """Capture EXACTLY the keys the production PPO Engine will use.
+
+    A uid is a sample/group identifier, not a unique rollout identifier.
+    The Engine resolves repeated uid values to uid_tpr_<mini-batch-row>,
+    preserving group membership while distinguishing sibling trajectories.
+    Do not independently duplicate its fallback implementation.
+    """
+    from .megatron_adapter import _trajectory_keys_from_minibatch
+
+    return _trajectory_keys_from_minibatch(batch)
 
 
 def capture_real_actor_update_minibatch(
