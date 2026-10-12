@@ -52,7 +52,7 @@ def inspect(path, *, siblings=2, require_ppo=False):
             )
         if len(keys) != len(set(keys)) or not all(isinstance(k, str) and k for k in keys):
             raise AssertionError("Actor capture requires exact unique trajectory keys")
-        temperature = data["temperature"].detach().cpu().float()
+        temperature = torch.as_tensor(data["temperature"], dtype=torch.float32).detach().cpu()
         if not bool(torch.isfinite(temperature).all() and (temperature == 1).all()):
             raise AssertionError(
                 "P0-5 current PPO replay requires exact temperature=1"
