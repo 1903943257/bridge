@@ -348,10 +348,17 @@ def run_tpr_forward_backward_batch(
     # numeric scalars before returning them across the worker boundary.
     for name, values in metric_lists.items():
         from verl.utils.metric import Metric
-        metric_lists[name] = [
-            float(value.aggregate()) if isinstance(value, Metric) else float(value)
-            for value in values
-        ]
+
+        if any(isinstance(value, Metric) for value in values):
+            if not all(isinstance(value, Metric) for value in values):
+                raise TypeError(f"TPR metric {name} mixes Metric and numeric values")
+            # Segment Metric(MEAN) values were converted to SUM contributions
+            # weighted by their share of the original global response tokens.
+            # The trainer later uses np.mean(list), so return ONE aggregate
+            # numeric value, not separate weighted contributions.
+            metric_lists[name] = [sum(float(value.aggregate()) for value in values)]
+        else:
+            metric_lists[name] = [float(value) for value in values]
 
     runner = TPRBatchRunner(
         run_tree=run_one_tree,
