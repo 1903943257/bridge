@@ -105,7 +105,7 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
                 lm = lm[-response_len:]
             if not torch.equal(lm, rows["response_mask"][i].detach().cpu().bool()):
                 raise AssertionError(f"Original loss_mask/response_mask mismatch row {i}")
-        temperature = data["temperature"].detach().cpu().float()
+        temperature = torch.as_tensor(data["temperature"], dtype=torch.float32).detach().cpu()
         if not bool(torch.isfinite(temperature).all()):
             raise AssertionError("Nonfinite actor PPO temperature")
         # The current Qwen core-logprob helper uses temperature=1; never
