@@ -110,7 +110,17 @@ def test_real_actor_update_minibatch_preserves_ppo_inputs_and_forest():
         valid_tokens += int(mask.bool().sum())
     if valid_tokens == 0:
         pytest.fail("actor mini-batch has no PPO training tokens")
-    temperature = batch["temperature"].float()
+    raw_temperature = batch["temperature"]
+    if isinstance(raw_temperature, (int, float)) and not isinstance(raw_temperature, bool):
+        temperature = torch.tensor([raw_temperature], dtype=torch.float32)
+    elif isinstance(raw_temperature, torch.Tensor):
+        temperature = raw_temperature.detach().float()
+    elif isinstance(raw_temperature, (tuple, list)):
+        temperature = torch.as_tensor(raw_temperature, dtype=torch.float32)
+    else:
+        pytest.fail(f"unsupported actor mini-batch temperature type: {type(raw_temperature)!r}")
+    if temperature.numel() not in (1, batch.batch_size[0]):
+        pytest.fail("actor mini-batch temperature must be scalar or per-row")
     if not bool(torch.isfinite(temperature).all()) or not bool((temperature > 0).all()):
         pytest.fail("actor mini-batch temperature is nonfinite or nonpositive")
     # Tree planning sees exactly the identities and tensors used by PPO,
