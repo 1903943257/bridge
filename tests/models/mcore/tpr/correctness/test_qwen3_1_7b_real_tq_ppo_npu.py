@@ -88,6 +88,18 @@ def _load_real_tq_probe(
     dump = torch.load(path, map_location="cpu", weights_only=False)
     original = dump["tensordict"]
     original_keys = tuple(dump["keys"])
+    # Preserve all eight trajectories (including any successful SWE runs).
+    # A TQ rollout dump may not contain actor-update advantages; report this
+    # explicitly rather than conflating task success with PPO gradient truth.
+    if "reward_scores" in dump:
+        print(f"PHASE5 TQ reward_scores={dump['reward_scores']}", flush=True)
+    print(
+        f"PHASE5 TQ_SOURCE path={path} keys={len(original_keys)} "
+        f"actor_advantages={'advantages' in original} "
+        f"old_log_probs={'old_log_probs' in original} "
+        f"mode={'FULL' if prompt_length is None else 'CROPPED_DEBUG'}",
+        flush=True,
+    )
     full_rows = _rows(original, "input_ids")
     prompt_rows = _rows(original, "prompts")
     response_rows = _rows(original, "responses")
