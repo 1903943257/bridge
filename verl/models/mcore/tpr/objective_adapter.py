@@ -92,6 +92,8 @@ class SegmentPPOObjectiveAdapter:
         # avoid device synchronization and host-side token materialization.
         self.capture_log_probs = bool(_metadata(batch, "tpr_capture_log_probs", default=False))
         self.debug_new_log_probs: dict[tuple[int, int], float] = {}
+        self.capture_logit_parts = bool(_metadata(batch, "tpr_capture_logit_parts", default=False))
+        self.debug_logit_parts: dict[tuple[int, int], tuple[float, float]] = {}
 
     def bind_tree(self, tree_plan: TreeExecutionPlan, *, shard_for_segment=None):
         """Bind an executable tree to SegmentExecutor's loss hook.
@@ -197,6 +199,20 @@ class SegmentPPOObjectiveAdapter:
             raise ValueError("log_prob_fn must return one scalar per unique query/target/temperature")
         gather = torch.tensor(gather_ids, device=logits.device, dtype=torch.long)
         log_probs = unique_log_probs.index_select(0, gather)
+        if self.capture_logit_parts:
+            # Diagnostic only: decompose target logit and FP32 log-partition.
+            # Keep the training log-prob implementation unchanged.
+            target_logits = scaled_logits.gather(1, targets[:, None]).squeeze(1)
+            lse = torch.logsumexp(scaled_logits.float(), dim=-1)
+            parts = list(zip(
+                target_logits.detach().float().cpu().tolist(),
+                lse.detach().cpu().tolist(),
+            ))
+            for ref, part_index in zip(refs, gather_ids, strict=True):
+                probe_key = (ref.sample_row, ref.response_offset)
+                if probe_key in self.debug_logit_parts:
+                    raise ValueError(f"duplicate logit-parts probe for logical token {probe_key}")
+                self.debug_logit_parts[probe_key] = parts[part_index]
         if self.capture_log_probs:
             for ref, value in zip(refs, log_probs.detach().float().cpu().tolist(), strict=True):
                 key = (ref.sample_row, ref.response_offset)
