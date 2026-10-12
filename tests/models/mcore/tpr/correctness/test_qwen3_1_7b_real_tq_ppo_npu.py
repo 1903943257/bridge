@@ -200,7 +200,7 @@ def _load_real_tq_probe(
     return batch
 
 
-def _native_response_logprobs(model, token_row, *, prompt_length, temperature):
+def _native_response_logprobs(model, token_row, *, prompt_length, temperature, logit_parts=None, row_id=None):
     from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
 
     dev = token_row.device
@@ -214,6 +214,18 @@ def _native_response_logprobs(model, token_row, *, prompt_length, temperature):
     # VERL's shift convention: query at position t-1 predicts input_ids[t].
     shifted_labels = torch.cat((token_row[1:], token_row[-1:]))
     logits = logits[0] / torch.as_tensor(temperature, dtype=logits.dtype, device=dev)
+    if logit_parts is not None:
+        if row_id is None:
+            raise ValueError("row_id required for logit decomposition")
+        # Capture only response query positions; log_prob kernel remains intact.
+        query_logits = logits[prompt_length - 1:-1]
+        query_targets = shifted_labels[prompt_length - 1:-1]
+        picked = query_logits.gather(1, query_targets[:, None]).squeeze(1)
+        norm = torch.logsumexp(query_logits.float(), dim=-1)
+        for offset, (target_value, log_partition) in enumerate(zip(
+            picked.detach().float().cpu().tolist(), norm.detach().cpu().tolist(), strict=True
+        )):
+            logit_parts[(row_id, offset)] = (target_value, log_partition)
     log_probs = vocab_parallel_log_probs_from_logits(logits, shifted_labels)
     return log_probs, log_probs[prompt_length-1:-1]
 
@@ -260,6 +272,15 @@ def _compare_grads(reference, actual):
             by_parameter.append((name, d2, r2, rel_l2))
     relative_l2 = (square_diff / max(square_ref, 1e-24)) ** .5
     cosine = dot / max((square_ref * square_actual) ** .5, 1e-24)
+    import math
+    ref_norm = math.sqrt(square_ref)
+    tpr_norm = math.sqrt(square_actual)
+    print(
+        f"QWEN17 PPO SELECTED_GRAD_NORM native={ref_norm:.9g} "
+        f"tpr={tpr_norm:.9g} relative_gap={abs(tpr_norm-ref_norm)/max(ref_norm, 1e-24):.9g} "
+        f"scope=selected_parameters_preclip",
+        flush=True,
+    )
     print(f"Qwen3-1.7B PPO grad: global_relative_l2={relative_l2:.6f}, cosine={cosine:.8f}")
     if detailed:
         # Contribution measures dW error ENERGY. Ranking only by per-tensor
@@ -1251,13 +1272,19 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
     tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
 
     loss_fn = partial(ppo_loss, config=_VanillaPPOConfig())
+    logit_parts_enabled = os.getenv("TPR_QWEN17_PPO_LOGIT_PARTS", "0") == "1"
+    native_logit_parts = {}
+    if logit_parts_enabled:
+        tu.assign_non_tensor(batch, tpr_capture_logit_parts=True)
     native_loss = torch.zeros((), device=device, dtype=torch.float32)
     native_repeat_abs = []
     ref.zero_grad(set_to_none=True)
     for row in range(8):
         token_row = batch["input_ids"][row].to(device)
         lp, _ = _native_response_logprobs(
-            ref, token_row, prompt_length=len(batch["prompts"][row]), temperature=1.0
+            ref, token_row, prompt_length=len(batch["prompts"][row]), temperature=1.0,
+            logit_parts=native_logit_parts if logit_parts_enabled else None,
+            row_id=row,
         )
         # Compare repeated Native forward of the very same checkpoint, real
         # row and attention shape. Native nonrepeatability is a separate noise
@@ -1470,6 +1497,34 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
             native_param_samples, tpr_param_samples,
             native_grads, tpr_grads,
         )
+    if logit_parts_enabled:
+        tree_parts = getattr(engine, "_tpr_captured_logit_parts", None)
+        if tree_parts is None:
+            raise AssertionError("TPR token logit decomposition capture missing")
+        if set(tree_parts) != set(native_logit_parts):
+            raise AssertionError(
+                f"Logit decomposition token ownership differs: "
+                f"native={len(native_logit_parts)} tpr={len(tree_parts)}"
+            )
+        ranked = sorted(
+            tree_parts,
+            key=lambda key: abs(float(captured[key]) - float(old_probs[key[0]][key[1]])),
+            reverse=True,
+        )
+        for row, offset in ranked[:int(os.getenv("TPR_QWEN17_PPO_LOGIT_PARTS_TOPK", "12"))]:
+            n_z, n_lse = native_logit_parts[(row, offset)]
+            t_z, t_lse = tree_parts[(row, offset)]
+            observed = float(captured[(row, offset)]) - float(old_probs[row][offset])
+            print(
+                f"QWEN17 PPO LOGIT_PARTS row={row} response={offset} "
+                f"native_target={n_z:.9g} tpr_target={t_z:.9g} "
+                f"target_delta={t_z-n_z:.9g} native_lse={n_lse:.9g} "
+                f"tpr_lse={t_lse:.9g} lse_delta={t_lse-n_lse:.9g} "
+                f"decomposed_delta={(t_z-n_z)-(t_lse-n_lse):.9g} "
+                f"observed_logprob_delta={observed:.9g} "
+                f"dtype=source_model_logits",
+                flush=True,
+            )
     diag_keys, diag_expected, diag_actual, bad, outside_clip = _logprob_diagnostics(
         batch, captured, old_probs
     )
