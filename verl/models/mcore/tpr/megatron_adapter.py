@@ -34,11 +34,17 @@ if TYPE_CHECKING:
     from verl.workers.engine.megatron.transformer_impl import MegatronEngine
 
 
-def install_tpr_module_spec(provider: Any) -> None:
-    """Install the opt-in TPR SelfAttention spec before model construction."""
+def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None:
+    """Install TPR attention before model construction.
 
+    The optional bridge argument preserves compatibility with Uni-Agent-CC
+    callers. The provider remains the owner of the transformer-layer spec.
+    """
     if provider is None:
-        raise NotImplementedError("TPR model construction requires the non-vanilla Megatron-Bridge provider")
+        raise NotImplementedError(
+            "TPR model construction requires the non-vanilla Megatron-Bridge provider; "
+            "passing bridge= does not replace a missing provider"
+        )
     provider.transformer_layer_spec = make_tpr_module_spec_provider(provider.transformer_layer_spec)
 
 
