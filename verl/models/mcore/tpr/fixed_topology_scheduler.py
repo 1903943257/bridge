@@ -18,6 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import os
+
+import torch
 from enum import Enum
 
 from torch import Tensor
@@ -114,6 +117,13 @@ class FixedTopologyScheduler:
             event_index = 0
             while event_index < len(self.events):
                 event = self.events[event_index]
+                trace_mem = os.getenv("TPR_MEM_TRACE", "0") == "1"
+                if trace_mem:
+                    segment = self.plan.get(event.segment_id)
+                    kind = "VISIT_LEAF" if self._is_direct_leaf_pair(event_index) else event.kind.value
+                    alloc = torch.npu.memory_allocated() / (1024 ** 3) if torch.npu.is_available() else 0.0
+                    reserved = torch.npu.memory_reserved() / (1024 ** 3) if torch.npu.is_available() else 0.0
+                    print(f"TPR_MEM EVENT_BEGIN index={event_index} kind={kind} segment={event.segment_id} parent={segment.parent_id} length={segment.length} prefix={segment.prefix_length} path_tokens={self.executor.kv_stack.prefix_length} depth={len(self.executor.kv_stack)} alloc_gib={alloc:.3f} reserved_gib={reserved:.3f}", flush=True)
                 if self._is_direct_leaf_pair(event_index):
                     result = self.executor.visit_leaf(event.segment_id)
                     direct_leaf_results.append(result)
@@ -123,6 +133,10 @@ class FixedTopologyScheduler:
                         peak_path_tokens,
                         result.forward.prefix_length + result.forward.suffix_length,
                     )
+                    if trace_mem:
+                        alloc = torch.npu.memory_allocated() / (1024 ** 3) if torch.npu.is_available() else 0.0
+                        reserved = torch.npu.memory_reserved() / (1024 ** 3) if torch.npu.is_available() else 0.0
+                        print(f"TPR_MEM EVENT_END index={event_index} kind=VISIT_LEAF segment={event.segment_id} alloc_gib={alloc:.3f} reserved_gib={reserved:.3f}", flush=True)
                     event_index += 2
                     continue
                 if event.kind is SegmentEventKind.PUSH:
@@ -134,6 +148,10 @@ class FixedTopologyScheduler:
                     backward_results.append(result)
                     all_loss_results.append(result)
                     execution_trace.append(PhysicalExecution(PhysicalExecutionKind.POP, event.segment_id))
+                if trace_mem:
+                    alloc = torch.npu.memory_allocated() / (1024 ** 3) if torch.npu.is_available() else 0.0
+                    reserved = torch.npu.memory_reserved() / (1024 ** 3) if torch.npu.is_available() else 0.0
+                    print(f"TPR_MEM EVENT_END index={event_index} kind={event.kind.value} segment={event.segment_id} path_tokens={self.executor.kv_stack.prefix_length} depth={len(self.executor.kv_stack)} alloc_gib={alloc:.3f} reserved_gib={reserved:.3f}", flush=True)
                 event_index += 1
             self.executor.kv_stack.assert_empty()
             if not all_loss_results:
