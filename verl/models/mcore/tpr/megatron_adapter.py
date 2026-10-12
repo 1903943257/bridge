@@ -343,23 +343,6 @@ def run_tpr_forward_backward_batch(
                 metric_lists.setdefault(name, []).append(value)
         return result
 
-    # The V1 Trainer reduces list-valued metrics via numpy.mean, which cannot
-    # add VERL Metric wrappers. Collapse weighted segment contributions to
-    # numeric scalars before returning them across the worker boundary.
-    for name, values in metric_lists.items():
-        from verl.utils.metric import Metric
-
-        if any(isinstance(value, Metric) for value in values):
-            if not all(isinstance(value, Metric) for value in values):
-                raise TypeError(f"TPR metric {name} mixes Metric and numeric values")
-            # Segment Metric(MEAN) values were converted to SUM contributions
-            # weighted by their share of the original global response tokens.
-            # The trainer later uses np.mean(list), so return ONE aggregate
-            # numeric value, not separate weighted contributions.
-            metric_lists[name] = [sum(float(value.aggregate()) for value in values)]
-        else:
-            metric_lists[name] = [float(value) for value in values]
-
     runner = TPRBatchRunner(
         run_tree=run_one_tree,
         finalize_gradients=lambda: finalize(engine.module, None, force_all_reduce=True),
@@ -394,6 +377,23 @@ def run_tpr_forward_backward_batch(
         "tpr/unique_tree_tokens": [unique_tree_tokens],
         "tpr/topology_token_reuse_ratio": [logical_input_tokens / unique_tree_tokens],
     })
+    # The V1 Trainer reduces list-valued metrics via numpy.mean, which cannot
+    # add VERL Metric wrappers. Collapse weighted segment contributions to
+    # numeric scalars before returning them across the worker boundary.
+    for name, values in metric_lists.items():
+        from verl.utils.metric import Metric
+
+        if any(isinstance(value, Metric) for value in values):
+            if not all(isinstance(value, Metric) for value in values):
+                raise TypeError(f"TPR metric {name} mixes Metric and numeric values")
+            # Segment Metric(MEAN) values were converted to SUM contributions
+            # weighted by their share of the original global response tokens.
+            # The trainer later uses np.mean(list), so return ONE aggregate
+            # numeric value, not separate weighted contributions.
+            metric_lists[name] = [sum(float(value.aggregate()) for value in values)]
+        else:
+            metric_lists[name] = [float(value) for value in values]
+
     # VERL postprocess expects list-valued micro-batch metrics and a list of
     # loss contributions. The sum of all physical segment objectives is the
     # entire mini-batch objective, with no additional micro-batch factor.
