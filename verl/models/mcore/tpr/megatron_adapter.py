@@ -216,7 +216,7 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    PP=TP=EP=CP=DP=1, vanilla token-mean PPO; no native Megatron /M schedule
+    PP=TP=EP=DP=1, CP=1/2 Ring, vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
     import torch
@@ -361,7 +361,10 @@ def run_tpr_forward_backward_batch(
         segment.length for tree in forest.trees
         for segment in tree.segment_plan.segments.values()
     )
-    loss = float(result.normalized_loss.item())
+    _, global_normalized_loss = aggregate_cp_loss(
+        result.loss_sum, result.normalized_loss, cp_runtime
+    )
+    loss = float(global_normalized_loss.item())
     metric_lists.update({
         "tpr/forest_trees": [result.tree_count],
         "tpr/physical_segments": [result.segment_count],
