@@ -230,6 +230,22 @@ def _native_response_logprobs(model, token_row, *, prompt_length, temperature, l
     return log_probs, log_probs[prompt_length-1:-1]
 
 
+def _full_gradient_norm(model):
+    """Unclipped all-parameter gradient L2; does not copy entire grads to host."""
+    import math
+
+    total = 0.0
+    count = 0
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            if parameter.grad is None:
+                raise AssertionError("missing grad for trainable parameter in full-norm probe")
+            grad = parameter.grad.detach()
+            total += float(grad.float().square().sum().item())
+            count += 1
+    return math.sqrt(total), count
+
+
 def _selected_gradient_snapshot(model):
     output = {}
     for name, parameter in model.named_parameters():
@@ -1322,6 +1338,7 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
         f"max_abs={repeat_differences.max().item():.6g} "
         f"mean_abs={repeat_differences.mean().item():.6g}"
     )
+    native_full_grad_norm, native_grad_count = _full_gradient_norm(ref)
     native_grads = _selected_gradient_snapshot(ref)
     if acceptance_enabled:
         # Bounded CPU samples; we do not copy a second 1.7B checkpoint or
@@ -1434,6 +1451,16 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
         _print_attention_layer_drift(
             native_trace, tpr_trace, tuple(sorted(trace_owners))
         )
+    tpr_full_grad_norm, tpr_grad_count = _full_gradient_norm(tpr)
+    if native_grad_count != tpr_grad_count:
+        raise AssertionError("Native/TPR trainable gradient count mismatch")
+    print(
+        f"QWEN17 PPO FULL_GRAD_NORM native={native_full_grad_norm:.9g} "
+        f"tpr={tpr_full_grad_norm:.9g} "
+        f"relative_gap={abs(tpr_full_grad_norm-native_full_grad_norm)/max(native_full_grad_norm,1e-24):.9g} "
+        f"trainable_parameters={native_grad_count} scope=all_parameters_preclip",
+        flush=True,
+    )
     tpr_grads = _selected_gradient_snapshot(tpr)
     if acceptance_enabled:
         tpr_param_samples = {
