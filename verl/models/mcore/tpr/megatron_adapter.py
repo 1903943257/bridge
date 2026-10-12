@@ -361,8 +361,12 @@ def run_tpr_forward_backward_batch(
         segment.length for tree in forest.trees
         for segment in tree.segment_plan.segments.values()
     )
+    # TPRBatchResult exposes normalized_loss only; all segment PPO losses
+    # already share the original global batch denominator. The helper's
+    # first (loss_sum) return is unused here, so pass the same additive
+    # local objective to both reduction slots.
     _, global_normalized_loss = aggregate_cp_loss(
-        result.loss_sum, result.normalized_loss, cp_runtime
+        result.normalized_loss, result.normalized_loss, cp_runtime
     )
     loss = float(global_normalized_loss.item())
     metric_lists.update({
