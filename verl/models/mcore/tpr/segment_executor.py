@@ -128,8 +128,6 @@ class SegmentExecutor:
                 "topology_only SegmentPlan requires segment_loss_fn; "
                 "CE SegmentPlan must use the existing CE loss path"
             )
-        if segment_loss_fn is not None and cp_group is not None:
-            raise NotImplementedError("external segment objectives currently support CP=1 only")
         counts = dict(segment_loss_term_counts or {})
         if segment_loss_fn is not None:
             if not callable(segment_loss_fn):
