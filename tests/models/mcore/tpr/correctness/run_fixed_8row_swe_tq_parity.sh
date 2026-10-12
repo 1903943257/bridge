@@ -22,6 +22,13 @@ export TPR_QWEN17_PPO_TRACE_LAYERS="${TPR_QWEN17_PPO_TRACE_LAYERS:-0}"
 export TPR_QWEN17_PPO_CORE_ORACLE="${TPR_QWEN17_PPO_CORE_ORACLE:-0}"
 export TPR_QWEN17_PPO_NATIVE_CUTOFF="${TPR_QWEN17_PPO_NATIVE_CUTOFF:-0}"
 export TPR_QWEN17_PPO_ACCEPTANCE="${TPR_QWEN17_PPO_ACCEPTANCE:-1}"
+export TPR_QWEN17_PPO_LOGIT_PARTS="${TPR_QWEN17_PPO_LOGIT_PARTS:-1}"
+export TPR_QWEN17_PPO_LOGIT_PARTS_TOPK="${TPR_QWEN17_PPO_LOGIT_PARTS_TOPK:-12}"
+# Never run the deprecated fixed-tile numerical oracle for parity.
+if [[ -n "${TPR_QWEN17_PPO_TILE_GEMM:-}" ]]; then
+  echo "ERROR: unset TPR_QWEN17_PPO_TILE_GEMM; fixed tile changes Native math" >&2
+  exit 2
+fi
 
 case "$MODE" in
   cropped)
