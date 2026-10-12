@@ -108,13 +108,11 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
         temperature = torch.as_tensor(data["temperature"], dtype=torch.float32).detach().cpu()
         if not bool(torch.isfinite(temperature).all()):
             raise AssertionError("Nonfinite actor PPO temperature")
-        # The current Qwen core-logprob helper uses temperature=1; never
-        # silently replay a differently tempered behavior policy.
-        if not bool((temperature == 1).all()):
-            raise AssertionError(
-                "P0-5 replay only supports actor temperature exactly 1; "
-                "temperature-aware reference forward is not implemented"
-            )
+        if temperature.numel() not in (1, total) or not bool((temperature > 0).all()):
+            raise AssertionError("P0-5 PPO temperature must be positive scalar or per-row")
+        rows["temperature"] = temperature.flatten().tolist()
+        if len(rows["temperature"]) == 1:
+            rows["temperature"] *= total
         rows["old"] = _rows(data, old_key)
         rows["adv"] = _rows(data, adv_key)
         if len(rows["old"]) != total or len(rows["adv"]) != total:
@@ -149,6 +147,7 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
                 raise AssertionError(f"Original PPO fields must match full response row={i}")
             if not bool(torch.isfinite(old[:512]).all() and torch.isfinite(adv[:512]).all()):
                 raise AssertionError(f"Nonfinite original PPO fields row={i}")
+            row["temperature"] = float(rows["temperature"][i])
             row["old"] = old[:512].clone()
             row["adv"] = adv[:512].clone()
         candidates.append(row)
@@ -202,6 +201,7 @@ def _load_true_siblings(path, vocab_size, *, sibling_count, objective):
         source.update(row["tokens"].numpy().tobytes())
         source.update(row["mask"].to(torch.uint8).numpy().tobytes())
         if objective == "ppo":
+            source.update(str(row["temperature"]).encode("ascii"))
             source.update(row["old"].numpy().tobytes())
             source.update(row["adv"].numpy().tobytes())
     info = {
@@ -240,10 +240,10 @@ def _objective(logprobs, row, normalizer, kind, clip):
     return numerator / normalizer, clipfrac
 
 
-def _response_lp(logits, tokens):
+def _response_lp(logits, tokens, temperature=1.0):
     if tuple(logits.shape[:2]) != (1, 1024):
         raise AssertionError(f"Expected original full logits M1024; got {logits.shape}")
-    queries = logits[0, 511:1023].float()
+    queries = (logits[0, 511:1023] / torch.as_tensor(temperature, dtype=logits.dtype, device=logits.device)).float()
     labels = tokens[512:1024].to(device=logits.device)
     return F.log_softmax(queries, dim=-1).gather(1, labels[:, None]).squeeze(1)
 
@@ -257,7 +257,7 @@ def _full(model, siblings, kind, clip, *, backwards):
     for row in siblings:
         tokens = row["tokens"].to(device=device)
         logits = model(tokens.unsqueeze(0), positions, None)
-        lp = _response_lp(logits, row["tokens"])
+        lp = _response_lp(logits, row["tokens"], row.get("temperature", 1.0) if kind == "ppo" else 1.0)
         term, clipfrac = _objective(lp, row, total, kind, clip)
         if backwards:
             term.backward()
@@ -300,12 +300,15 @@ def _tpr(model, siblings, kind, clip):
             # A fork logit can predict DIFFERENT first response tokens of
             # distinct real trajectories: keep all sibling-owned targets.
             valid = [r for r in siblings if bool(r["mask"][0])]
-            selected = logits[0, 511:512].float()
+            selected = logits[0, 511:512]
             targets = torch.tensor([int(r["response"][0]) for r in valid],
                                    device=logits.device, dtype=torch.long)
-            lp = F.log_softmax(selected, dim=-1).expand(
-                len(valid), -1
-            ).gather(1, targets[:, None]).squeeze(1)
+            per_row = []
+            for row in valid:
+                scale = row.get("temperature", 1.0) if kind == "ppo" else 1.0
+                scaled = (selected / torch.as_tensor(scale, dtype=selected.dtype, device=selected.device)).float()
+                per_row.append(F.log_softmax(scaled, dim=-1)[0, int(row["response"][0])])
+            lp = torch.stack(per_row)
             for row, value in zip(valid, lp, strict=True):
                 captured.setdefault(str(row["row"]), {})[0] = value.detach().float().cpu().reshape(1)
             # Every sibling gets its own actual PPO advantage and old LP.
@@ -324,7 +327,9 @@ def _tpr(model, siblings, kind, clip):
             root_loss = float(objective.detach().cpu())
         else:
             row = byid[sid]
-            selected = logits[0, :511].float()
+            selected = logits[0, :511]
+            scale = row.get("temperature", 1.0) if kind == "ppo" else 1.0
+            selected = (selected / torch.as_tensor(scale, dtype=selected.dtype, device=selected.device)).float()
             targets = row["response"][1:].to(device=logits.device)
             lp = F.log_softmax(selected, dim=-1).gather(1, targets[:, None]).squeeze(1)
             captured.setdefault(str(row["row"]), {})[1] = lp.detach().float().cpu().clone()
