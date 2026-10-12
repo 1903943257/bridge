@@ -343,6 +343,16 @@ def run_tpr_forward_backward_batch(
                 metric_lists.setdefault(name, []).append(value)
         return result
 
+    # The V1 Trainer reduces list-valued metrics via numpy.mean, which cannot
+    # add VERL Metric wrappers. Collapse weighted segment contributions to
+    # numeric scalars before returning them across the worker boundary.
+    for name, values in metric_lists.items():
+        from verl.utils.metric import Metric
+        metric_lists[name] = [
+            float(value.aggregate()) if isinstance(value, Metric) else float(value)
+            for value in values
+        ]
+
     runner = TPRBatchRunner(
         run_tree=run_one_tree,
         finalize_gradients=lambda: finalize(engine.module, None, force_all_reduce=True),
