@@ -650,7 +650,19 @@ class SegmentExecutor:
             device=logits.device,
         )
         max_target = max(term.target_token_id for term in owned_terms)
-        if max_target >= logits.shape[-1]:
+        native_loss = getattr(self.model, "compute_language_model_loss", None)
+        # Under TP>1 Megatron's logits contain a *local vocabulary shard*.
+        # Labels retain GLOBAL vocab ids, so comparing them to local_vocab
+        # falsely rejects valid targets on TP ranks. Only the test-double CE
+        # fallback expects full-vocabulary local logits.
+        global_vocab_size = getattr(self.model, "vocab_size", None)
+        if callable(native_loss):
+            if global_vocab_size is not None and max_target >= global_vocab_size:
+                raise ValueError(
+                    f"segment {segment.segment_id} target token {max_target} "
+                    f"is outside global vocabulary size {global_vocab_size}"
+                )
+        elif max_target >= logits.shape[-1]:
             raise ValueError(
                 f"segment {segment.segment_id} target token {max_target} "
                 f"is outside vocabulary size {logits.shape[-1]}"
@@ -660,7 +672,7 @@ class SegmentExecutor:
             dtype=torch.float32,
             device=logits.device,
         )
-        compute_language_model_loss = getattr(self.model, "compute_language_model_loss", None)
+        compute_language_model_loss = native_loss
         if callable(compute_language_model_loss):
             # Follow Megatron's native language-model CE path. For long local
             # sequences, checkpoint sequence chunks so the large [tokens, vocab]

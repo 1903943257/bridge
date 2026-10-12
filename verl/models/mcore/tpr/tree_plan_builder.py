@@ -15,7 +15,7 @@ from typing import Any
 import torch
 
 from .segment_plan import SegmentPlan, SegmentSpec
-from .trajectory_tree import TrajectoryTree, build_trajectory_trees
+from .trajectory_tree import TrajectoryTree, build_trajectory_trees, build_trajectory_trees_legacy
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +73,7 @@ def build_tree_execution_plans(
     *,
     trees: tuple[TrajectoryTree, ...] | None = None,
     require_loss_mask_alignment: bool = False,
+    tree_builder: str = "radix",
 ) -> ForestExecutionPlan:
     """Build a forest of topology-only SegmentPlans and PPO ownership references.
 
@@ -81,10 +82,17 @@ def build_tree_execution_plans(
     one ref; duplicate branches/samples intentionally retain separate refs.
     Optional loss-mask alignment catches mismatch against the native
     batch_num_tokens denominator before entering the Megatron schedule.
+    Default radix builds direct compressed TPR topology. The old per-token
+    builder remains available as tree_builder="legacy" for CPU regression.
     """
+    if tree_builder not in ("legacy", "radix"):
+        raise ValueError(f"unsupported TPR tree_builder={tree_builder!r}; expected legacy or radix")
     keys = list(keys)
     if trees is None:
-        trees = build_trajectory_trees(keys, batch)
+        if tree_builder == "legacy":
+            trees = build_trajectory_trees_legacy(keys, batch)
+        else:
+            trees = build_trajectory_trees(keys, batch)
     input_rows = _rows(batch, "input_ids")
     response_masks = _rows(batch, "response_mask")
     if len(keys) != len(input_rows) or len(keys) != len(response_masks):

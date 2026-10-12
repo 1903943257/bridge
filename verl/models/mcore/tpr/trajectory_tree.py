@@ -249,7 +249,7 @@ def _compress_real_root(real_root: _TrieNode, *, uid: str, tree_index: int) -> T
     )
 
 
-def build_trajectory_trees(
+def build_trajectory_trees_legacy(
     keys: list[str] | tuple[str, ...],
     batch: Any,
 ) -> tuple[TrajectoryTree, ...]:
@@ -299,6 +299,24 @@ def build_trajectory_trees(
             trees.append(_compress_real_root(real_root, uid=uid, tree_index=tree_index))
 
     return tuple(trees)
+
+
+def build_trajectory_trees(
+    keys: list[str] | tuple[str, ...],
+    batch: Any,
+) -> tuple[TrajectoryTree, ...]:
+    """Build exact TPR trajectory trees via the direct-compressed radix path.
+
+    The experimental fast builder passed exact legacy-topology and PPO
+    reference differential tests. Keep build_trajectory_trees_legacy available
+    for explicit regression comparison only; regular TPR callers use radix.
+    This affects *only* CPU topology construction: the resulting public
+    TrajectoryTree/SegmentRef, UID boundaries, loss ownership and runtime
+    executor stay unchanged.
+    """
+    from .trajectory_tree_radix import build_trajectory_trees_radix
+
+    return build_trajectory_trees_radix(keys, batch)
 
 
 def build_prompt_sibling_trees(
