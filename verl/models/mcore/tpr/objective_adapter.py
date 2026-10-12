@@ -117,17 +117,23 @@ class SegmentPPOObjectiveAdapter:
         return segment_loss_fn, counts
 
     def _temperatures(self, refs: Sequence[SegmentObjectiveRef]) -> list[float]:
-        temperature = self.batch.get("temperature", 1.0)
+        # TensorDict non-tensor metadata must be unwrapped via VERL accessor.
+        temperature = _metadata(self.batch, "temperature", default=1.0)
         if isinstance(temperature, Tensor):
             if temperature.numel() == 1:
                 values = [float(temperature.item())] * len(refs)
             else:
                 flat = temperature.flatten()
                 values = [float(flat[ref.sample_row].item()) for ref in refs]
+        elif isinstance(temperature, (list, tuple)):
+            values = [float(temperature[ref.sample_row]) for ref in refs]
         elif isinstance(temperature, (float, int)):
             values = [float(temperature)] * len(refs)
         else:
-            raise TypeError(f"unsupported per-sample temperature type: {type(temperature)!r}")
+            raise TypeError(
+                "unsupported per-sample temperature type: "
+                f"{type(temperature)!r}, value={temperature!r}"
+            )
         if any(not 0 < value < float("inf") for value in values):
             raise ValueError("temperature must be finite and positive")
         return values
