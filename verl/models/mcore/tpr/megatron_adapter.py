@@ -79,12 +79,15 @@ def run_tpr_forward_backward(
         "EP": engine.engine_config.expert_model_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
-    unsupported_sizes = {name: size for name, size in parallel_sizes.items() if size != 1}
-    if unsupported_sizes:
+    tp_size = parallel_sizes["TP"]
+    unsupported_sizes = {name: size for name, size in parallel_sizes.items()
+                         if name != "TP" and size != 1}
+    if tp_size not in (1, 2) or unsupported_sizes:
         raise NotImplementedError(
-            "TPR formal CP entry currently requires TP/PP/EP/DP=1, "
-            f"got {unsupported_sizes}"
+            f"TPR thin entry supports TP=1/2 with PP=EP=DP=1, got {parallel_sizes}"
         )
+    if tp_size > 1 and engine.engine_config.context_parallel_size != 1:
+        raise NotImplementedError("TPR TP2+SP phase requires CP=1; TP2+CP deferred")
     if engine.engine_config.virtual_pipeline_model_parallel_size is not None:
         raise NotImplementedError("TPR MVP does not support virtual pipeline parallelism")
     if engine.model_config.mtp.enable:
@@ -123,6 +126,12 @@ def run_tpr_forward_backward(
         cp_backend=cp_runtime.backend,
     )
     scheduler = FixedTopologyScheduler(request.plan, executor, events=request.events)
+    if tp_size > 1:
+        from .tp_validation import assert_tp_plan_agreement, digest_segment_plan
+
+        assert_tp_plan_agreement(
+            digest_segment_plan(request.plan, scheduler.events), tp_size=tp_size
+        )
 
     no_sync_func = getattr(config, "no_sync_func", None)
     if isinstance(no_sync_func, list):
@@ -216,7 +225,8 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    PP=TP=EP=DP=1, CP=1/2 Ring, vanilla token-mean PPO; no native /M schedule
+    TP=1/2 (SP optional at TP=2), PP=EP=DP=1; CP=1/2 at TP=1,
+    CP=1 at TP=2. Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
     import torch
@@ -244,8 +254,14 @@ def run_tpr_forward_backward_batch(
         "CP": engine.engine_config.context_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
-    if any(sizes[name] != 1 for name in ("TP", "PP", "EP", "DP")) or sizes["CP"] not in (1, 2):
-        raise NotImplementedError(f"TPR PPO supports CP=1/2 with TP/PP/EP/DP=1, got {sizes}")
+    tp_size = sizes["TP"]
+    if (tp_size not in (1, 2) or sizes["CP"] not in (1, 2)
+            or any(sizes[name] != 1 for name in ("PP", "EP", "DP"))
+            or (tp_size > 1 and sizes["CP"] != 1)):
+        raise NotImplementedError(
+            f"TPR PPO supports TP=1/2, CP=1/2 for TP1 or CP=1 for TP2, "
+            f"PP=EP=DP=1, got {sizes}"
+        )
     if engine.engine_config.virtual_pipeline_model_parallel_size not in (None, 1):
         raise NotImplementedError("TPR PPO does not support virtual PP")
     if engine.model_config.mtp.enable or engine.enable_routing_replay:
@@ -284,6 +300,10 @@ def run_tpr_forward_backward_batch(
     forest = build_tree_execution_plans(keys, data)
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
+    if tp_size > 1:
+        from .tp_validation import assert_tp_plan_agreement, digest_forest_plan
+
+        assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     if cp_runtime.size == 2 and cp_runtime.backend_name != "ring":
         raise NotImplementedError("TPR PPO CP=2 currently requires Ring backend")
