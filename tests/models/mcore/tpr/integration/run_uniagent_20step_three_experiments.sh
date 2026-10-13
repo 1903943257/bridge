@@ -76,6 +76,11 @@ else
   exit 1
 fi
 
+# VERL/V1 uses Ray + vLLM-Ascend for E1. Tear down only this container's
+# local Ray runtime before torchrun E2/E3, so retained actor/rollout workers
+# do not consume NPU memory and invalidate the offline peak comparison.
+ray stop --force > "$RUN_ROOT/logs/e1_ray_cleanup.log" 2>&1 || true
+
 # Preflight: one rank0 original real Actor minibatch per online step;
 # align steps 1..20, preserve old logprobs/advantages, select bounded
 # COMPLETE trajectories, and refuse duplicates/missing captures.
