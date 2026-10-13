@@ -70,31 +70,40 @@ class _RingCPOnlyCoreAttention(MegatronModule):
         )
 
 
-def load_qwen3_1_7b_config(path: Path):
+_DENSE_PROFILES = {
+    "1.7b": (28, 2048, 6144, 16, 8, 128),
+    "4b": (36, 2560, 9728, 32, 8, 128),
+}
+
+
+def load_qwen3_dense_config(path: Path, *, profile: str = "1.7b"):
+    """Validate exact real HF model profile before loading TP shards."""
     _validate_checkpoint_files(path)
+    if profile not in _DENSE_PROFILES:
+        raise ValueError(f"unsupported real checkpoint profile {profile!r}")
     cfg = AutoConfig.from_pretrained(
         str(path), trust_remote_code=True, local_files_only=True
     )
-    expected = {
-        "model_type": "qwen3",
-        "num_hidden_layers": 28,
-        "hidden_size": 2048,
-        "intermediate_size": 6144,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "vocab_size": 151936,
-        "tie_word_embeddings": True,
-    }
+    expected = dict(zip(
+        ("num_hidden_layers", "hidden_size", "intermediate_size",
+         "num_attention_heads", "num_key_value_heads", "head_dim"),
+        _DENSE_PROFILES[profile],
+    ))
+    expected.update(model_type="qwen3", vocab_size=151936,
+                    tie_word_embeddings=True)
     for key, value in expected.items():
         if getattr(cfg, key) != value:
             raise AssertionError(
-                f"expected authentic Qwen3-1.7B {key}={value}, "
+                f"expected authentic Qwen3-{profile} {key}={value}, "
                 f"got {getattr(cfg, key)!r}"
             )
     if cfg.attention_dropout != 0:
-        raise AssertionError("TP2 Qwen checkpoint requires attention_dropout=0")
+        raise AssertionError("Qwen TP checkpoint requires attention_dropout=0")
     return cfg
+
+
+def load_qwen3_1_7b_config(path: Path):
+    return load_qwen3_dense_config(path, profile="1.7b")
 
 
 @torch.no_grad()
@@ -102,7 +111,7 @@ def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int
     """Load every parameter from checkpoint; assert shape and full coverage."""
     state = _load_hf_state_dict(path)
     if tp_size not in (1, 2) or not 0 <= tp_rank < tp_size:
-        raise ValueError("Qwen3-1.7B isolated parallel tests require TP=1 or TP=2")
+        raise ValueError("Qwen3 dense isolated parallel tests require TP=1 or TP=2")
     if hf.num_key_value_heads % tp_size or hf.vocab_size % tp_size:
         raise AssertionError("invalid Qwen TP group or vocab divisibility")
 
@@ -208,13 +217,14 @@ def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int
 def make_real_qwen3_tp_model(
     runtime, *, model_path: Path, tp_size: int = 2, load_weights: bool = True,
     sequence_parallel: bool = False, cp_size: int = 1,
+    profile: str = "1.7b",
 ):
     """Construct Qwen3-1.7B with real native TP=1 or 2 layout.
 
     When load_weights=False, the caller MUST load the already-sharded
     state_dict of a checkpoint-loaded peer BEFORE performing any forward.
     """
-    hf = load_qwen3_1_7b_config(model_path)
+    hf = load_qwen3_dense_config(model_path, profile=profile)
     config = hf_to_mcore_config_dense(
         hf, torch.bfloat16,
         tensor_model_parallel_size=tp_size,
@@ -286,7 +296,7 @@ def make_real_qwen3_tp_model(
         load_hf_qwen3_tp_shards(
             model, hf, model_path, tp_rank=runtime.rank, tp_size=tp_size
         )
-    assert model.config.num_layers == 28
+    assert model.config.num_layers == hf.num_hidden_layers
     # Both the native full-trajectory reference (no active TPR context)
     # and TPR's tree branch must use the expected CANN attention operator.
     # If a future MindSpeed/Megatron spec bypasses our replacement, fail
@@ -302,10 +312,13 @@ def make_real_qwen3_tp_model(
     assert model.config.tensor_model_parallel_size == tp_size
     assert model.config.context_parallel_size == cp_size
     assert model.config.sequence_parallel is sequence_parallel
-    assert model.embedding.word_embeddings.weight.shape == (151936 // tp_size, 2048)
+    assert model.embedding.word_embeddings.weight.shape == (hf.vocab_size // tp_size, hf.hidden_size)
     assert model.output_layer.weight is None
-    assert len(model.decoder.layers) == 28
-    assert model.decoder.layers[0].self_attention.linear_qkv.weight.shape == (4096 // tp_size, 2048)
+    assert len(model.decoder.layers) == hf.num_hidden_layers
+    assert model.decoder.layers[0].self_attention.linear_qkv.weight.shape == (
+        (hf.num_attention_heads + 2 * hf.num_key_value_heads) * hf.head_dim // tp_size,
+        hf.hidden_size,
+    )
     model.train()
     return model, hf
 

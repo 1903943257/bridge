@@ -53,6 +53,34 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
     )
 
 
+
+def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
+    """TP+RingCP DP1 acceptance scope; unsupported configurations fail closed."""
+    tp, cp = sizes["TP"], sizes["CP"]
+    if (tp not in (1, 2) or cp not in (1, 2, 4)
+            or any(sizes[k] != 1 for k in ("PP", "EP", "DP"))):
+        raise NotImplementedError(
+            "TPR requires TP=1/2, CP=1/2/4 and PP=EP=DP=1; "
+            f"got {sizes}"
+        )
+    return tp
+
+
+def _validate_tpr_cp_combination(tp_size: int, cp_runtime: Any, config: Any) -> None:
+    if cp_runtime.size <= 1:
+        return
+    if cp_runtime.backend_name != "ring":
+        raise NotImplementedError(
+            "TPR TP+CP PPO requires the tested Ring backend; "
+            f"got {cp_runtime.backend_name!r}"
+        )
+    if tp_size > 1 and getattr(config, "sequence_parallel", False):
+        raise NotImplementedError(
+            "TP2+CP requires sequence_parallel=False; combined TP+SP+CP "
+            "has not been validated"
+        )
+
+
 def run_tpr_forward_backward(
     engine: MegatronEngine,
     request: TPRForwardBackwardRequest,
@@ -75,19 +103,12 @@ def run_tpr_forward_backward(
 
     parallel_sizes = {
         "TP": engine.engine_config.tensor_model_parallel_size,
+        "CP": engine.engine_config.context_parallel_size,
         "PP": engine.engine_config.pipeline_model_parallel_size,
         "EP": engine.engine_config.expert_model_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
-    tp_size = parallel_sizes["TP"]
-    unsupported_sizes = {name: size for name, size in parallel_sizes.items()
-                         if name != "TP" and size != 1}
-    if tp_size not in (1, 2) or unsupported_sizes:
-        raise NotImplementedError(
-            f"TPR thin entry supports TP=1/2 with PP=EP=DP=1, got {parallel_sizes}"
-        )
-    if tp_size > 1 and engine.engine_config.context_parallel_size != 1:
-        raise NotImplementedError("TPR TP2+SP phase requires CP=1; TP2+CP deferred")
+    tp_size = _validate_tpr_parallel_sizes(parallel_sizes, ppo=False)
     if engine.engine_config.virtual_pipeline_model_parallel_size is not None:
         raise NotImplementedError("TPR MVP does not support virtual pipeline parallelism")
     if engine.model_config.mtp.enable:
@@ -117,6 +138,7 @@ def run_tpr_forward_backward(
         raise TypeError("TPR thin entry requires a model built with TPRSelfAttention")
     layer_numbers = tuple(sorted(attention.layer_number for attention in tpr_attentions))
     cp_runtime = resolve_engine_cp_runtime(engine, config)
+    _validate_tpr_cp_combination(tp_size, cp_runtime, config)
     executor = SegmentExecutor(
         model,
         request.plan,
@@ -225,8 +247,9 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    TP=1/2 (SP optional at TP=2), PP=EP=DP=1; CP=1/2 at TP=1,
-    CP=1 at TP=2. Vanilla token-mean PPO; no native /M schedule
+    TP=1/2, CP=1/2/4, PP=EP=DP=1. Ring required for CP>1,
+    and native SP is restricted to CP=1 at TP2.
+    Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
     import torch
@@ -254,14 +277,7 @@ def run_tpr_forward_backward_batch(
         "CP": engine.engine_config.context_parallel_size,
         "DP": engine.get_data_parallel_size(),
     }
-    tp_size = sizes["TP"]
-    if (tp_size not in (1, 2) or sizes["CP"] not in (1, 2)
-            or any(sizes[name] != 1 for name in ("PP", "EP", "DP"))
-            or (tp_size > 1 and sizes["CP"] != 1)):
-        raise NotImplementedError(
-            f"TPR PPO supports TP=1/2, CP=1/2 for TP1 or CP=1 for TP2, "
-            f"PP=EP=DP=1, got {sizes}"
-        )
+    tp_size = _validate_tpr_parallel_sizes(sizes, ppo=True)
     if engine.engine_config.virtual_pipeline_model_parallel_size not in (None, 1):
         raise NotImplementedError("TPR PPO does not support virtual PP")
     if engine.model_config.mtp.enable or engine.enable_routing_replay:
@@ -305,8 +321,7 @@ def run_tpr_forward_backward_batch(
 
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
-    if cp_runtime.size == 2 and cp_runtime.backend_name != "ring":
-        raise NotImplementedError("TPR PPO CP=2 currently requires Ring backend")
+    _validate_tpr_cp_combination(tp_size, cp_runtime, config)
     objective = SegmentPPOObjectiveAdapter(
         data, loss_function, dp_group=engine.get_data_parallel_group()
     )
