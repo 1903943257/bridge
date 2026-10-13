@@ -73,6 +73,8 @@ def build_tree_execution_plans(
     *,
     trees: tuple[TrajectoryTree, ...] | None = None,
     require_loss_mask_alignment: bool = False,
+    tree_policy: str = "exact",
+    turn_min_segment_tokens: int = 128,
 ) -> ForestExecutionPlan:
     """Build a forest of topology-only SegmentPlans and PPO ownership references.
 
@@ -82,9 +84,18 @@ def build_tree_execution_plans(
     Optional loss-mask alignment catches mismatch against the native
     batch_num_tokens denominator before entering the Megatron schedule.
     """
+    if tree_policy not in ("exact", "qwen_turn"):
+        raise ValueError(f"unknown TPR tree_policy: {tree_policy!r}")
     keys = list(keys)
     if trees is None:
-        trees = build_trajectory_trees(keys, batch)
+        if tree_policy == "qwen_turn":
+            from .trajectory_tree_turn import build_trajectory_trees_turn
+
+            trees = build_trajectory_trees_turn(
+                keys, batch, min_segment_tokens=turn_min_segment_tokens
+            )
+        else:
+            trees = build_trajectory_trees(keys, batch)
     input_rows = _rows(batch, "input_ids")
     response_masks = _rows(batch, "response_mask")
     if len(keys) != len(input_rows) or len(keys) != len(response_masks):

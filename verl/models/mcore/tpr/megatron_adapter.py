@@ -319,8 +319,18 @@ def run_tpr_forward_backward_batch(
     if token_count is None or token_count <= 0 or dp_size != 1:
         raise ValueError("Engine must attach positive batch_num_tokens and dp_size=1 before TPR routing")
 
+    import os
+
+    tree_policy = os.getenv("TPR_TREE_POLICY", "exact")
+    try:
+        turn_min_tokens = int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128"))
+    except ValueError as exc:
+        raise ValueError("TPR_TURN_MIN_SEGMENT_TOKENS must be a positive integer") from exc
     keys = _trajectory_keys_from_minibatch(data)
-    forest = build_tree_execution_plans(keys, data)
+    forest = build_tree_execution_plans(
+        keys, data, tree_policy=tree_policy,
+        turn_min_segment_tokens=turn_min_tokens,
+    )
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
     if tp_size > 1:

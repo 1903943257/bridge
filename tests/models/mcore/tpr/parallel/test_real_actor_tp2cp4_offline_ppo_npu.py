@@ -243,13 +243,19 @@ def test_recorded_full_vs_tpr_one_step():
         batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
         from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
         from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
-        forest = build_tree_execution_plans(_trajectory_keys_from_minibatch(batch), batch)
+        forest = build_tree_execution_plans(
+            _trajectory_keys_from_minibatch(batch), batch,
+            tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
+            turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
+        )
         if mode == "full" and (len(forest.trees) != len(rows)
                                or forest.segment_count != len(rows)):
             raise AssertionError("Full control accidentally reused a prefix")
-        if mode == "tpr" and (len(forest.trees) != 1
-                              or forest.segment_count <= len(rows)):
-            raise AssertionError("TPR mode did not create expected shared tree")
+        if mode == "tpr" and os.getenv("TPR_TREE_POLICY", "exact") == "exact":
+            if len(forest.trees) != 1 or forest.segment_count <= len(rows):
+                raise AssertionError("Exact TPR mode did not create expected shared tree")
+        # Turn mode is allowed to produce multiple trees if there is no valid
+        # complete-turn common prefix. Never invent shared KV for such rows.
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=4,
             sequence_parallel=False, profile="4b",
