@@ -89,6 +89,9 @@ def _profile_summary(rank_snapshots):
                 "prefix":event["prefix_length"],"max_rank_npu_event_ms":0.,
                 "max_rank_cpu_enqueue_ms":0.,"peak_allocated_gib":0.,
                 "peak_reserved_gib":0.,
+                "max_rank_live_alloc_before_gib":0.,
+                "max_rank_live_alloc_after_gib":0.,
+                "max_rank_live_alloc_delta_gib":float("-inf"),
             })
             if group["length"] != event["length"] or group["prefix"] != event["prefix_length"]:
                 raise AssertionError(f"segment plan different across ranks {key}")
@@ -103,6 +106,16 @@ def _profile_summary(rank_snapshots):
             )
             group["peak_reserved_gib"] = max(
                 group["peak_reserved_gib"],event["peak_reserved_bytes"]/2**30
+            )
+            group["max_rank_live_alloc_before_gib"] = max(
+                group["max_rank_live_alloc_before_gib"],event["alloc_before_bytes"]/2**30
+            )
+            group["max_rank_live_alloc_after_gib"] = max(
+                group["max_rank_live_alloc_after_gib"],event["alloc_after_bytes"]/2**30
+            )
+            group["max_rank_live_alloc_delta_gib"] = max(
+                group["max_rank_live_alloc_delta_gib"],
+                (event["alloc_after_bytes"]-event["alloc_before_bytes"])/2**30
             )
     return {"segment_events":list(groups.values()),"cpu_stage_ms_worst_rank":stage_ms}
 
