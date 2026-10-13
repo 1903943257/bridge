@@ -320,7 +320,11 @@ def run_tpr_forward_backward_batch(
         raise ValueError("Engine must attach positive batch_num_tokens and dp_size=1 before TPR routing")
 
     import os
+    import time
 
+    detailed_profile = os.getenv("TPR_EXEC_PROFILE", "0") == "1"
+    stage_ms = {}
+    profile_origin = time.perf_counter()
     tree_policy = os.getenv("TPR_TREE_POLICY", "exact")
     try:
         turn_min_tokens = int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128"))
@@ -333,10 +337,15 @@ def run_tpr_forward_backward_batch(
     )
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
+    if detailed_profile:
+        stage_ms["tree_build_cpu_ms"] = (time.perf_counter()-profile_origin)*1000
+    tp_check_start = time.perf_counter()
     if tp_size > 1:
         from .tp_validation import assert_tp_plan_agreement, digest_forest_plan
 
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
+    if detailed_profile:
+        stage_ms["tp_plan_collective_ms"] = (time.perf_counter()-tp_check_start)*1000
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
     objective = SegmentPPOObjectiveAdapter(
@@ -354,8 +363,15 @@ def run_tpr_forward_backward_batch(
         raise RuntimeError("TPR PPO requires native finalize_model_grads_func")
 
     metric_lists: dict[str, list[Any]] = {}
+    from .segment_event_profiler import SegmentEventProfiler
+    event_profiler = SegmentEventProfiler() if detailed_profile else None
+    setup_ms = 0.0
+    metrics_ms = 0.0
+    tree_number = 0
 
     def run_one_tree(tree_plan):
+        nonlocal setup_ms, metrics_ms, tree_number
+        setup_start = time.perf_counter() if detailed_profile else None
         shard_for_segment = None if cp_runtime.backend is None else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
         callback, counts = objective.bind_tree(tree_plan, shard_for_segment=shard_for_segment)
         executor = SegmentExecutor(
@@ -368,7 +384,14 @@ def run_tpr_forward_backward_batch(
             cp_group=cp_runtime.group,
             cp_backend=cp_runtime.backend,
         )
-        result = FixedTopologyScheduler(tree_plan.segment_plan, executor).run()
+        if detailed_profile:
+            setup_ms += (time.perf_counter()-setup_start)*1000
+        result = FixedTopologyScheduler(
+            tree_plan.segment_plan, executor,
+            event_profiler=event_profiler, tree_index=tree_number,
+        ).run()
+        tree_number += 1
+        metrics_start = time.perf_counter() if detailed_profile else None
         if not bool(torch.isfinite(result.normalized_loss).item()):
             raise FloatingPointError("non-finite TPR PPO tree loss; gradients will not be finalized")
         from verl.utils.metric import AggregationType, Metric
@@ -393,6 +416,8 @@ def run_tpr_forward_backward_batch(
                         f"TPR PPO metric {name} requires unsupported {value.aggregation}"
                     )
                 metric_lists.setdefault(name, []).append(value)
+        if detailed_profile:
+            metrics_ms += (time.perf_counter()-metrics_start)*1000
         return result
 
     runner = TPRBatchRunner(
@@ -400,7 +425,12 @@ def run_tpr_forward_backward_batch(
         finalize_gradients=lambda: finalize(engine.module, None, force_all_reduce=True),
         no_sync_context=no_sync_func,
     )
+    run_start = time.perf_counter() if detailed_profile else None
     result = runner.run(forest)
+    if detailed_profile:
+        stage_ms["executor_setup_cpu_ms"] = setup_ms
+        stage_ms["segment_metrics_cpu_ms"] = metrics_ms
+        stage_ms["tree_run_and_finalize_host_ms"] = (time.perf_counter()-run_start)*1000
     if not bool(torch.isfinite(result.normalized_loss).item()):
         raise FloatingPointError("non-finite TPR PPO mini-batch loss")
     if objective.capture_log_probs:
@@ -423,6 +453,13 @@ def run_tpr_forward_backward_batch(
         result.normalized_loss, result.normalized_loss, cp_runtime
     )
     loss = float(global_normalized_loss.item())
+    if detailed_profile:
+        stage_ms["whole_entry_host_ms"] = (time.perf_counter()-profile_origin)*1000
+        # NPU events must only be materialized after caller's one final NPU sync.
+        engine._tpr_segment_event_profiler = event_profiler
+        engine._tpr_stage_profile = stage_ms
+        engine._tpr_segment_peak_allocated_bytes = event_profiler.max_allocated_bytes
+        engine._tpr_segment_peak_reserved_bytes = event_profiler.max_reserved_bytes
     metric_lists.update({
         "tpr/forest_trees": [result.tree_count],
         "tpr/physical_segments": [result.segment_count],
