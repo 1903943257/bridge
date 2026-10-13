@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Restrict *all* Ray/vLLM/actor child processes to physical Ascend 8..15.
+# The eight visible NPUs are indexed 0..7 inside torchrun/Ray.
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 # ============================================================
 # Uni-Agent Qwen3-4B SWE end-to-end: rollout -> TQ -> GRPO/PPO -> actor update.
 # Retains the established Uni-Agent-CC V1 Trainer path and SWE task.
-# TP2*CP4=8 NPU ranks per replica. Default 16 NPUs -> DP2; set
-# N_GPUS_PER_NODE=8 to run the smaller DP1 smoke. Native only.
-# NOTE: current Bridge main includes TP2 CP1 but still rejects TP2 CP4 and DP2, so this is
-# a NATIVE baseline + real Actor PPO capture, NOT a TPR TP2/CP4 acceptance.
+# Experimental TPR TP2 x RingCP4 x DP1 smoke on physical NPU 8..15.
+# Native-TP + Ring-CP2 module parity passed; TP2+CP4 PPO E2E is NOT yet proven.
+# DP2 and combined native SP+CP are still forbidden by Engine guards.
 # ============================================================
 ROOT=/workspace/uni-agent-cc
 # ------------------------------------------------------------
@@ -18,8 +20,8 @@ TRAIN_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TEST_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TASK_CONFIG=${ROOT}/examples/claude_code_swe_task/task_config_claude_code_django11163.yaml
 # tpr
-# Deliberately native until TP2 x CP4 TPR production guard is implemented.
-TPR_ENABLED=False
+# Explicit TPR trial: use the TPR Forest Engine, not the Native baseline.
+TPR_ENABLED=True
 # ------------------------------------------------------------
 # Same rollout config as run_e2e.sh
 # ------------------------------------------------------------
@@ -44,10 +46,10 @@ NUM_AGENT_WORKERS=1
 TRAJECTORY_SELECTION=all
 MASK_UNFINISHED_EPISODE=False
 # ------------------------------------------------------------
-# Training side: native Megatron TP2 x CP4 smoke + genuine PPO capture
+# Training side: TPR Megatron TP2 x RingCP4 x DP1, genuine PPO update
 # ------------------------------------------------------------
 NNODES=1
-N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-16}
+N_GPUS_PER_NODE=8  # Physical NPUs 8-15, one TP2 x CP4 replica; DP must stay 1.
 TRAIN_TP=2
 TRAIN_PP=1
 TRAIN_CP=4
@@ -55,7 +57,8 @@ TPR_CP_BACKEND=ring
 TRAIN_DP=$((N_GPUS_PER_NODE / (TRAIN_TP * TRAIN_PP * TRAIN_CP)))
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-$TRAIN_DP}
 GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-$TRAIN_DP}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_DP}
+# One complete rollout group (N siblings) per PPO mini-batch for Prefix reuse.
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$((TRAIN_PROMPT_BSZ * N))}
 PPO_MICRO_BATCH_SIZE_PER_GPU=1
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
 # 与当前旧训练栈匹配：
@@ -75,7 +78,7 @@ NUM_WARMUP_BATCHES=0
 # ------------------------------------------------------------
 # Output
 # ------------------------------------------------------------
-RUN_NAME=swe-django-11163-qwen3-4b-n${N}-tp2cp4-long-response
+RUN_NAME=swe-django-11163-qwen3-4b-n${N}-tpr-tp2cp4-npu8-15-long-response
 AGENT_LOG_DIR=/workspace/logs/${RUN_NAME}/agent
 TRAIN_LOG_DIR=/workspace/logs/${RUN_NAME}
 TQ_DUMP_DIR=/workspace/tq_dump/django11163_4b_tp2cp4
@@ -98,7 +101,7 @@ export VLLM_ASCEND_ENABLE_TOPK_OPTIMIZE=1
 export TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT=2400
 # The existing patched TrainingWorker captures ORIGINAL actor mini_batch_td.
 # Use a distinct capture directory: actor_capture.py refuses overwrites.
-export TPR_CAPTURE_ACTOR_MINIBATCH_DIR="${TPR_CAPTURE_ACTOR_MINIBATCH_DIR:-/workspace/tpr_actor_capture_4b_tp2cp4}"
+export TPR_CAPTURE_ACTOR_MINIBATCH_DIR="${TPR_CAPTURE_ACTOR_MINIBATCH_DIR:-/workspace/tpr_actor_capture_4b_tpr_tp2cp4_npu8_15}"
 unset TPR_REAL_ACTOR_CAPTURE || true
 mkdir -p "${AGENT_LOG_DIR}"
 mkdir -p "${TRAIN_LOG_DIR}"
@@ -143,19 +146,31 @@ if limit > 40960:
         )
 print(f"LONG_CONTEXT_CHECK max_model_len={limit} rope_scaling={rope}")
 PY_CTX_CHECK
-if [[ "${N_GPUS_PER_NODE}" != "8" && "${N_GPUS_PER_NODE}" != "16" ]]; then
-    echo "ERROR: TP2 x CP4 requires 8 or 16 training NPUs (DP1 or DP2)" >&2
+if [[ "${N_GPUS_PER_NODE}" != "8" || "${TRAIN_DP}" != "1" ]]; then
+    echo "ERROR: this TPR trial must use 8 visible NPUs (TP2 x CP4 x DP1)" >&2
     exit 2
 fi
+python - <<'PY_NPU_VISIBILITY'
+import os
+import torch
+import torch_npu  # noqa: F401
+
+visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+count = torch.npu.device_count()
+print(f"TPR_NPU_VISIBILITY physical={visible} logical_count={count}", flush=True)
+if visible != "8,9,10,11,12,13,14,15" or count != 8:
+    raise SystemExit("ERROR: expected exactly 8 visible Ascend NPUs (physical 8..15)")
+PY_NPU_VISIBILITY
 if (( TRAIN_PROMPT_BSZ % TRAIN_DP != 0 || GEN_BATCH_SIZE % TRAIN_DP != 0 || PPO_MINI_BATCH_SIZE % TRAIN_DP != 0 )); then
     echo "ERROR: train/gen/ppo mini batch sizes must be divisible by TRAIN_DP=${TRAIN_DP}." >&2
     exit 2
 fi
-if (( TRAIN_DP > 1 )); then
-    echo "NOTE: DP${TRAIN_DP} will distribute actor mini-batches; verify per-DP sibling grouping and reward diversity." >&2
+if [[ "${TPR_ENABLED}" != "True" || "${TPR_CP_BACKEND}" != "ring" ]]; then
+    echo "ERROR: this smoke requires TPR_ENABLED=True and Ring CP" >&2
+    exit 2
 fi
-if [[ "${TPR_ENABLED}" != "False" ]]; then
-    echo "ERROR: TPR TP2 x CP4 PPO is not enabled in the production Engine. Run Native first." >&2
+if (( PPO_MINI_BATCH_SIZE < N )); then
+    echo "ERROR: PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE} splits N=${N} siblings; TPR reuse would be lost" >&2
     exit 2
 fi
 if find "${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}" -maxdepth 1 -name 'actor_update_rank*_batch*.pt' | grep -q .; then
@@ -167,7 +182,8 @@ echo "Uni-Agent TRAIN/TQ E2E"
 echo "============================================================"
 echo "MODEL_PATH        = ${MODEL_PATH}"
 echo "MODEL_NAME        = ${MODEL_NAME}"
-echo "TPR_ENABLED       = ${TPR_ENABLED} (Native baseline; TPR TP2 x CP4 not wired)"
+echo "TPR_ENABLED       = ${TPR_ENABLED} (TPR TP2 x RingCP4 x DP1 experimental)"
+echo "VISIBLE_NPUS      = ${ASCEND_RT_VISIBLE_DEVICES} (physical IDs)"
 echo "TRAIN_FILE        = ${TRAIN_FILE}"
 echo "TASK_CONFIG       = ${TASK_CONFIG}"
 echo
