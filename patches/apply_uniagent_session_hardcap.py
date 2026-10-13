@@ -39,6 +39,9 @@ def replace_exact(src: str, before: str, after: str, label: str) -> str:
 
 
 def patch_session(src: str) -> str:
+    # These anchors are shared across upstream Gateway variants, including
+    # revisions using owner_request, owner_future or no request coalescing.
+    # We deliberately never touch their in-flight bookkeeping.
     src = replace_exact(
         src,
         '        self._metadata = dict(metadata or {})\n'
@@ -59,22 +62,23 @@ def patch_session(src: str) -> str:
         '                # Prepare can touch codec and multimodal extractor state, so only\n',
         "session.run_generation guard",
     )
+    # Put flag at a shared, low-risk location *after* input preparation.
+    # Both current owner_future and older/newer request bookkeeping versions
+    # have the same EncodedData.capacity_exhausted predicate.
     src = replace_exact(
         src,
-        '                        if encoded.chain_id is not None:\n'
-        '                            self._close_length_exhausted_chain(encoded)\n'
-        '                        self._touch()\n',
-        '                        if encoded.chain_id is not None:\n'
-        '                            self._close_length_exhausted_chain(encoded)\n'
-        '                        elif self._hard_stop_on_trajectory_capacity:\n'
-        '                            self._hard_cap_reached = True\n'
-        '                        self._touch()\n',
+        '                if encoded.capacity_exhausted:\n',
+        '                if encoded.capacity_exhausted:\n'
+        '                    if self._hard_stop_on_trajectory_capacity:\n'
+        '                        self._hard_cap_reached = True\n',
         "session.capacity_without_generation",
     )
+    # Do not delete the committed chain here: owner_future / coalesced waiters
+    # may still read it later in the same method. At finalize the active chain
+    # is materialized with max_trajectory_length; the watcher stops the Runner.
     src = replace_exact(
         src,
-        '                chain_id = self._commit_generation_to_chain(encoded, assistant_msg)\n'
-        '                if owner_request is not None and owner_request.waiter_count:\n',
+        '                chain_id = self._commit_generation_to_chain(encoded, assistant_msg)\n',
         '                chain_id = self._commit_generation_to_chain(encoded, assistant_msg)\n'
         '                if (\n'
         '                    self._hard_stop_on_trajectory_capacity\n'
@@ -82,41 +86,18 @@ def patch_session(src: str) -> str:
         '                    and len(encoded.buffer.prompt_ids) + len(encoded.buffer.response_ids)\n'
         '                    >= self._trajectory_capacity\n'
         '                ):\n'
-        '                    # Close at the exact final model token. Do not wait for\n'
-        '                    # another Claude Code request to trigger materialization.\n'
-        '                    chain_index, completed_chain = self._find_active_chain(chain_id)\n'
-        '                    self.materialized_chains.append(\n'
-        '                        MaterializedChain(\n'
-        '                            trajectory=self._build_materialized_trajectory(\n'
-        '                                chain=completed_chain,\n'
-        '                                extra_fields={"materialization_reason": "max_trajectory_length"},\n'
-        '                            ),\n'
-        '                            order_seq=self._next_order_seq(),\n'
-        '                        )\n'
-        '                    )\n'
-        '                    del self.active_chains[chain_index]\n'
-        '                    self._hard_cap_reached = True\n'
-        '                if owner_request is not None and owner_request.waiter_count:\n',
+        '                    self._hard_cap_reached = True\n',
         "session.exact_capacity_commit",
     )
-    # On exact-cap closure the chain no longer exists. Avoid a lookup for
-    # coalesced waiters, whose response is already safely committed.
+    # A concurrent request can finish backend generation after another
+    # request filled the budget: do not commit this response as a new chain.
     src = replace_exact(
         src,
-        '                if owner_request is not None and owner_request.waiter_count:\n'
-        '                    # Attribute at commit, even if waiters cancel or resume after finalize.\n'
-        '                    _, chain = self._find_active_chain(chain_id)\n'
-        '                    chain.num_coalesced_requests += owner_request.waiter_count\n',
-        '                if owner_request is not None and owner_request.waiter_count:\n'
-        '                    # Attribute exact-request waiters even after hard-cap materialization.\n'
-        '                    _, chain = self._find_active_chain(chain_id) if not self._hard_cap_reached else (None, None)\n'
-        '                    if chain is not None:\n'
-        '                        chain.num_coalesced_requests += owner_request.waiter_count\n'
-        '                    elif self.materialized_chains:\n'
-        '                        self.materialized_chains[-1].trajectory.extra_fields["num_coalesced_requests"] = (\n'
-        '                            owner_request.waiter_count\n'
-        '                        )\n',
-        "session.coalesced_waiter_at_cap",
+        '                assistant_msg, finish_reason = await self._codec.decode_response(\n',
+        '                if self._hard_stop_on_trajectory_capacity and self._hard_cap_reached:\n'
+        '                    raise HTTPException(status_code=410, detail="Session trajectory capacity exhausted")\n'
+        '                assistant_msg, finish_reason = await self._codec.decode_response(\n',
+        "session.concurrent_commit_guard",
     )
     src = replace_exact(
         src,
@@ -130,13 +111,29 @@ def patch_session(src: str) -> str:
     )
     src = replace_exact(
         src,
+        '                    trajectory=self._build_materialized_trajectory(chain=chain),\n',
+        '                    trajectory=self._build_materialized_trajectory(\n'
+        '                        chain=chain,\n'
+        '                        extra_fields=(\n'
+        '                            {"materialization_reason": "max_trajectory_length"}\n'
+        '                            if self._hard_stop_on_trajectory_capacity\n'
+        '                            and self._hard_cap_reached\n'
+        '                            and self._trajectory_capacity is not None\n'
+        '                            and len(chain.buffer.prompt_ids) + len(chain.buffer.response_ids)\n'
+        '                            >= self._trajectory_capacity\n'
+        '                            else None\n'
+        '                        ),\n'
+        '                    ),\n',
+        "session.materialize_at_exact_capacity",
+    )
+    src = replace_exact(
+        src,
         '            "num_trajectories": len(self.materialized_chains),\n',
         '            "num_trajectories": len(self.materialized_chains),\n'
         '            "hard_cap_reached": self._hard_cap_reached,\n',
         "session.snapshot",
     )
     return src
-
 
 def patch_manager(src: str) -> str:
     return replace_exact(
