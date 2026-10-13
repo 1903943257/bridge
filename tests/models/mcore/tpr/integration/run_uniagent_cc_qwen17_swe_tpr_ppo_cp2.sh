@@ -23,7 +23,7 @@ TPR_ENABLED=False
 # ------------------------------------------------------------
 # Same rollout config as run_e2e.sh
 # ------------------------------------------------------------
-N=2
+N=${N:-2}
 TEMPERATURE=0.6
 TOP_P=0.95
 TOP_K=20
@@ -52,9 +52,9 @@ TRAIN_TP=2
 TRAIN_PP=1
 TRAIN_CP=4
 TPR_CP_BACKEND=ring
-TRAIN_PROMPT_BSZ=1
-GEN_BATCH_SIZE=1
-PPO_MINI_BATCH_SIZE=1
+TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-1}
+GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-1}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-1}
 PPO_MICRO_BATCH_SIZE_PER_GPU=1
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
 # 与当前旧训练栈匹配：
@@ -64,7 +64,7 @@ VANILLA_MBRIDGE=True
 PARAM_OFFLOAD=True
 OPTIMIZER_OFFLOAD=True
 # Capture an authentic actor update first; do not pretend zero-advantage means PPO parity.
-TOTAL_TRAINING_STEPS=1
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
 TOTAL_EPOCHS=1
 # 不做 validation/checkpoint。
 SAVE_FREQ=-1
@@ -74,7 +74,7 @@ NUM_WARMUP_BATCHES=0
 # ------------------------------------------------------------
 # Output
 # ------------------------------------------------------------
-RUN_NAME=swe-django-11163-qwen3-4b-tp2cp4-long-response
+RUN_NAME=swe-django-11163-qwen3-4b-n${N}-tp2cp4-long-response
 AGENT_LOG_DIR=/workspace/logs/${RUN_NAME}/agent
 TRAIN_LOG_DIR=/workspace/logs/${RUN_NAME}
 TQ_DUMP_DIR=/workspace/tq_dump/django11163_4b_tp2cp4
