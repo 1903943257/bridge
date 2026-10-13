@@ -25,9 +25,31 @@ _MARKER = "# TPR P0 real actor-update capture (opt-in; before train_batch)"
 _MATCH = re.compile(r"(?m)^(?P<indent>[ \t]+)actor_output = self\.train_batch\(mini_batch_td\)[ \t]*$")
 
 
+def _capture_block(indent: str, *, legacy: bool = False) -> str:
+    """Exact capture block; legacy layout is used only for safe upgrades."""
+    lines = [
+        f"{indent}{_MARKER}",
+        f"{indent}import os as _tpr_actor_capture_os",
+        f'{indent}_tpr_actor_dir = _tpr_actor_capture_os.environ.get("TPR_CAPTURE_ACTOR_MINIBATCH_DIR")',
+        f"{indent}if _tpr_actor_dir:",
+        f"{indent}    from verl.models.mcore.tpr.actor_capture import capture_real_actor_update_minibatch",
+    ]
+    if not legacy:
+        lines.append(
+            f'{indent}    _tpr_capture_index = getattr(self, "_tpr_actor_capture_index", 0)'
+        )
+    lines += [
+        f"{indent}    capture_real_actor_update_minibatch(",
+        f"{indent}        mini_batch_td, _tpr_actor_dir, batch_idx=batch_idx"
+        + ("" if legacy else ", capture_index=_tpr_capture_index"),
+        f"{indent}    )",
+    ]
+    if not legacy:
+        lines.append(f"{indent}    self._tpr_actor_capture_index = _tpr_capture_index + 1")
+    return "\n".join(lines) + "\n"
+
+
 def transform(source: str) -> tuple[str, str]:
-    if _MARKER in source:
-        return source, "already_applied"
     matches = list(_MATCH.finditer(source))
     if len(matches) != 1:
         raise ValueError(
@@ -37,19 +59,25 @@ def transform(source: str) -> tuple[str, str]:
         )
     matched = matches[0]
     indent = matched.group("indent")
-    # Body is entirely behind the env variable. The helper refuses to
-    # overwrite existing captures and preserves real data identity.
-    extra = "\n".join([
-        f"{indent}{_MARKER}",
-        f"{indent}import os as _tpr_actor_capture_os",
-        f'{indent}_tpr_actor_dir = _tpr_actor_capture_os.environ.get("TPR_CAPTURE_ACTOR_MINIBATCH_DIR")',
-        f"{indent}if _tpr_actor_dir:",
-        f"{indent}    from verl.models.mcore.tpr.actor_capture import capture_real_actor_update_minibatch",
-        f"{indent}    capture_real_actor_update_minibatch(",
-        f"{indent}        mini_batch_td, _tpr_actor_dir, batch_idx=batch_idx",
-        f"{indent}    )",
-    ]) + "\n"
-    result = source[: matched.start()] + extra + source[matched.start() :]
+    new_block = _capture_block(indent)
+    if _MARKER in source:
+        if source.count(_MARKER) != 1:
+            raise ValueError("Multiple actor capture markers; refusing unsafe patch")
+        marker_pos = source.index(_MARKER)
+        line_start = source.rfind("\n", 0, marker_pos) + 1
+        if line_start >= matched.start():
+            raise ValueError("Actor capture marker is not before train_batch")
+        installed = source[line_start:matched.start()]
+        if installed == new_block:
+            return source, "already_applied"
+        if installed != _capture_block(indent, legacy=True):
+            raise ValueError(
+                "Existing actor capture block was customized; refusing to overwrite it"
+            )
+        result = source[:line_start] + new_block + source[matched.start():]
+        ast.parse(result)
+        return result, "upgraded"
+    result = source[:matched.start()] + new_block + source[matched.start():]
     ast.parse(result)
     return result, "patched"
 
