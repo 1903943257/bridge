@@ -174,7 +174,7 @@ def _global_bf16_gradient_norm(model, runtime):
     squared sum. TP-replicated norm parameters are counted only on TP rank0.
     Each rank participates in the WORLD scalar all-reduce.
     """
-    local = torch.zeros((), dtype=torch.float64, device=runtime.device)
+    local = torch.zeros((), dtype=torch.float32, device=runtime.device)
     if runtime.cp_rank == 0:
         for name, param in model.named_parameters():
             grad = param.grad
@@ -183,7 +183,7 @@ def _global_bf16_gradient_norm(model, runtime):
             tp_shard = bool(getattr(param, "tensor_model_parallel", False))
             if tp_shard or runtime.tp_rank == 0:
                 v = grad.detach().float()
-                local += (v * v).sum().double()
+                local += (v * v).sum()
                 del v
     dist.all_reduce(local, op=dist.ReduceOp.SUM)
     return float(torch.sqrt(local).item())

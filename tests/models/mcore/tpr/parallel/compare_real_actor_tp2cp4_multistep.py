@@ -10,7 +10,7 @@ import json
 import math
 from pathlib import Path
 import torch
-from .compare_real_actor_tp2cp4_offline_ppo import (
+from compare_real_actor_tp2cp4_offline_ppo import (
     _l2_pair, _logprobs, _complete_gradient_metrics,
 )
 
