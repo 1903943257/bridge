@@ -66,7 +66,22 @@ PARAM_OFFLOAD=True
 OPTIMIZER_OFFLOAD=True
 # Capture an authentic actor update first; do not pretend zero-advantage means PPO parity.
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
-TOTAL_EPOCHS=1
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
+# E1 Native only: opt-in full activation recompute to reduce online OOM.
+# Offline Native/TPR Replay must disable recompute independently.
+NATIVE_RECOMPUTE=${NATIVE_RECOMPUTE:-False}
+RECOMPUTE_ARGS=()
+case "${NATIVE_RECOMPUTE}" in
+  True|true|1)
+    RECOMPUTE_ARGS=(
+      "++actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full"
+      "++actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform"
+      "++actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1"
+    )
+    ;;
+  False|false|0) ;;
+  *) echo "NATIVE_RECOMPUTE must be True or False" >&2; exit 2 ;;
+esac
 # 不做 validation/checkpoint。
 SAVE_FREQ=-1
 TEST_FREQ=-1
@@ -193,6 +208,9 @@ echo "TRAIN_DP          = ${TRAIN_DP}"
 echo "TRAIN_PROMPT_BSZ  = ${TRAIN_PROMPT_BSZ}"
 echo "GEN_BATCH_SIZE    = ${GEN_BATCH_SIZE}"
 echo "PPO_MINI_BSZ      = ${PPO_MINI_BATCH_SIZE}"
+echo "NATIVE_RECOMPUTE  = ${NATIVE_RECOMPUTE}"
+echo "TOTAL_STEPS       = ${TOTAL_TRAINING_STEPS}"
+echo "TOTAL_EPOCHS      = ${TOTAL_EPOCHS}"
 echo
 echo "USE_MBRIDGE       = ${USE_MBRIDGE}"
 echo "VANILLA_MBRIDGE   = ${VANILLA_MBRIDGE}"
@@ -287,6 +305,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size="${TRAIN_PP}" \
     actor_rollout_ref.actor.megatron.context_parallel_size="${TRAIN_CP}" \
     actor_rollout_ref.actor.megatron.use_remove_padding=True \
+    "${RECOMPUTE_ARGS[@]}" \
     +actor_rollout_ref.actor.megatron.tpr_enabled="${TPR_ENABLED}" \
     +actor_rollout_ref.actor.megatron.tpr_cp_backend="${TPR_CP_BACKEND}" \
     \
