@@ -85,18 +85,25 @@ def _complete_gradient_metrics(full, tpr):
             y = torch.load(right/entry["filename"], map_location="cpu", weights_only=True)
             if x.shape != y.shape or x.dtype != y.dtype:
                 raise AssertionError(f"Full/TPR exact gradient mismatch {entry['name']}")
-            x, y = x.float(), y.float()
-            delta = x - y
-            aa = float(torch.sum(x.double() ** 2))
-            bb = float(torch.sum(y.double() ** 2))
-            xy = float(torch.sum(x.double() * y.double()))
-            dd = float(torch.sum(delta.double() ** 2))
+            # Stream tensor chunks: a 4B shard may be hundreds of millions
+            # of BF16 entries; avoid materializing whole FP64 copies on CPU.
+            aa = bb = xy = dd = 0.0
+            xf = x.reshape(-1)
+            yf = y.reshape(-1)
+            for start in range(0, xf.numel(), 1_048_576):
+                v = xf[start:start+1_048_576].double()
+                w = yf[start:start+1_048_576].double()
+                d = v - w
+                aa += float((v*v).sum())
+                bb += float((w*w).sum())
+                xy += float((v*w).sum())
+                dd += float((d*d).sum())
             full_sq += aa
             tpr_sq += bb
             dot += xy
             diff_sq += dd
             contributions.append((entry["name"], tp_rank, math.sqrt(dd)))
-            del x, y, delta
+            del x, y, xf, yf
     return {
         "full_norm": math.sqrt(full_sq), "tpr_norm": math.sqrt(tpr_sq),
         "norm_relative_gap": abs(math.sqrt(full_sq)-math.sqrt(tpr_sq))/max(math.sqrt(full_sq), 1e-30),
