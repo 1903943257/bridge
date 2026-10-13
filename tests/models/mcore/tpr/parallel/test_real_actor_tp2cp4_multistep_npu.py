@@ -248,6 +248,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
             torch.npu.reset_peak_memory_stats()
             start_alloc = torch.npu.memory_allocated()
             fwd_start = time.perf_counter()
+            prior_finalize_seconds = finalize_seconds[0]
             out = run_tpr_forward_backward_batch(
                 engine, batch, partial(ppo_loss, config=_PPO()),
                 forward_only=False,
@@ -306,6 +307,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     "peak_reserved_bytes":reserved,
                     "allocated_before_bytes":start_alloc,
                     "fwd_bwd_seconds":fwd_seconds,
+                    "finalize_seconds":finalize_seconds[0]-prior_finalize_seconds,
                     "cpu_optimizer_seconds":update_seconds,
                     "forest_trees":len(forest.trees),
                     "forest_segments":forest.segment_count,
