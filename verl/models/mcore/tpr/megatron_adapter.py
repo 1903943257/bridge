@@ -57,19 +57,26 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
     """TP+RingCP DP1 acceptance scope; unsupported configurations fail closed."""
     tp, cp = sizes["TP"], sizes["CP"]
-    if (tp not in (1, 2) or cp not in (1, 2, 4)
+    supported_cp = (
+        (cp in (1, 2) if tp == 1 else cp in (1, 2, 4))
+        if ppo else (cp >= 1 if tp == 1 else cp in (1, 2, 4))
+    )
+    if (tp not in (1, 2) or not supported_cp
             or any(sizes[k] != 1 for k in ("PP", "EP", "DP"))):
         raise NotImplementedError(
-            "TPR requires TP=1/2, CP=1/2/4 and PP=EP=DP=1; "
-            f"got {sizes}"
+            "TPR PPO: TP1 CP1/2 or TP2 CP1/2/4; "
+            "thin entry: TP1 CP>=1 or TP2 CP1/2/4; "
+            f"PP=EP=DP=1, got {sizes}"
         )
     return tp
 
 
-def _validate_tpr_cp_combination(tp_size: int, cp_runtime: Any, config: Any) -> None:
+def _validate_tpr_cp_combination(
+    tp_size: int, cp_runtime: Any, config: Any, *, ppo: bool
+) -> None:
     if cp_runtime.size <= 1:
         return
-    if cp_runtime.backend_name != "ring":
+    if (ppo or tp_size > 1) and cp_runtime.backend_name != "ring":
         raise NotImplementedError(
             "TPR TP+CP PPO requires the tested Ring backend; "
             f"got {cp_runtime.backend_name!r}"
@@ -138,7 +145,7 @@ def run_tpr_forward_backward(
         raise TypeError("TPR thin entry requires a model built with TPRSelfAttention")
     layer_numbers = tuple(sorted(attention.layer_number for attention in tpr_attentions))
     cp_runtime = resolve_engine_cp_runtime(engine, config)
-    _validate_tpr_cp_combination(tp_size, cp_runtime, config)
+    _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=False)
     executor = SegmentExecutor(
         model,
         request.plan,
@@ -321,7 +328,7 @@ def run_tpr_forward_backward_batch(
 
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
-    _validate_tpr_cp_combination(tp_size, cp_runtime, config)
+    _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
     objective = SegmentPPOObjectiveAdapter(
         data, loss_function, dp_group=engine.get_data_parallel_group()
     )
