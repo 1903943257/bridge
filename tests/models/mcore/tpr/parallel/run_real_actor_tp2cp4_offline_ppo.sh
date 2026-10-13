@@ -24,15 +24,27 @@ case "${TPR_OFFLINE_RUN_MODES:-both}" in
    compare) modes=() ;;
    *) echo "Unknown TPR_OFFLINE_RUN_MODES" >&2; exit 2;;
 esac
+errors=()
 for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
     echo "TPR_OFFLINE_START mode=$mode rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES"
-    torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29784 \
+    # An OOM in Full must not prevent the independent TPR memory experiment.
+    if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29784 \
        -m pytest -vv -s -x \
        tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_offline_ppo_npu.py \
-       2>&1 | tee "$TPR_OFFLINE_OUTPUT_DIR/${mode}.log"
+       2>&1 | tee "$TPR_OFFLINE_OUTPUT_DIR/${mode}.log"; then
+       echo "TPR_OFFLINE mode=$mode completed"
+    else
+       errors+=("$mode")
+       echo "TPR_OFFLINE mode=$mode FAILED; retaining the log and trying remaining modes" >&2
+    fi
 done
-if [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "both" || "${TPR_OFFLINE_RUN_MODES:-both}" == "compare" ]]; then
+if [[ "${#errors[@]}" == 0 ]] && \
+   [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "both" || "${TPR_OFFLINE_RUN_MODES:-both}" == "compare" ]]; then
     python tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_offline_ppo.py \
       "$TPR_OFFLINE_OUTPUT_DIR" | tee "$TPR_OFFLINE_OUTPUT_DIR/comparison.log"
+fi
+if (("${#errors[@]}" > 0)); then
+    echo "TPR_OFFLINE failed_modes=${errors[*]} (logs preserved)" >&2
+    exit 1
 fi
