@@ -69,8 +69,55 @@ def _lp_compare(full, tpr):
     }
 
 
+
+def _profile_summary(rank_snapshots):
+    """Per-segment envelope: max-rank event time and allocator peak.
+
+    Stream NPU events are NOT summed as exclusive wall time; separate
+    end-to-end critical-path time is measured after torch.npu.synchronize().
+    """
+    groups = {}
+    stage_ms = {}
+    for rank_snap in rank_snapshots:
+        for key, value in rank_snap.get("stage_profile", {}).items():
+            stage_ms[key] = max(stage_ms.get(key,0.0), float(value))
+        for event in rank_snap.get("segment_events", ()):
+            key = (event["tree_index"],event["segment_id"],event["kind"])
+            group = groups.setdefault(key, {
+                "tree":event["tree_index"],"segment_id":event["segment_id"],
+                "kind":event["kind"],"length":event["length"],
+                "prefix":event["prefix_length"],"max_rank_npu_event_ms":0.,
+                "max_rank_cpu_enqueue_ms":0.,"peak_allocated_gib":0.,
+                "peak_reserved_gib":0.,
+            })
+            if group["length"] != event["length"] or group["prefix"] != event["prefix_length"]:
+                raise AssertionError(f"segment plan different across ranks {key}")
+            group["max_rank_npu_event_ms"] = max(
+                group["max_rank_npu_event_ms"], float(event["npu_event_ms"])
+            )
+            group["max_rank_cpu_enqueue_ms"] = max(
+                group["max_rank_cpu_enqueue_ms"], float(event["cpu_enqueue_ms"])
+            )
+            group["peak_allocated_gib"] = max(
+                group["peak_allocated_gib"],event["peak_allocated_bytes"]/2**30
+            )
+            group["peak_reserved_gib"] = max(
+                group["peak_reserved_gib"],event["peak_reserved_bytes"]/2**30
+            )
+    return {"segment_events":list(groups.values()),"cpu_stage_ms_worst_rank":stage_ms}
+
 def compare(outdir: Path, steps: int):
-    milestones = tuple(n for n in (1,2,5,10,20,30,40,50) if n <= steps)
+    first = outdir / "full_step1_rank0.pt"
+    if not first.exists():
+        raise FileNotFoundError(first)
+    first_snap = torch.load(first, map_location="cpu", weights_only=False)
+    if first_snap.get("capture_manifest"):
+        milestones = tuple(range(1,steps+1))
+        run_protocol = "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
+    else:
+        milestones = tuple(n for n in (1,2,5,10,20,30,40,50) if n <= steps)
+        run_protocol = "REPEATED_FIXED_PPO_DATA_NOT_ON_POLICY"
+    del first_snap
     observed = []
     for step in milestones:
         mode = {}
@@ -104,12 +151,21 @@ def compare(outdir: Path, steps: int):
         lps = _lp_compare(f,t)
         sampled_grad = _l2_pair(f,t)
         complete_grad = _complete_gradient_metrics(f,t)
+        f_profile = _profile_summary(f)
+        t_profile = _profile_summary(t)
+        full_norm = f[0]["global_grad_norm_preclip"]
+        tpr_norm = t[0]["global_grad_norm_preclip"]
         record = {
             "step":step,
             "full_loss":f[0]["loss"], "tpr_loss":t[0]["loss"],
             "loss_gap":t[0]["loss"]-f[0]["loss"],
             "full_grad_norm":f[0]["global_grad_norm_preclip"],
-            "tpr_grad_norm":t[0]["global_grad_norm_preclip"],
+            "tpr_grad_norm":tpr_norm,
+            "grad_norm_relative_gap":abs(tpr_norm-full_norm)/max(full_norm,1e-30),
+            "full_finalize_seconds_critical":max(x.get("finalize_seconds",0.) for x in f),
+            "tpr_finalize_seconds_critical":max(x.get("finalize_seconds",0.) for x in t),
+            "full_segment_profile":f_profile,
+            "tpr_segment_profile":t_profile,
             "full_grad_clip_factor":f[0]["grad_clip_factor"],
             "tpr_grad_clip_factor":t[0]["grad_clip_factor"],
             "sampled_grad_relative_l2":sampled_grad,
@@ -124,6 +180,13 @@ def compare(outdir: Path, steps: int):
             "tpr_peak_allocated_gib":max(x["peak_allocated_bytes"] for x in t)/2**30,
         }
         observed.append(record)
+        if f_profile["segment_events"] or t_profile["segment_events"]:
+            for label, prof in (("full",f_profile),("tpr",t_profile)):
+                top_events = sorted(prof["segment_events"], key=lambda x:x["max_rank_npu_event_ms"], reverse=True)
+                print(f"TPR_20STEP_PROFILE step={step} mode={label} "
+                      f"overhead_ms={prof['cpu_stage_ms_worst_rank']} "
+                      f"segment_event_count={len(top_events)} "
+                      f"top_events={top_events[:12]}",flush=True)
         print(
             f"TPR_50STEP step={step} loss_full={record['full_loss']:.9g} "
             f"loss_tpr={record['tpr_loss']:.9g} gap={record['loss_gap']:.9g} "
@@ -131,19 +194,24 @@ def compare(outdir: Path, steps: int):
             f"sampled_grad_rel_l2={sampled_grad:.6g} "
             f"full_gradnorm={record['full_grad_norm']:.6g} "
             f"tpr_gradnorm={record['tpr_grad_norm']:.6g} "
+            f"gradnorm_rel_gap={record['grad_norm_relative_gap']:.6g} "
             f"FP32_master_update_rel_l2={master['master_update_rel_l2']:.6g} "
             f"FP32_master_update_cos={master['master_update_cosine']:.6g} "
             f"full_peak_gib={record['full_peak_allocated_gib']:.3f} "
             f"tpr_peak_gib={record['tpr_peak_allocated_gib']:.3f}", flush=True
         )
     result = {
-        "status": "DIAGNOSTIC_FIXED_DATA_PPO_NOT_ON_POLICY",
+        "status": "DIAGNOSTIC_SEQUENTIAL_OFFLINE_PPO_REPLAY",
+        "run_protocol":run_protocol,
         "steps_completed":steps,
         "milestones":observed,
         "interpretation":(
-            "Repeated identical actor-captured PPO tokens, advantages, old "
-            "logprobs and CPU FP32-master AdamW; no fresh rollouts, so not "
-            "an RL generalization or on-policy convergence comparison. "
+            "Original actor-captured PPO tokens, advantages and old logprobs; "
+            "if run_protocol is SEQUENTIAL_20_DISTINCT_REAL_CAPTURES, a distinct "
+            "captured batch is consumed in online capture step order. "
+            "The replay policies are separately trained from the same initial "
+            "weights and are NOT resampled online at each replay step. "
+            "CPU FP32-master AdamW is diagnostic and not production optimizer. "
             "Full is unshared RingCP and not native MindSpeed attention."
         ),
     }
