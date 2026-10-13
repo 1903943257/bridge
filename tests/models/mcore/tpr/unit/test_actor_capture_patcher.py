@@ -31,6 +31,8 @@ def test_actor_capture_patch_preserves_actual_train_batch_and_is_opt_in():
     assert status == "patched"
     assert "TPR_CAPTURE_ACTOR_MINIBATCH_DIR" in updated
     assert "capture_real_actor_update_minibatch(" in updated
+    assert "capture_index=_tpr_capture_index" in updated
+    assert "self._tpr_actor_capture_index = _tpr_capture_index + 1" in updated
     assert updated.count("actor_output = self.train_batch(mini_batch_td)") == 1
     assert updated.index("capture_real_actor_update_minibatch(") < updated.index(
         "actor_output = self.train_batch(mini_batch_td)"
@@ -49,3 +51,31 @@ def test_actor_capture_patch_rejects_unknown_worker_source():
 def test_actor_capture_patch_rejects_duplicate_train_calls():
     with pytest.raises(ValueError, match="got 2"):
         _patcher().transform(_SOURCE + "\n" + _SOURCE)
+
+
+def test_actor_capture_patch_upgrades_previous_installed_block():
+    patcher = _patcher()
+    original_call = "        actor_output = self.train_batch(mini_batch_td)\n"
+    old = _SOURCE.replace(
+        original_call, patcher._capture_block("        ", legacy=True) + original_call
+    )
+    upgraded, status = patcher.transform(old)
+    assert status == "upgraded"
+    assert "capture_index=_tpr_capture_index" in upgraded
+    assert upgraded.count("actor_output = self.train_batch(mini_batch_td)") == 1
+    ast.parse(upgraded)
+    again, status = patcher.transform(upgraded)
+    assert status == "already_applied"
+    assert again == upgraded
+
+
+def test_actor_capture_patch_rejects_customized_existing_block():
+    patcher = _patcher()
+    call = "        actor_output = self.train_batch(mini_batch_td)\n"
+    old = _SOURCE.replace(call, patcher._capture_block("        ", legacy=True) + call)
+    corrupted = old.replace(
+        "        if _tpr_actor_dir:",
+        "        if _tpr_actor_dir and True:",
+    )
+    with pytest.raises(ValueError, match="customized"):
+        patcher.transform(corrupted)
