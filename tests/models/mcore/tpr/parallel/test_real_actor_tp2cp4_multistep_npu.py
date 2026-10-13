@@ -53,6 +53,24 @@ class _CPLeaderCpuMasterAdamW:
                     master, torch.zeros_like(master), torch.zeros_like(master)
                 )
 
+    def sample_master(self):
+        """Bounded FP32-master witness, only on CP group leader."""
+        from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+        if self.runtime.cp_rank != 0:
+            return {}
+        result = {}
+        for name, (weight, _, _) in self.state.items():
+            ids = torch.tensor(
+                exact_sample_indices(weight.numel(), 32),
+                dtype=torch.long, device="cpu",
+            )
+            result[name] = {
+                "shape": tuple(weight.shape),
+                "indices": ids,
+                "values": weight.flatten().index_select(0, ids).clone(),
+            }
+        return result
+
     def step(self, step: int, global_grad_norm: float):
         if not math.isfinite(global_grad_norm) or global_grad_norm <= 0:
             raise FloatingPointError(f"Invalid global gradient norm {global_grad_norm}")
@@ -175,6 +193,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
         engine = _make_engine(model, runtime, finalize_seconds)
         before = _witness(model, grads=False)
         optimizer = _CPLeaderCpuMasterAdamW(model, runtime, lr, clip_norm)
+        initial_master = optimizer.sample_master()
         output.mkdir(parents=True, exist_ok=True)
         for step in range(1, steps + 1):
             if step in milestones and (output / f"{mode}_step{step}_rank{dist.get_rank()}.pt").exists():
@@ -211,6 +230,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
             torch.npu.synchronize()
             update_seconds = time.perf_counter() - update_start
             post = _witness(model, grads=False) if capture_lp else {}
+            master_after = optimizer.sample_master() if capture_lp else {}
             if capture_lp:
                 snap = {
                     "mode":mode, "step":step, "steps":steps,
@@ -225,6 +245,8 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     "logprobs":dict(engine._tpr_captured_log_probs),
                     "param_initial":before,
                     "param_after":post,
+                    "master_initial":initial_master,
+                    "master_after":master_after,
                     "gradient_samples":grad_witness,
                     "global_grad_norm_preclip":grad_norm,
                     "full_grad_dir":full_grad_dir,
