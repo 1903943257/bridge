@@ -55,8 +55,11 @@ the AdamW replay does not fake nonzero rewards or gradients.
 `prepare_real_actor_20step_manifest.py` requires exactly one rank0
 capture for every real global step 1..20 (strictly no missing/duplicate step).
 For each captured step, selects up to three **whole trajectories** with
-length <= 49,152 and aggregate full tokens <= 130,000, starting with the
-shortest ones. At least two real eligible rows are required per step;
+length <= 49,152 and aggregate full tokens <= 130,000. If both
+positive and negative genuine Advantages are available, first preserve
+the shortest feasible positive/negative pair, then fill remaining slots
+with shortest eligible rows; never fabricate rewards. At least two
+real eligible rows are required per step;
 otherwise fail **before** starting any offline 8-NPU job. Never truncate
 sequences or generate synthetic PPO fields. Its JSON manifest records each
 step's chosen source file and **original row ids**, lengths and PPO tokens.
