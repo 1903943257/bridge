@@ -81,16 +81,41 @@ def prepare(directory: Path, output: Path, *, steps: int = 20,
                 bool((valid_adv < 0).any().item()),
                 float(valid_adv.abs().max().item()),
             ))
-        # Greedy with smallest full-sequence length first; fixed ordering
-        # across both independent jobs and no synthetic class-balanced rows.
+        # Protect real PPO learning signal. If positive and negative
+        # advantages both exist, prefer one observed REAL row from each sign
+        # before filling with the shortest remaining rows. Never invent a
+        # reward/advantage or truncate a trajectory to fit the budget.
         candidates.sort()
         selected = []
         total = 0
-        for length, row, count, positive, negative, max_abs_adv in candidates:
-            if len(selected) >= max_rows or total + length > max_total_tokens:
-                continue
-            selected.append((length, row, count, positive, negative, max_abs_adv))
-            total += length
+
+        def choose(candidate):
+            nonlocal total
+            if (candidate is None or candidate in selected
+                    or len(selected) >= max_rows
+                    or total + candidate[0] > max_total_tokens):
+                return False
+            selected.append(candidate)
+            total += candidate[0]
+            return True
+
+        positives = [candidate for candidate in candidates if candidate[3]]
+        negatives = [candidate for candidate in candidates if candidate[4]]
+        if positives and negatives:
+            # Try the least expensive positive/negative pair jointly, rather
+            # than choosing only shorter failures and losing every success.
+            pairs = [
+                (p,n) for p in positives for n in negatives
+                if p[1] != n[1] and p[0] + n[0] <= max_total_tokens
+            ]
+            if pairs:
+                pos, neg = min(pairs, key=lambda pair: (
+                    pair[0][0]+pair[1][0], pair[0][1], pair[1][1]
+                ))
+                choose(pos)
+                choose(neg)
+        for candidate in candidates:
+            choose(candidate)
         if len(selected) < 2:
             raise RuntimeError(
                 f"step={step} has only {len(selected)} eligible FULL trajectories "
