@@ -17,7 +17,7 @@ Ported from PR #5 at 38b4f713 onto main 37e73bc4e4fce2a7b54c4165881b6d2947013e41
 ```bash
 pytest -q tests/models/mcore/tpr/unit/test_tp_validation.py tests/models/mcore/tpr/unit/test_tpr_self_attention.py tests/models/mcore/tpr/unit/test_module_spec.py
 TPR_RUN_TP2=1 torchrun --nproc_per_node=2 -m pytest -q -s tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py
-TPR_RUN_TP_SP=1 torchrun --nproc_per_node=2 -m pytest -q -s tests/models/mcore/tpr/parallel/test_tpr_tp2_sp_npu.py
+TPR_RUN_TP2_SP=1 torchrun --nproc_per_node=2 -m pytest -q -s tests/models/mcore/tpr/parallel/test_tpr_tp2_sp_npu.py
 ```
 
 NPU tests have not yet been rerun on this integrated main branch. Do not assume production PPO E2E, TP+CP, DP, or BF16 strict numeric equivalence.
