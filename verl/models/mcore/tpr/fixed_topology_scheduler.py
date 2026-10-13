@@ -85,6 +85,8 @@ class FixedTopologyScheduler:
         executor: SegmentExecutor,
         *,
         events: Sequence[SegmentEvent] | None = None,
+        event_profiler=None,
+        tree_index: int = 0,
     ) -> None:
         if not isinstance(plan, SegmentPlan):
             raise TypeError(f"plan must be SegmentPlan, got {type(plan).__name__}")
@@ -101,6 +103,8 @@ class FixedTopologyScheduler:
         self.events = plan.validate_events(candidate_events)
         self.plan = plan
         self.executor = executor
+        self.event_profiler = event_profiler
+        self.tree_index = tree_index
         self.state = SchedulerState.READY
 
     def run(self) -> TreeScheduleResult:
@@ -124,8 +128,21 @@ class FixedTopologyScheduler:
                     alloc = torch.npu.memory_allocated() / (1024 ** 3) if torch.npu.is_available() else 0.0
                     reserved = torch.npu.memory_reserved() / (1024 ** 3) if torch.npu.is_available() else 0.0
                     print(f"TPR_MEM EVENT_BEGIN index={event_index} kind={kind} segment={event.segment_id} parent={segment.parent_id} length={segment.length} prefix={segment.prefix_length} path_tokens={self.executor.kv_stack.prefix_length} depth={len(self.executor.kv_stack)} alloc_gib={alloc:.3f} reserved_gib={reserved:.3f}", flush=True)
-                if self._is_direct_leaf_pair(event_index):
+                is_leaf = self._is_direct_leaf_pair(event_index)
+                profiling = None
+                if self.event_profiler is not None:
+                    spec = self.plan.get(event.segment_id)
+                    profiling = self.event_profiler.begin(
+                        spec,
+                        kind=("visit_leaf" if is_leaf else (
+                            "push" if event.kind is SegmentEventKind.PUSH else "pop")),
+                        tree_index=self.tree_index,
+                        depth=self.plan.depth_of(event.segment_id),
+                    )
+                if is_leaf:
                     result = self.executor.visit_leaf(event.segment_id)
+                    if profiling is not None:
+                        self.event_profiler.end(profiling)
                     direct_leaf_results.append(result)
                     all_loss_results.append(result.backward)
                     execution_trace.append(PhysicalExecution(PhysicalExecutionKind.VISIT_LEAF, event.segment_id))
@@ -148,6 +165,8 @@ class FixedTopologyScheduler:
                     backward_results.append(result)
                     all_loss_results.append(result)
                     execution_trace.append(PhysicalExecution(PhysicalExecutionKind.POP, event.segment_id))
+                if profiling is not None:
+                    self.event_profiler.end(profiling)
                 if trace_mem:
                     alloc = torch.npu.memory_allocated() / (1024 ** 3) if torch.npu.is_available() else 0.0
                     reserved = torch.npu.memory_reserved() / (1024 ** 3) if torch.npu.is_available() else 0.0
