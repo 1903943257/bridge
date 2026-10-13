@@ -65,12 +65,23 @@ def patch_session(src: str) -> str:
     # Put flag at a shared, low-risk location *after* input preparation.
     # Both current owner_future and older/newer request bookkeeping versions
     # have the same EncodedData.capacity_exhausted predicate.
+    # Coalescing revisions nest this condition at different indentation
+    # depths. Match the whole line, never a suffix of a longer indentation
+    # (which would yield syntactically invalid Python).
+    cap_lines = [line for line in src.splitlines(keepends=True)
+                 if line.strip() == "if encoded.capacity_exhausted:"]
+    if len(cap_lines) != 1:
+        raise PatchError(
+            f"session.capacity_without_generation: expected one condition, found {len(cap_lines)}"
+        )
+    cap_line = cap_lines[0]
+    cap_indent = cap_line[:len(cap_line) - len(cap_line.lstrip())]
     src = replace_exact(
         src,
-        '                if encoded.capacity_exhausted:\n',
-        '                if encoded.capacity_exhausted:\n'
-        '                    if self._hard_stop_on_trajectory_capacity:\n'
-        '                        self._hard_cap_reached = True\n',
+        cap_line,
+        cap_line
+        + cap_indent + '    if self._hard_stop_on_trajectory_capacity:\n'
+        + cap_indent + '        self._hard_cap_reached = True\n',
         "session.capacity_without_generation",
     )
     # Do not delete the committed chain here: owner_future / coalesced waiters
