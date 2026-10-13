@@ -64,6 +64,9 @@ export TRAIN_PROMPT_BSZ=1
 export GEN_BATCH_SIZE=1
 export PPO_MINI_BATCH_SIZE=1
 export SESSION_HARD_CAP=True
+export MODEL_PATH="$MODEL"
+export RUN_NAME="$(basename "$RUN_ROOT")"
+export TQ_DUMP_DIR="$RUN_ROOT/tq_dump"
 export TPR_CAPTURE_ACTOR_MINIBATCH_DIR="$RUN_ROOT/captures"
 echo "TPR_NIGHTLY_E1_START native_online_20step_recompute_true"
 if bash "$ONLINE_SCRIPT" 2>&1 | tee "$RUN_ROOT/logs/e1_online_20step.log"; then
@@ -103,6 +106,7 @@ export TPR_OFFLINE_ADAMW_LR=2e-5
 export TPR_OFFLINE_ADAMW_CLIP_NORM=1.0
 export TPR_OFFLINE_OUTPUT_DIR="$RUN_ROOT/offline"
 export TPR_OFFLINE_SAVE_FULL_GRADS=0
+unset TPR_OFFLINE_FULL_GRAD_STEPS || true
 export TPR_EXEC_PROFILE=1
 export TPR_TURN_MIN_SEGMENT_TOKENS=128
 unset TPR_MEM_TRACE || true
