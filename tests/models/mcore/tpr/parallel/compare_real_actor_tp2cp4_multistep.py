@@ -174,10 +174,18 @@ def compare(outdir: Path, steps: int):
             "master":master,
             "full_fwd_bwd_seconds_critical":max(x["fwd_bwd_seconds"] for x in f),
             "tpr_fwd_bwd_seconds_critical":max(x["fwd_bwd_seconds"] for x in t),
+            "fwd_bwd_speedup": (
+                max(x["fwd_bwd_seconds"] for x in f) /
+                max(x["fwd_bwd_seconds"] for x in t)
+            ),
             "full_cpu_adamw_seconds_critical":max(x["cpu_optimizer_seconds"] for x in f),
             "tpr_cpu_adamw_seconds_critical":max(x["cpu_optimizer_seconds"] for x in t),
             "full_peak_allocated_gib":max(x["peak_allocated_bytes"] for x in f)/2**30,
             "tpr_peak_allocated_gib":max(x["peak_allocated_bytes"] for x in t)/2**30,
+            "peak_allocated_saving_fraction": (
+                1 - max(x["peak_allocated_bytes"] for x in t) /
+                max(x["peak_allocated_bytes"] for x in f)
+            ),
         }
         observed.append(record)
         if f_profile["segment_events"] or t_profile["segment_events"]:
@@ -198,7 +206,9 @@ def compare(outdir: Path, steps: int):
             f"FP32_master_update_rel_l2={master['master_update_rel_l2']:.6g} "
             f"FP32_master_update_cos={master['master_update_cosine']:.6g} "
             f"full_peak_gib={record['full_peak_allocated_gib']:.3f} "
-            f"tpr_peak_gib={record['tpr_peak_allocated_gib']:.3f}", flush=True
+            f"tpr_peak_gib={record['tpr_peak_allocated_gib']:.3f} "
+            f"speedup={record['fwd_bwd_speedup']:.4g} "
+            f"allocated_saving={record['peak_allocated_saving_fraction']:.2%}", flush=True
         )
     result = {
         "status": "DIAGNOSTIC_SEQUENTIAL_OFFLINE_PPO_REPLAY",
