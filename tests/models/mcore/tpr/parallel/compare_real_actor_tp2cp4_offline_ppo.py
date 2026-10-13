@@ -54,6 +54,60 @@ def _logprobs(rows):
             output[key] = float(value)
     return output
 
+
+def _complete_gradient_metrics(full, tpr):
+    """Exact relative L2, cosine, and per-parameter contributors.
+
+    Streams one saved original-BF16 gradient tensor at a time. Only CP0
+    replicas participate. TP-sharded parameters count both TP shards;
+    TP-replicated parameters count once.
+    """
+    import math
+    dot = full_sq = tpr_sq = diff_sq = 0.0
+    contributions = []
+    enabled = any(x.get("full_grad_dir") for x in full + tpr)
+    if not enabled:
+        return None
+    for tp_rank in (0, 1):
+        a = next(x for x in full if x["tp_rank"] == tp_rank and x["cp_rank"] == 0)
+        b = next(x for x in tpr if x["tp_rank"] == tp_rank and x["cp_rank"] == 0)
+        if not a.get("full_grad_dir") or not b.get("full_grad_dir"):
+            raise AssertionError("Both modes require complete BF16 grads on all TP shards")
+        left, right = Path(a["full_grad_dir"]), Path(b["full_grad_dir"])
+        la = torch.load(left/"manifest.pt", map_location="cpu", weights_only=False)
+        lb = torch.load(right/"manifest.pt", map_location="cpu", weights_only=False)
+        if la != lb:
+            raise AssertionError(f"TP{tp_rank} gradient manifest mismatch")
+        for entry in la:
+            if not entry["tp_sharded"] and tp_rank != 0:
+                continue
+            x = torch.load(left/entry["filename"], map_location="cpu", weights_only=True)
+            y = torch.load(right/entry["filename"], map_location="cpu", weights_only=True)
+            if x.shape != y.shape or x.dtype != y.dtype:
+                raise AssertionError(f"Full/TPR exact gradient mismatch {entry['name']}")
+            x, y = x.float(), y.float()
+            delta = x - y
+            aa = float(torch.sum(x.double() ** 2))
+            bb = float(torch.sum(y.double() ** 2))
+            xy = float(torch.sum(x.double() * y.double()))
+            dd = float(torch.sum(delta.double() ** 2))
+            full_sq += aa
+            tpr_sq += bb
+            dot += xy
+            diff_sq += dd
+            contributions.append((entry["name"], tp_rank, math.sqrt(dd)))
+            del x, y, delta
+    return {
+        "full_norm": math.sqrt(full_sq), "tpr_norm": math.sqrt(tpr_sq),
+        "norm_relative_gap": abs(math.sqrt(full_sq)-math.sqrt(tpr_sq))/max(math.sqrt(full_sq), 1e-30),
+        "relative_l2": math.sqrt(diff_sq/max(full_sq, 1e-30)),
+        "cosine": dot / max(math.sqrt(full_sq*tpr_sq), 1e-30),
+        "largest_absolute_gradient_differences": sorted(
+            contributions, key=lambda z: z[2], reverse=True
+        )[:12],
+    }
+
+
 def compare(root):
     snapshots = {}
     for mode in ("full", "tpr"):
@@ -104,6 +158,21 @@ def compare(root):
         raise AssertionError(f"PPO scalar not synchronized across CP ranks: {losses}")
     loss_gap = abs(losses[0][0]-losses[0][1])
     grad_rel = _l2_pair(full, tpr)
+    complete_grad = _complete_gradient_metrics(full, tpr)
+    grad_norms = None
+    if all("global_bf16_grad_norm" in x for x in full + tpr):
+        f_norm = full[0]["global_bf16_grad_norm"]
+        t_norm = tpr[0]["global_bf16_grad_norm"]
+        grad_norms = {
+            "full": f_norm, "tpr": t_norm,
+            "relative_gap": abs(t_norm-f_norm)/max(f_norm,1e-30),
+        }
+        for item in full:
+            if abs(item["global_bf16_grad_norm"]-f_norm) > 1e-6:
+                raise AssertionError("inconsistent distributed Full gradient norm")
+        for item in tpr:
+            if abs(item["global_bf16_grad_norm"]-t_norm) > 1e-6:
+                raise AssertionError("inconsistent distributed TPR gradient norm")
     step_rel = _weight_diff(full, tpr, "param_after")
 
     def perf(mode):
@@ -126,6 +195,8 @@ def compare(root):
         "ppo_loss_gap_lt_0.02": loss_gap < 0.02,
         "logical_logprob_rel_l2_lt_0.05": logprob_rel < 0.05,
         "sampled_grad_rel_l2_lt_0.05": grad_rel < 0.05,
+        **({"complete_grad_rel_l2_lt_0.05": complete_grad["relative_l2"] < 0.05}
+           if complete_grad is not None else {}),
         "finite": all(math.isfinite(v) for v in
                       (loss_gap, logprob_rel, grad_rel, step_rel, ratio)),
     }
@@ -141,6 +212,8 @@ def compare(root):
         flush=True,
     )
     print(f"TPR_OFFLINE_PERF full={fp} tpr={tp}", flush=True)
+    print(f"TPR_OFFLINE_GRAD_NORM {grad_norms}", flush=True)
+    print(f"TPR_OFFLINE_COMPLETE_GRAD {complete_grad}", flush=True)
     if not all(gates.values()):
         raise AssertionError("Recorded PPO Full/TPR one-step provisional gate failed")
     return gates
