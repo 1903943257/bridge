@@ -21,6 +21,14 @@ if [[ ! -d "$MODEL" ]]; then
   echo "ERROR: missing real Qwen3-4B checkpoint: $MODEL" >&2
   exit 2
 fi
+# Real PPO capture must be wired into the actual VERL TrainingWorker;
+# just exporting TPR_CAPTURE_ACTOR_MINIBATCH_DIR is not sufficient.
+WORKER="$VERL_ROOT/verl/workers/engine_workers.py"
+if [[ ! -f "$WORKER" ]] || ! grep -Fq 'TPR P0 real actor-update capture' "$WORKER"; then
+  echo "ERROR: TrainingWorker capture hook is not installed: $WORKER" >&2
+  echo "Apply/check Bridge patches/apply_tpr_actor_capture.py before the nightly run." >&2
+  exit 2
+fi
 if [[ -f /workspace/.venvs/uniagent-cc/bin/activate ]]; then
   source /workspace/.venvs/uniagent-cc/bin/activate
 fi
