@@ -5,14 +5,14 @@ set -euo pipefail
 # Retains the established Uni-Agent-CC V1 Trainer path and SWE task.
 # TP2*CP4=8 NPU ranks per replica. Default 16 NPUs -> DP2; set
 # N_GPUS_PER_NODE=8 to run the smaller DP1 smoke. Native only.
-# NOTE: production Bridge TPR PPO currently rejects TP2/CP4, so this is
+# NOTE: current Bridge main includes TP2 CP1 but still rejects TP2 CP4 and DP2, so this is
 # a NATIVE baseline + real Actor PPO capture, NOT a TPR TP2/CP4 acceptance.
 # ============================================================
 ROOT=/workspace/uni-agent-cc
 # ------------------------------------------------------------
 # Same model / data / task as the verified inference E2E
 # ------------------------------------------------------------
-MODEL_PATH=${MODEL_PATH:-/workspace/hf_models/Qwen3-4B}
+MODEL_PATH=${MODEL_PATH:-/workspace/hf_models/Qwen3-4B-128K}
 MODEL_NAME=Qwen3-4B
 TRAIN_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TEST_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
@@ -23,13 +23,13 @@ TPR_ENABLED=False
 # ------------------------------------------------------------
 # Same rollout config as run_e2e.sh
 # ------------------------------------------------------------
-N=${N:-2}
+N=${N:-8}
 TEMPERATURE=0.6
 TOP_P=0.95
 TOP_K=20
 TOOL_PARSER=hermes
 # Qwen3-4B: restore the original long-response budget (16K+112K=128K).
-# Qwen3-4B needs YaRN for 131072 context: preflight checks config.json.
+# Use the user-prepared Qwen3-4B-128K checkpoint; preflight verifies YaRN configuration.
 MAX_PROMPT_LENGTH=16384
 MAX_RESPONSE_LENGTH=114688
 MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
