@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import time
 from functools import partial
 from pathlib import Path
@@ -164,7 +165,9 @@ def test_recorded_fixed_ppo_optimizer_drift():
         raise ValueError("Invalid FP32 AdamW hyperparameters")
 
     all_milestones = (1, 2, 5, 10, 20, 30, 40, 50)
-    milestones = tuple(x for x in all_milestones if x <= steps)
+    milestones = (tuple(range(1, steps+1))
+                  if os.getenv("TPR_OFFLINE_CAPTURE_MANIFEST") else
+                  tuple(x for x in all_milestones if x <= steps))
     full_grad_steps = {
         int(x) for x in os.getenv("TPR_OFFLINE_FULL_GRAD_STEPS", "").split(",") if x
     }
@@ -172,11 +175,26 @@ def test_recorded_fixed_ppo_optimizer_drift():
                             or os.getenv("TPR_OFFLINE_SAVE_FULL_GRADS") != "1"):
         raise ValueError("Full gradient steps must be milestones and explicitly opt-in")
 
+    manifest_path = os.getenv("TPR_OFFLINE_CAPTURE_MANIFEST")
+    manifest_items = None
+    if manifest_path:
+        manifest = json.loads(Path(manifest_path).read_text())
+        if (manifest.get("protocol") != "real_actor_20_distinct_captures_v1"
+                or manifest.get("steps") != steps
+                or len(manifest.get("items", [])) != steps):
+            raise ValueError("offline manifest must contain exact 1..N genuine capture steps")
+        manifest_items = manifest["items"]
+        if [item["step"] for item in manifest_items] != list(range(1, steps+1)):
+            raise ValueError("offline manifest steps must be exactly 1..N")
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
         from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
         from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
+        first = manifest_items[0] if manifest_items is not None else None
+        if first is not None:
+            capture = Path(first["capture"])
+            rows = tuple(first["rows"])
         batch, original_keys, token_count, sha = _load_real_pair(capture, rows, mode)
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
@@ -205,6 +223,23 @@ def test_recorded_fixed_ppo_optimizer_drift():
                 raise FileExistsError("No overwrite of existing fixed replay snapshot")
 
         for step in range(1, steps+1):
+            if manifest_items is not None:
+                item = manifest_items[step-1]
+                capture = Path(item["capture"])
+                rows = tuple(item["rows"])
+                batch, original_keys, token_count, sha = _load_real_pair(
+                    capture, rows, mode
+                )
+                if token_count != item["ppo_tokens"]:
+                    raise AssertionError(
+                        f"step {step}: PPO captured token count differs from manifest"
+                    )
+                # Trace the precise physical topology of THIS real step.
+                forest = build_tree_execution_plans(
+                    _trajectory_keys_from_minibatch(batch), batch,
+                    tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
+                    turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
+                )
             model.zero_grad(set_to_none=True)
             capture_lp = step in milestones
             tu.assign_non_tensor(batch, tpr_capture_log_probs=capture_lp)
@@ -219,8 +254,20 @@ def test_recorded_fixed_ppo_optimizer_drift():
             )
             torch.npu.synchronize()
             fwd_seconds = time.perf_counter() - fwd_start
-            peak = torch.npu.max_memory_allocated()
-            reserved = torch.npu.max_memory_reserved()
+            profile = (
+                getattr(engine, "_tpr_segment_event_profiler", None)
+                if os.getenv("TPR_EXEC_PROFILE") == "1" else None
+            )
+            peak = max(
+                int(torch.npu.max_memory_allocated()),
+                profile.max_allocated_bytes if profile is not None else 0,
+            )
+            reserved = max(
+                int(torch.npu.max_memory_reserved()),
+                profile.max_reserved_bytes if profile is not None else 0,
+            )
+            segment_events = profile.materialize() if profile is not None else []
+            stage_profile = dict(getattr(engine, "_tpr_stage_profile", {})) if profile is not None else {}
             grad_norm = _global_bf16_gradient_norm(model, runtime)
             if not math.isfinite(grad_norm):
                 raise FloatingPointError(f"step={step}: gradient norm invalid")
@@ -262,7 +309,14 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     "cpu_optimizer_seconds":update_seconds,
                     "forest_trees":len(forest.trees),
                     "forest_segments":forest.segment_count,
-                    "run_kind":"REPEATED_FIXED_PPO_DATA_NOT_ON_POLICY",
+                    "run_kind":(
+                        "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
+                        if manifest_items is not None
+                        else "REPEATED_FIXED_PPO_DATA_NOT_ON_POLICY"
+                    ),
+                    "capture_manifest":str(manifest_path) if manifest_path else None,
+                    "segment_events":segment_events,
+                    "stage_profile":stage_profile,
                 }
                 target = output / f"{mode}_step{step}_rank{dist.get_rank()}.pt"
                 torch.save(snap, target)
@@ -271,7 +325,9 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     f"TPR_FIXED_PPO step={step} mode={mode} "
                     f"loss={float(out['loss'][0]):.9g} gradnorm={grad_norm:.9g} "
                     f"clip_scale={scale:.6g} fwd_bwd_s={fwd_seconds:.3f} "
-                    f"cpu_adamw_s={update_seconds:.3f} peak_gib={peak/2**30:.3f}",
+                    f"cpu_adamw_s={update_seconds:.3f} peak_gib={peak/2**30:.3f} "
+                    f"source_step={step if manifest_items is not None else 'fixed'} "
+                    f"segments={forest.segment_count}",
                     flush=True,
                 )
             dist.barrier()
