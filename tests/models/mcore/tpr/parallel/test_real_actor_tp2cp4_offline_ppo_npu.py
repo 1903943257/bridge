@@ -1,7 +1,7 @@
 """Offline recorded Qwen3-4B true-PPO: full independent Ring vs shared TPR.
 
 Each invocation runs ONE mode on eight NPU ranks, no Ray/vLLM.
-"full" means two unshared, COMPLETE causal trajectories using the SAME
+"full" means unshared, COMPLETE causal trajectories using the SAME
 TPR-capable Qwen/Ring backend; it does NOT claim native MindSpeed FA parity.
 The original captured advantages, old_log_probs, masks and temperature are used.
 Default SGD step is a low-memory diagnostic, NOT production AdamW.
@@ -110,16 +110,17 @@ def _load_real_pair(path: Path, rows: tuple[int, int], mode: str):
         "advantages", "old_log_probs", "temperature"
     )):
         raise AssertionError("Missing original PPO input")
-    if len(set(rows)) != 2 or min(rows) < 0 or max(rows) >= len(raw["keys"]):
-        raise ValueError("Select two distinct existing capture rows")
+    if (len(rows) < 2 or len(set(rows)) != len(rows)
+            or min(rows) < 0 or max(rows) >= len(raw["keys"])):
+        raise ValueError("Select at least two distinct existing capture rows")
     data = tu.index_select_tensor_dict(raw["tensordict"], list(rows))
     original_keys = tuple(raw["keys"][i] for i in rows)
     if mode == "tpr":
         keys = original_keys
     else:
-        # Force two independent one-root forests: physically full trajectories,
-        # with no shared cached Prefix KV. Do NOT modify any PPO tensor values.
-        keys = tuple(f"offline_full_{i}_tpr_0" for i in range(2))
+        # Force independent one-root forests: physically complete trajectories,
+        # with no shared cached Prefix KV. Preserve original PPO tensor values.
+        keys = tuple(f"offline_full_{i}_tpr_0" for i in range(len(rows)))
     token_count = sum(int(m.bool().sum()) for m in data["response_mask"].unbind(0))
     assert token_count > 0
     for ids, p, r, mask, adv, old in zip(
@@ -134,7 +135,7 @@ def _load_real_pair(path: Path, rows: tuple[int, int], mode: str):
             raise AssertionError("Original PPO fields do not align")
     tu.assign_non_tensor(
         data, tpr_trajectory_keys=keys, dp_size=1,
-        batch_num_tokens=token_count, global_batch_size=2,
+        batch_num_tokens=token_count, global_batch_size=len(rows),
         tpr_capture_log_probs=True,
     )
     digest = hashlib.sha256()
@@ -165,13 +166,70 @@ def _witness(model, *, grads: bool):
     return result
 
 
-def test_recorded_two_sibling_full_vs_tpr_one_step():
+
+def _global_bf16_gradient_norm(model, runtime):
+    """Exact global L2 of finalized BF16 grads, TP shards counted once.
+
+    CP-finalized replicas are identical, so only CP0 participates in local
+    squared sum. TP-replicated norm parameters are counted only on TP rank0.
+    Each rank participates in the WORLD scalar all-reduce.
+    """
+    local = torch.zeros((), dtype=torch.float64, device=runtime.device)
+    if runtime.cp_rank == 0:
+        for name, param in model.named_parameters():
+            grad = param.grad
+            if grad is None:
+                raise RuntimeError(f"missing global gradient norm tensor: {name}")
+            tp_shard = bool(getattr(param, "tensor_model_parallel", False))
+            if tp_shard or runtime.tp_rank == 0:
+                v = grad.detach().float()
+                local += (v * v).sum().double()
+                del v
+    dist.all_reduce(local, op=dist.ReduceOp.SUM)
+    return float(torch.sqrt(local).item())
+
+
+def _save_complete_grads(model, runtime, destination: Path, mode: str, step: int):
+    """Opt-in exact BF16 gradient shards, CP rank0 only, streamed to disk.
+
+    Full-gradient relative L2 cannot be reconstructed from scalar norms alone.
+    Persist one TP-shard gradient per tensor and preserve the original dtype.
+    """
+    if runtime.cp_rank != 0:
+        return None
+    target = destination / f"{mode}_step{step}_tp{runtime.tp_rank}_full_grads"
+    if target.exists():
+        raise FileExistsError(target)
+    target.mkdir(parents=True)
+    entries = []
+    for index, (name, param) in enumerate(model.named_parameters()):
+        if param.grad is None:
+            raise RuntimeError(f"Cannot save missing full gradient {name}")
+        filename = f"grad_{index:04d}.pt"
+        torch.save(param.grad.detach().cpu().contiguous(), target / filename)
+        entries.append({
+            "name": name, "shape": tuple(param.grad.shape),
+            "filename": filename,
+            "tp_sharded": bool(getattr(param, "tensor_model_parallel", False)),
+        })
+    torch.save(entries, target / "manifest.pt")
+    return str(target)
+
+
+def test_recorded_full_vs_tpr_one_step():
     mode = os.environ.get("TPR_OFFLINE_MODE")
     if mode not in ("full", "tpr"):
         raise AssertionError("Set TPR_OFFLINE_MODE=full or tpr")
-    rows = tuple(int(z) for z in os.getenv("TPR_OFFLINE_ROWS", "4,6").split(","))
-    if len(rows) != 2:
-        raise ValueError("TPR_OFFLINE_ROWS must contain exactly two row IDs")
+    rows_value = os.getenv("TPR_OFFLINE_ROWS", "4,6")
+    if rows_value == "all":
+        raw = torch.load(os.environ["TPR_REAL_ACTOR_MINIBATCH"],
+                         map_location="cpu", weights_only=False)
+        rows = tuple(range(len(raw["keys"])))
+        del raw
+    else:
+        rows = tuple(int(z) for z in rows_value.split(","))
+    if len(rows) < 2:
+        raise ValueError("TPR_OFFLINE_ROWS must select >=2 original row IDs")
     checkpoint = Path(os.environ.get(
         "TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"
     ))
@@ -186,10 +244,12 @@ def test_recorded_two_sibling_full_vs_tpr_one_step():
         from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
         from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
         forest = build_tree_execution_plans(_trajectory_keys_from_minibatch(batch), batch)
-        if mode == "full" and (len(forest.trees) != 2 or forest.segment_count != 2):
+        if mode == "full" and (len(forest.trees) != len(rows)
+                               or forest.segment_count != len(rows)):
             raise AssertionError("Full control accidentally reused a prefix")
-        if mode == "tpr" and (len(forest.trees) != 1 or forest.segment_count <= 2):
-            raise AssertionError("TPR mode did not create a shared tree")
+        if mode == "tpr" and (len(forest.trees) != 1
+                              or forest.segment_count <= len(rows)):
+            raise AssertionError("TPR mode did not create expected shared tree")
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=4,
             sequence_parallel=False, profile="4b",
@@ -247,6 +307,12 @@ def test_recorded_two_sibling_full_vs_tpr_one_step():
         torch.npu.synchronize()
         fwd_bwd_sec = time.perf_counter() - before_time
         grad = _witness(model, grads=True)
+        grad_norm = _global_bf16_gradient_norm(model, runtime)
+        full_grad_dir = None
+        if os.getenv("TPR_OFFLINE_SAVE_FULL_GRADS", "0") == "1":
+            full_grad_dir = _save_complete_grads(
+                model, runtime, destination, mode, step=1
+            )
         peak_alloc = torch.npu.max_memory_allocated()
         peak_reserved = torch.npu.max_memory_reserved()
         # Optional controlled single SGD step: no extra AdamW FP32 states.
@@ -278,6 +344,8 @@ def test_recorded_two_sibling_full_vs_tpr_one_step():
             "metrics": out["metrics"],
             "logprobs": engine._tpr_captured_log_probs,
             "gradient_samples": grad,
+            "global_bf16_grad_norm": grad_norm,
+            "full_grad_dir": full_grad_dir,
             "param_before": before, "param_after": after,
             "time_forward_backward_finalize_s": fwd_bwd_sec,
             "time_finalize_s": finalize_sec[0],
@@ -295,6 +363,7 @@ def test_recorded_two_sibling_full_vs_tpr_one_step():
         print(
             f"TPR_OFFLINE_REPLAY mode={mode} rank={dist.get_rank()} "
             f"rows={rows} loss={payload['loss']:.9g} "
+            f"global_grad_norm={grad_norm:.9g} "
             f"fwd_bwd_sec={fwd_bwd_sec:.3f} "
             f"peak_alloc_gib={peak_alloc / 2**30:.3f} "
             f"peak_reserved_gib={peak_reserved / 2**30:.3f} "
