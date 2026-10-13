@@ -73,9 +73,13 @@ class _CPLeaderCpuMasterAdamW:
         return result
 
     def step(self, step: int, global_grad_norm: float):
-        if not math.isfinite(global_grad_norm) or global_grad_norm <= 0:
+        if not math.isfinite(global_grad_norm) or global_grad_norm < 0:
             raise FloatingPointError(f"Invalid global gradient norm {global_grad_norm}")
-        scale = min(1.0, self.clip_norm / global_grad_norm)
+        # Real GRPO groups may have all-zero advantages (every rollout got
+        # the same reward). Zero new grads are valid: AdamW's prior momentum
+        # may still update weights. Never terminate a 20-step overnight run.
+        scale = (1.0 if global_grad_norm == 0 else
+                 min(1.0, self.clip_norm / global_grad_norm))
         beta1, beta2, eps = 0.9, 0.95, 1e-8
         with torch.no_grad():
             if self.runtime.cp_rank == 0:
