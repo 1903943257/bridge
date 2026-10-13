@@ -3,8 +3,8 @@ set -euo pipefail
 # ============================================================
 # Uni-Agent Qwen3-4B SWE end-to-end: rollout -> TQ -> GRPO/PPO -> actor update.
 # Retains the established Uni-Agent-CC V1 Trainer path and SWE task.
-# TP2*CP4=8 NPU ranks per replica. Default DP=1 (8 NPUs); explicit
-# N_GPUS_PER_NODE=16 selects DP2 and needs a DP-compatible data batch.
+# TP2*CP4=8 NPU ranks per replica. Default 16 NPUs -> DP2; set
+# N_GPUS_PER_NODE=8 to run the smaller DP1 smoke. Native only.
 # NOTE: production Bridge TPR PPO currently rejects TP2/CP4, so this is
 # a NATIVE baseline + real Actor PPO capture, NOT a TPR TP2/CP4 acceptance.
 # ============================================================
@@ -47,14 +47,15 @@ MASK_UNFINISHED_EPISODE=False
 # Training side: native Megatron TP2 x CP4 smoke + genuine PPO capture
 # ------------------------------------------------------------
 NNODES=1
-N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-16}
 TRAIN_TP=2
 TRAIN_PP=1
 TRAIN_CP=4
 TPR_CP_BACKEND=ring
-TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-1}
-GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-1}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-1}
+TRAIN_DP=$((N_GPUS_PER_NODE / (TRAIN_TP * TRAIN_PP * TRAIN_CP)))
+TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-$TRAIN_DP}
+GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-$TRAIN_DP}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_DP}
 PPO_MICRO_BATCH_SIZE_PER_GPU=1
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
 # 与当前旧训练栈匹配：
@@ -146,8 +147,12 @@ if [[ "${N_GPUS_PER_NODE}" != "8" && "${N_GPUS_PER_NODE}" != "16" ]]; then
     echo "ERROR: TP2 x CP4 requires 8 or 16 training NPUs (DP1 or DP2)" >&2
     exit 2
 fi
-if [[ "${N_GPUS_PER_NODE}" == "16" ]]; then
-    echo "WARNING: 16 NPUs => DP2. Check actor batch/minibatch divisibility and shared-prefix placement." >&2
+if (( TRAIN_PROMPT_BSZ % TRAIN_DP != 0 || GEN_BATCH_SIZE % TRAIN_DP != 0 || PPO_MINI_BATCH_SIZE % TRAIN_DP != 0 )); then
+    echo "ERROR: train/gen/ppo mini batch sizes must be divisible by TRAIN_DP=${TRAIN_DP}." >&2
+    exit 2
+fi
+if (( TRAIN_DP > 1 )); then
+    echo "NOTE: DP${TRAIN_DP} will distribute actor mini-batches; verify per-DP sibling grouping and reward diversity." >&2
 fi
 if [[ "${TPR_ENABLED}" != "False" ]]; then
     echo "ERROR: TPR TP2 x CP4 PPO is not enabled in the production Engine. Run Native first." >&2
@@ -184,6 +189,10 @@ echo "TPR_CP_BACKEND    = ${TPR_CP_BACKEND}"
 echo
 echo "NNODES            = ${NNODES}"
 echo "N_GPUS_PER_NODE   = ${N_GPUS_PER_NODE}"
+echo "TRAIN_DP          = ${TRAIN_DP}"
+echo "TRAIN_PROMPT_BSZ  = ${TRAIN_PROMPT_BSZ}"
+echo "GEN_BATCH_SIZE    = ${GEN_BATCH_SIZE}"
+echo "PPO_MINI_BSZ      = ${PPO_MINI_BATCH_SIZE}"
 echo
 echo "USE_MBRIDGE       = ${USE_MBRIDGE}"
 echo "VANILLA_MBRIDGE   = ${VANILLA_MBRIDGE}"
