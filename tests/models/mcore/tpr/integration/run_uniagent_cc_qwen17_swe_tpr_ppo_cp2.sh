@@ -92,10 +92,10 @@ NUM_WARMUP_BATCHES=0
 # ------------------------------------------------------------
 # Output
 # ------------------------------------------------------------
-RUN_NAME=swe-django-11163-qwen3-4b-n${N}-tp2cp4-long-response
+RUN_NAME=${RUN_NAME:-swe-django-11163-qwen3-4b-n${N}-tp2cp4-long-response}
 AGENT_LOG_DIR=/workspace/logs/${RUN_NAME}/agent
 TRAIN_LOG_DIR=/workspace/logs/${RUN_NAME}
-TQ_DUMP_DIR=/workspace/tq_dump/django11163_4b_tp2cp4
+TQ_DUMP_DIR=${TQ_DUMP_DIR:-/workspace/tq_dump/django11163_4b_tp2cp4}
 CKPTS_DIR=/workspace/ckpts/${RUN_NAME}
 # ============================================================
 # Environment
