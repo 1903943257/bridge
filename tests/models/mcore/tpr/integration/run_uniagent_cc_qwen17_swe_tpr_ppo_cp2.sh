@@ -158,7 +158,7 @@ if [[ "${TPR_ENABLED}" != "False" ]]; then
     echo "ERROR: TPR TP2 x CP4 PPO is not enabled in the production Engine. Run Native first." >&2
     exit 2
 fi
-if find "${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}" -maxdepth 1 -name 'actor_update_rank*_batch*.pt' | grep -q .; then
+if find "${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}" -maxdepth 1 -name 'actor_update_*.pt' | grep -q .; then
     echo "ERROR: Actor capture directory already has .pt snapshots; choose a NEW directory." >&2
     exit 2
 fi
