@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Opt-in hard session token cap for the pinned Uni-Agent Gateway/Framework.
+
+The upstream trajectory capacity (prompt_length + response_length) ordinarily
+materializes a chain and allows the Agent to continue. This patch makes that
+same capacity TERMINATE the *session*, preserving a single unfinished sample
+with reward 0 rather than continuing Claude Code in a new training trajectory.
+
+Usage:
+    python patches/apply_uniagent_session_hardcap.py --check /workspace/uni-agent-cc
+    python patches/apply_uniagent_session_hardcap.py /workspace/uni-agent-cc
+
+No modifications to VERL, TPR, Claude Code or the reward function are needed.
+The behavior is disabled by default and enabled only by Framework config:
+    actor_rollout_ref.rollout.custom.agent_framework.hard_stop_on_trajectory_capacity=true
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import difflib
+import os
+import tempfile
+from pathlib import Path
+
+
+class PatchError(RuntimeError):
+    pass
+
+
+def replace_exact(src: str, before: str, after: str, label: str) -> str:
+    """Idempotent; reject drift and partial edits instead of patching nearby code."""
+    if after in src:
+        return src
+    count = src.count(before)
+    if count != 1:
+        raise PatchError(f"{label}: expected one unmodified anchor, got {count}")
+    return src.replace(before, after, 1)
+
+
+def patch_session(src: str) -> str:
+    src = replace_exact(
+        src,
+        '        self._metadata = dict(metadata or {})\n'
+        '        self._trace_identity = dict(self._metadata.get("_trace_identity") or {})\n',
+        '        self._metadata = dict(metadata or {})\n'
+        '        self._hard_stop_on_trajectory_capacity = (\n'
+        '            self._metadata.get("hard_stop_on_trajectory_capacity") is True\n'
+        '        )\n'
+        '        self._hard_cap_reached = False\n'
+        '        self._trace_identity = dict(self._metadata.get("_trace_identity") or {})\n',
+        "session.__init__",
+    )
+    src = replace_exact(
+        src,
+        '                # Prepare can touch codec and multimodal extractor state, so only\n',
+        '                if self._hard_stop_on_trajectory_capacity and self._hard_cap_reached:\n'
+        '                    raise HTTPException(status_code=410, detail="Session trajectory capacity exhausted")\n'
+        '                # Prepare can touch codec and multimodal extractor state, so only\n',
+        "session.run_generation guard",
+    )
+    src = replace_exact(
+        src,
+        '                        if encoded.chain_id is not None:\n'
+        '                            self._close_length_exhausted_chain(encoded)\n'
+        '                        self._touch()\n',
+        '                        if encoded.chain_id is not None:\n'
+        '                            self._close_length_exhausted_chain(encoded)\n'
+        '                        elif self._hard_stop_on_trajectory_capacity:\n'
+        '                            self._hard_cap_reached = True\n'
+        '                        self._touch()\n',
+        "session.capacity_without_generation",
+    )
+    src = replace_exact(
+        src,
+        '                chain_id = self._commit_generation_to_chain(encoded, assistant_msg)\n'
+        '                if owner_request is not None and owner_request.waiter_count:\n',
+        '                chain_id = self._commit_generation_to_chain(encoded, assistant_msg)\n'
+        '                if (\n'
+        '                    self._hard_stop_on_trajectory_capacity\n'
+        '                    and self._trajectory_capacity is not None\n'
+        '                    and len(encoded.buffer.prompt_ids) + len(encoded.buffer.response_ids)\n'
+        '                    >= self._trajectory_capacity\n'
+        '                ):\n'
+        '                    # Close at the exact final model token. Do not wait for\n'
+        '                    # another Claude Code request to trigger materialization.\n'
+        '                    chain_index, completed_chain = self._find_active_chain(chain_id)\n'
+        '                    self.materialized_chains.append(\n'
+        '                        MaterializedChain(\n'
+        '                            trajectory=self._build_materialized_trajectory(\n'
+        '                                chain=completed_chain,\n'
+        '                                extra_fields={"materialization_reason": "max_trajectory_length"},\n'
+        '                            ),\n'
+        '                            order_seq=self._next_order_seq(),\n'
+        '                        )\n'
+        '                    )\n'
+        '                    del self.active_chains[chain_index]\n'
+        '                    self._hard_cap_reached = True\n'
+        '                if owner_request is not None and owner_request.waiter_count:\n',
+        "session.exact_capacity_commit",
+    )
+    # On exact-cap closure the chain no longer exists. Avoid a lookup for
+    # coalesced waiters, whose response is already safely committed.
+    src = replace_exact(
+        src,
+        '                if owner_request is not None and owner_request.waiter_count:\n'
+        '                    # Attribute at commit, even if waiters cancel or resume after finalize.\n'
+        '                    _, chain = self._find_active_chain(chain_id)\n'
+        '                    chain.num_coalesced_requests += owner_request.waiter_count\n',
+        '                if owner_request is not None and owner_request.waiter_count:\n'
+        '                    # Attribute exact-request waiters even after hard-cap materialization.\n'
+        '                    _, chain = self._find_active_chain(chain_id) if not self._hard_cap_reached else (None, None)\n'
+        '                    if chain is not None:\n'
+        '                        chain.num_coalesced_requests += owner_request.waiter_count\n'
+        '                    elif self.materialized_chains:\n'
+        '                        self.materialized_chains[-1].trajectory.extra_fields["num_coalesced_requests"] = (\n'
+        '                            owner_request.waiter_count\n'
+        '                        )\n',
+        "session.coalesced_waiter_at_cap",
+    )
+    src = replace_exact(
+        src,
+        '    def _close_length_exhausted_chain(self, encoded: EncodedData) -> None:\n'
+        '        if encoded.chain_id is None:\n',
+        '    def _close_length_exhausted_chain(self, encoded: EncodedData) -> None:\n'
+        '        if self._hard_stop_on_trajectory_capacity:\n'
+        '            self._hard_cap_reached = True\n'
+        '        if encoded.chain_id is None:\n',
+        "session.close_exhausted",
+    )
+    src = replace_exact(
+        src,
+        '            "num_trajectories": len(self.materialized_chains),\n',
+        '            "num_trajectories": len(self.materialized_chains),\n'
+        '            "hard_cap_reached": self._hard_cap_reached,\n',
+        "session.snapshot",
+    )
+    return src
+
+
+def patch_manager(src: str) -> str:
+    return replace_exact(
+        src,
+        '    async def shutdown(self) -> None:\n'
+        '        """Stop owned gateway actors and clear routing state."""\n',
+        '    async def get_session_state(self, session_id: str) -> dict:\n'
+        '        """Forward the Gateway actor session snapshot without changing its lifecycle."""\n'
+        '        gateway, _ = self._get_gateway(session_id)\n'
+        '        return await gateway.get_session_state.remote(session_id=session_id)\n'
+        '\n'
+        '    async def shutdown(self) -> None:\n'
+        '        """Stop owned gateway actors and clear routing state."""\n',
+        "manager.get_session_state",
+    )
+
+
+CAP_HELPERS = '''
+    async def _wait_for_session_hard_cap(self, session_id: str) -> None:
+        """Observe Gateway token truth; never infer token usage from wall time."""
+        while True:
+            state = await self.gateway_manager.get_session_state(session_id)
+            if state.get("hard_cap_reached", False):
+                return
+            await asyncio.sleep(0.25)
+
+    async def _await_runner_with_hard_cap(
+        self, object_ref, session_id: str, timeout: float | None
+    ) -> tuple[TaskResult | None, bool]:
+        """Stop Ray Task, then finalize a failed/unfinished first trajectory."""
+        waiter = asyncio.ensure_future(asyncio.wait_for(object_ref, timeout=timeout))
+        watcher = asyncio.create_task(self._wait_for_session_hard_cap(session_id))
+        capped = TaskResult(
+            reward=0.0,
+            accuracy=0.0,
+            finished=False,
+            extra_info={"session_length_truncated": True, "materialization_reason": "max_trajectory_length"},
+        )
+        try:
+            done, _ = await asyncio.wait({waiter, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if watcher in done:
+                await watcher  # Surface an actual Gateway failure, never call it a token cap.
+                try:
+                    await self._cancel_runner_task(object_ref, session_id)
+                except asyncio.CancelledError:
+                    # A cancelled Ray ObjectRef may raise CancelledError inside
+                    # the cancellation helper; preserve external parent cancellation.
+                    if asyncio.current_task().cancelling():
+                        raise
+                logger.info("session %s: hard token cap reached; Ray runner stopped", session_id)
+                return capped, True
+            try:
+                runner_result = await waiter
+            except Exception:
+                # The provider may have returned HTTP 410 before the poll woke.
+                if (await self.gateway_manager.get_session_state(session_id)).get("hard_cap_reached", False):
+                    return capped, True
+                raise
+            if (await self.gateway_manager.get_session_state(session_id)).get("hard_cap_reached", False):
+                return capped, True
+            return runner_result, False
+        finally:
+            for pending in (watcher, waiter):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(watcher, waiter, return_exceptions=True)
+
+'''
+def patch_framework(src: str) -> str:
+    src = replace_exact(
+        src,
+        '        trajectory_postprocessor_kwargs: dict[str, object] | None = None,\n'
+        '    ):\n',
+        '        trajectory_postprocessor_kwargs: dict[str, object] | None = None,\n'
+        '        hard_stop_on_trajectory_capacity: bool = False,\n'
+        '    ):\n',
+        "framework.init_signature",
+    )
+    src = replace_exact(
+        src,
+        '        self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}\n',
+        '        self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}\n'
+        '        self._hard_stop_on_trajectory_capacity = hard_stop_on_trajectory_capacity\n',
+        "framework.init_field",
+    )
+    src = replace_exact(
+        src,
+        '            trajectory_postprocessor_kwargs=trajectory_postprocessor_kwargs,\n'
+        '        )\n',
+        '            trajectory_postprocessor_kwargs=trajectory_postprocessor_kwargs,\n'
+        '            hard_stop_on_trajectory_capacity=af_cfg.get("hard_stop_on_trajectory_capacity", False),\n'
+        '        )\n',
+        "framework.from_config",
+    )
+    src = replace_exact(
+        src,
+        '        for runner_name, runner_cfg in agent_runners_cfg.items():\n'
+        '            runner_registry[str(runner_name)] = _RunnerConfig.from_config(runner_name, runner_cfg)\n',
+        '        for runner_name, runner_cfg in agent_runners_cfg.items():\n'
+        '            runner_registry[str(runner_name)] = _RunnerConfig.from_config(runner_name, runner_cfg)\n'
+        '        hard_stop = af_cfg.get("hard_stop_on_trajectory_capacity", False)\n'
+        '        if type(hard_stop) is not bool:\n'
+        '            raise TypeError("hard_stop_on_trajectory_capacity must be a bool")\n'
+        '        if hard_stop and any(cfg.dispatch_mode != "ray_task" for cfg in runner_registry.values()):\n'
+        '            raise ValueError("hard_stop_on_trajectory_capacity requires dispatch_mode=ray_task")\n',
+        "framework.validate_hardcap",
+    )
+    src = replace_exact(
+        src,
+        '                metadata={"_trace_identity": trace_identity},\n',
+        '                metadata={\n'
+        '                    "_trace_identity": trace_identity,\n'
+        '                    "hard_stop_on_trajectory_capacity": self._hard_stop_on_trajectory_capacity,\n'
+        '                },\n',
+        "framework.create_session_metadata",
+    )
+    src = replace_exact(
+        src,
+        '    async def _run_agent_episode(\n',
+        CAP_HELPERS + '    async def _run_agent_episode(\n',
+        "framework.runner_hardcap_helpers",
+    )
+    src = replace_exact(
+        src,
+        '                    try:\n'
+        '                        task_result = await asyncio.wait_for(\n'
+        '                            object_ref,\n'
+        '                            timeout=runner_config.session_timeout_seconds,\n'
+        '                        )\n'
+        '                    except (asyncio.TimeoutError, asyncio.CancelledError):\n',
+        '                    try:\n'
+        '                        if self._hard_stop_on_trajectory_capacity:\n'
+        '                            task_result, hit_capacity = await self._await_runner_with_hard_cap(\n'
+        '                                object_ref, session_id, runner_config.session_timeout_seconds\n'
+        '                            )\n'
+        '                        else:\n'
+        '                            task_result = await asyncio.wait_for(\n'
+        '                                object_ref,\n'
+        '                                timeout=runner_config.session_timeout_seconds,\n'
+        '                            )\n'
+        '                            hit_capacity = False\n'
+        '                    except (asyncio.TimeoutError, asyncio.CancelledError):\n',
+        "framework.ray_runner_wait",
+    )
+    src = replace_exact(
+        src,
+        '                session_trajectories = await self.gateway_manager.finalize_session(session_id)\n'
+        '                session_trajectories = _select_session_trajectories(\n',
+        '                session_trajectories = await self.gateway_manager.finalize_session(session_id)\n'
+        '                if self._hard_stop_on_trajectory_capacity and hit_capacity:\n'
+        '                    if (\n'
+        '                        len(session_trajectories) != 1\n'
+        '                        or session_trajectories[0].extra_fields.get("materialization_reason")\n'
+        '                        != "max_trajectory_length"\n'
+        '                    ):\n'
+        '                        raise RuntimeError(\n'
+        '                            f"Session hard cap expected one truncated trajectory; got {len(session_trajectories)}"\n'
+        '                        )\n'
+        '                session_trajectories = _select_session_trajectories(\n',
+        "framework.avoid_multiplying_rollouts",
+    )
+    return src
+
+
+PATCHES = {
+    "uni_agent/gateway/session/session.py": patch_session,
+    "uni_agent/gateway/manager.py": patch_manager,
+    "uni_agent/framework/framework.py": patch_framework,
+}
+
+
+def apply(root: Path, *, check: bool) -> dict[str, str]:
+    before: dict[Path, str] = {}
+    after: dict[Path, str] = {}
+    for rel, transform in PATCHES.items():
+        target = root / rel
+        if not target.is_file():
+            raise PatchError(f"missing Uni-Agent file: {target}")
+        source = target.read_text(encoding="utf-8")
+        modified = transform(source)
+        ast.parse(modified, filename=str(target))
+        before[target] = source
+        after[target] = modified
+    for target, original in before.items():
+        modified = after[target]
+        print(f"{target}: {'already-patched' if original == modified else 'patch-required'}")
+        if original != modified:
+            print("".join(difflib.unified_diff(
+                original.splitlines(keepends=True),
+                modified.splitlines(keepends=True),
+                fromfile=str(target), tofile=str(target) + " (hard-cap)",
+            )), end="")
+    if check:
+        print("CHECK ONLY: no files changed")
+        return {str(p): "check" for p in before}
+    updated: list[Path] = []
+    try:
+        for target, original in before.items():
+            modified = after[target]
+            if original == modified:
+                continue
+            if target.read_text(encoding="utf-8") != original:
+                raise PatchError(f"target changed after preflight: {target}")
+            fd, tmp = tempfile.mkstemp(prefix=".uniagent-hardcap-", dir=target.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(modified)
+                os.chmod(tmp, target.stat().st_mode)
+                os.replace(tmp, target)
+                updated.append(target)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+    except BaseException:
+        for target in reversed(updated):
+            target.write_text(before[target], encoding="utf-8")
+        raise
+    print("APPLIED: strict 48K session cap available (opt-in config)")
+    return {str(p): "patched" for p in before}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("uniagent_root", type=Path)
+    parser.add_argument("--check", action="store_true", help="Validate anchors and print diff, no writes")
+    args = parser.parse_args()
+    root = args.uniagent_root.expanduser().resolve()
+    try:
+        apply(root, check=args.check)
+    except (OSError, PatchError, SyntaxError, ValueError) as exc:
+        parser.error(str(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

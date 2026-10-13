@@ -28,10 +28,11 @@ TEMPERATURE=0.6
 TOP_P=0.95
 TOP_K=20
 TOOL_PARSER=hermes
-# Qwen3-4B: restore the original long-response budget (16K+112K=128K).
-# Use the user-prepared Qwen3-4B-128K checkpoint; preflight verifies YaRN configuration.
+# Model checkpoint supports 128K, but ONE AGENT SESSION is capped at 48K
+# total training tokens (prompt + response + intermediate tool/context tokens).
+# Gateway enforcement uses rollout.prompt_length + rollout.response_length.
 MAX_PROMPT_LENGTH=16384
-MAX_RESPONSE_LENGTH=114688
+MAX_RESPONSE_LENGTH=32768
 MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 ROLLOUT_TP=2
 ROLLOUT_GPU_MEMORY_UTILIZATION=0.60
@@ -39,9 +40,10 @@ GATEWAY_COUNT=1
 CONCURRENCY=2
 # 一个 prompt group 即可。
 NUM_AGENT_WORKERS=1
-# 当前每个 session 只有一个 materialized trajectory，
-# all / longest 实际等价。这里保持 standalone inference 语义。
+# Session-level hard stop prevents split materializations; keep ALL to avoid
+# silently choosing the wrong member of a group if a regression occurs.
 TRAJECTORY_SELECTION=all
+SESSION_HARD_CAP=${SESSION_HARD_CAP:-True}
 MASK_UNFINISHED_EPISODE=False
 # ------------------------------------------------------------
 # Training side: native Megatron TP2 x CP4 smoke + genuine PPO capture
@@ -101,6 +103,17 @@ CKPTS_DIR=/workspace/ckpts/${RUN_NAME}
 cd "${ROOT}"
 if [ -f /workspace/.venvs/uniagent-cc/bin/activate ]; then
     source /workspace/.venvs/uniagent-cc/bin/activate
+fi
+# Uni-Agent upstream implements per-trajectory materialization, NOT a hard
+# Session token stop. Install Bridge's strict, opt-in patch before Ray starts.
+if [[ "${SESSION_HARD_CAP}" == "True" || "${SESSION_HARD_CAP}" == "true" || "${SESSION_HARD_CAP}" == "1" ]]; then
+    BRIDGE_ROOT="${BRIDGE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)}"
+    SESSION_PATCHER="${UNIAGENT_SESSION_PATCHER:-${BRIDGE_ROOT}/patches/apply_uniagent_session_hardcap.py}"
+    if [[ ! -f "${SESSION_PATCHER}" ]]; then
+        echo "ERROR: session-cap patcher not found: ${SESSION_PATCHER}; set UNIAGENT_SESSION_PATCHER" >&2
+        exit 2
+    fi
+    python "${SESSION_PATCHER}" "${ROOT}" || exit 2
 fi
 # IMPORTANT:
 # 不加入 /workspace/Megatron-Bridge/src。
@@ -186,6 +199,7 @@ echo "TPR_ENABLED       = ${TPR_ENABLED} (Native baseline; TPR TP2 x CP4 not wir
 echo "TRAIN_FILE        = ${TRAIN_FILE}"
 echo "TASK_CONFIG       = ${TASK_CONFIG}"
 echo
+echo "SESSION_HARD_CAP  = ${SESSION_HARD_CAP}"
 echo "N                 = ${N}"
 echo "TEMPERATURE       = ${TEMPERATURE}"
 echo "TOP_P             = ${TOP_P}"
@@ -347,6 +361,7 @@ python -m verl.trainer.main_ppo \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.dispatch_mode=ray_task \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.max_concurrent_sessions="${CONCURRENCY}" \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.trajectory_selection="${TRAJECTORY_SELECTION}" \
+    ++actor_rollout_ref.rollout.custom.agent_framework.hard_stop_on_trajectory_capacity="${SESSION_HARD_CAP}" \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path="${TASK_CONFIG}" \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name="${MODEL_NAME}" \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.report_reward=True \
