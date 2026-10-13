@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # ============================================================
-# Uni-Agent Qwen3-1.7B SWE smoke: rollout -> TQ(train) -> ReplayBuffer
-#
-# 基准严格继承已经跑通的 run_e2e.sh：
-#   model / dataset / task / sampling / context / N / TP 全部一致
-#
-# 本阶段目标：
-#   验证 Uni-Agent rollout -> TQ -> TPR PPO CP2 Ring -> optimizer step。
+# Uni-Agent Qwen3-4B SWE end-to-end: rollout -> TQ -> GRPO/PPO -> actor update.
+# Retains the established Uni-Agent-CC V1 Trainer path and SWE task.
+# TP2*CP4=8 NPU ranks per replica. Default DP=1 (8 NPUs); explicit
+# N_GPUS_PER_NODE=16 selects DP2 and needs a DP-compatible data batch.
+# NOTE: production Bridge TPR PPO currently rejects TP2/CP4, so this is
+# a NATIVE baseline + real Actor PPO capture, NOT a TPR TP2/CP4 acceptance.
 # ============================================================
 ROOT=/workspace/uni-agent-cc
 # ------------------------------------------------------------
 # Same model / data / task as the verified inference E2E
 # ------------------------------------------------------------
-MODEL_PATH=/workspace/hf_models/Qwen3-1.7B-128K
-MODEL_NAME=Qwen3-1.7B
+MODEL_PATH=${MODEL_PATH:-/workspace/hf_models/Qwen3-4B}
+MODEL_NAME=Qwen3-4B
 TRAIN_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TEST_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TASK_CONFIG=${ROOT}/examples/claude_code_swe_task/task_config_claude_code_django11163.yaml
 # tpr
-TPR_ENABLED=True
+# Deliberately native until TP2 x CP4 TPR production guard is implemented.
+TPR_ENABLED=False
 # ------------------------------------------------------------
 # Same rollout config as run_e2e.sh
 # ------------------------------------------------------------
@@ -28,12 +28,12 @@ TEMPERATURE=0.6
 TOP_P=0.95
 TOP_K=20
 TOOL_PARSER=hermes
-# Qwen3-1.7B-128K:
-# 16384 + 114688 = 131072
+# Qwen3-4B: restore the original long-response budget (16K+112K=128K).
+# Qwen3-4B needs YaRN for 131072 context: preflight checks config.json.
 MAX_PROMPT_LENGTH=16384
-MAX_RESPONSE_LENGTH=4096
+MAX_RESPONSE_LENGTH=114688
 MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
-ROLLOUT_TP=1
+ROLLOUT_TP=2
 ROLLOUT_GPU_MEMORY_UTILIZATION=0.60
 GATEWAY_COUNT=1
 CONCURRENCY=2
@@ -44,13 +44,13 @@ NUM_AGENT_WORKERS=1
 TRAJECTORY_SELECTION=all
 MASK_UNFINISHED_EPISODE=False
 # ------------------------------------------------------------
-# Training side: CP2 Ring TPR PPO E2E penetration
+# Training side: native Megatron TP2 x CP4 smoke + genuine PPO capture
 # ------------------------------------------------------------
 NNODES=1
-N_GPUS_PER_NODE=2
-TRAIN_TP=1
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
+TRAIN_TP=2
 TRAIN_PP=1
-TRAIN_CP=2
+TRAIN_CP=4
 TPR_CP_BACKEND=ring
 TRAIN_PROMPT_BSZ=1
 GEN_BATCH_SIZE=1
@@ -63,7 +63,7 @@ USE_MBRIDGE=True
 VANILLA_MBRIDGE=True
 PARAM_OFFLOAD=True
 OPTIMIZER_OFFLOAD=True
-# 这次不是验证长期训练，只需要 step 1。
+# Capture an authentic actor update first; do not pretend zero-advantage means PPO parity.
 TOTAL_TRAINING_STEPS=1
 TOTAL_EPOCHS=1
 # 不做 validation/checkpoint。
@@ -74,10 +74,10 @@ NUM_WARMUP_BATCHES=0
 # ------------------------------------------------------------
 # Output
 # ------------------------------------------------------------
-RUN_NAME=swe-django-11163-qwen3-1.7b-n2-train-tq-p16s4
+RUN_NAME=swe-django-11163-qwen3-4b-tp2cp4-long-response
 AGENT_LOG_DIR=/workspace/logs/${RUN_NAME}/agent
 TRAIN_LOG_DIR=/workspace/logs/${RUN_NAME}
-TQ_DUMP_DIR=/workspace/tq_dump/django11163
+TQ_DUMP_DIR=/workspace/tq_dump/django11163_4b_tp2cp4
 CKPTS_DIR=/workspace/ckpts/${RUN_NAME}
 # ============================================================
 # Environment
@@ -95,10 +95,15 @@ export VLLM_USE_V1=1
 export TASK_QUEUE_ENABLE=1
 export VLLM_ASCEND_ENABLE_TOPK_OPTIMIZE=1
 export TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT=2400
+# The existing patched TrainingWorker captures ORIGINAL actor mini_batch_td.
+# Use a distinct capture directory: actor_capture.py refuses overwrites.
+export TPR_CAPTURE_ACTOR_MINIBATCH_DIR="${TPR_CAPTURE_ACTOR_MINIBATCH_DIR:-/workspace/tpr_actor_capture_4b_tp2cp4}"
+unset TPR_REAL_ACTOR_CAPTURE || true
 mkdir -p "${AGENT_LOG_DIR}"
 mkdir -p "${TRAIN_LOG_DIR}"
 mkdir -p "${TQ_DUMP_DIR}"
 mkdir -p "${CKPTS_DIR}"
+mkdir -p "${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}"
 # ============================================================
 # Preflight
 # ============================================================
@@ -114,11 +119,50 @@ test -f "${TASK_CONFIG}" || {
     echo "ERROR: task config not found: ${TASK_CONFIG}"
     exit 1
 }
+# The official Qwen3-4B is native 32K / config 40960.
+# Full 131072 tokens require a model config with YaRN enabled for BOTH
+# rollout and actor, not just a larger max_model_len CLI override.
+MODEL_PATH="${MODEL_PATH}" MAX_MODEL_LEN="${MAX_MODEL_LEN}" python - <<'PY_CTX_CHECK'
+import json, os
+from pathlib import Path
+p = Path(os.environ["MODEL_PATH"]) / "config.json"
+if not p.is_file():
+    raise SystemExit(f"ERROR: no model config: {p}")
+c = json.loads(p.read_text())
+limit = int(os.environ["MAX_MODEL_LEN"])
+rope = c.get("rope_scaling") or {}
+if limit > 40960:
+    if (rope.get("rope_type", rope.get("type")) != "yarn"
+        or float(rope.get("factor", 0)) < 4.0):
+        raise SystemExit(
+            "ERROR: 131072-token Qwen3-4B needs YaRN in the model "
+            "config.json (rope_type=yarn, factor>=4, "
+            "original_max_position_embeddings=32768). "
+            "Prepare a separate 128K config/checkpoint directory and set MODEL_PATH."
+        )
+print(f"LONG_CONTEXT_CHECK max_model_len={limit} rope_scaling={rope}")
+PY_CTX_CHECK
+if [[ "${N_GPUS_PER_NODE}" != "8" && "${N_GPUS_PER_NODE}" != "16" ]]; then
+    echo "ERROR: TP2 x CP4 requires 8 or 16 training NPUs (DP1 or DP2)" >&2
+    exit 2
+fi
+if [[ "${N_GPUS_PER_NODE}" == "16" ]]; then
+    echo "WARNING: 16 NPUs => DP2. Check actor batch/minibatch divisibility and shared-prefix placement." >&2
+fi
+if [[ "${TPR_ENABLED}" != "False" ]]; then
+    echo "ERROR: TPR TP2 x CP4 PPO is not enabled in the production Engine. Run Native first." >&2
+    exit 2
+fi
+if find "${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}" -maxdepth 1 -name 'actor_update_rank*_batch*.pt' | grep -q .; then
+    echo "ERROR: Actor capture directory already has .pt snapshots; choose a NEW directory." >&2
+    exit 2
+fi
 echo "============================================================"
 echo "Uni-Agent TRAIN/TQ E2E"
 echo "============================================================"
 echo "MODEL_PATH        = ${MODEL_PATH}"
 echo "MODEL_NAME        = ${MODEL_NAME}"
+echo "TPR_ENABLED       = ${TPR_ENABLED} (Native baseline; TPR TP2 x CP4 not wired)"
 echo "TRAIN_FILE        = ${TRAIN_FILE}"
 echo "TASK_CONFIG       = ${TASK_CONFIG}"
 echo
@@ -146,6 +190,7 @@ echo "VANILLA_MBRIDGE   = ${VANILLA_MBRIDGE}"
 echo
 echo "TQ_DUMP_DIR       = ${TQ_DUMP_DIR}"
 echo "AGENT_LOG_DIR     = ${AGENT_LOG_DIR}"
+echo "ACTOR_CAPTURE_DIR = ${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}"
 echo "============================================================"
 python - <<'PY'
 import importlib.util
