@@ -106,7 +106,26 @@ def _runtime():
                 f"actual={sorted(actual)} expected={sorted(expected[label])} "
                 f"layout={layout}"
             )
+    # A separate FP32 WORLD probe is essential on Ascend 910B.
+    # HCCL AllReduce does not support FP64 on this hardware, even though
+    # AllGather is able to carry FP64 tensors.
+    world_probe = torch.tensor(
+        float(my_rank + 1), device=device, dtype=torch.float32,
+    )
+    dist.all_reduce(
+        world_probe, op=dist.ReduceOp.SUM, group=dist.group.WORLD,
+    )
+    torch.npu.synchronize()
+    if float(world_probe.item()) != 36.0:
+        raise AssertionError(
+            "TPR_DP2_WORLD_FP32_REDUCE_FAILED "
+            f"rank={my_rank} received={world_probe.item()} expected=36"
+        )
     if dist.get_rank() == 0:
+        print(
+            "TPR_DP2_WORLD_FP32_REDUCE_PASS rank_sum=36 world_size=8",
+            flush=True,
+        )
         print(
             f"TPR_DP2_PROCESS_GROUP_AUDIT layout={layout} "
             f"rank0_groups={{"
@@ -336,19 +355,30 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             torch.npu.synchronize()
             own_seconds = time.perf_counter() - start
 
-            critical = torch.tensor(own_seconds, dtype=torch.float64, device=runtime.device)
-            dist.all_reduce(critical, op=dist.ReduceOp.MAX)
-            peak = torch.tensor(float(torch.npu.max_memory_allocated()),
-                                dtype=torch.float64, device=runtime.device)
-            dist.all_reduce(peak, op=dist.ReduceOp.MAX)
-            # Engine returns the CP-SUMmed, DP-size-scaled local forest
-            # contribution. Each DP replica has DIFFERENT trajectories,
-            # so their pre-DP scalar losses SHOULD generally differ.
-            # The intended global token-mean reporting result is the mean
-            # of the two DP contributions. TP and CP ranks each carry a
-            # replica of this scalar; world SUM/8 averages these duplicated
-            # views. This is a diagnostic/reporting collective only.
-            # Gradient synchronization stays with native DP-with-CP.
+            # Ascend 910B HCCL Reduce does NOT support float64. These
+            # world MAX reductions must use FP32 or their outputs may stay
+            # rank-local, invalidating speed and peak-memory comparisons.
+            critical = torch.tensor(
+                own_seconds, dtype=torch.float32, device=runtime.device,
+            )
+            dist.all_reduce(
+                critical, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
+            )
+            peak = torch.tensor(
+                float(torch.npu.max_memory_allocated()),
+                dtype=torch.float32, device=runtime.device,
+            )
+            dist.all_reduce(
+                peak, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
+            )
+            # Engine returns the CP-SUMmed DP-local PPO contribution.
+            # DP replicas own different samples, so their local losses
+            # SHOULD differ. The global reporting objective is the mean
+            # of the eight CP×TP replicated local contributions.
+            # Use HCCL-supported FP32 for all_reduce; also all_gather
+            # the original FP64-packaged local scalars below and
+            # independently check the reduction result on every rank.
+            # Neither reporting path contributes to autograd/grad sync.
             local_ppo_tokens = sum(
                 int(x.bool().sum()) for x in batch["response_mask"].unbind(0)
             )
@@ -356,9 +386,11 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 raise AssertionError("TPR forest dropped or duplicated supervised PPO tokens")
             local_loss = float(result["loss"][0])
             global_loss = torch.tensor(
-                local_loss, dtype=torch.float64, device=runtime.device,
+                local_loss, dtype=torch.float32, device=runtime.device,
             )
-            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(
+                global_loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD,
+            )
             global_loss.div_(dist.get_world_size())
 
             # All fields have fixed width and are transferred as numeric
