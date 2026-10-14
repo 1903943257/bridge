@@ -47,4 +47,4 @@ echo "VERL_ENGINE_FULL_LAUNCH output_prefix=$RUN_ROOT/offline/${TPR_VERL_FULL_RE
 torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29787 \
   -m pytest -vv -s -x \
   tests/models/mcore/tpr/parallel/test_verl_engine_full_replay_npu.py \
-  2>&1 | tee "$RUN_ROOT/logs/verl_engine_full_replay.log"
+  2>&1 | tee "$RUN_ROOT/logs/${TPR_VERL_FULL_REPLAY_PREFIX}_replay.log"
