@@ -74,6 +74,12 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         raise AssertionError("Expected Native Full and TPR respectively")
     if tpr.get("topology") != {"tp": 2, "cp": 2, "dp": 2, "world": 8}:
         raise AssertionError("TPR result is not TP2 CP2 DP2")
+    if (full.get("hccl_stats_reduce_dtype") != "float32"
+            or tpr.get("hccl_stats_reduce_dtype") != "float32"):
+        raise AssertionError(
+            "Stale Full/TPR benchmark: HCCL FP64 AllReduce cannot be "
+            "trusted on Ascend 910B; rerun BOTH modes with FP32 stats"
+        )
     for field in ("source_step", "source_capture", "input_sha256",
                   "checkpoint", "warmups", "repeats",
                   "capture_logprobs", "profiler_enabled"):
