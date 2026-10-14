@@ -30,8 +30,12 @@ patch into the local Uni-Agent checkout, not VERL or TPR.
   cleanup/force-kill behavior, finalizes (does not abort) the training
   trajectory, and emits TaskResult(reward=0.0, accuracy=0.0, finished=False)
   with extra_info.session_length_truncated=True.
-- If the hard-capped session does not return exactly ONE trajectory labeled
-  max_trajectory_length, fail loudly rather than duplicating GRPO samples.
+- If a Session already accumulated multiple materialized trajectories when
+  the hard stop triggers, select ONLY the first original chain and force its
+  `reward_score`/`reward_info.reward` to 0 before scoring/TQ writes; record
+  original_session_chain_count and multi_chain_session=true. The hard-cap
+  evidence still requires a max_trajectory_length materialization somewhere
+  in the finalized Session.
 - Default upstream behavior remains unchanged when the flag is false.
 
 The Qwen3-4B training script now sets rollout token capacity to
@@ -84,3 +88,15 @@ experiment; unfinished capped failures can be compared to successful samples.
 An all-zero-reward GRPO group has zero advantages, but executed AdamW updates
 could still move parameters via historical momentum or weight decay, and
 colocate_async Rollouts may use stale weight versions.
+
+## 2026-10-14 backward-compatible safeguard
+
+The updated hardcap patcher upgrades existing already-patched Framework sources
+in place (no original checkout restoration). A pre-existing multi-chain Session
+now keeps the **first** original trajectory and sets its reward to zero,
+instead of trusting the final materialized chain or silently selecting the
+longest. This occurs before original GRPO advantages are computed, so
+newly-captured PPO labels match the modified reward policy. Reapplying the
+patcher is intended to be idempotent; validate with `--check` before live Ray
+deployment. Old Actor captures from previous online experiments are immutable;
+changing their `rm_scores` without recomputing group Advantage is invalid.
