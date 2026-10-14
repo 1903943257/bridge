@@ -113,8 +113,20 @@ import json,sys
 print(json.load(open(sys.argv[1]))['items'][0]['capture'])
 PY
 )"
-export TPR_OFFLINE_ROWS=0,1
-export TPR_OFFLINE_STEPS=20
+readarray -t _selected_capture_info < <(python - "$MANIFEST" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+if m.get("protocol")!="real_actor_session_first_multicapture_v2":
+    raise SystemExit("expected the session-first replay manifest")
+print(m["steps"])
+print(",".join(map(str,m["items"][0]["rows"])))
+PY
+)
+if [[ "${#_selected_capture_info[@]}" -ne 2 ]]; then
+  echo "ERROR: invalid session-first multi-capture replay manifest" >&2; exit 2
+fi
+export TPR_OFFLINE_ROWS="${_selected_capture_info[1]}"
+export TPR_OFFLINE_STEPS="${_selected_capture_info[0]}"
 export TPR_OFFLINE_ADAMW_LR=2e-5
 export TPR_OFFLINE_ADAMW_CLIP_NORM=1.0
 export TPR_OFFLINE_OUTPUT_DIR="$RUN_ROOT/offline"
