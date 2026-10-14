@@ -484,6 +484,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "warmups": warmups, "repeats": repeats,
                 "capture_logprobs": capture_lp, "profiler_enabled": profile,
                 "ppo_logprob_chunk_tokens": lp_chunk_tokens,
+                "hccl_stats_reduce_dtype": "float32",
                 "recompute": False, "updated_weights": False,
                 "median_fwd_bwd_s": statistics.median(times),
                 "gradient_witness": gradient_witness,
