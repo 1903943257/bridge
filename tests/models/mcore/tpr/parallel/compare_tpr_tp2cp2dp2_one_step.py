@@ -21,9 +21,16 @@ def compare_sampled_gradients(full: dict, tpr: dict):
     for key in ("names", "shapes", "samples_per_name", "samples_per_parameter"):
         if left[key] != right[key]:
             raise AssertionError(f"Full/TPR sampled gradient layout differs: {key}")
-    for source in (left, right):
-        if source.get("replica_sample_max_abs") != 0:
-            raise AssertionError("A CP/DP replica has non-identical finalized gradients")
+    # Full CP4's native Megatron gradient path is the reference; if it
+    # exhibits small per-CP replica drift, report it as a limitation of
+    # sampled Full-vs-TPR parity instead of misdiagnosing a DP2 bug.
+    # TPR DP2 must have exactly equal finalized gradients on all DP+CP ranks.
+    if right.get("replica_sample_max_abs") != 0:
+        raise AssertionError(
+            "TPR DP2 replica gradients are not identical after finalize: "
+            f"sample_max_abs={right['replica_sample_max_abs']}"
+        )
+    full_replica_max_abs = float(left.get("replica_sample_max_abs", 0.0))
     fvalues = [float(v) for shard in left["tp_shards"] for v in shard]
     tvalues = [float(v) for shard in right["tp_shards"] for v in shard]
     if not fvalues or len(fvalues) != len(tvalues):
@@ -35,6 +42,14 @@ def compare_sampled_gradients(full: dict, tpr: dict):
     tnorm2 = sum(b*b for b in tvalues)
     error2 = sum((a-b)**2 for a, b in zip(fvalues, tvalues))
     return {
+        "full_reference_replica_exact": full_replica_max_abs == 0,
+        "full_reference_replica_sample_max_abs": full_replica_max_abs,
+        "tpr_dp2_replica_exact": True,
+        "sampled_gradient_parity_caveat": (
+            "Full CP4 reference gradients have sampled replica disagreement; "
+            "Full-vs-TPR gradient similarity uses its CP0 representative."
+            if full_replica_max_abs else None
+        ),
         "sampled_parameter_count": len(left["names"]),
         "sampled_gradient_element_count": len(fvalues),
         "sampled_gradient_rel_l2": math.sqrt(error2 / fnorm2) if fnorm2 else (
@@ -132,6 +147,7 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
     grad_text = (
         f"sampled_grad_rel_l2={sampled_gradients['sampled_gradient_rel_l2']:.6g} "
         f"sampled_grad_cosine={sampled_gradients['sampled_gradient_cosine']:.6g} "
+        f"full_replica_max_abs={sampled_gradients['full_reference_replica_sample_max_abs']:.9g} "
         if sampled_gradients is not None else
         "sampled_grad_rel_l2=not_available "
     )
