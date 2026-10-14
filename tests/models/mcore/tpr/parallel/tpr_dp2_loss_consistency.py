@@ -1,77 +1,92 @@
-"""Validate one TP2/CP2/DP2 recorded PPO replay's loss-report reductions.
+"""Strictly audit reporting losses in one TP2/CP2/DP2 recorded PPO replay.
 
-The TPR PPO adapter already CP-SUMs a local forest's loss. The benchmark
-then DP-averages the two replicas, leaving ONE reporting scalar per TP
-shard. TP shards can differ slightly numerically, even though their
-forward's vocab-parallel logprob value should approximately match.
+Each DP replica handles a DIFFERENT subset of the original eight Sessions.
+The engine's returned scalar has ALREADY been summed across CP, but is
+a LOCAL DP contribution (scaled by VERL's dp_size=2 policy). Thus DP0
+and DP1 loss contributions MUST NOT be expected to match.
 
-This module checks strict *within-TP* CP×DP reporting consistency,
-separately records pre-TP scalar drift, and checks the final TP-averaged
-reporting value. It never changes the training loss or gradients.
+The benchmark's world-wide scalar mean sums the two DP contributions
+while averaging over duplicated TP/CP views. It is reporting-only.
+The production PPO objective and weight-gradient collectives are untouched.
 """
 from __future__ import annotations
 
 import math
 
 
-def analyze_dp2_loss_report(ranks: list[dict], *, cpdp_atol: float = 1e-6) -> dict:
+def analyze_dp2_loss_report(ranks: list[dict], *, cp_atol: float = 1e-6) -> dict:
     if len(ranks) != 8:
-        raise AssertionError(f"Expected eight loss reports, got {len(ranks)}")
-    by_tp: dict[int, list[dict]] = {0: [], 1: []}
-    for rank in ranks:
-        tp, cp, dp = (int(rank[k]) for k in ("tp_rank", "cp_rank", "dp_rank"))
-        if tp not in by_tp or cp not in (0, 1) or dp not in (0, 1):
-            raise AssertionError(f"Unexpected TP/CP/DP rank coordinates: {rank}")
-        by_tp[tp].append(rank)
-    for tp, peers in by_tp.items():
-        if {(int(p["cp_rank"]), int(p["dp_rank"])) for p in peers} != {
-            (0, 0), (0, 1), (1, 0), (1, 1)
-        }:
-            raise AssertionError(f"TP={tp} does not cover CP2×DP2 exactly once")
+        raise AssertionError(f"Expected eight rank reports, got {len(ranks)}")
+    by_coordinate = {}
+    for row in ranks:
+        key = tuple(int(row[k]) for k in ("tp_rank", "cp_rank", "dp_rank"))
+        if any(x not in (0, 1) for x in key) or key in by_coordinate:
+            raise AssertionError(f"Invalid or repeated TP/CP/DP coordinates: {key}")
+        by_coordinate[key] = row
+    if len(by_coordinate) != 8:
+        raise AssertionError("TP2/CP2/DP2 coordinates do not cover all eight ranks")
 
-    values = [
-        float(p["global_loss"]) for p in ranks
-    ]
-    raw_by_tp = [
-        [float(p["global_loss_pre_tp"]) for p in by_tp[tp]]
-        for tp in (0, 1)
-    ]
-    if not all(math.isfinite(x) for x in values + raw_by_tp[0] + raw_by_tp[1]):
-        raise AssertionError("Non-finite PPO global loss reported by rank")
-    cpdp_spread = {
-        str(tp): max(raw_by_tp[tp]) - min(raw_by_tp[tp])
+    local = {
+        key: float(row["local_loss_dp_scaled"])
+        for key, row in by_coordinate.items()
+    }
+    global_values = [float(row["global_loss"]) for row in ranks]
+    if not all(math.isfinite(x) for x in (*local.values(), *global_values)):
+        raise AssertionError("Non-finite PPO loss in distributed report")
+
+    # CP-SUMmed losses should be equal on both CP ranks of one TP shard
+    # and one DP replica. Do NOT check equality across DP replicas:
+    # their input forests and token contributions are intentionally different.
+    cp_gaps = {
+        (tp, dp): abs(local[(tp, 0, dp)] - local[(tp, 1, dp)])
+        for tp in (0, 1) for dp in (0, 1)
+    }
+    if max(cp_gaps.values()) > cp_atol:
+        raise AssertionError(
+            "CP replicas disagree on CP-SUMmed PPO local loss: "
+            f"gaps={cp_gaps}, "
+            f"rank_values={[(r['rank'], r['tp_rank'], r['cp_rank'], r['dp_rank'], r['local_loss_dp_scaled']) for r in ranks]}"
+        )
+
+    # The TP shards each represent the same logical result but may drift
+    # numerically. Preserve the discrepancy, do not silently claim TP parity.
+    tp_gaps = {
+        (cp, dp): abs(local[(0, cp, dp)] - local[(1, cp, dp)])
+        for cp in (0, 1) for dp in (0, 1)
+    }
+    dp_means = {
+        dp: sum(local[(tp, cp, dp)] for tp in (0, 1) for cp in (0, 1)) / 4
+        for dp in (0, 1)
+    }
+    tp_means = {
+        tp: sum(local[(tp, cp, dp)] for cp in (0, 1) for dp in (0, 1)) / 4
         for tp in (0, 1)
     }
-    # Each CP/DP rank of the same TP shard performed identical CP and DP
-    # AllReduce; disagreement in that replica group is a real bug.
-    if any(gap > cpdp_atol for gap in cpdp_spread.values()):
+    expected_global = sum(local.values()) / 8
+    global_gap = max(global_values) - min(global_values)
+    if global_gap > cp_atol:
         raise AssertionError(
-            "CP/DP replicas disagree on pre-TP PPO loss: "
-            f"cpdp_spread={cpdp_spread}, "
-            f"rank_values={[ (r['rank'], r['tp_rank'], r['cp_rank'], r['dp_rank'], r['global_loss_pre_tp']) for r in ranks ]}"
+            "World-reduced PPO reporting loss differs across ranks: "
+            f"max_gap={global_gap:.9g}, values={global_values}"
         )
-    consensus_spread = max(values) - min(values)
-    if consensus_spread > cpdp_atol:
+    if abs(sum(global_values) / 8 - expected_global) > cp_atol:
         raise AssertionError(
-            "TP-averaged global PPO reporting loss still differs across ranks: "
-            f"spread={consensus_spread:.9g}, "
-            f"rank_values={[ (r['rank'], r['global_loss']) for r in ranks ]}"
+            "Global PPO reporting mean does not match DP local contributions: "
+            f"reported={sum(global_values)/8:.9g} expected={expected_global:.9g}"
         )
-    means = [sum(raw_by_tp[tp]) / len(raw_by_tp[tp]) for tp in (0, 1)]
-    reconstructed = (means[0] + means[1]) / 2
-    if abs(sum(values)/len(values) - reconstructed) > cpdp_atol:
-        raise AssertionError(
-            f"TP loss aggregation is not a mean of the two TP shards: "
-            f"global={sum(values)/len(values)} expected={reconstructed}"
-        )
+
     return {
-        "global_reporting_loss": sum(values) / len(values),
-        "tp0_pre_tp_loss": means[0],
-        "tp1_pre_tp_loss": means[1],
-        "tp_shard_loss_gap": abs(means[0] - means[1]),
-        "tp_shard_loss_gap_exceeds_1e_4": abs(means[0] - means[1]) > 1e-4,
-        "cpdp_pre_tp_max_gap": max(cpdp_spread.values()),
-        "global_reporting_max_gap": consensus_spread,
-        "tp_reporting_reduce": "SUM(tp_group)/2 after SUM(dp_group)/2 after CP SUM",
+        "global_reporting_loss": sum(global_values) / 8,
+        "dp0_local_loss": dp_means[0],
+        "dp1_local_loss": dp_means[1],
+        "dp_local_contribution_gap": abs(dp_means[0] - dp_means[1]),
+        "tp0_pre_tp_loss": tp_means[0],
+        "tp1_pre_tp_loss": tp_means[1],
+        "tp_shard_loss_gap": abs(tp_means[0] - tp_means[1]),
+        "tp_local_max_gap": max(tp_gaps.values()),
+        "cp_replica_max_gap": max(cp_gaps.values()),
+        "global_reporting_max_gap": global_gap,
+        "expected_global_from_raw_rank_losses": expected_global,
+        "reporting_reduce": "SUM(all_world_local_CP_aggregated_DP_contributions)/8",
         "training_objective_modified": False,
     }
