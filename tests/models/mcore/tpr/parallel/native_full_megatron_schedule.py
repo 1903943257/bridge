@@ -247,9 +247,14 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
                   f"allocated_gib={torch.npu.memory_allocated()/2**30:.3f} "
                   f"peak_gib={torch.npu.max_memory_allocated()/2**30:.3f}",
                   flush=True)
-            # Megatron divides each microbatch's loss by M; cancel that
-            # normalization, and offset CP's replicated-gradient averaging.
-            return local_loss * (count * 4), {"metrics": metrics}
+            # Megatron's 2-tuple loss branch already multiplies by CP size
+            # and divides by num_microbatches. Because each local_loss uses
+            # the ORIGINAL global PPO-token denominator, cancel only /M:
+            #   (local_loss * M) * CP / M = local_loss * CP.
+            # The explicit CP grad all-reduce + /CP below then gives the
+            # correct global PPO gradient. Multiplying CP here a second
+            # time produced the earlier ~4x native gradient bug.
+            return local_loss * count, {"metrics": metrics}
 
         return model_logits, loss_func
 
