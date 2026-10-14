@@ -175,6 +175,10 @@ def test_fixed_shape_40k_one_mode():
                 )
                 runs.append(record)
             dist.barrier()
+        gradient_witness = None
+        if os.getenv("TPR_BENCH_GRAD_WITNESS", "0") == "1":
+            from .gradient_witness import collect_tp2_gradient_witness
+            gradient_witness = collect_tp2_gradient_witness(model, runtime)
         if dist.get_rank() == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
             target = output_dir / f"step{step}_{mode}_fixed_shape.json"
@@ -190,6 +194,7 @@ def test_fixed_shape_40k_one_mode():
                 "capture_logprobs": capture_logprobs,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
                 "median_fwd_bwd_s": statistics.median(measured),
+                "gradient_witness": gradient_witness,
                 "runs": runs,
             }, indent=2))
             print(
