@@ -110,7 +110,28 @@ def classify_length(length, cap):
     return ">49152"
 
 
-def scan(directory, cap, show_top, output):
+
+def selected_manifest_identities(manifest_path):
+    if manifest_path is None:
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("protocol") != "real_actor_session_first_8merged_v3":
+        raise ValueError("Selection comparison requires original session-first v3 manifest")
+    identities = set()
+    for item in manifest["items"]:
+        step = int(item["source_global_step"])
+        raw = torch.load(item["capture"], map_location="cpu", weights_only=False)
+        batch = raw["tensordict"]
+        provenance = item["source_row_provenance"]
+        if len(provenance) != len(raw["keys"]):
+            raise AssertionError("Manifest provenance row count mismatch")
+        for row, info in enumerate(provenance):
+            ids = batch["input_ids"][row]
+            sha = hashlib.sha256(ids.contiguous().numpy().tobytes()).hexdigest()
+            identities.add((step, str(info["uid"]), str(info["session_id"]), sha))
+    return identities
+
+def scan(directory, cap, show_top, output, manifest_path=None):
     files = []
     for path in directory.glob("actor_update_step*_rank0_capture*_batch*.pt"):
         match = PATTERN.fullmatch(path.name)
@@ -166,6 +187,9 @@ def scan(directory, cap, show_top, output):
                 records[identity] = entry
 
     values = list(records.values())
+    selected = selected_manifest_identities(manifest_path)
+    selected_values = ([records[key] for key in selected if key in records]
+                       if selected is not None else None)
     counts = Counter(r["status"] for r in values)
     overcap = Counter(r["status"] for r in values if r["length"] > cap)
     buckets = {
@@ -195,6 +219,16 @@ def scan(directory, cap, show_top, output):
         "unclassified_rows": counts["UNKNOWN"],
         "length_buckets": buckets,
         "observed_fields": sorted(observed_fields),
+        "manifest_selected": (None if selected_values is None else {
+            "matched_unique_trajectories": len(selected_values),
+            "expected_manifest_trajectories": len(selected),
+            "maximum_confirmed_true_tokens": max(
+                (r["length"] for r in selected_values if r["status"] == "TRUE"), default=None),
+            "maximum_positive_reward_proxy_tokens": max(
+                (r["length"] for r in selected_values
+                 if r["status"] == "POSITIVE_REWARD"), default=None),
+            "statuses": dict(Counter(r["status"] for r in selected_values)),
+        }),
         "longest_confirmed_true": maximal("TRUE"),
         "longest_positive_reward_proxy": maximal("POSITIVE_REWARD"),
         "longest_unknown": maximal("UNKNOWN"),
@@ -204,7 +238,7 @@ def scan(directory, cap, show_top, output):
             "capture_files", "raw_real_rows", "deduplicated_original_trajectories",
             "cap_tokens", "statuses", "over_cap_statuses",
             "maximum_confirmed_true_tokens", "maximum_positive_reward_proxy_tokens",
-            "unclassified_rows", "length_buckets",
+            "unclassified_rows", "length_buckets", "manifest_selected",
         )}, ensure_ascii=False), flush=True)
     for title, key in (("CONFIRMED_TRUE", "longest_confirmed_true"),
                        ("REWARD_PROXY", "longest_positive_reward_proxy"),
@@ -234,7 +268,9 @@ if __name__ == "__main__":
     parser.add_argument("--cap", type=int, default=40960)
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--manifest", type=Path,
+                        help="Also report the original 8-per-step v3 replay selection")
     args = parser.parse_args()
     if args.cap <= 0 or args.top <= 0:
         parser.error("--cap and --top must be positive")
-    scan(args.capture_dir, args.cap, args.top, args.output)
+    scan(args.capture_dir, args.cap, args.top, args.output, args.manifest)
