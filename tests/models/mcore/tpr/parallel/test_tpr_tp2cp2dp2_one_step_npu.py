@@ -172,6 +172,10 @@ def _source_step():
             or manifest.get("max_seq_len") != 40960
             or not 1 <= step <= 20):
         raise ValueError("Requires original 20-step, session-first 40K capture manifest")
+    if (manifest.get("only_step_derived") not in (None, step)
+            or manifest.get("experimental_sequence_cap", 40960) !=
+                manifest["items"][step - 1].get("effective_sequence_cap", 40960)):
+        raise ValueError("Refuse to replay unrelated or mismatched 30K derived step")
     item = manifest["items"][step - 1]
     if (item["step"] != step or item["source_global_step"] != step
             or item["rows"] != list(range(8))
@@ -256,6 +260,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
     output = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
     checkpoint = Path(os.getenv("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
     step, capture, source = _source_step()
+    effective_sequence_cap = int(source.get("effective_sequence_cap", 40960))
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
@@ -263,6 +268,8 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
         batch, plan, global_tokens, sha = _placement(
             capture, runtime, source["ppo_tokens"],
         )
+        if max(int(x.numel()) for x in batch["input_ids"].unbind(0)) > effective_sequence_cap:
+            raise AssertionError("DP2 input exceeds experimental sequence cap")
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=2,
             sequence_parallel=False, profile="4b", native_attention=False,
@@ -361,6 +368,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             times = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             data = {
                 "source_step": step, "mode": "tpr",
+                "effective_sequence_cap": effective_sequence_cap,
                 "topology": {"tp": 2, "cp": 2, "dp": 2, "world": 8},
                 "source_capture": str(capture), "checkpoint": str(checkpoint),
                 "input_sha256": sha, "global_ppo_tokens": global_tokens,
