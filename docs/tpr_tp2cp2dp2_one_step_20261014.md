@@ -125,3 +125,54 @@ Outputs:
   deeper activation-memory change (e.g. validated TP-aware swap/recompute)
   or smaller single-trajectory length; changing capture length invalidates
   the original 40K fixed-source comparison.
+
+
+## Isolated Step-6 30-Ki memory-capacity / DP correctness experiment
+
+The TP2CP2DP2 40K Qwen3-4B experiment encountered a genuine
+autograd-backward NPU OOM even after the optional PPO logprob chunks.
+With CP2, per-card local sequence length is twice that of the Full
+TP2CP4 baseline. 30 Ki tokens (30720) is a capacity hypothesis,
+**not a guaranteed pass**.
+
+Run the matched one-step experiment from the repo checkout:
+
+    bash tests/models/mcore/tpr/parallel/run_tpr_dp2_vs_full_30k_one_step.sh \
+      /workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json \
+      /workspace/tpr_dp2_30k_step6_v1 \
+      6
+
+The script refuses to overwrite the root directory. It uses the same
+physical NPU 8..15 and original Qwen3-4B-128K weights as the 40K tests.
+It derives only Step 6: original 40K source capture is immutable, every
+original prompt is retained, each response is cropped at the **right**
+to make prompt+response <= 30720, and every retained PPO label/mask
+keeps its original value. If the prompt alone exceeds 30720, or no
+supervised PPO token would remain, preprocessing fails explicitly.
+
+Derived manifest retains the original 20-step max_seq_len=40960 because
+19 unchanged steps still reference the 40K source; it declares
+experimental_sequence_cap=30720 and only_step_derived=6, and its
+selected Step 6 item points at the new shortened capture and updated
+PPO token count. Both Full and TPR gate this cap, and the strict
+comparison checks exact derived source path, SHA, global supervised
+tokens, warmups/repeats, and checkpoint. The **existing 40K Full JSON
+must never be used as the baseline for this run**.
+
+Outputs under ROOT:
+
+- capture_manifest.json / step6_cap30720.pt / truncation_audit.json
+- full/step6_full_fixed_shape.json (Full TP2CP4DP1)
+- tpr/step6_tpr_tp2cp2dp2.json (TPR TP2CP2DP2)
+- tpr/comparison.json: Full/TPR loss gap, median F/B+gradient-finalize
+  timing, max-rank peak memory, DP partitions and duplicated tree tokens,
+  and deterministic sampled gradient rel-L2 and cosine.
+- CP/DP replica sampled weight gradients must be identical after finalize;
+  this gate is run after timing. Sampled gradient comparisons are **not**
+  full-parameter gradient equality. Neither job updates AdamW weights.
+
+Use TPR_BENCH_WARMUPS=0 TPR_BENCH_REPEATS=1 for a quick functional
+smoke test (new output directory); keep the default 1 warmup + 3 measured
+iterations for timing. Both jobs inherit the same setting. If 30K still
+OOMs, inspect per-rank DP placement and longest surviving tree before
+changing sequence length again.
