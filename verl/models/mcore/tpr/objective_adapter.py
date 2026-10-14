@@ -68,6 +68,7 @@ class SegmentPPOObjectiveAdapter:
         entropy_fn: Callable[[Tensor], Tensor] | None = None,
         calculate_entropy: bool | None = None,
         dp_group: Any = None,
+        log_prob_chunk_size: int | None = None,
     ) -> None:
         if loss_function is None:
             raise ValueError("PPO objective requires a VERL loss_function")
@@ -88,6 +89,16 @@ class SegmentPPOObjectiveAdapter:
             if calculate_entropy is None else bool(calculate_entropy)
         )
         self.dp_group = dp_group
+        if log_prob_chunk_size is not None and (
+            not isinstance(log_prob_chunk_size, int)
+            or isinstance(log_prob_chunk_size, bool)
+            or log_prob_chunk_size <= 0
+        ):
+            raise ValueError(
+                f"log_prob_chunk_size must be a positive integer or None, "
+                f"got {log_prob_chunk_size!r}"
+            )
+        self.log_prob_chunk_size = log_prob_chunk_size
         # Optional numerical probe only; disabled for ordinary training to
         # avoid device synchronization and host-side token materialization.
         self.capture_log_probs = bool(_metadata(batch, "tpr_capture_log_probs", default=False))
@@ -192,9 +203,43 @@ class SegmentPPOObjectiveAdapter:
         positions = torch.tensor([key[0] for key in keys], device=logits.device, dtype=torch.long)
         targets = torch.tensor([key[1] for key in keys], device=logits.device, dtype=torch.long)
         temps = torch.tensor([key[2] for key in keys], device=logits.device, dtype=torch.float32)
-        selected_logits = logits[0].index_select(0, positions)
-        scaled_logits = selected_logits / temps.to(selected_logits.dtype)[:, None]
-        unique_log_probs = self.log_prob_fn(scaled_logits, targets)
+        # PPO's native vocab-parallel logprob may save large BF16/FP32
+        # [unique_queries, local_vocab] intermediates until backward.
+        # With CP2 on 40K samples that can OOM even though every segment's
+        # decoder activation fits. Optional token-chunk checkpointing leaves
+        # PPO normalization and the *physical logits* unchanged, but
+        # rematerializes selected logits / softmax on the backward pass.
+        # All TP ranks owning this CP shard have identical refs/chunk order.
+        use_chunked_lp = (
+            self.log_prob_chunk_size is not None
+            and len(keys) > self.log_prob_chunk_size
+            and not self.calculate_entropy
+            and not self.capture_logit_parts
+        )
+        if use_chunked_lp:
+            from torch.utils.checkpoint import checkpoint
+
+            def log_probs_for_chunk(full_logits, chunk_positions, chunk_targets, chunk_temps):
+                selected = full_logits[0].index_select(0, chunk_positions)
+                scaled = selected / chunk_temps.to(selected.dtype)[:, None]
+                return self.log_prob_fn(scaled, chunk_targets)
+
+            unique_log_probs = torch.cat([
+                checkpoint(
+                    log_probs_for_chunk,
+                    logits,
+                    positions[start:start + self.log_prob_chunk_size],
+                    targets[start:start + self.log_prob_chunk_size],
+                    temps[start:start + self.log_prob_chunk_size],
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+                for start in range(0, len(keys), self.log_prob_chunk_size)
+            ], dim=0)
+        else:
+            selected_logits = logits[0].index_select(0, positions)
+            scaled_logits = selected_logits / temps.to(selected_logits.dtype)[:, None]
+            unique_log_probs = self.log_prob_fn(scaled_logits, targets)
         if unique_log_probs.ndim != 1 or unique_log_probs.numel() != len(keys):
             raise ValueError("log_prob_fn must return one scalar per unique query/target/temperature")
         gather = torch.tensor(gather_ids, device=logits.device, dtype=torch.long)
