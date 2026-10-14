@@ -23,7 +23,7 @@ import torch
 from verl.utils import tensordict_utils as tu
 
 PATTERN = re.compile(
-    r"actor_update_step(\\d+)_rank0_capture(\\d+)_batch(\\d+)\\.pt$"
+    r"actor_update_step(\d+)_rank0_capture(\d+)_batch(\d+)\.pt$"
 )
 SUCCESS_FIELDS = ("is_correct", "correct", "success", "is_success", "acc", "accuracy")
 PROXY_FIELDS = ("reward_score", "rm_scores", "reward", "rewards")
