@@ -155,7 +155,8 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
     )
     loss_consistency_text = (
         f"tpr_tp_shard_loss_gap={dp2_loss_report['tp_shard_loss_gap']:.9g} "
-        f"tpr_cpdp_loss_gap={dp2_loss_report['cpdp_pre_tp_max_gap']:.9g} "
+        f"tpr_cp_replica_loss_gap={dp2_loss_report['cp_replica_max_gap']:.9g} "
+        f"tpr_dp_local_contribution_gap={dp2_loss_report['dp_local_contribution_gap']:.9g} "
         if dp2_loss_report is not None else ""
     )
     print(
