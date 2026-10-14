@@ -71,6 +71,41 @@ def collect_tp2_gradient_witness(
             break
         offset += count
 
+    # For a small offending tensor (e.g. Qwen RMSNorm, 2560 elements),
+    # also gather the ENTIRE original BF16 gradient. This distinguishes
+    # sampled-gather artifacts from genuine one-ULP parameter drift.
+    focus_grad = None
+    for name, param in model.named_parameters():
+        if name == worst_param and param.numel() <= 8192:
+            focus_grad = param.grad.detach().reshape(-1).contiguous()
+            break
+    focus_summary = None
+    if focus_grad is not None:
+        focus_peers = [torch.empty_like(focus_grad) for _ in group_members]
+        dist.all_gather(focus_peers, focus_grad, group=cpdp)
+        focus_cpu = torch.stack(focus_peers, dim=0).float().cpu()
+        focus_span = focus_cpu.max(dim=0).values - focus_cpu.min(dim=0).values
+        focus_worst_value, focus_worst_pos = focus_span.abs().max(dim=0)
+        focus_pos = int(focus_worst_pos.item())
+        focus_summary = {
+            "parameter": worst_param,
+            "dtype": str(focus_grad.dtype),
+            "elements": int(focus_grad.numel()),
+            "differing_elements": int((focus_span != 0).sum().item()),
+            "max_abs": float(focus_worst_value.item()),
+            "worst_param_offset": focus_pos,
+            "worst_peer_values": [
+                [int(rank), float(focus_cpu[i, focus_pos].item())]
+                for i, rank in enumerate(group_members)
+            ],
+        }
+        if dist.get_rank() == 0 and focus_summary["differing_elements"]:
+            print(
+                f"TPR_GRAD_FULL_PARAM_GATHER_DIAG mode={mode} "
+                f"cpdp_group={group_members} detail={focus_summary}",
+                flush=True,
+            )
+
     # Fixed-width WORLD all-gather only; no unsupported FP64 AllReduce.
     state = torch.tensor(
         [dist.get_rank(), runtime.tp_rank, runtime.cp_rank,
@@ -137,5 +172,6 @@ def collect_tp2_gradient_witness(
             "rank0_worst_peer_values": worst_peer_values,
             "rank0_worst_param": worst_param,
             "rank0_differing_samples": differing_samples,
+            "rank0_focused_parameter": focus_summary,
         },
     }
