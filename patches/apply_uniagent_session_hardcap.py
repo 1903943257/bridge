@@ -289,6 +289,29 @@ def patch_framework(src: str) -> str:
         '                    except (asyncio.TimeoutError, asyncio.CancelledError):\n',
         "framework.ray_runner_wait",
     )
+    # Upgrade already-patched Docker sources from the older strict
+    # "exactly one chain" guard. The user may have run the old patcher last
+    # night; a patcher upgrade must be idempotent, not require restoring files.
+    old_guard = (
+        '                    if (\n'
+        '                        len(session_trajectories) != 1\n'
+        '                        or session_trajectories[0].extra_fields.get("materialization_reason")\n'
+        '                        != "max_trajectory_length"\n'
+        '                    ):\n'
+    )
+    new_guard = (
+        '                    if (\n'
+        '                        not session_trajectories\n'
+        '                        or not any(\n'
+        '                            t.extra_fields.get("materialization_reason") == "max_trajectory_length"\n'
+        '                            for t in session_trajectories\n'
+        '                        )\n'
+        '                    ):\n'
+    )
+    if old_guard in src:
+        if src.count(old_guard) != 1:
+            raise PatchError("framework old hardcap guard appears multiple times")
+        src = src.replace(old_guard, new_guard, 1)
     src = replace_exact(
         src,
         '                session_trajectories = await self.gateway_manager.finalize_session(session_id)\n'
