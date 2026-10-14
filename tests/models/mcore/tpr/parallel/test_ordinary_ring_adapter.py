@@ -78,3 +78,35 @@ def test_native_whole_ring_opt_in_virtual_right_padding(monkeypatch):
     out.sum().backward()
     assert observed == [((64,1,2048),(64,1,512),(64,1,512),2)]
     assert torch.all(q.grad == 1)
+
+
+def test_offline_native_ring_adapter_flattens_heads_for_projection(monkeypatch):
+    """Regression: a four-dimensional Q must produce [S,1,H*D] for TP row GEMM."""
+    import os
+    from .test_real_actor_tp2cp4_offline_ppo_npu import _install_offline_full_ring_backend
+
+    monkeypatch.setenv("TPR_OFFLINE_FULL_RING_BACKEND", "native")
+    seen = []
+
+    def fake_native(q,k,v,**kwargs):
+        seen.append(kwargs["allow_trailing_padding"])
+        return q.flatten(2).contiguous()
+
+    monkeypatch.setattr(ring, "ordinary_ring_cp_attention", fake_native)
+    # The installer replaces only the custom dispatch function, preserving
+    # the original MindSpeed native function and its autograd contract.
+    with monkeypatch.context() as local_patch:
+        local_patch.setattr(ring, "ring_cp_attention", lambda *a, **k: None)
+        backend = _install_offline_full_ring_backend("full")
+        assert backend.startswith("mindspeed_native_")
+        q = torch.randn(23, 1, 16, 128, requires_grad=True)
+        k = torch.randn(23, 1, 4, 128, requires_grad=True)
+        out = ring.ring_cp_attention(q,k,k,prefix_blocks=())
+        assert out.shape == (23,1,2048)
+        # This is the exact input layout expected by Megatron RowParallelLinear.
+        weight = torch.randn(17,2048)
+        proj = torch.matmul(out.reshape(-1,2048),weight.t())
+        assert proj.shape == (23,17)
+        proj.sum().backward()
+        assert q.grad is not None
+    assert seen == [True]
