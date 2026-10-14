@@ -1,0 +1,313 @@
+"""One recorded PPO step: Qwen3-4B TPR TP2 x RingCP2 x DP2 on 8 NPUs.
+
+Compare against the EXISTING TP2 x CP4 x DP1 Native Full fixed-shape JSON.
+Same 8 original Sessions and HF checkpoint; no rollout and no AdamW.
+One *source* step is replayed for warmup/repeated F/B timing, without updates.
+The DP placement is the DFS minimax planner imported from PR #5; this is
+an isolated research experiment, NOT a production VERL DP2 enablement.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import statistics
+import sys
+import time
+from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+from megatron.core import parallel_state
+
+from verl.models.mcore.tpr.dp_placement import plan_tpr_dta_dp
+from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+from verl.utils import tensordict_utils as tu
+
+from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _load_real_pair
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") != "1",
+    reason="opt in to the offline TP2 CP2 DP2 8-NPU one-step benchmark",
+)
+
+
+def _runtime():
+    if int(os.getenv("WORLD_SIZE", "1")) != 8:
+        raise AssertionError("TP2 x RingCP2 x DP2 requires exactly 8 ranks")
+    import torch_npu  # noqa: F401
+    from mindspeed.args_utils import get_full_args
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(local_rank)
+    dist.init_process_group(backend="hccl")
+    argv = sys.argv[:]
+    try:
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.megatron_adaptor import repatch
+    finally:
+        sys.argv[:] = argv
+    repatch({
+        "tensor_model_parallel_size": 2,
+        "context_parallel_size": 2,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_algo": "megatron_cp_algo",
+        "sequence_parallel": False,
+        "use_flash_attn": True,
+    })
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+    assert get_full_args().context_parallel_algo == "megatron_cp_algo"
+    tp = parallel_state.get_tensor_model_parallel_group()
+    cp = parallel_state.get_context_parallel_group()
+    dp = parallel_state.get_data_parallel_group()
+    assert (dist.get_world_size(tp), dist.get_world_size(cp),
+            dist.get_world_size(dp)) == (2, 2, 2)
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    model_parallel_cuda_manual_seed(261013)
+    return SimpleNamespace(
+        tp_group=tp, cp_group=cp, dp_group=dp,
+        pp_group=parallel_state.get_pipeline_model_parallel_group(),
+        tp_rank=parallel_state.get_tensor_model_parallel_rank(),
+        cp_rank=parallel_state.get_context_parallel_rank(),
+        dp_rank=parallel_state.get_data_parallel_rank(),
+        rank=parallel_state.get_tensor_model_parallel_rank(),
+        device=torch.device("npu", local_rank),
+    )
+
+
+def _engine_with_dp_finalize(model, runtime):
+    """CP-average then native DP-average; never transfer or sync Prefix KV."""
+    model.config.no_sync_func = None
+    model.config.grad_scale_func = None
+    model.config.calculate_per_token_loss = False
+    model.config.recompute_granularity = None
+
+    def finalize(chunks, num_tokens, *, force_all_reduce=False, **kwargs):
+        assert chunks == [model] and num_tokens is None and force_all_reduce
+        # All CP ranks participate in one logical local forest.
+        # Local loss is normalized with GLOBAL tokens and multiplied by DP=2
+        # by VERL's token-mean PPO. Two DP gradients are then AVERAGED.
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                raise RuntimeError(f"Missing gradient before DP finalize: {name}")
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=runtime.cp_group)
+            param.grad.div_(2)
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=runtime.dp_group)
+            param.grad.div_(2)
+
+    model.config.finalize_model_grads_func = finalize
+    return SimpleNamespace(
+        module=[model],
+        engine_config=SimpleNamespace(
+            tpr_enabled=True, tensor_model_parallel_size=2,
+            context_parallel_size=2, pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            virtual_pipeline_model_parallel_size=None,
+            dynamic_context_parallel=False, tpr_cp_backend="ring",
+            use_fused_kernels=False, override_transformer_config={},
+        ),
+        model_config=SimpleNamespace(mtp=SimpleNamespace(enable=False)),
+        enable_routing_replay=False,
+        get_data_parallel_size=lambda: 2,
+        get_data_parallel_group=lambda: runtime.dp_group,
+    )
+
+
+def _source_step():
+    step = int(os.environ["TPR_BENCH_SOURCE_STEP"])
+    manifest_path = Path(os.environ["TPR_OFFLINE_CAPTURE_MANIFEST"])
+    manifest = json.loads(manifest_path.read_text())
+    if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
+            or manifest.get("steps") != 20
+            or manifest.get("expected_sessions") != 8
+            or manifest.get("max_seq_len") != 40960
+            or not 1 <= step <= 20):
+        raise ValueError("Requires original 20-step, session-first 40K capture manifest")
+    item = manifest["items"][step - 1]
+    if (item["step"] != step or item["source_global_step"] != step
+            or item["rows"] != list(range(8))
+            or item.get("session_count") != 8
+            or item["max_sequence_length"] > 40960):
+        raise AssertionError("Refuse changed or untruncated original Session selection")
+    capture = Path(item["capture"])
+    if not capture.is_file():
+        raise FileNotFoundError(capture)
+    return step, capture, item
+
+
+def _placement(capture, runtime, expected_tokens):
+    # All eight ranks independently see the same global PPO input and plan.
+    # No cross-DP prefix sharing: each DP replica builds an ordinary local tree.
+    global_batch, global_keys, global_tokens, global_sha = _load_real_pair(
+        capture, tuple(range(8)), "tpr",
+    )
+    if global_tokens != expected_tokens:
+        raise AssertionError("Manifest/global PPO-token count disagrees")
+    sequences = [list(map(int, ids.tolist())) for ids in global_batch["input_ids"].unbind(0)]
+    placement = plan_tpr_dta_dp(
+        sequences, global_keys, dp_size=2, enforce_equal_rows=False,
+    )
+    if (sorted(sum((list(p) for p in placement.partitions), [])) != list(range(8))
+            or not all(placement.partitions)):
+        raise AssertionError("DP placement lost/duplicated a Session")
+    local_rows = placement.partitions[runtime.dp_rank]
+    # Exactly the original Session rows, including captured advantages,
+    # response_mask, old_log_probs and temperatures.
+    batch, keys, local_tokens, _ = _load_real_pair(capture, local_rows, "tpr")
+    if keys != tuple(global_keys[i] for i in local_rows):
+        raise AssertionError("Physical row-to-PPO identity changed")
+    tu.assign_non_tensor(
+        batch, dp_size=2, batch_num_tokens=global_tokens,
+        global_batch_size=8,
+        tpr_capture_log_probs=os.getenv("TPR_BENCH_CAPTURE_LOGPROBS", "1") == "1",
+    )
+    assignment = (runtime.dp_rank, tuple(local_rows), local_tokens,
+                  tuple(placement.partitions), global_sha)
+    assignments = [None] * dist.get_world_size()
+    dist.all_gather_object(assignments, assignment)
+    for dp_rank in (0, 1):
+        members = [item for item in assignments if item[0] == dp_rank]
+        if len(members) != 4 or any(x != members[0] for x in members):
+            raise AssertionError(f"TP/CP peers disagree on DP{dp_rank} row placement")
+    if sum(next(x[2] for x in assignments if x[0] == d) for d in (0, 1)) != global_tokens:
+        raise AssertionError("DP replicas do not cover exactly the global PPO tokens")
+    return batch, placement, global_tokens, global_sha
+
+
+def test_tpr_tp2cp2dp2_one_recorded_step():
+    if os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") != "1":
+        raise ValueError("Offline DP2 adapter gate was not explicitly enabled")
+    if os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0") != "0":
+        raise ValueError("Full baseline and this TPR run must both disable recompute")
+    if os.getenv("TPR_TREE_POLICY") != "qwen_turn":
+        raise ValueError("Use the same qwen_turn policy as the TP2CP4 Full comparison")
+    if os.getenv("TPR_OFFLINE_MODE") != "tpr":
+        raise ValueError("This experiment must run only the TPR path")
+    warmups = int(os.getenv("TPR_BENCH_WARMUPS", "1"))
+    repeats = int(os.getenv("TPR_BENCH_REPEATS", "3"))
+    if not 0 <= warmups <= 10 or not 1 <= repeats <= 20:
+        raise ValueError("warmups=0..10 and repeats=1..20 required")
+    capture_lp = os.getenv("TPR_BENCH_CAPTURE_LOGPROBS", "1") == "1"
+    profile = os.getenv("TPR_EXEC_PROFILE", "0") == "1"
+    output = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
+    checkpoint = Path(os.getenv("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
+    step, capture, source = _source_step()
+    runtime = _runtime()
+    try:
+        from verl.workers.utils.losses import ppo_loss
+
+        batch, plan, global_tokens, sha = _placement(
+            capture, runtime, source["ppo_tokens"],
+        )
+        model, hf = make_real_qwen3_tp_model(
+            runtime, model_path=checkpoint, tp_size=2, cp_size=2,
+            sequence_parallel=False, profile="4b", native_attention=False,
+        )
+        assert hf.num_hidden_layers == 36
+        engine = _engine_with_dp_finalize(model, runtime)
+        runs = []
+        for iteration in range(warmups + repeats):
+            model.zero_grad(set_to_none=True)
+            dist.barrier()
+            torch.npu.synchronize()
+            torch.npu.reset_peak_memory_stats()
+            start = time.perf_counter()
+            result = run_tpr_forward_backward_batch(
+                engine, batch, partial(ppo_loss, config=_PPO()), forward_only=False,
+            )
+            torch.npu.synchronize()
+            own_seconds = time.perf_counter() - start
+
+            critical = torch.tensor(own_seconds, dtype=torch.float64, device=runtime.device)
+            dist.all_reduce(critical, op=dist.ReduceOp.MAX)
+            peak = torch.tensor(float(torch.npu.max_memory_allocated()),
+                                dtype=torch.float64, device=runtime.device)
+            dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+            # local loss is scaled by DP=2; DP-averaged losses reconstruct
+            # the one global token-mean PPO objective of the Full baseline.
+            local_loss = float(result["loss"][0])
+            global_loss = torch.tensor(local_loss, dtype=torch.float64, device=runtime.device)
+            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=runtime.dp_group)
+            global_loss.div_(2)
+
+            stages = dict(engine._tpr_stage_profile) if profile else {}
+            row = {
+                "rank": dist.get_rank(), "tp_rank": runtime.tp_rank,
+                "cp_rank": runtime.cp_rank, "dp_rank": runtime.dp_rank,
+                "rows": list(plan.partitions[runtime.dp_rank]),
+                "local_loss_dp_scaled": local_loss,
+                "global_loss": float(global_loss.item()),
+                "local_unique_tree_tokens": int(result["metrics"]["tpr/unique_tree_tokens"][0]),
+                "local_ppo_tokens": sum(int(x.bool().sum()) for x in batch["response_mask"].unbind(0)),
+                "stage_ms": stages,
+            }
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, row)
+            if max(abs(x["global_loss"]-gathered[0]["global_loss"]) for x in gathered) > 1e-4:
+                raise AssertionError("Global token-mean PPO loss differs across ranks")
+            if dist.get_rank() == 0:
+                item = {
+                    "iteration": iteration, "warmup": iteration < warmups,
+                    "critical_fwd_bwd_s": float(critical.item()),
+                    "peak_allocated_gib": float(peak.item()) / 2**30,
+                    "loss": float(global_loss.item()),
+                    "ranks": gathered,
+                }
+                runs.append(item)
+                print(
+                    f"TPR_TP2CP2DP2 step={step} iter={iteration} "
+                    f"warmup={int(iteration < warmups)} "
+                    f"critical_fwd_bwd_s={item['critical_fwd_bwd_s']:.6f} "
+                    f"peak_gib={item['peak_allocated_gib']:.3f} "
+                    f"global_loss={item['loss']:.9g} "
+                    f"rows={plan.partitions} costs={plan.tree_tokens_by_rank}",
+                    flush=True,
+                )
+            dist.barrier()
+
+        if dist.get_rank() == 0:
+            output.mkdir(parents=True, exist_ok=True)
+            target = output / f"step{step}_tpr_tp2cp2dp2.json"
+            if target.exists():
+                raise FileExistsError(target)
+            times = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
+            data = {
+                "source_step": step, "mode": "tpr",
+                "topology": {"tp": 2, "cp": 2, "dp": 2, "world": 8},
+                "source_capture": str(capture), "checkpoint": str(checkpoint),
+                "input_sha256": sha, "global_ppo_tokens": global_tokens,
+                "placement_policy": plan.policy,
+                "dp_partitions": [list(x) for x in plan.partitions],
+                "dp_tree_token_costs": list(plan.tree_tokens_by_rank),
+                "global_tree_tokens": plan.global_tree_tokens,
+                "duplicated_tree_tokens": plan.duplicated_tree_tokens,
+                "equal_rows_per_rank": plan.equal_rows_per_rank,
+                "warmups": warmups, "repeats": repeats,
+                "capture_logprobs": capture_lp, "profiler_enabled": profile,
+                "recompute": False, "updated_weights": False,
+                "median_fwd_bwd_s": statistics.median(times),
+                "runs": runs,
+            }
+            target.write_text(json.dumps(data, indent=2))
+            print(
+                f"TPR_TP2CP2DP2_SUMMARY step={step} "
+                f"median_fwd_bwd_s={data['median_fwd_bwd_s']:.6f} "
+                f"dp_rows={data['dp_partitions']} duplicated_tree_tokens="
+                f"{plan.duplicated_tree_tokens} output={target}",
+                flush=True,
+            )
+    finally:
+        if parallel_state.model_parallel_is_initialized():
+            parallel_state.destroy_model_parallel()
+        if dist.is_initialized():
+            dist.destroy_process_group()
