@@ -145,6 +145,19 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
             raise ValueError("invalid original PPO temperature")
         prepared.append((row, length, offsets, idxs, temperature))
 
+    # A silent loss of query ownership invalidates every subsequent parity
+    # number, even if the native training job otherwise finishes successfully.
+    local_ref_count = torch.tensor(
+        sum(len(item[2]) for item in prepared),
+        dtype=torch.int64, device=runtime.device,
+    )
+    dist.all_reduce(local_ref_count, op=dist.ReduceOp.SUM, group=runtime.cp_group)
+    if int(local_ref_count.item()) != global_tokens:
+        raise AssertionError(
+            f"Native CP PPO ownership lost tokens: {int(local_ref_count.item())} "
+            f"vs original {global_tokens}"
+        )
+
     def forward_step(data_iterator, module):
         row, length, response_offsets, local_indices, temperature = next(data_iterator)
         calls[0] += 1
