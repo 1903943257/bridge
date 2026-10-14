@@ -26,6 +26,13 @@ export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 export TPR_BENCH_CAPTURE_LOGPROBS="${TPR_BENCH_CAPTURE_LOGPROBS:-1}"
+# Isolated benchmark knob, NOT a VERL production flag. Use fp32 only
+# after the standalone HCCL FP32 control has passed on this machine.
+export TPR_OFFLINE_GRAD_SYNC_DTYPE="${TPR_OFFLINE_GRAD_SYNC_DTYPE:-bf16}"
+[[ "$TPR_OFFLINE_GRAD_SYNC_DTYPE" == "bf16" || "$TPR_OFFLINE_GRAD_SYNC_DTYPE" == "fp32" ]] || {
+  echo "TPR_OFFLINE_GRAD_SYNC_DTYPE must be bf16 or fp32" >&2
+  exit 2
+}
 # Sampled parameter gradients checked AFTER timing in both topologies.
 export TPR_BENCH_GRAD_WITNESS=1
 export TPR_EXEC_PROFILE=0
