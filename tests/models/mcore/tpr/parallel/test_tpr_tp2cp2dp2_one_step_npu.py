@@ -457,11 +457,16 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             dist.barrier()
 
         gradient_witness = None
+        replica_policy = os.getenv("TPR_BENCH_GRAD_REPLICA_POLICY", "strict")
+        if replica_policy not in ("strict", "diagnostic"):
+            raise ValueError(
+                "TPR_BENCH_GRAD_REPLICA_POLICY must be 'strict' or 'diagnostic'"
+            )
         if os.getenv("TPR_BENCH_GRAD_WITNESS", "0") == "1":
             from .gradient_witness import collect_tp2_gradient_witness
             gradient_witness = collect_tp2_gradient_witness(
                 model, runtime, mode="tpr_tp2cp2dp2",
-                require_exact_replicas=True,
+                require_exact_replicas=(replica_policy == "strict"),
             )
         if dist.get_rank() == 0:
             output.mkdir(parents=True, exist_ok=True)
@@ -488,6 +493,11 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "recompute": False, "updated_weights": False,
                 "median_fwd_bwd_s": statistics.median(times),
                 "gradient_witness": gradient_witness,
+                "gradient_replica_policy": replica_policy,
+                "gradient_replica_validation_passed": (
+                    gradient_witness["replica_validation_passed"]
+                    if gradient_witness is not None else None
+                ),
                 "runs": runs,
             }
             target.write_text(json.dumps(data, indent=2))
