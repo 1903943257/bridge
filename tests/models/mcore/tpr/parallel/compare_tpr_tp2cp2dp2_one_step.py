@@ -12,6 +12,46 @@ import statistics
 from pathlib import Path
 
 
+def compare_sampled_gradients(full: dict, tpr: dict):
+    left, right = full.get("gradient_witness"), tpr.get("gradient_witness")
+    if left is None and right is None:
+        return None
+    if left is None or right is None:
+        raise AssertionError("Full/TPR sampled gradient witness must be present on both")
+    for key in ("names", "shapes", "samples_per_name", "samples_per_parameter"):
+        if left[key] != right[key]:
+            raise AssertionError(f"Full/TPR sampled gradient layout differs: {key}")
+    for source in (left, right):
+        if source.get("replica_sample_max_abs") != 0:
+            raise AssertionError("A CP/DP replica has non-identical finalized gradients")
+    fvalues = [float(v) for shard in left["tp_shards"] for v in shard]
+    tvalues = [float(v) for shard in right["tp_shards"] for v in shard]
+    if not fvalues or len(fvalues) != len(tvalues):
+        raise AssertionError("Empty or mismatched TP2 gradient witness")
+    if not all(math.isfinite(v) for v in fvalues + tvalues):
+        raise AssertionError("Non-finite Full/TPR gradient witness")
+    dot = sum(a*b for a, b in zip(fvalues, tvalues))
+    fnorm2 = sum(a*a for a in fvalues)
+    tnorm2 = sum(b*b for b in tvalues)
+    error2 = sum((a-b)**2 for a, b in zip(fvalues, tvalues))
+    return {
+        "sampled_parameter_count": len(left["names"]),
+        "sampled_gradient_element_count": len(fvalues),
+        "sampled_gradient_rel_l2": math.sqrt(error2 / fnorm2) if fnorm2 else (
+            0.0 if error2 == 0.0 else math.inf
+        ),
+        "sampled_gradient_cosine": (
+            dot / math.sqrt(fnorm2*tnorm2)
+            if fnorm2 > 0 and tnorm2 > 0 else
+            (1.0 if fnorm2 == tnorm2 == 0 else 0.0)
+        ),
+        "sampled_gradient_max_abs": max(abs(a-b) for a, b in zip(fvalues, tvalues)),
+        "full_sample_l2": math.sqrt(fnorm2),
+        "tpr_sample_l2": math.sqrt(tnorm2),
+        "note": "Deterministic sparse gradient samples; not full-parameter rel-L2",
+    }
+
+
 def compare(full_path: Path, tpr_path: Path) -> dict:
     full = json.loads(full_path.read_text())
     tpr = json.loads(tpr_path.read_text())
@@ -34,6 +74,9 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         raise AssertionError("Both experiments must be fixed-weight F/B without AdamW")
     if full["runs"][0]["ppo_tokens"] != tpr["global_ppo_tokens"]:
         raise AssertionError("Global PPO-token count changed between Full and TPR")
+    sampled_gradients = compare_sampled_gradients(full, tpr)
+    if tpr_cap < 40960 and sampled_gradients is None:
+        raise AssertionError("30K DP correctness experiment requires sampled gradient witness")
     if (len(full["runs"]) != full["warmups"] + full["repeats"]
             or len(tpr["runs"]) != tpr["warmups"] + tpr["repeats"]):
         raise AssertionError("Missing warmup or measured F/B iteration")
@@ -79,18 +122,26 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         "full_loss": fl, "tpr_global_loss": tl,
         "ppo_loss_absolute_gap": abs(fl-tl),
         "global_ppo_tokens": tpr["global_ppo_tokens"],
+        "sampled_gradient_parity": sampled_gradients,
         "dp_rows": tpr["dp_partitions"],
         "dp_tree_token_costs": tpr["dp_tree_token_costs"],
         "duplicated_tree_tokens": tpr["duplicated_tree_tokens"],
         "timed_scope": "forward_backward_plus_gradient_finalize_only",
         "updated_weights": False,
     }
+    grad_text = (
+        f"sampled_grad_rel_l2={sampled_gradients['sampled_gradient_rel_l2']:.6g} "
+        f"sampled_grad_cosine={sampled_gradients['sampled_gradient_cosine']:.6g} "
+        if sampled_gradients is not None else
+        "sampled_grad_rel_l2=not_available "
+    )
     print(
         f"TPR_DP2_VS_FULL step={result['source_step']} "
         f"full_median_s={f:.6f} tpr_median_s={t:.6f} "
         f"speedup={f/t:.6f} "
         f"full_peak_gib={fpeak:.3f} tpr_peak_gib={tpeak:.3f} "
         f"ppo_loss_gap={result['ppo_loss_absolute_gap']:.9g} "
+        f"{grad_text}"
         f"dp_rows={result['dp_rows']} "
         f"duplicated_tree_tokens={result['duplicated_tree_tokens']}",
         flush=True,
