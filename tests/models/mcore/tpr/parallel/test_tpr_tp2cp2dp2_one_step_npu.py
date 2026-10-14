@@ -363,7 +363,10 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
         gradient_witness = None
         if os.getenv("TPR_BENCH_GRAD_WITNESS", "0") == "1":
             from .gradient_witness import collect_tp2_gradient_witness
-            gradient_witness = collect_tp2_gradient_witness(model, runtime)
+            gradient_witness = collect_tp2_gradient_witness(
+                model, runtime, mode="tpr_tp2cp2dp2",
+                require_exact_replicas=True,
+            )
         if dist.get_rank() == 0:
             output.mkdir(parents=True, exist_ok=True)
             target = output / f"step{step}_tpr_tp2cp2dp2.json"
