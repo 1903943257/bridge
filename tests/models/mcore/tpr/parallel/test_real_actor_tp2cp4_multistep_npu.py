@@ -375,7 +375,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
                         else "tpr_segment_executor"
                     ),
                     "native_recompute_layers": (
-                        int(os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "1"))
+                        int(os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0"))
                         if mode == "full" else None
                     ),
                     "native_loss_scaling": (
