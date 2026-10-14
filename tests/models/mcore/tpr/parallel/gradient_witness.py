@@ -51,9 +51,12 @@ def collect_tp2_gradient_witness(
     )
     offset = 0
     worst_param = "<unknown>"
-    for name, count in zip(names, sample_sizes, strict=True):
-        if offset <= int(worst_idx.item()) < offset + count:
+    worst_param_index = -1
+    worst_sample = int(worst_idx.item())
+    for param_index, (name, count) in enumerate(zip(names, sample_sizes, strict=True)):
+        if offset <= worst_sample < offset + count:
             worst_param = name
+            worst_param_index = param_index
             break
         offset += count
     group_members = tuple(
@@ -64,7 +67,7 @@ def collect_tp2_gradient_witness(
     state = torch.tensor(
         [dist.get_rank(), runtime.tp_rank, runtime.cp_rank,
          getattr(runtime, "dp_rank", 0), float(local_max.item()),
-         local_relative, float(int(worst_idx.item()))],
+         local_relative, float(worst_sample), float(worst_param_index)],
         device=samples.device, dtype=torch.float64,
     )
     all_states = [torch.empty_like(state) for _ in range(dist.get_world_size())]
@@ -74,13 +77,16 @@ def collect_tp2_gradient_witness(
     if error != 0.0 and dist.get_rank() == 0:
         affected = [
             f"rank={int(x[0])}/tp={int(x[1])}/cp={int(x[2])}/dp={int(x[3])}:"
-            f"max_abs={x[4]:.9g},rel_l2={x[5]:.9g},sample_idx={int(x[6])}"
+            f"max_abs={x[4]:.9g},rel_l2={x[5]:.9g},"
+            f"param={names[int(x[7])] if 0 <= int(x[7]) < len(names) else '<unknown>'},"
+            f"sample_idx={int(x[6])}"
             for x in rank_states if x[4] > 0
         ]
         print(
             f"TPR_GRAD_REPLICA_DIAG mode={mode} "
             f"require_exact={int(require_exact_replicas)} "
             f"world_max_abs={error:.9g} "
+            f"rank0_cpdp_group={group_members} "
             f"affected={'; '.join(affected)}",
             flush=True,
         )
