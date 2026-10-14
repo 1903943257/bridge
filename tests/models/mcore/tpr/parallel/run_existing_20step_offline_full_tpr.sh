@@ -39,7 +39,7 @@ SELECTOR=tests/models/mcore/tpr/parallel/prepare_real_actor_20step_manifest.py
 if [[ "$RUN_MODE" != "compare" ]]; then
   if [[ ! -f "$TPR_OFFLINE_CAPTURE_MANIFEST" ]]; then
     python "$SELECTOR" "$CAPTURE_DIR" "$TPR_OFFLINE_CAPTURE_MANIFEST" \
-      --steps 20 --max-seq-len 49152 --max-rows 3 --max-total-tokens 130000 \
+      --steps 20 --max-seq-len 49152 --expected-sessions 8 \
       2>&1 | tee "$RUN_ROOT/logs/manifest.log"
   fi
 fi
@@ -50,10 +50,12 @@ readarray -t manifest_info < <(python - "$TPR_OFFLINE_CAPTURE_MANIFEST" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
     d=json.load(f)
-if (d.get("protocol")!="real_actor_session_first_multicapture_v2"
-        or d.get("online_steps")!=20
-        or d.get("steps",0)!=len(d.get("items",[]))):
-    raise SystemExit("Require the session-first 20-online-step Capture manifest")
+if (d.get("protocol")!="real_actor_session_first_8merged_v3"
+        or d.get("online_steps")!=20 or d.get("steps")!=20
+        or d.get("expected_sessions")!=8
+        or len(d.get("items",[]))!=20
+        or any(len(item["rows"])!=8 for item in d["items"])):
+    raise SystemExit("Require full 8-Session per-step merged PPO manifest (v3)")
 print(d["steps"])
 print(d["items"][0]["capture"])
 print(",".join(str(x) for x in d["items"][0]["rows"]))
@@ -65,7 +67,7 @@ fi
 export TPR_OFFLINE_STEPS="${manifest_info[0]}"
 export TPR_REAL_ACTOR_MINIBATCH="${manifest_info[1]}"
 export TPR_OFFLINE_ROWS="${manifest_info[2]}"
-echo "TPR_SESSION_FIRST_CAPTURE_SELECTION online_steps=20 replay_updates=$TPR_OFFLINE_STEPS"
+echo "TPR_SESSION_FIRST_CAPTURE_SELECTION online_steps=20 replay_updates=$TPR_OFFLINE_STEPS sessions_per_step=8, NO total-token cap"
 echo "TPR_20STEP_OFFLINE_START capture_dir=$CAPTURE_DIR root=$RUN_ROOT mode=$RUN_MODE"
 echo "E2: Native MindSpeed Ring core attention on FULL complete sequences"
 echo "E3: Custom TPR Ring with Turn-based prefix reuse"
