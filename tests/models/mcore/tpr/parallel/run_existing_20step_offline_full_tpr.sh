@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# E2 + E3 ONLY. Reuse an existing 20-step REAL Actor Capture. No Ray/rollouts.
+# Usage: bash this_script.sh CAPTURE_DIR [RUN_ROOT] [both|full|tpr|compare]
+set -euo pipefail
+cd "$(dirname "$0")/../../../../.."
+if [[ "$#" -lt 1 || "$#" -gt 3 ]]; then
+  echo "Usage: bash $0 /workspace/YOUR_20_STEP_ACTOR_CAPTURE_DIR [RUN_ROOT] [both|full|tpr|compare]" >&2
+  exit 2
+fi
+CAPTURE_DIR="$(realpath "$1")"
+[[ -d "$CAPTURE_DIR" ]] || { echo "Missing Capture Dir: $CAPTURE_DIR" >&2; exit 2; }
+RUN_ROOT="${2:-/workspace/tpr_20step_offline_only_$(date +%Y%m%d_%H%M%S)}"
+RUN_MODE="${3:-both}"
+case "$RUN_MODE" in both|full|tpr|compare) ;; *) echo "Bad mode: $RUN_MODE" >&2; exit 2;; esac
+if [[ "$RUN_MODE" == "compare" && ! -d "$RUN_ROOT/offline" ]]; then
+  echo "Compare mode requires prior Full/TPR snapshot directory" >&2; exit 2
+fi
+mkdir -p "$RUN_ROOT/logs" "$RUN_ROOT/offline"
+export PYTHONUNBUFFERED=1
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+export TPR_QWEN_4B_PATH=/workspace/hf_models/Qwen3-4B-128K
+export TPR_OFFLINE_CAPTURE_MANIFEST="$RUN_ROOT/capture_manifest.json"
+export TPR_OFFLINE_OUTPUT_DIR="$RUN_ROOT/offline"
+export TPR_OFFLINE_STEPS=20
+export TPR_OFFLINE_ADAMW_LR=2e-5
+export TPR_OFFLINE_ADAMW_CLIP_NORM=1.0
+export TPR_OFFLINE_SAVE_FULL_GRADS=0
+unset TPR_OFFLINE_FULL_GRAD_STEPS || true
+export TPR_EXEC_PROFILE=1
+export TPR_TREE_POLICY=qwen_turn
+export TPR_TURN_MIN_SEGMENT_TOKENS=128
+export TPR_OFFLINE_FULL_RING_BACKEND=native
+unset TPR_MEM_TRACE || true
+RUNNER=tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_multistep.sh
+SELECTOR=tests/models/mcore/tpr/parallel/prepare_real_actor_20step_manifest.py
+[[ -f "$RUNNER" && -f "$SELECTOR" ]] || {
+  echo "Offline scripts missing: sync Bridge main tests into the Docker VERL checkout" >&2; exit 2;
+}
+if [[ "$RUN_MODE" != "compare" ]]; then
+  if [[ ! -f "$TPR_OFFLINE_CAPTURE_MANIFEST" ]]; then
+    python "$SELECTOR" "$CAPTURE_DIR" "$TPR_OFFLINE_CAPTURE_MANIFEST" \
+      --steps 20 --max-seq-len 49152 --max-rows 3 --max-total-tokens 130000 \
+      2>&1 | tee "$RUN_ROOT/logs/manifest.log"
+  fi
+fi
+export TPR_REAL_ACTOR_MINIBATCH="$(python - "$TPR_OFFLINE_CAPTURE_MANIFEST" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    d=json.load(f)
+if d.get("protocol")!="real_actor_20_distinct_captures_v1" or d.get("steps")!=20:
+    raise SystemExit("Not a 20-real-capture manifest")
+print(d["items"][0]["capture"])
+PY
+)"
+export TPR_OFFLINE_ROWS=0,1 # overwritten by manifest row selection inside test
+echo "TPR_20STEP_OFFLINE_START capture_dir=$CAPTURE_DIR root=$RUN_ROOT mode=$RUN_MODE"
+echo "E2: Native MindSpeed Ring core attention on FULL complete sequences"
+echo "E3: Custom TPR Ring with Turn-based prefix reuse"
+full_exit=0
+tpr_exit=0
+if [[ "$RUN_MODE" == "both" || "$RUN_MODE" == "full" ]]; then
+  export TPR_OFFLINE_RUN_MODES=full
+  bash "$RUNNER" 2>&1 | tee "$RUN_ROOT/logs/e2_full_native_ring.log" || full_exit=$?
+  echo "E2_FINISHED status=$full_exit"
+fi
+if [[ "$RUN_MODE" == "both" || "$RUN_MODE" == "tpr" ]]; then
+  export TPR_OFFLINE_RUN_MODES=tpr
+  bash "$RUNNER" 2>&1 | tee "$RUN_ROOT/logs/e3_tpr_turn.log" || tpr_exit=$?
+  echo "E3_FINISHED status=$tpr_exit"
+fi
+if [[ "$full_exit" == "0" && "$tpr_exit" == "0" ]] && \
+  { [[ "$RUN_MODE" == "both" ]] || [[ "$RUN_MODE" == "compare" ]]; }; then
+  export TPR_OFFLINE_RUN_MODES=compare
+  bash "$RUNNER" 2>&1 | tee "$RUN_ROOT/logs/final_comparison.log"
+fi
+echo "OFFLINE_20STEP_ROOT=$RUN_ROOT full_exit=$full_exit tpr_exit=$tpr_exit"
+if [[ "$full_exit" != "0" || "$tpr_exit" != "0" ]]; then exit 1; fi
