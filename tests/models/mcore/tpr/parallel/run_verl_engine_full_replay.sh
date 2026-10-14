@@ -25,6 +25,15 @@ export TPR_OFFLINE_CAPTURE_MANIFEST="$RUN_ROOT/capture_manifest.json"
 export TPR_OFFLINE_OUTPUT_DIR="$RUN_ROOT/offline"
 export TPR_QWEN_4B_PATH=/workspace/hf_models/Qwen3-4B-128K
 export TPR_VERL_FULL_REPLAY_STEPS="$STEPS"
+# Smoke and full-20 jobs must start independently from the original checkpoint.
+# Never resume a 20-step optimizer run from only a one-step diagnostic snapshot.
+if [[ "$STEPS" == 20 ]]; then
+  export TPR_VERL_FULL_REPLAY_PREFIX=verl_full
+elif [[ "$STEPS" == 1 ]]; then
+  export TPR_VERL_FULL_REPLAY_PREFIX=verl_full_smoke
+else
+  export TPR_VERL_FULL_REPLAY_PREFIX="verl_full_test${STEPS}"
+fi
 export TPR_OFFLINE_ADAMW_LR="${TPR_OFFLINE_ADAMW_LR:-2e-5}"
 export TPR_OFFLINE_ADAMW_CLIP_NORM="${TPR_OFFLINE_ADAMW_CLIP_NORM:-1.0}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}"
@@ -34,7 +43,7 @@ if [[ "$ASCEND_RT_VISIBLE_DEVICES" != "8,9,10,11,12,13,14,15" ]]; then
 fi
 mkdir -p "$RUN_ROOT/logs" "$RUN_ROOT/offline"
 echo "VERL_ENGINE_FULL_LAUNCH engine=MindspeedEngineWithLMHead steps=$STEPS recompute=OFF" 
-echo "VERL_ENGINE_FULL_LAUNCH output_prefix=$RUN_ROOT/offline/verl_full_step"
+echo "VERL_ENGINE_FULL_LAUNCH output_prefix=$RUN_ROOT/offline/${TPR_VERL_FULL_REPLAY_PREFIX}_step"
 torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29787 \
   -m pytest -vv -s -x \
   tests/models/mcore/tpr/parallel/test_verl_engine_full_replay_npu.py \
