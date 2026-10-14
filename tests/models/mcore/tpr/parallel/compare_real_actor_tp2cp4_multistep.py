@@ -126,7 +126,11 @@ def compare(outdir: Path, steps: int):
     first_snap = torch.load(first, map_location="cpu", weights_only=False)
     if first_snap.get("capture_manifest"):
         milestones = tuple(range(1,steps+1))
-        run_protocol = "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
+        run_protocol = (
+            "SESSION_FIRST_SEQUENTIAL_CAPTURE_UPDATES"
+            if first_snap.get("source_capture_index") is not None
+            else "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
+        )
     else:
         milestones = tuple(n for n in (1,2,5,10,20,30,40,50) if n <= steps)
         run_protocol = "REPEATED_FIXED_PPO_DATA_NOT_ON_POLICY"
@@ -148,7 +152,8 @@ def compare(outdir: Path, steps: int):
             for field in (
                 "step", "steps", "source_capture", "source_rows", "source_keys",
                 "data_sha256", "checkpoint", "optimizer", "lr", "clip_norm",
-                "tokens", "run_kind", "rank", "tp_rank", "cp_rank"
+                "tokens", "run_kind", "rank", "tp_rank", "cp_rank",
+                "source_online_global_step", "source_capture_index"
             ):
                 if a[field] != b[field]:
                     raise AssertionError(f"Full vs TPR step={step} mismatch in {field}")
@@ -173,6 +178,8 @@ def compare(outdir: Path, steps: int):
         tpr_norm = t[0]["global_grad_norm_preclip"]
         record = {
             "step":step,
+            "source_online_global_step":f[0].get("source_online_global_step"),
+            "source_capture_index":f[0].get("source_capture_index"),
             "full_attention_impl":f[0].get("ring_attention_impl","legacy_custom"),
             "tpr_attention_impl":t[0].get("ring_attention_impl","legacy_custom"),
             "full_loss":f[0]["loss"], "tpr_loss":t[0]["loss"],
@@ -235,8 +242,12 @@ def compare(outdir: Path, steps: int):
         "milestones":observed,
         "interpretation":(
             "Original actor-captured PPO tokens, advantages and old logprobs; "
-            "if run_protocol is SEQUENTIAL_20_DISTINCT_REAL_CAPTURES, a distinct "
-            "captured batch is consumed in online capture step order. "
+            "if run_protocol is SESSION_FIRST_SEQUENTIAL_CAPTURE_UPDATES, "
+            "multiple actor captures from the same online global step can be "
+            "replayed as separate optimizer updates; session-first filtering "
+            "uses the explicit original trajectory ordinal only when present, "
+            "otherwise earliest capture-order row (not guaranteed original first). "
+            "No historical reward/advantage value is modified. "
             "The replay policies are separately trained from the same initial "
             "weights and are NOT resampled online at each replay step. "
             "CPU FP32-master AdamW is diagnostic and not production optimizer. "
