@@ -44,6 +44,11 @@ def _source_capture(path, *, overlong_prompt=False):
     }
     nested["temperature"] = torch.ones(8, dtype=torch.float32)
     batch = TensorDict(nested, batch_size=[8])
+    # Real captured TensorDicts contain batch-level scalar metadata, not
+    # only row-aligned tensors. These values must survive shallow cloning
+    # without being revalidated as shape-[8] arrays.
+    tu.assign_non_tensor(batch, scalar_metadata=17,
+                         scalar_tensor_metadata=torch.tensor(1.25))
     keys = [f"uid1_tpr_{i}" for i in range(8)]
     torch.save({
         "capture_stage": "actor_update_mini_batch",
@@ -61,6 +66,10 @@ def test_derived_capture_truncates_all_response_labels_without_mutating_source(t
     assert raw["offline_sequence_cap"] == 8
     assert stats["max_sequence_length"] == 8
     cropped, original = raw["tensordict"], before["tensordict"]
+    assert set(cropped.keys()) == set(original.keys())
+    assert tu.get_non_tensor_data(cropped, key="scalar_metadata") == 17
+    scalar_value = tu.get_non_tensor_data(cropped, key="scalar_tensor_metadata")
+    assert torch.equal(torch.as_tensor(scalar_value), torch.tensor(1.25))
     for row in range(8):
         assert torch.equal(cropped["prompts"][row], original["prompts"][row])
         assert torch.equal(cropped["input_ids"][row], original["input_ids"][row][:8])
