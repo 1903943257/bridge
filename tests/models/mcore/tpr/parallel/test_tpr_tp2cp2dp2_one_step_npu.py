@@ -76,6 +76,47 @@ def _runtime():
             dist.get_world_size(dp), dist.get_world_size(dp_cp)) == (2, 2, 2, 4)
     device = torch.device("npu", local_rank)
 
+    # Validate actual collective membership, not merely group size. An
+    # all-reduce over the wrong two-rank group still sums two ones in the
+    # prewarm and can silently combine CP peers instead of DP replicas.
+    coords = torch.tensor(
+        [dist.get_rank(), parallel_state.get_tensor_model_parallel_rank(),
+         parallel_state.get_context_parallel_rank(),
+         parallel_state.get_data_parallel_rank()],
+        dtype=torch.int64, device=device,
+    )
+    all_coords = [torch.empty_like(coords) for _ in range(dist.get_world_size())]
+    dist.all_gather(all_coords, coords)
+    layout = [tuple(map(int, row.cpu().tolist())) for row in all_coords]
+    if sorted(rank for rank, *_ in layout) != list(range(8)):
+        raise AssertionError(f"Invalid global TP/CP/DP rank layout: {layout}")
+    my_rank, my_tp, my_cp, my_dp = map(int, coords.cpu().tolist())
+    expected = {
+        "tp": {rank for rank, t, c, d in layout if (c, d) == (my_cp, my_dp)},
+        "cp": {rank for rank, t, c, d in layout if (t, d) == (my_tp, my_dp)},
+        "dp": {rank for rank, t, c, d in layout if (t, c) == (my_tp, my_cp)},
+        "dp_cp": {rank for rank, t, c, d in layout if t == my_tp},
+    }
+    groups = {"tp": tp, "cp": cp, "dp": dp, "dp_cp": dp_cp}
+    for label, group in groups.items():
+        actual = set(dist.get_process_group_ranks(group))
+        if actual != expected[label]:
+            raise AssertionError(
+                f"TPR_DP2_PROCESS_GROUP_MISMATCH rank={my_rank} label={label} "
+                f"actual={sorted(actual)} expected={sorted(expected[label])} "
+                f"layout={layout}"
+            )
+    if dist.get_rank() == 0:
+        print(
+            f"TPR_DP2_PROCESS_GROUP_AUDIT layout={layout} "
+            f"rank0_groups={{"
+            + ", ".join(
+                f"{key}:{sorted(dist.get_process_group_ranks(value))}"
+                for key, value in groups.items()
+            ) + "}",
+            flush=True,
+        )
+
     # Initialize the HCCL communicators BEFORE loading the Qwen3-4B model
     # and entering 40K-token forward/backward. Otherwise the first DP
     # all_reduce during finalize may lazily request ~1 GiB HCCL memory
