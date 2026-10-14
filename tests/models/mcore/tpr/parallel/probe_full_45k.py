@@ -347,7 +347,7 @@ def prepare_all(manifest, cap, output):
         entry["benchmark_original_lengths"] = old
         entry["benchmark_lengths"] = new
         entry["benchmark_original_ppo_tokens"] = item["ppo_tokens"]
-        if entry["rows"] != list(range(8)) or raw["keys"] != tuple(raw["keys"]):
+        if entry["rows"] != list(range(8)) or len(raw["keys"]) != 8:
             raise AssertionError("Selected eight Session rows unexpectedly changed")
         print(
             f"TPR_40K_PREPARED step={step} sessions=8 truncated_rows={truncated} "
