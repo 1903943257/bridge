@@ -117,13 +117,21 @@ def test_fixed_shape_40k_one_mode():
                 loss = float(out["loss"][0])
             torch.npu.synchronize()
             own_seconds = time.perf_counter() - start
-            critical = torch.tensor([own_seconds], dtype=torch.float64, device=runtime.device)
-            dist.all_reduce(critical, op=dist.ReduceOp.MAX)
+            # FP64 HCCL AllReduce is unsupported on Ascend 910B.
+            # Use FP32 for world MAX time and memory statistics.
+            critical = torch.tensor(
+                [own_seconds], dtype=torch.float32, device=runtime.device,
+            )
+            dist.all_reduce(
+                critical, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
+            )
             peak = torch.tensor(
-                [float(torch.npu.max_memory_allocated())], dtype=torch.float64,
+                [float(torch.npu.max_memory_allocated())], dtype=torch.float32,
                 device=runtime.device,
             )
-            dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+            dist.all_reduce(
+                peak, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
+            )
 
             # AFTER timing: profiler materialization and optional per-rank
             # snapshots, never included in the F/B critical path.
