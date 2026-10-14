@@ -216,6 +216,37 @@ def _save_complete_grads(model, runtime, destination: Path, mode: str, step: int
     return str(target)
 
 
+
+def _install_offline_full_ring_backend(mode: str) -> str:
+    """Native MindSpeed whole Ring core attention, never a Prefix path.
+
+    SegmentExecutor still handles full-sequence sharding/RoPE/PPO/gradients.
+    This is not full production Native Engine or optimizer.
+    """
+    chosen = os.getenv("TPR_OFFLINE_FULL_RING_BACKEND", "custom")
+    if chosen not in ("custom", "native"):
+        raise ValueError("TPR_OFFLINE_FULL_RING_BACKEND must be custom or native")
+    if mode != "full" or chosen == "custom":
+        return "tpr_custom_ring"
+    from verl.models.mcore.tpr.parallel import ring_attention as ring
+
+    def native_full_attention(query, current_key, current_value, *,
+                              prefix_blocks=(), **kwargs):
+        if prefix_blocks:
+            raise AssertionError("Native Full Ring cannot receive shared Prefix KV")
+        result = ring.ordinary_ring_cp_attention(
+            query, current_key, current_value,
+            allow_trailing_padding=True, **kwargs
+        )
+        # Return the same [S,B,H,D] interface as TPR custom Ring.
+        if result.numel() != query.numel():
+            raise AssertionError("native Ring output size mismatch")
+        return result.reshape(query.shape)
+
+    ring.ring_cp_attention = native_full_attention
+    return "mindspeed_native_whole_ring_virtual_right_padding"
+
+
 def test_recorded_full_vs_tpr_one_step():
     mode = os.environ.get("TPR_OFFLINE_MODE")
     if mode not in ("full", "tpr"):
@@ -256,6 +287,7 @@ def test_recorded_full_vs_tpr_one_step():
                 raise AssertionError("Exact TPR mode did not create expected shared tree")
         # Turn mode is allowed to produce multiple trees if there is no valid
         # complete-turn common prefix. Never invent shared KV for such rows.
+        ring_impl = _install_offline_full_ring_backend(mode)
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=4,
             sequence_parallel=False, profile="4b",
@@ -341,8 +373,13 @@ def test_recorded_full_vs_tpr_one_step():
             "source_capture": str(source), "source_rows": rows,
             "source_keys": real_keys, "data_sha256": data_sha,
             "objective": "original_captured_vanilla_PPO_token_mean",
-            "reference": "full_unshared_same_Ring_backend" if mode == "full"
-                else "TPR_shared_Ring",
+            "reference": (
+                "full_unshared_MindSpeed_native_Ring"
+                if mode == "full" and ring_impl.startswith("mindspeed_")
+                else "full_unshared_same_Ring_backend" if mode == "full"
+                else "TPR_shared_Ring"
+            ),
+            "ring_attention_impl":ring_impl,
             "optimizer": f"diagnostic_bf16_sgd_lr_{lr}",
             "logical_ppo_tokens": count, "forest_trees": len(forest.trees),
             "forest_segments": forest.segment_count,
