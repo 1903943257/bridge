@@ -217,3 +217,46 @@ The benchmark records `loss_report.dp0_local_loss`,
 The comparison exports the complete `tpr_loss_consistency`.
 This is NOT proof of full parameter-gradient parity or native multi-step
 DP2 training correctness.
+
+
+## Root cause of grouped "global" loss on Ascend 910B (2026-10-14)
+
+The later 30K run reported two so-called *world-reduced* values:
+
+- ranks 0..3: 0.0017172833904623985
+- ranks 4..7: 0.036174286156892776
+
+A genuine eight-rank SUM followed by /8 cannot return different values
+on these two sets of ranks. The old benchmark used
+`dtype=torch.float64` for **all three** HCCL reductions:
+global-loss SUM, critical F/B-time MAX and peak-NPU-memory MAX.
+
+Ascend torch_npu's ProcessGroupHCCL.cpp supports FP64 HCCL reduction
+only on Ascend950/Atlas A5; on Ascend910B it is unsupported.
+See https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/distributed/ProcessGroupHCCL.cpp
+(`checkSupportedDataType`; AllGather's type handling differs).
+On this installed stack the scalar FP64 reductions evidently failed to
+produce a true cross-rank aggregate. The exact backend error behavior
+may vary by CANN/torch_npu version. No assertion tolerance relaxation
+can make invalid FP64 reductions valid.
+
+Fix: FP32 for ALL HCCL AllReduce report scalars (SUM and MAX) in
+both DP2 TPR and the Full fixed-shape benchmark; FP64 remains permitted
+for HCCL AllGather of fixed-width diagnostic records (no reduction).
+Before loading model weights, run a rank-coded FP32 WORLD AllReduce:
+SUM(rank+1) over ranks 0..7 must equal 36, and fail otherwise.
+The DP2 per-rank AllGather records independent FP64-valued local loss
+scalars; the loss-report gate compares the FP32 world-SUM/8 against
+the FP64-precision reference reconstructed from ALL eight gathered
+local values. It still verifies CP replica agreement, while allowing
+different DP-local contributions.
+
+**Previously produced Full/TPR time and peak-memory JSONs must be
+considered untrusted if they used FP64 HCCL reductions.**
+Both new JSON schemas contain
+`"hccl_stats_reduce_dtype": "float32"`; the comparison script refuses
+legacy outputs without this marker. To establish a fair 30K speedup,
+rerun BOTH Full TP2CP4 and TPR TP2CP2DP2 on the *same* derived 30K
+capture, with a clean output directory. A quick TPR-only smoke
+test may reuse the derived manifest, but it cannot be used as a
+reliable speedup against a stale Full result.
