@@ -108,6 +108,14 @@ def test_fixed_shape_40k_one_mode():
         engine = _make_engine(model, runtime, finalize_time) if mode == "tpr" else None
         if os.getenv("TPR_EXEC_PROFILE", "0") not in ("0", "1"):
             raise ValueError("TPR_EXEC_PROFILE must be 0 or 1")
+        from .grad_sync_precision import offline_grad_sync_dtype
+        grad_sync_dtype = offline_grad_sync_dtype()
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_FULL_GRAD_REDUCE_MODE dtype={grad_sync_dtype} "
+                "cp_group_size=4",
+                flush=True,
+            )
         runs = []
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
@@ -216,6 +224,7 @@ def test_fixed_shape_40k_one_mode():
                 "input_sha256": data_sha, "source_capture": str(capture),
                 "checkpoint": str(checkpoint), "warmups": warmups,
                 "repeats": repeats, "updated_weights": False,
+                "gradient_sync_reduce_dtype": grad_sync_dtype,
                 "hccl_stats_reduce_dtype": "float32",
                 "capture_logprobs": capture_logprobs,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
