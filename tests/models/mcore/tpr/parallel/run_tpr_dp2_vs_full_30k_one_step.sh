@@ -26,6 +26,8 @@ export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 export TPR_BENCH_CAPTURE_LOGPROBS="${TPR_BENCH_CAPTURE_LOGPROBS:-1}"
+# Sampled parameter gradients checked AFTER timing in both topologies.
+export TPR_BENCH_GRAD_WITNESS=1
 export TPR_EXEC_PROFILE=0
 export TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS=0
 export TPR_TREE_POLICY=qwen_turn
