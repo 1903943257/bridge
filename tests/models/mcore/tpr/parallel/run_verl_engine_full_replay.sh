@@ -19,50 +19,53 @@ fi
   echo "Missing original model checkpoint" >&2
   exit 2
 }
-# The legacy online capture stack used the separate "mbridge" package.
-# This genuine VERL Engine imports "megatron.bridge" from Megatron-Bridge.
-# Do NOT install/upgrade arbitrary Megatron or MindSpeed packages here:
-# first reuse the exact local Megatron-Bridge source when it exists.
+# Match the already-successful UniAgent E2E environment, NOT the NVIDIA
+# Megatron-Bridge PEFT stack (which unconditionally imports TransformerEngine).
+# Online: use_mbridge=True + vanilla_mbridge=True -> legacy "mbridge".
+# Do not inject /workspace/Megatron-Bridge/src or pip-install TE on Ascend.
 if [[ -n "${TPR_MEGATRON_BRIDGE_SRC:-}" ]]; then
-  [[ -f "${TPR_MEGATRON_BRIDGE_SRC}/megatron/bridge/__init__.py" ]] || {
-    echo "Invalid TPR_MEGATRON_BRIDGE_SRC: ${TPR_MEGATRON_BRIDGE_SRC}" >&2
-    exit 2
-  }
-  export PYTHONPATH="${TPR_MEGATRON_BRIDGE_SRC}:${PYTHONPATH:-}"
-elif [[ -f /workspace/Megatron-Bridge/src/megatron/bridge/__init__.py ]]; then
-  # Prefer a locally installed package, but allow the known local source tree
-  # when the megatron.bridge submodule is missing.
-  if ! python - <<'PY' >/dev/null 2>&1
-import importlib.util
-assert importlib.util.find_spec("megatron.bridge") is not None
-PY
-  then
-    export PYTHONPATH="/workspace/Megatron-Bridge/src:${PYTHONPATH:-}"
-  fi
+  echo "ERROR: unset TPR_MEGATRON_BRIDGE_SRC; VERL Full uses vanilla_mbridge=True" >&2
+  exit 2
 fi
+# An inherited source path from the previous failed experiment can shadow the
+# working legacy MBridge environment; strip only this known incompatible path.
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="$(python - <<'PY'
+import os
+print(":".join(p for p in os.environ.get("PYTHONPATH", "").split(":")
+               if p and p != "/workspace/Megatron-Bridge/src"))
+PY
+)"
+fi
+export PYTHONPATH="/workspace/vllm-ascend:/workspace/uni-agent-cc/verl:/workspace/uni-agent-cc:${PYTHONPATH:-}"
 
-# Fail before launching eight NPU workers if the true Engine dependency is
-# missing or incompatible.  mbridge != megatron.bridge.
+# Check the FULL Engine source branch (not just the package name) before NPU
+# launch. A different upstream VERL snapshot might lack vanilla_mbridge even
+# though the working E2E script passes that setting.
 python - <<'PY'
-import importlib.util
+import inspect
 import sys
-try:
-    import megatron.core as core
-    from megatron.bridge import AutoBridge
-except (ImportError, ModuleNotFoundError) as exc:
+import mbridge
+from verl.workers.config import McoreEngineConfig
+from verl.workers.engine.mindspeed.transformer_impl import MindspeedEngineWithLMHead
+from verl.models.mcore.mbridge import AutoBridge
+fields = inspect.signature(McoreEngineConfig).parameters
+if "vanilla_mbridge" not in fields:
     raise SystemExit(
-        "VERL_FULL_PREFLIGHT_FAIL: genuine VERL/MBridge Engine requires "
-        "'megatron.bridge.AutoBridge', which is NOT the separate 'mbridge' "
-        "package used by the older capture script. Set "
-        "TPR_MEGATRON_BRIDGE_SRC=/path/to/Megatron-Bridge/src if that "
-        "source tree is already available; otherwise install a "
-        "Megatron-Bridge version compatible with this NPU/Megatron-Core "
-        "environment. Do not upgrade Megatron-Core/MindSpeed blindly. "
-        f"Original error: {exc!r}"
-    ) from exc
+        "VERL_FULL_PREFLIGHT_FAIL: installed McoreEngineConfig lacks "
+        "vanilla_mbridge. Need the SAME VERL code revision as the successful "
+        "UniAgent E2E, not an unrelated upstream Megatron-Bridge-only version."
+    )
+source = inspect.getsource(MindspeedEngineWithLMHead._build_tf_config)
+if "vanilla_mbridge" not in source and "vanilla_bridge" not in source:
+    raise SystemExit(
+        "VERL_FULL_PREFLIGHT_FAIL: installed Engine lacks the proven legacy "
+        "mbridge branch. Inspect the actual successful E2E Engine revision."
+    )
 print("VERL_FULL_PREFLIGHT_PASS", "python=", sys.executable,
-      "megatron_core=", getattr(core, "__file__", None),
-      "AutoBridge=", AutoBridge, flush=True)
+      "legacy_mbridge=", getattr(mbridge, "__file__", None),
+      "AutoBridge=", AutoBridge,
+      "config_vanilla_mbridge=True", flush=True)
 PY
 
 export PYTHONUNBUFFERED=1
