@@ -84,6 +84,14 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
             "Stale Full/TPR benchmark: HCCL FP64 AllReduce cannot be "
             "trusted on Ascend 910B; rerun BOTH modes with FP32 stats"
         )
+    grad_dtype = tpr.get("gradient_sync_reduce_dtype")
+    if (grad_dtype not in ("bf16", "fp32")
+            or full.get("gradient_sync_reduce_dtype") != grad_dtype):
+        raise AssertionError(
+            "Full/TPR weight-gradient reduction precision differs or is "
+            "unrecorded: rerun BOTH with the same "
+            "TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16 or fp32"
+        )
     for field in ("source_step", "source_capture", "input_sha256",
                   "checkpoint", "warmups", "repeats",
                   "capture_logprobs", "profiler_enabled"):
@@ -139,6 +147,7 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         "input_sha256": tpr["input_sha256"],
         "full_topology": "TP2_CP4_DP1",
         "tpr_topology": "TP2_CP2_DP2",
+        "gradient_sync_reduce_dtype": grad_dtype,
         "full_median_fwd_bwd_s": f,
         "tpr_median_fwd_bwd_s": t,
         "speedup": f / t,
