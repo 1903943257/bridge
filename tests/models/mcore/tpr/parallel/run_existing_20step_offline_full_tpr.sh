@@ -29,7 +29,7 @@ unset TPR_OFFLINE_FULL_GRAD_STEPS || true
 export TPR_EXEC_PROFILE=1
 export TPR_TREE_POLICY=qwen_turn
 export TPR_TURN_MIN_SEGMENT_TOKENS=128
-export TPR_OFFLINE_FULL_RING_BACKEND="${TPR_OFFLINE_FULL_RING_BACKEND:-custom}"
+export TPR_OFFLINE_FULL_RING_BACKEND="${TPR_OFFLINE_FULL_RING_BACKEND:-native}"
 unset TPR_MEM_TRACE || true
 RUNNER=tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_multistep.sh
 SELECTOR=tests/models/mcore/tpr/parallel/prepare_real_actor_20step_manifest.py
@@ -68,6 +68,20 @@ export TPR_OFFLINE_STEPS="${manifest_info[0]}"
 export TPR_REAL_ACTOR_MINIBATCH="${manifest_info[1]}"
 export TPR_OFFLINE_ROWS="${manifest_info[2]}"
 echo "TPR_SESSION_FIRST_CAPTURE_SELECTION online_steps=20 replay_updates=$TPR_OFFLINE_STEPS sessions_per_step=8, NO total-token cap"
+if [[ "$TPR_OFFLINE_FULL_RING_BACKEND" == native && ( "$RUN_MODE" == both || "$RUN_MODE" == full ) ]]; then
+  python - <<'PY'
+import inspect
+from verl.models.mcore.tpr.parallel.ring_attention import ordinary_ring_cp_attention
+if "allow_trailing_padding" not in inspect.signature(ordinary_ring_cp_attention).parameters:
+    raise SystemExit(
+        "ERROR: Docker VERL ring_attention.py is outdated: native Full requires "
+        "ordinary_ring_cp_attention(..., allow_trailing_padding=...). "
+        "Sync bridge/main verl/models/mcore/tpr/parallel/ring_attention.py "
+        "into this checkout before running the 8-NPU job."
+    )
+print("TPR_NATIVE_RING_PREFLIGHT=PASS")
+PY
+fi
 echo "TPR_20STEP_OFFLINE_START capture_dir=$CAPTURE_DIR root=$RUN_ROOT mode=$RUN_MODE"
 echo "E2: Native MindSpeed Ring core attention on FULL complete sequences"
 echo "E3: Custom TPR Ring with Turn-based prefix reuse"
