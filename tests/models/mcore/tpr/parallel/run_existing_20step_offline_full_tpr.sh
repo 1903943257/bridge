@@ -95,7 +95,9 @@ if [[ "$RUN_MODE" == "both" || "$RUN_MODE" == "tpr" ]]; then
   echo "E3_FINISHED status=$tpr_exit"
 fi
 if [[ "$full_exit" == "0" && "$tpr_exit" == "0" ]] && \
-  { [[ "$RUN_MODE" == "both" ]] || [[ "$RUN_MODE" == "compare" ]]; }; then
+  { [[ "$RUN_MODE" == "both" ]] || [[ "$RUN_MODE" == "compare" ]] ||
+    { [[ "$RUN_MODE" == "full" ]] &&
+      [[ -f "$RUN_ROOT/offline/tpr_step${TPR_OFFLINE_STEPS}_rank7.pt" ]]; }; }; then
   export TPR_OFFLINE_RUN_MODES=compare
   bash "$RUNNER" 2>&1 | tee "$RUN_ROOT/logs/final_comparison.log"
 fi
