@@ -43,16 +43,29 @@ if [[ "$RUN_MODE" != "compare" ]]; then
       2>&1 | tee "$RUN_ROOT/logs/manifest.log"
   fi
 fi
-export TPR_REAL_ACTOR_MINIBATCH="$(python - "$TPR_OFFLINE_CAPTURE_MANIFEST" <<'PY'
+# One ONLINE step can contain several genuine Actor mini-batch captures.
+# Replay ALL retained updates in manifest chronological order; never
+# confuse capture_index with a Session trajectory index.
+readarray -t manifest_info < <(python - "$TPR_OFFLINE_CAPTURE_MANIFEST" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
     d=json.load(f)
-if d.get("protocol")!="real_actor_20_distinct_captures_v1" or d.get("steps")!=20:
-    raise SystemExit("Not a 20-real-capture manifest")
+if (d.get("protocol")!="real_actor_session_first_multicapture_v2"
+        or d.get("online_steps")!=20
+        or d.get("steps",0)!=len(d.get("items",[]))):
+    raise SystemExit("Require the session-first 20-online-step Capture manifest")
+print(d["steps"])
 print(d["items"][0]["capture"])
+print(",".join(str(x) for x in d["items"][0]["rows"]))
 PY
-)"
-export TPR_OFFLINE_ROWS=0,1 # overwritten by manifest row selection inside test
+)
+if [[ "${#manifest_info[@]}" -ne 3 ]]; then
+    echo "Invalid session-first offline manifest" >&2; exit 2
+fi
+export TPR_OFFLINE_STEPS="${manifest_info[0]}"
+export TPR_REAL_ACTOR_MINIBATCH="${manifest_info[1]}"
+export TPR_OFFLINE_ROWS="${manifest_info[2]}"
+echo "TPR_SESSION_FIRST_CAPTURE_SELECTION online_steps=20 replay_updates=$TPR_OFFLINE_STEPS"
 echo "TPR_20STEP_OFFLINE_START capture_dir=$CAPTURE_DIR root=$RUN_ROOT mode=$RUN_MODE"
 echo "E2: Native MindSpeed Ring core attention on FULL complete sequences"
 echo "E3: Custom TPR Ring with Turn-based prefix reuse"
