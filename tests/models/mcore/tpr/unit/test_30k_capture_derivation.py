@@ -67,8 +67,8 @@ def test_derived_capture_truncates_all_response_labels_without_mutating_source(t
     assert stats["max_sequence_length"] == 8
     cropped, original = raw["tensordict"], before["tensordict"]
     assert set(cropped.keys()) == set(original.keys())
-    assert tu.get_non_tensor_data(cropped, key="scalar_metadata") == 17
-    scalar_value = tu.get_non_tensor_data(cropped, key="scalar_tensor_metadata")
+    assert tu.get_non_tensor_data(cropped, key="scalar_metadata", default=None) == 17
+    scalar_value = tu.get_non_tensor_data(cropped, key="scalar_tensor_metadata", default=None)
     assert torch.equal(torch.as_tensor(scalar_value), torch.tensor(1.25))
     for row in range(8):
         assert torch.equal(cropped["prompts"][row], original["prompts"][row])
