@@ -121,6 +121,7 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
     )
     fl = full["runs"][-1]["loss"]
     tl = tpr["runs"][-1]["loss"]
+    dp2_loss_report = tpr["runs"][-1].get("loss_report")
     result = {
         "source_step": tpr["source_step"],
         "effective_sequence_cap": tpr_cap,
@@ -136,6 +137,7 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         "mean_peak_memory_reduction_ratio": (fpeak-tpeak)/fpeak,
         "full_loss": fl, "tpr_global_loss": tl,
         "ppo_loss_absolute_gap": abs(fl-tl),
+        "tpr_loss_consistency": dp2_loss_report,
         "global_ppo_tokens": tpr["global_ppo_tokens"],
         "sampled_gradient_parity": sampled_gradients,
         "dp_rows": tpr["dp_partitions"],
@@ -151,12 +153,18 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         if sampled_gradients is not None else
         "sampled_grad_rel_l2=not_available "
     )
+    loss_consistency_text = (
+        f"tpr_tp_shard_loss_gap={dp2_loss_report['tp_shard_loss_gap']:.9g} "
+        f"tpr_cpdp_loss_gap={dp2_loss_report['cpdp_pre_tp_max_gap']:.9g} "
+        if dp2_loss_report is not None else ""
+    )
     print(
         f"TPR_DP2_VS_FULL step={result['source_step']} "
         f"full_median_s={f:.6f} tpr_median_s={t:.6f} "
         f"speedup={f/t:.6f} "
         f"full_peak_gib={fpeak:.3f} tpr_peak_gib={tpeak:.3f} "
         f"ppo_loss_gap={result['ppo_loss_absolute_gap']:.9g} "
+        f"{loss_consistency_text}"
         f"{grad_text}"
         f"dp_rows={result['dp_rows']} "
         f"duplicated_tree_tokens={result['duplicated_tree_tokens']}",
