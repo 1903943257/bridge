@@ -48,7 +48,8 @@ verl/models/mcore/tpr/dp_placement.py::plan_tpr_dta_dp.
    input digest and actual logical tree-token metrics are recorded.
 
 The only Engine code change is the opt-in
-TPR_EXPERIMENTAL_OFFLINE_DP2=1 gate for PPO TP2/CP2/DP2 and matching dp_size
+TPR_EXPERIMENTAL_OFFLINE_DP2=1 and TPR_RUN_TP2CP2DP2_ONE_STEP=1 gates
+for PPO TP2/CP2/DP2 and matching dp_size
 metadata. DP1 production behavior and unsupported topologies are unchanged.
 
 ## Run
