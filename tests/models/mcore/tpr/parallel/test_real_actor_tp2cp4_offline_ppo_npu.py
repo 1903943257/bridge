@@ -238,10 +238,17 @@ def _install_offline_full_ring_backend(mode: str) -> str:
             query, current_key, current_value,
             allow_trailing_padding=True, **kwargs
         )
-        # Return the same [S,B,H,D] interface as TPR custom Ring.
+        # The TPR Ring returns [S, B, H*D], NOT the input Q [S,B,H,D].
+        # Megatron RowParallelLinear expects K=H*D; returning four dims
+        # leaks K=D (e.g. 128 vs 2048) and fails aclnnMatmul.
         if result.numel() != query.numel():
             raise AssertionError("native Ring output size mismatch")
-        return result.reshape(query.shape)
+        if query.ndim != 4 or query.shape[1] != 1:
+            raise AssertionError(f"unexpected Q shape {tuple(query.shape)}")
+        output = result.reshape(query.shape[0], query.shape[1], -1)
+        if output.shape[-1] != query.shape[2] * query.shape[3]:
+            raise AssertionError("native Ring hidden size mismatch")
+        return output
 
     ring.ring_cp_attention = native_full_attention
     return "mindspeed_native_whole_ring_virtual_right_padding"
