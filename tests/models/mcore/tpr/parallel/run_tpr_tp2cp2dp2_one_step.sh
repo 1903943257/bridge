@@ -41,9 +41,18 @@ export TPR_TURN_MIN_SEGMENT_TOKENS=128
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 export TPR_BENCH_CAPTURE_LOGPROBS="${TPR_BENCH_CAPTURE_LOGPROBS:-1}"
+# Recompute PPO logprob intermediates per chunk instead of retaining the
+# whole CP2 local-vocabulary softmax workspace until backward. Set 0 to
+# reproduce the original code path; chunking is not native Megatron recompute.
+export TPR_PPO_LOGPROB_CHUNK_TOKENS="${TPR_PPO_LOGPROB_CHUNK_TOKENS:-512}"
 export TPR_EXEC_PROFILE="${TPR_EXEC_PROFILE:-0}"
 export PYTHONUNBUFFERED=1
-unset TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC TPR_MEM_TRACE || true
+unset TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
+if [[ "${TPR_BENCH_MEM_TRACE:-0}" == "1" ]]; then
+  export TPR_MEM_TRACE=1
+else
+  unset TPR_MEM_TRACE || true
+fi
 
 python - "$MANIFEST" "$STEP" <<'PY'
 import json, pathlib, sys
@@ -63,7 +72,7 @@ print("TPR_DP2_INPUT step=%s source=%s ppo_tokens=%s full_tokens=%s" %
 PY
 
 echo "TPR_DP2_START source_step=$STEP topology=TP2,CP2,DP2 source=$MANIFEST"
-echo "TPR_DP2_TIMING forward_backward_plus_CP_DP_gradient_finalize; no_optimizer_update"
+echo "TPR_DP2_TIMING forward_backward_plus_CP_DP_gradient_finalize; no_optimizer_update logprob_chunk_tokens=$TPR_PPO_LOGPROB_CHUNK_TOKENS"
 torchrun --nproc_per_node=8 --master_addr=127.0.0.1 \
   --master_port="${TPR_BENCH_MASTER_PORT:-29793}" \
   -m pytest -q -s -x \
