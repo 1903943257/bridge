@@ -178,6 +178,8 @@ def _runtime():
 
 def _engine_with_dp_finalize(model, runtime):
     """Native DP-with-CP weight-gradient average; never sync Prefix KV."""
+    from .grad_sync_precision import offline_grad_sync_dtype, reduce_average_weight_grad
+    grad_dtype = offline_grad_sync_dtype()
     model.config.no_sync_func = None
     model.config.grad_scale_func = None
     model.config.calculate_per_token_loss = False
@@ -195,10 +197,10 @@ def _engine_with_dp_finalize(model, runtime):
             if param.grad is None:
                 raise RuntimeError(f"Missing gradient before DP finalize: {name}")
             try:
-                dist.all_reduce(
-                    param.grad, op=dist.ReduceOp.SUM, group=runtime.dp_cp_group,
+                reduce_average_weight_grad(
+                    param, runtime.dp_cp_group, name=name,
+                    reduce_dtype=grad_dtype,
                 )
-                param.grad.div_(dist.get_world_size(runtime.dp_cp_group))
             except RuntimeError:
                 print(
                     f"TPR_DP2_GRAD_SYNC_FAILED rank={dist.get_rank()} "
@@ -341,7 +343,15 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             sequence_parallel=False, profile="4b", native_attention=False,
         )
         assert hf.num_hidden_layers == 36
+        from .grad_sync_precision import offline_grad_sync_dtype
+        grad_sync_dtype = offline_grad_sync_dtype()
         engine = _engine_with_dp_finalize(model, runtime)
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_DP2_GRAD_REDUCE_MODE dtype={grad_sync_dtype} "
+                f"weighted_group_size={dist.get_world_size(runtime.dp_cp_group)}",
+                flush=True,
+            )
         runs = []
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
@@ -489,6 +499,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "warmups": warmups, "repeats": repeats,
                 "capture_logprobs": capture_lp, "profiler_enabled": profile,
                 "ppo_logprob_chunk_tokens": lp_chunk_tokens,
+                "gradient_sync_reduce_dtype": grad_sync_dtype,
                 "hccl_stats_reduce_dtype": "float32",
                 "recompute": False, "updated_weights": False,
                 "median_fwd_bwd_s": statistics.median(times),
