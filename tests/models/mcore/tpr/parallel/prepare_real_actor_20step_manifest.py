@@ -28,6 +28,61 @@ REQUIRED = (
     "input_ids", "prompts", "responses", "response_mask",
     "loss_mask", "old_log_probs", "advantages", "temperature",
 )
+def _concat_original_rows(parts):
+    """Losslessly combine per-row TensorDicts across Actor captures.
+
+    torch.cat(TensorDict) dispatches to aten.cat for nested jagged tensors,
+    unsupported on the pinned PyTorch version. Rebuild each jagged field from
+    its ORIGINAL unbound tensors, preserving dtype and exact values.
+    """
+    from tensordict import TensorDict
+    from tensordict.tensorclass import NonTensorData, NonTensorStack
+
+    keys = tuple(parts[0].keys())
+    if any(set(part.keys()) != set(keys) for part in parts):
+        raise ValueError("Actor captures have incompatible TensorDict fields")
+    combined = {}
+    for key in keys:
+        values = [part.get(key) for part in parts]
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            if any(not isinstance(v, torch.Tensor) for v in values):
+                raise TypeError(f"mixed Tensor field for {key}")
+            if first.is_nested:
+                if any(not v.is_nested for v in values):
+                    raise TypeError(f"incompatible nested field for {key}")
+                original_rows = [v.unbind(0)[0] for v in values]
+                ragged_idx = getattr(first, "_ragged_idx", first.dim() - 1)
+                combined[key] = tu.nested_tensor_from_tensor_list(
+                    original_rows, ragged_idx=ragged_idx
+                )
+            else:
+                combined[key] = torch.cat(values, dim=0)
+        elif isinstance(first, NonTensorStack):
+            combined[key] = NonTensorStack(
+                *(tu.unwrap_non_tensor_data(v[0]) for v in values)
+            )
+        elif isinstance(first, NonTensorData):
+            originals = [tu.unwrap_non_tensor_data(v) for v in values]
+            if any(v != originals[0] for v in originals[1:]):
+                # A scalar NonTensorData cannot hold per-row differences.
+                # Promote only this field to row-wise stack.
+                combined[key] = NonTensorStack(*originals)
+            else:
+                combined[key] = first
+        else:
+            raise TypeError(f"unsupported TensorDict field {key}: {type(first)}")
+    merged = TensorDict(combined, batch_size=[len(parts)])
+    for i, part in enumerate(parts):
+        for key in keys:
+            original = tu.get(part,key)
+            actual = tu.get(merged,key)
+            if isinstance(original, torch.Tensor):
+                if not torch.equal(actual[i],original[0]):
+                    raise AssertionError(f"lossless field reconstruction failed: {key}[{i}]")
+    return merged
+
+
 CAPTURE_NAME = re.compile(
     r"actor_update_step(?P<step>\d+)_rank0_capture(?P<ordinal>\d+)_batch(?P<batch>\d+)\.pt$"
 )
@@ -156,7 +211,7 @@ def prepare(directory: Path, output: Path, *, steps: int = 20,
         # A failed merge is a hard error; silently losing TensorDict fields is
         # unacceptable for a real PPO correctness comparison.
         try:
-            merged = torch.cat(selected_parts, dim=0)
+            merged = _concat_original_rows(selected_parts)
         except Exception as exc:
             raise RuntimeError(
                 f"step={global_step}: cannot concatenate original captured "
