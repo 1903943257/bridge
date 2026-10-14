@@ -335,36 +335,31 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             peak = torch.tensor(float(torch.npu.max_memory_allocated()),
                                 dtype=torch.float64, device=runtime.device)
             dist.all_reduce(peak, op=dist.ReduceOp.MAX)
-            # The adapter CP-SUMs the local PPO loss. DP-averaging then
-            # reconstructs the global token-mean objective PER TP SHARD.
-            # TP shards can have small numerical differences in distributed
-            # vocab logprobs, so TP-average only the *reporting* scalar,
-            # keeping the actual loss, backward, and grad finalize untouched.
+            # Engine returns the CP-SUMmed, DP-size-scaled local forest
+            # contribution. Each DP replica has DIFFERENT trajectories,
+            # so their pre-DP scalar losses SHOULD generally differ.
+            # The intended global token-mean reporting result is the mean
+            # of the two DP contributions. TP and CP ranks each carry a
+            # replica of this scalar; world SUM/8 averages these duplicated
+            # views. This is a diagnostic/reporting collective only.
+            # Gradient synchronization stays with native DP-with-CP.
             local_ppo_tokens = sum(
                 int(x.bool().sum()) for x in batch["response_mask"].unbind(0)
             )
             if int(result["metrics"]["tpr/logical_loss_tokens"][0]) != local_ppo_tokens:
                 raise AssertionError("TPR forest dropped or duplicated supervised PPO tokens")
             local_loss = float(result["loss"][0])
-            global_loss_pre_tp = torch.tensor(
+            global_loss = torch.tensor(
                 local_loss, dtype=torch.float64, device=runtime.device,
             )
-            dist.all_reduce(
-                global_loss_pre_tp, op=dist.ReduceOp.SUM, group=runtime.dp_group,
-            )
-            global_loss_pre_tp.div_(dist.get_world_size(runtime.dp_group))
-            # A reporting reduction ONLY; it must never be used as a
-            # differentiable training loss. CP loss was already summed.
-            global_loss = global_loss_pre_tp.clone()
-            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=runtime.tp_group)
-            global_loss.div_(dist.get_world_size(runtime.tp_group))
+            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
+            global_loss.div_(dist.get_world_size())
 
             # All fields have fixed width and are transferred as numeric
             # tensors; do not use all_gather_object with HCCL.
             stats = torch.tensor(
                 [float(runtime.tp_rank), float(runtime.cp_rank),
-                 float(runtime.dp_rank), local_loss,
-                 float(global_loss_pre_tp.item()), float(global_loss.item()),
+                 float(runtime.dp_rank), local_loss, float(global_loss.item()),
                  float(result["metrics"]["tpr/unique_tree_tokens"][0]),
                  float(local_ppo_tokens)],
                 dtype=torch.float64, device=runtime.device,
@@ -373,7 +368,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             dist.all_gather(received_stats, stats)
             gathered = []
             for rank_id, values in enumerate(received_stats):
-                (tp_rank, cp_rank, dp_rank, rank_loss, rank_pre_tp_loss,
+                (tp_rank, cp_rank, dp_rank, rank_loss,
                  rank_global_loss, unique, tokens) = values.cpu().tolist()
                 dp_rank = int(dp_rank)
                 gathered.append({
@@ -381,7 +376,6 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     "cp_rank": int(cp_rank), "dp_rank": dp_rank,
                     "rows": list(plan.partitions[dp_rank]),
                     "local_loss_dp_scaled": rank_loss,
-                    "global_loss_pre_tp": rank_pre_tp_loss,
                     "global_loss": rank_global_loss,
                     "local_unique_tree_tokens": int(unique),
                     "local_ppo_tokens": int(tokens),
@@ -396,10 +390,10 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             if dist.get_rank() == 0:
                 print(
                     f"TPR_DP2_LOSS_REPORT step={step} iteration={iteration} "
-                    f"tp0_pre_tp={loss_report['tp0_pre_tp_loss']:.9g} "
-                    f"tp1_pre_tp={loss_report['tp1_pre_tp_loss']:.9g} "
-                    f"tp_shard_loss_gap={loss_report['tp_shard_loss_gap']:.9g} "
-                    f"cpdp_pre_tp_max_gap={loss_report['cpdp_pre_tp_max_gap']:.9g} "
+                    f"dp0_local={loss_report['dp0_local_loss']:.9g} "
+                    f"dp1_local={loss_report['dp1_local_loss']:.9g} "
+                    f"tp_local_max_gap={loss_report['tp_local_max_gap']:.9g} "
+                    f"cp_replica_max_gap={loss_report['cp_replica_max_gap']:.9g} "
                     f"global_reporting_max_gap={loss_report['global_reporting_max_gap']:.9g}",
                     flush=True,
                 )
