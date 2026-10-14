@@ -178,25 +178,42 @@ OOMs, inspect per-rank DP placement and longest surviving tree before
 changing sequence length again.
 
 
-## 30K loss-report gate (2026-10-14)
 
-After the 30K backward and DP-with-CP gradient finalize, an early
-one-step run reached the benchmark's global-loss assert. The old
-benchmark only DP-averaged the scalar returned by
-`run_tpr_forward_backward_batch`, which is **already CP-SUMmed**; the
-resulting reporting value was one scalar **per TP shard**, not yet a
-canonical value shared by all eight ranks. Requiring all eight numbers
-to match at 1e-4 therefore conflated *within-TP CP/DP replica
-consistency* with *between-TP numerical drift*. The observed numerical
-gap and offending ranks have **not yet been measured**.
+## 30K DP-local loss contribution vs global reporting (2026-10-14)
 
-The revised report keeps the existing PPO objective/backward intact:
-CP-SUM (in the engine) -> DP-SUM/2 (benchmark) -> TP-SUM/2 (reporting
-scalar only). It records both TP shard pre-TP values, their gap, and
-the canonical globally reported scalar. The gate still rejects
-CP/DP replicas disagreeing within the same TP shard (tolerance 1e-6)
-or any mismatch after TP reporting reduction, while separately recording
-`tp_shard_loss_gap_exceeds_1e_4` rather than silently relaxing it.
-The Full/TPR comparison exports the complete `tpr_loss_consistency`
-record. This is not a claim that TP drift itself is acceptable or that
-Full/TPR gradient parity has passed; those remain independent checks.
+The 30K test reached the post-backward loss gate. Its old diagnostic
+incorrectly asserted that the DP0 and DP1 contributions must be equal,
+despite the DTA-DP placement assigning different trajectories to each
+replica. In the observed run the two values were:
+
+- DP0: 0.006869133561849594 on ranks 0,1,2,3
+- DP1: 0.1446971446275711 on ranks 4,5,6,7
+
+Their 0.1378280110657215 difference is **not** TP BF16 rounding;
+it is grouped by DP replica. A global token-mean objective is additive
+over the two disjoint DP partitions; unequal local contributions are
+permitted. The earlier TP-drift explanation was incorrect.
+
+The experiment now does:
+1. Before model loading, ALL ranks exchange TP/CP/DP coordinates and
+   validate Megatron's TP/CP/DP/DP-with-CP process-group memberships.
+   Rank-coded HCCL probes also validate the collective SUM results.
+   Group-size-only checks were insufficient.
+2. The engine computes and CP-SUMs its *DP-local* PPO loss, with the
+   original global-token denominator and VERL dp_size=2 scaling.
+3. To **report only**, the benchmark world-SUMs the eight rank-local
+   values and divides by eight, which is equivalent to averaging the
+   two distinct DP contributions when their TP/CP views agree.
+4. It checks CP agreement *within each (TP,DP)*, reports any TP shard
+   drift separately, and requires all eight final reported global
+   scalars to agree and match the reconstructed raw average.
+   DP0 and DP1 raw loss contributions are NEVER required to match.
+5. Gradients remain finalized by Megatron's DP-with-CP SUM/4
+   and the sampled post-timing replicated-gradient gate stays strict.
+
+The benchmark records `loss_report.dp0_local_loss`,
+`dp1_local_loss`, `cp_replica_max_gap`,
+`tp_local_max_gap`, and `global_reporting_max_gap`.
+The comparison exports the complete `tpr_loss_consistency`.
+This is NOT proof of full parameter-gradient parity or native multi-step
+DP2 training correctness.
