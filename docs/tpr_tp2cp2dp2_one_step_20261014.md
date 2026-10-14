@@ -332,3 +332,73 @@ required. A PASS excludes a simple isolated BF16 collective defect,
 but does not prove autograd's long-sequence parameter-gradient
 buffer or asynchronous execution is correct. A FAIL identifies
 a backend/collective identity issue worth investigating first.
+
+
+## BF16 HCCL gradient-collective replica mismatch reproduced (2026-10-14)
+
+The standalone 8-NPU probe, with no model or autograd, failed on
+its first 2560-element BF16 tensor:
+
+- TP0 CP×DP group (0,2,4,6) and TP1 group (1,3,5,7)
+- 197 of 2560 BF16 elements differ across post-finalize copies
+- maximum absolute replica spread 6.103515625e-05
+
+This shows that the observed small BF16 gradient-replica disagreement
+can be reproduced **independently of TPR**. It does not yet isolate
+whether the discrepancy is present directly after HCCL BF16
+AllReduce(SUM) or only after the local BF16 in-place division by 4.
+
+The revised standalone probe prints five individually synchronized,
+raw-AllGather-verified stages on each four-rank group:
+`bf16_sum_before_div`, `bf16_after_div`,
+`fp32_sum_before_div`, `fp32_after_div`,
+`fp32_mean_cast_to_bf16`. It also independently
+AllGathers original BF16 inputs to build a CPU FP32 reference SUM.
+It REQUIRES FP32 reduction and FP32->BF16 cast to produce identical
+replica copies and match the input SUM; BF16 discrepancies are
+reported without aborting early. The strict historical failure
+can be requested using `TPR_PROBE_REQUIRE_BF16_EXACT=1`.
+
+Experimental model-run workaround (not production VERL):
+`TPR_OFFLINE_GRAD_SYNC_DTYPE=fp32` promotes one accumulated BF16
+**weight parameter** gradient at a time to FP32, AllReduces and divides
+in FP32, and copies the result back to its original dtype. It applies
+only to this isolated TP2CP2DP2 benchmark and its matching Full CP4
+baseline; the original BF16 path remains the default. It does not
+alter TPR KV/dKV, model forward/backward, DP placement or PPO labels.
+Each model-run JSON records `gradient_sync_reduce_dtype` and the
+comparison rejects mixed or unspecified gradient-sync dtypes.
+
+Sequence of validation:
+
+1. Run the standalone dtype-stage probe first (same 8 physical NPUs);
+   confirm all FP32 stages are bitwise consistent and correct vs CPU
+   input-reconstruction. If FP32 fails, DO NOT run the Qwen FP32
+   gradient-sync workaround.
+2. To check weight gradient correctness, run TPR-only 30K
+   with `TPR_OFFLINE_GRAD_SYNC_DTYPE=fp32`, strict
+   `TPR_BENCH_GRAD_REPLICA_POLICY=strict`, and a NEW output directory.
+3. Only if successful, rerun matched Full+TPR 30K with FP32 mode on
+   BOTH. FP32 gradient collectives cost more bandwidth and workspace,
+   so old BF16 ~1.33x performance is not a valid FP32 speedup claim.
+4. Only sampled replica equality is checked; complete Full-vs-TPR
+   gradient parity and multi-step AdamW training are still unverified.
+
+Standalone:
+    TPR_RUN_HCCL_BF16_GRAD_PROBE=1 \
+    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 \
+    torchrun --nproc_per_node=8 --master_port=29917 -m pytest -q -s -x \
+      tests/models/mcore/tpr/parallel/test_hccl_bf16_replica_probe_npu.py
+
+FP32 TPR-only strict:
+    TPR_OFFLINE_GRAD_SYNC_DTYPE=fp32 TPR_BENCH_GRAD_WITNESS=1 \
+    TPR_BENCH_WARMUPS=0 TPR_BENCH_REPEATS=1 \
+    bash tests/models/mcore/tpr/parallel/run_tpr_tp2cp2dp2_one_step.sh \
+      /workspace/tpr_dp2_30k_smoke_v2/capture_manifest.json \
+      /workspace/tpr_dp2_30k_fp32_grad_sync_strict_v1 6
+
+Matched pair (after successful probe and smoke test):
+    TPR_OFFLINE_GRAD_SYNC_DTYPE=fp32 \
+    bash tests/models/mcore/tpr/parallel/run_tpr_dp2_vs_full_30k_one_step.sh \
+      /workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json \
+      /workspace/tpr_dp2_30k_fp32_grad_sync_pair_v1 6
