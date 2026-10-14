@@ -306,6 +306,59 @@ def patch_framework(src: str) -> str:
         '                session_trajectories = _select_session_trajectories(\n',
         "framework.avoid_multiplying_rollouts",
     )
+    # Even with a 48K hard cap, a Gateway Session may have already
+    # materialized an earlier chain before the stop takes effect. Preserve
+    # exactly the FIRST chain, discard later materializations, and force a
+    # failure reward so a late successful chain never rewards the truncated
+    # episode. This policy is OPT-IN with hard_stop_on_trajectory_capacity.
+    src = replace_exact(
+        src,
+        '                session_trajectories = _select_session_trajectories(\\n',
+        '                hardcap_multi_chain_count = (\\n'
+        '                    len(session_trajectories) if self._hard_stop_on_trajectory_capacity\\n'
+        '                    else 0\\n'
+        '                )\\n'
+        '                if hardcap_multi_chain_count > 1:\\n'
+        '                    logger.warning(\\n'
+        '                        "session %s: %d finalized chains despite hard cap; keeping first and forcing reward 0",\\n'
+        '                        session_id, hardcap_multi_chain_count,\\n'
+        '                    )\\n'
+        '                    session_trajectories = session_trajectories[:1]\\n'
+        '                session_trajectories = _select_session_trajectories(\\n',
+        "framework.select_first_chain_after_hardcap",
+    )
+    src = replace_exact(
+        src,
+        '            annotations = self._score_from_reward_info(session_trajectories)\\n',
+        '            annotations = (\\n'
+        '                [(0.0, {"multi_chain_session": True,\\n'
+        '                        "original_session_chain_count": hardcap_multi_chain_count})]\\n'
+        '                if hardcap_multi_chain_count > 1\\n'
+        '                else self._score_from_reward_info(session_trajectories)\\n'
+        '            )\\n',
+        "framework.zero_reward_without_running_reward_worker",
+    )
+    src = replace_exact(
+        src,
+        '            self._log_trajectory_summary(session_id, result_trajectories)\\n',
+        '            if hardcap_multi_chain_count > 1:\\n'
+        '                if len(result_trajectories) != 1:\\n'
+        '                    raise RuntimeError("multi-chain hard-cap must retain exactly one first trajectory")\\n'
+        '                result_trajectories = [\\n'
+        '                    replace(\\n'
+        '                        result_trajectories[0],\\n'
+        '                        reward_score=0.0,\\n'
+        '                        reward_info={**dict(result_trajectories[0].reward_info or {}), "reward": 0.0},\\n'
+        '                        extra_fields={\\n'
+        '                            **dict(result_trajectories[0].extra_fields or {}),\\n'
+        '                            "multi_chain_session": True,\\n'
+        '                            "original_session_chain_count": hardcap_multi_chain_count,\\n'
+        '                        },\\n'
+        '                    )\\n'
+        '                ]\\n'
+        '            self._log_trajectory_summary(session_id, result_trajectories)\\n',
+        "framework.first_chain_zero_reward_metadata",
+    )
     return src
 
 
