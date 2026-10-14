@@ -95,7 +95,7 @@ ray stop --force > "$RUN_ROOT/logs/e1_ray_cleanup.log" 2>&1 || true
 MANIFEST="$RUN_ROOT/capture_manifest.json"
 echo "TPR_NIGHTLY_CAPTURE_PREFLIGHT_START"
 if python "$PREP_SCRIPT" "$RUN_ROOT/captures" "$MANIFEST" \
-    --steps 20 --max-seq-len 49152 --max-rows 3 --max-total-tokens 130000 \
+    --steps 20 --max-seq-len 49152 --expected-sessions 8 \
     2>&1 | tee "$RUN_ROOT/logs/capture_preflight.log"; then
   echo "TPR_NIGHTLY_CAPTURE_PREFLIGHT_PASS"
 else
@@ -116,8 +116,12 @@ PY
 readarray -t _selected_capture_info < <(python - "$MANIFEST" <<'PY'
 import json,sys
 m=json.load(open(sys.argv[1]))
-if m.get("protocol")!="real_actor_session_first_multicapture_v2":
-    raise SystemExit("expected the session-first replay manifest")
+if m.get("protocol")!="real_actor_session_first_8merged_v3":
+    raise SystemExit("expected the full-eight merged PPO replay manifest")
+if m["online_steps"]!=20 or m["steps"]!=20:
+    raise SystemExit("expected exactly one merged batch per online step")
+if any(len(item["rows"])!=8 for item in m["items"]):
+    raise SystemExit("merged batch is not complete N=8")
 print(m["steps"])
 print(",".join(map(str,m["items"][0]["rows"])))
 PY
