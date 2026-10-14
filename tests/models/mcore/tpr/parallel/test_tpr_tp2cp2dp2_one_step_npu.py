@@ -124,13 +124,19 @@ def _runtime():
     for label, group, expected_size in (
         ("cp", cp, 2), ("dp", dp, 2), ("dp_cp", dp_cp, 4),
     ):
-        probe = torch.ones(1, device=device, dtype=torch.float32)
+        # Rank-coded probe catches a wrong 2-rank group whose SUM(ones)
+        # would still appear to have the correct world size.
+        probe = torch.tensor(
+            float(dist.get_rank() + 1), device=device, dtype=torch.float32,
+        )
         dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=group)
         torch.npu.synchronize()
-        if float(probe.item()) != expected_size:
+        expected_sum = float(sum(rank + 1 for rank in expected[label]))
+        if len(expected[label]) != expected_size or float(probe.item()) != expected_sum:
             raise AssertionError(
-                f"Wrong {label} communicator: got {probe.item()} "
-                f"instead of {expected_size}"
+                f"Wrong {label} communicator rank={dist.get_rank()} "
+                f"group_ranks={dist.get_process_group_ranks(group)} "
+                f"received_rank_sum={probe.item()} expected_rank_sum={expected_sum}"
             )
     if dist.get_rank() == 0:
         print(
