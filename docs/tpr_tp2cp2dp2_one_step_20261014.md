@@ -176,3 +176,27 @@ smoke test (new output directory); keep the default 1 warmup + 3 measured
 iterations for timing. Both jobs inherit the same setting. If 30K still
 OOMs, inspect per-rank DP placement and longest surviving tree before
 changing sequence length again.
+
+
+## 30K loss-report gate (2026-10-14)
+
+After the 30K backward and DP-with-CP gradient finalize, an early
+one-step run reached the benchmark's global-loss assert. The old
+benchmark only DP-averaged the scalar returned by
+`run_tpr_forward_backward_batch`, which is **already CP-SUMmed**; the
+resulting reporting value was one scalar **per TP shard**, not yet a
+canonical value shared by all eight ranks. Requiring all eight numbers
+to match at 1e-4 therefore conflated *within-TP CP/DP replica
+consistency* with *between-TP numerical drift*. The observed numerical
+gap and offending ranks have **not yet been measured**.
+
+The revised report keeps the existing PPO objective/backward intact:
+CP-SUM (in the engine) -> DP-SUM/2 (benchmark) -> TP-SUM/2 (reporting
+scalar only). It records both TP shard pre-TP values, their gap, and
+the canonical globally reported scalar. The gate still rejects
+CP/DP replicas disagreeing within the same TP shard (tolerance 1e-6)
+or any mismatch after TP reporting reduction, while separately recording
+`tp_shard_loss_gap_exceeds_1e_4` rather than silently relaxing it.
+The Full/TPR comparison exports the complete `tpr_loss_consistency`
+record. This is not a claim that TP drift itself is acceptable or that
+Full/TPR gradient parity has passed; those remain independent checks.
