@@ -170,14 +170,26 @@ def _placement(capture, runtime, expected_tokens):
         global_batch_size=8,
         tpr_capture_log_probs=os.getenv("TPR_BENCH_CAPTURE_LOGPROBS", "1") == "1",
     )
-    assignment = (runtime.dp_rank, tuple(local_rows), local_tokens,
-                  tuple(placement.partitions), global_sha)
-    assignments = [None] * dist.get_world_size()
-    dist.all_gather_object(assignments, assignment)
+    # HCCL object collectives can decode a corrupted pickle-size header as a
+    # gigantic allocation (all_gather_object -> resize_(max_object_size)).
+    # Exchange a fixed-size device tensor instead. Eight rows fit one bitmask.
+    local_mask = sum(1 << int(row) for row in local_rows)
+    fingerprint = int(global_sha[:15], 16)  # 60 bits, fits int64
+    payload = torch.tensor(
+        [runtime.dp_rank, local_mask, local_tokens, fingerprint],
+        dtype=torch.int64, device=runtime.device,
+    )
+    received = [torch.empty_like(payload) for _ in range(dist.get_world_size())]
+    dist.all_gather(received, payload)
+    assignments = [tuple(map(int, x.cpu().tolist())) for x in received]
     for dp_rank in (0, 1):
-        members = [item for item in assignments if item[0] == dp_rank]
-        if len(members) != 4 or any(x != members[0] for x in members):
+        members = [x for x in assignments if x[0] == dp_rank]
+        expected_mask = sum(1 << int(row) for row in placement.partitions[dp_rank])
+        if (len(members) != 4 or any(x != members[0] for x in members)
+                or members[0][1] != expected_mask):
             raise AssertionError(f"TP/CP peers disagree on DP{dp_rank} row placement")
+    if any(x[3] != fingerprint for x in assignments):
+        raise AssertionError("Input fingerprint differs between ranks")
     if sum(next(x[2] for x in assignments if x[0] == d) for d in (0, 1)) != global_tokens:
         raise AssertionError("DP replicas do not cover exactly the global PPO tokens")
     return batch, placement, global_tokens, global_sha
@@ -244,19 +256,37 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=runtime.dp_group)
             global_loss.div_(2)
 
-            stages = dict(engine._tpr_stage_profile) if profile else {}
-            row = {
-                "rank": dist.get_rank(), "tp_rank": runtime.tp_rank,
-                "cp_rank": runtime.cp_rank, "dp_rank": runtime.dp_rank,
-                "rows": list(plan.partitions[runtime.dp_rank]),
-                "local_loss_dp_scaled": local_loss,
-                "global_loss": float(global_loss.item()),
-                "local_unique_tree_tokens": int(result["metrics"]["tpr/unique_tree_tokens"][0]),
-                "local_ppo_tokens": local_ppo_tokens,
-                "stage_ms": stages,
-            }
-            gathered = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, row)
+            # All fields have fixed width and are transferred as numeric
+            # tensors; do not use all_gather_object with HCCL.
+            stats = torch.tensor(
+                [float(runtime.tp_rank), float(runtime.cp_rank),
+                 float(runtime.dp_rank), local_loss, float(global_loss.item()),
+                 float(result["metrics"]["tpr/unique_tree_tokens"][0]),
+                 float(local_ppo_tokens)],
+                dtype=torch.float64, device=runtime.device,
+            )
+            received_stats = [torch.empty_like(stats) for _ in range(dist.get_world_size())]
+            dist.all_gather(received_stats, stats)
+            gathered = []
+            for rank_id, values in enumerate(received_stats):
+                tp_rank, cp_rank, dp_rank, rank_loss, rank_global_loss, unique, tokens = (
+                    values.cpu().tolist()
+                )
+                dp_rank = int(dp_rank)
+                gathered.append({
+                    "rank": rank_id, "tp_rank": int(tp_rank),
+                    "cp_rank": int(cp_rank), "dp_rank": dp_rank,
+                    "rows": list(plan.partitions[dp_rank]),
+                    "local_loss_dp_scaled": rank_loss,
+                    "global_loss": rank_global_loss,
+                    "local_unique_tree_tokens": int(unique),
+                    "local_ppo_tokens": int(tokens),
+                    # Rank-zero stage profile is retained locally below;
+                    # other ranks' variable-length dictionaries are not sent.
+                    "stage_ms": {},
+                })
+            if profile and dist.get_rank() == 0:
+                gathered[0]["stage_ms"] = dict(engine._tpr_stage_profile)
             if max(abs(x["global_loss"]-gathered[0]["global_loss"]) for x in gathered) > 1e-4:
                 raise AssertionError("Global token-mean PPO loss differs across ranks")
             if dist.get_rank() == 0:
