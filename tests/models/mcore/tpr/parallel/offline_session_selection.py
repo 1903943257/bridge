@@ -84,6 +84,7 @@ def first_session_indices(ordered_batches):
     of the same Session are dropped, even across actor mini-batches.
     """
     candidates = {}
+    counts = {}
     descriptions = []
     for capture_order, (path,batch) in enumerate(ordered_batches):
         ids, ordinals, field = session_rows(batch)
@@ -93,6 +94,7 @@ def first_session_indices(ordered_batches):
             "trajectory_ordinal_field":field,
         })
         for row,identity in enumerate(ids):
+            counts[identity] = counts.get(identity, 0) + 1
             if ordinals is None:
                 order=(1,capture_order,row)
             else:
@@ -113,6 +115,10 @@ def first_session_indices(ordered_batches):
         indices.sort()
     return kept_by_capture,{
         "sessions_seen":len(candidates),
+        "sessions_with_multiple_captured_trajectories":sum(
+            1 for count in counts.values() if count > 1
+        ),
+        "discarded_trajectory_rows":sum(counts.values())-len(candidates),
         "original_trajectory_ordinal_present":exact,
         "capture_first_fallback_sessions":inferred,
         "input_capture_descriptions":descriptions,
