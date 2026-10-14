@@ -360,6 +360,10 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 )
             dist.barrier()
 
+        gradient_witness = None
+        if os.getenv("TPR_BENCH_GRAD_WITNESS", "0") == "1":
+            from .gradient_witness import collect_tp2_gradient_witness
+            gradient_witness = collect_tp2_gradient_witness(model, runtime)
         if dist.get_rank() == 0:
             output.mkdir(parents=True, exist_ok=True)
             target = output / f"step{step}_tpr_tp2cp2dp2.json"
@@ -383,6 +387,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "ppo_logprob_chunk_tokens": lp_chunk_tokens,
                 "recompute": False, "updated_weights": False,
                 "median_fwd_bwd_s": statistics.median(times),
+                "gradient_witness": gradient_witness,
                 "runs": runs,
             }
             target.write_text(json.dumps(data, indent=2))
