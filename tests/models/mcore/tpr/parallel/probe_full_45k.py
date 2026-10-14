@@ -7,6 +7,7 @@ Full-vs-TPR speedup claims without creating the SAME trimmed input for TPR.
 
 python tests/models/mcore/tpr/parallel/probe_full_45k.py audit MANIFEST
 python tests/models/mcore/tpr/parallel/probe_full_45k.py prepare MANIFEST NEW_DIR --step 1
+python tests/models/mcore/tpr/parallel/probe_full_45k.py prepare-all MANIFEST NEW_ROOT --cap 40960
 """
 from __future__ import annotations
 
@@ -234,14 +235,158 @@ def prepare(manifest, original_step, cap, output):
     }), flush=True)
 
 
+
+def prepare_all(manifest, cap, output):
+    """Truncate existing first-of-Session v3 rows for a 20-step speed/memory run.
+
+    This does NOT reselect a chain: all 160 keys, row identities, and original
+    first-of-Session selections come exclusively from the existing manifest.
+    Copies preserve token-aligned PPO arrays on retained response positions.
+    No source capture or original manifest is changed.
+    """
+    if output.exists():
+        raise FileExistsError(f"Refuse to overwrite benchmark directory: {output}")
+    if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
+            or manifest.get("online_steps") != 20
+            or manifest.get("steps") != 20
+            or manifest.get("expected_sessions") != 8
+            or len(manifest.get("items", [])) != 20
+            or any(item.get("rows") != list(range(8))
+                   or item.get("session_count") != 8
+                   for item in manifest["items"])):
+        raise ValueError("Requires the EXISTING 20-step, N=8 session-first v3 manifest")
+
+    # Preflight all original prompt lengths BEFORE creating output files.
+    # A long second/third Session chain must not be picked as a replacement.
+    prompt_lengths = []
+    for step in range(1, 21):
+        item, raw, batch = load_item(manifest, step)
+        if item["step"] != step or item["source_global_step"] != step:
+            raise AssertionError(f"Original session-first step order changed: {step}")
+        if int(raw["capture_global_step"]) != step:
+            raise AssertionError(f"Original merged capture step mismatch: {step}")
+        if tuple(raw["keys"]) != tuple(
+            f"{p['uid']}_tpr_{row}"
+            for row, p in enumerate(item["source_row_provenance"])
+        ):
+            raise AssertionError(f"Original first-of-session trajectory keys differ step={step}")
+        for row in range(8):
+            p = int(batch["prompts"][row].numel())
+            prompt_lengths.append(p)
+            if p >= cap - 1:
+                raise ValueError(
+                    f"step={step} row={row} original selected prompt length={p} "
+                    f"cannot be truncated to total cap={cap} without changing prompt "
+                    "or removing response. Do not silently select another chain."
+                )
+        del raw, batch
+    print(
+        f"TPR_40K_PREFLIGHT steps=20 sessions=160 first_chain_only=true "
+        f"prompt_min={min(prompt_lengths)} prompt_max={max(prompt_lengths)} "
+        f"cap={cap} status=PASS", flush=True,
+    )
+
+    merged_dir = output / "session_first_batches"
+    merged_dir.mkdir(parents=True)
+    new_manifest = copy.deepcopy(manifest)
+    new_manifest["max_seq_len"] = cap
+    new_manifest["performance_benchmark"] = {
+        "kind": "OFFLINE_FIRST_SESSION_8_PER_STEP_TRUNCATED_FOR_CAPACITY",
+        "total_token_cap": cap,
+        "original_source_manifest": "v3 session-first, passed as prepare-all input",
+        "original_capture_files_mutated": False,
+        "first_session_selection_changed": False,
+        "rows_per_step": 8,
+        "recompute": "OFF",
+        "original_ppo_values_recomputed": False,
+        "warning": "Retained old_log_probs/advantages remain original values. "
+                   "Shortened trajectories are not valid original SWE rewards or "
+                   "untruncated 48K PPO correctness evidence. The identical "
+                   "derived manifest MUST be used by both Full and TPR.",
+    }
+    total_original = total_benchmark = total_ppo_original = total_ppo_benchmark = 0
+    truncated_rows = 0
+    for step in range(1, 21):
+        item, raw, batch = load_item(manifest, step)
+        old, new, ppo = trim_eight(batch, cap)
+        truncated = sum(a != b for a, b in zip(old, new))
+        truncated_rows += truncated
+        total_original += sum(old)
+        total_benchmark += sum(new)
+        total_ppo_original += int(item["ppo_tokens"])
+        total_ppo_benchmark += ppo
+        # These rows and keys are ALREADY the preserved first Session trajectories.
+        # Never call the source first_session_indices selector again.
+        raw["tensordict"] = batch
+        raw["offline_benchmark_truncation"] = {
+            "original_capture": item["capture"],
+            "source_global_step": step,
+            "original_lengths": old,
+            "benchmark_lengths": new,
+            "cap": cap,
+            "original_ppo_tokens": item["ppo_tokens"],
+            "benchmark_ppo_tokens": ppo,
+            "first_session_selection_changed": False,
+        }
+        capture = merged_dir / f"actor_update_step{step:06d}_session_first8.pt"
+        if capture.exists():
+            raise FileExistsError(capture)
+        temporary = capture.with_suffix(".pt.tmp")
+        try:
+            torch.save(raw, temporary)
+            temporary.replace(capture)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        entry = new_manifest["items"][step - 1]
+        entry["capture"] = str(capture.resolve())
+        entry["ppo_tokens"] = ppo
+        entry["logical_full_tokens"] = sum(new)
+        entry["max_sequence_length"] = max(new)
+        entry["min_sequence_length"] = min(new)
+        entry["benchmark_original_lengths"] = old
+        entry["benchmark_lengths"] = new
+        entry["benchmark_original_ppo_tokens"] = item["ppo_tokens"]
+        if entry["rows"] != list(range(8)) or raw["keys"] != tuple(raw["keys"]):
+            raise AssertionError("Selected eight Session rows unexpectedly changed")
+        print(
+            f"TPR_40K_PREPARED step={step} sessions=8 truncated_rows={truncated} "
+            f"original_tokens={sum(old)} benchmark_tokens={sum(new)} "
+            f"original_ppo={item['ppo_tokens']} benchmark_ppo={ppo} "
+            f"max_len={max(new)}", flush=True,
+        )
+        del item, raw, batch
+    summary = {
+        "steps": 20, "sessions_per_step": 8, "cap_tokens": cap,
+        "truncated_rows": truncated_rows,
+        "original_total_tokens": total_original,
+        "benchmark_total_tokens": total_benchmark,
+        "original_ppo_tokens": total_ppo_original,
+        "benchmark_ppo_tokens": total_ppo_benchmark,
+    }
+    new_manifest["performance_benchmark"]["summary"] = summary
+    target = output / "capture_manifest.json"
+    if target.exists():
+        raise FileExistsError(target)
+    target.write_text(json.dumps(new_manifest, indent=2, ensure_ascii=False))
+    print("TPR_40K_20STEP_READY " + json.dumps({
+        **summary, "manifest": str(target.resolve())
+    }, ensure_ascii=False), flush=True)
+    print("TPR_40K_COMMAND: bash tests/models/mcore/tpr/parallel/"
+          "run_existing_20step_offline_full_tpr.sh "
+          "/workspace/tpr_actor_capture_4b_n8_run5 "
+          f"{output} full", flush=True)
+    return new_manifest
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     subs = ap.add_subparsers(dest="command", required=True)
-    for name in ("audit", "prepare"):
+    for name in ("audit", "prepare", "prepare-all"):
         p = subs.add_parser(name)
         p.add_argument("manifest", type=Path)
         p.add_argument("--cap", type=int, default=45 * 1024)
-        if name == "prepare":
+        if name in ("prepare", "prepare-all"):
             p.add_argument("output", type=Path)
             p.add_argument("--step", type=int, default=1)
     args = ap.parse_args()
@@ -250,5 +395,7 @@ if __name__ == "__main__":
     loaded = json.loads(args.manifest.read_text())
     if args.command == "audit":
         audit(loaded, args.cap)
-    else:
+    elif args.command == "prepare":
         prepare(loaded, args.step, args.cap, args.output)
+    else:
+        prepare_all(loaded, args.cap, args.output)
