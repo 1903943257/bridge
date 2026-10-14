@@ -45,6 +45,10 @@ def test_fixed_shape_40k_one_mode():
             or manifest.get("max_seq_len") != 40960
             or not 1 <= step <= 20):
         raise ValueError("Requires existing, already truncated, session-first 40K/20-step manifest")
+    if (manifest.get("only_step_derived") not in (None, step)
+            or manifest.get("experimental_sequence_cap", 40960) !=
+                manifest["items"][step - 1].get("effective_sequence_cap", 40960)):
+        raise ValueError("Refuse to replay an unrelated or mismatched 30K derived step")
     item = manifest["items"][step - 1]
     if (item["step"] != step or item["source_global_step"] != step
             or item["rows"] != list(range(8)) or item.get("session_count") != 8
@@ -71,7 +75,10 @@ def test_fixed_shape_40k_one_mode():
             capture, tuple(range(8)), mode,
         )
         if tokens != item["ppo_tokens"]:
-            raise AssertionError("40K manifest PPO token count mismatch")
+            raise AssertionError("Capture/manifest PPO token count mismatch")
+        if max(int(x.numel()) for x in batch["input_ids"].unbind(0)) > int(
+                item.get("effective_sequence_cap", 40960)):
+            raise AssertionError("Capture exceeds its declared experimental sequence cap")
         if any(int(row.numel()) > 40960 for row in batch["input_ids"].unbind(0)):
             raise AssertionError("Encountered an untruncated row")
         if not source_keys or len(source_keys) != 8:
@@ -176,6 +183,7 @@ def test_fixed_shape_40k_one_mode():
             measured = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             target.write_text(json.dumps({
                 "source_step": step, "mode": mode,
+                "effective_sequence_cap": int(item.get("effective_sequence_cap", 40960)),
                 "input_sha256": data_sha, "source_capture": str(capture),
                 "checkpoint": str(checkpoint), "warmups": warmups,
                 "repeats": repeats, "updated_weights": False,
