@@ -1,225 +1,277 @@
-"""CPU-only session-first selection manifest for offline Full vs Turn TPR.
+"""CPU-only: build 8 original whole trajectories per online step for replay.
 
-Reads EVERY original rank0 Actor mini-batch captured at each online step.
-Keeps the earliest available row from each (uid,session_id) across captures;
-never changes old_log_probs, advantages, rewards or any original .pt file.
-A new offline optimizer update is scheduled for each capture with >=1 selected
-valid row. Offline optimizer updates may outnumber online global steps.
+The source captures are immutable. A session is identified by (uid, session_id).
+Across ALL captures for that online global step choose its first original chain
+(when trajectory ordinal is available), else earliest captured row (explicitly
+audited as an approximation). Assemble all selected sessions into one
+TensorDict-backed capture per step, so Full and TPR can see the SAME eight-way
+tree, instead of separately replaying accidental Actor micro-batches.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
 import torch
 
-try:
-    from .offline_session_selection import first_session_indices
-except ImportError:
-    from offline_session_selection import first_session_indices
+from verl.utils import tensordict_utils as tu
 
-REQUIRED = ("input_ids", "prompts", "responses", "response_mask",
-            "loss_mask", "old_log_probs", "advantages", "temperature")
+try:
+    from .offline_session_selection import first_session_indices, session_rows
+except ImportError:
+    from offline_session_selection import first_session_indices, session_rows
+
+REQUIRED = (
+    "input_ids", "prompts", "responses", "response_mask",
+    "loss_mask", "old_log_probs", "advantages", "temperature",
+)
 CAPTURE_NAME = re.compile(
     r"actor_update_step(?P<step>\d+)_rank0_capture(?P<ordinal>\d+)_batch(?P<batch>\d+)\.pt$"
 )
 
 
 def _all_capture_steps(directory: Path) -> dict[int, list[Path]]:
-    """All actual actor updates, not only the first capture in a global step."""
-    found: dict[int,list[tuple[int,int,Path]]] = {}
-    seen_ordinals=set()
+    found: dict[int, list[tuple[int,int,Path]]] = {}
+    seen_ordinals = set()
     for path in directory.glob("actor_update_step*_rank0_capture*_batch*.pt"):
         match = CAPTURE_NAME.fullmatch(path.name)
         if match is None:
             continue
-        step=int(match.group("step"))
-        order=int(match.group("ordinal"))
-        batch_idx=int(match.group("batch"))
-        if (order, batch_idx) in seen_ordinals:
+        step = int(match.group("step"))
+        ordinal = int(match.group("ordinal"))
+        batch_idx = int(match.group("batch"))
+        if (ordinal, batch_idx) in seen_ordinals:
             raise RuntimeError(f"duplicate Actor capture ordinal/batch: {path}")
-        seen_ordinals.add((order,batch_idx))
-        found.setdefault(step,[]).append((order,batch_idx,path.resolve()))
+        seen_ordinals.add((ordinal, batch_idx))
+        found.setdefault(step, []).append((ordinal, batch_idx, path.resolve()))
     return {
-        step:[path for _,_,path in sorted(items)]
-        for step,items in found.items()
+        step: [path for _,_,path in sorted(entries)]
+        for step,entries in found.items()
     }
 
 
 def prepare(directory: Path, output: Path, *, steps: int = 20,
-            max_seq_len: int = 49152, max_rows: int = 3,
-            max_total_tokens: int = 130000):
-    if steps <= 0 or max_seq_len <= 0 or max_rows < 1 or max_total_tokens <= 0:
-        raise ValueError("invalid selection limits")
+            max_seq_len: int = 49152, expected_sessions: int = 8):
+    if steps < 1 or max_seq_len < 1 or expected_sessions < 1:
+        raise ValueError("steps, max_seq_len and expected_sessions must be positive")
+    if output.exists():
+        raise FileExistsError(output)
     found = _all_capture_steps(directory)
-    missing=[step for step in range(1,steps+1) if step not in found]
+    missing = [step for step in range(1, steps+1) if step not in found]
     if missing:
         raise FileNotFoundError(
-            f"expected Actor captures at EVERY global step 1..{steps}; "
-            f"missing={missing}; present={sorted(found)}"
+            f"expected Actor captures at EVERY online step 1..{steps}, "
+            f"missing={missing}, present={sorted(found)}"
         )
-    items=[]
-    audits=[]
-    for global_step in range(1,steps+1):
-        paths=found[global_step]
-        originals=[]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    merged_dir = output.parent / "session_first_batches"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    items, audits = [], []
+
+    for global_step in range(1, steps+1):
+        paths = found[global_step]
+        sources = []
         for path in paths:
-            raw=torch.load(path,map_location="cpu",weights_only=False)
-            if raw.get("capture_stage")!="actor_update_mini_batch":
-                raise AssertionError(f"not real Actor PPO capture: {path}")
-            if int(raw.get("capture_global_step",-1))!=global_step:
+            raw = torch.load(path, map_location="cpu", weights_only=False)
+            if raw.get("capture_stage") != "actor_update_mini_batch":
+                raise AssertionError(f"not an Actor PPO update capture: {path}")
+            if int(raw.get("capture_global_step", -1)) != global_step:
                 raise AssertionError(f"global step mismatch: {path}")
-            batch=raw["tensordict"]
-            if any(k not in batch for k in REQUIRED):
-                raise AssertionError(f"missing PPO fields: {path}")
-            if len(raw["keys"])!=len(batch["input_ids"]):
-                raise AssertionError(f"bad row identities: {path}")
-            originals.append(raw)
-        rows_by_capture,audit=first_session_indices([
-            (str(path),raw["tensordict"])
-            for path,raw in zip(paths,originals)
+            batch = raw["tensordict"]
+            missing_fields = [key for key in REQUIRED if key not in batch]
+            if missing_fields:
+                raise AssertionError(f"{path}: missing PPO fields {missing_fields}")
+            if len(raw["keys"]) != len(batch["input_ids"]):
+                raise AssertionError(f"{path}: keys / TensorDict rows mismatch")
+            sources.append(raw)
+
+        keep, audit = first_session_indices([
+            (str(path), raw["tensordict"])
+            for path, raw in zip(paths, sources)
         ])
-        audit["online_global_step"]=global_step
-        audit["original_capture_count"]=len(paths)
-        audit["original_rows"]=sum(len(raw["keys"]) for raw in originals)
-        audit["eligible_capture_count"]=0
-        audit["chosen_rows"]=0
-        for path,raw,kept in zip(paths,originals,rows_by_capture):
-            batch=raw["tensordict"]
-            candidates=[]
-            for row in kept:
-                ids=batch["input_ids"][row]
-                mask=batch["response_mask"][row].bool()
-                old=batch["old_log_probs"][row]
-                adv=batch["advantages"][row]
-                size=int(ids.numel())
-                nt=int(mask.sum().item())
-                if mask.numel()!=old.numel() or mask.numel()!=adv.numel():
-                    raise AssertionError(
-                        f"bad old_lp/advantages alignment step={global_step} row={row}"
-                    )
-                if size>max_seq_len or nt==0:
-                    continue
-                valid_adv=adv[mask].float()
-                candidates.append((
-                    size,row,nt,
-                    bool((valid_adv>0).any().item()),
-                    bool((valid_adv<0).any().item()),
-                    float(valid_adv.abs().max().item()),
-                ))
-            candidates.sort()
-            selected=[]
-            logical_tokens=0
-            def choose(candidate):
-                nonlocal logical_tokens
-                if (candidate is None or candidate in selected
-                        or len(selected)>=max_rows
-                        or logical_tokens+candidate[0]>max_total_tokens):
-                    return False
-                selected.append(candidate)
-                logical_tokens+=candidate[0]
-                return True
-            pos=[x for x in candidates if x[3]]
-            neg=[x for x in candidates if x[4]]
-            pairs=[
-                (a,b) for a in pos for b in neg
-                if a[1]!=b[1] and a[0]+b[0]<=max_total_tokens
-            ]
-            if pairs:
-                a,b=min(pairs,key=lambda pair:(
-                    pair[0][0]+pair[1][0],pair[0][1],pair[1][1]
-                ))
-                choose(a)
-                choose(b)
-            for candidate in candidates:
-                choose(candidate)
-            if not selected:
-                # This Actor mini-batch has no first-of-session eligible
-                # trajectory (e.g. all its rows are discarded continuation
-                # chains); don't fabricate a replay update for it.
-                print(f"TPR_OFFLINE_CAPTURE_SKIPPED global_step={global_step} "
-                      f"file={path.name} original_rows={len(raw['keys'])} "
-                      f"session_first_candidates={len(kept)}",flush=True)
-                continue
-            selected_rows=sorted(x[1] for x in selected)
-            ntokens=sum(x[2] for x in selected)
-            replay_step=len(items)+1
-            item={
-                "step":replay_step, # sequential OFFLINE optimizer update
-                "source_global_step":global_step,
-                "source_capture_index":int(raw["capture_index"]),
-                "source_mini_batch_idx":int(raw["capture_mini_batch_idx"]),
-                "capture":str(path),
-                "rows":selected_rows,
-                "original_rows":len(raw["keys"]),
-                "session_first_candidates":len(kept),
-                "logical_full_tokens":logical_tokens,
-                "ppo_tokens":ntokens,
-                "positive_advantage_present":any(x[3] for x in selected),
-                "negative_advantage_present":any(x[4] for x in selected),
-                "max_abs_advantage":max(x[5] for x in selected),
-                "max_sequence_length":max(x[0] for x in selected),
-            }
-            items.append(item)
-            audit["eligible_capture_count"]+=1
-            audit["chosen_rows"]+=len(selected_rows)
-            print(f"TPR_20STEP_MANIFEST replay_update={replay_step} "
-                  f"online_step={global_step} capture={path.name} "
-                  f"rows={selected_rows} logical_tokens={logical_tokens} "
-                  f"ppo_tokens={ntokens}",flush=True)
-        if audit["eligible_capture_count"]==0:
-            raise RuntimeError(
-                f"online global_step={global_step} has no valid FIRST-session "
-                "trajectory in any captured Actor mini-batch; refusing "
-                "to silently omit an online step."
+        if audit["sessions_seen"] != expected_sessions:
+            raise AssertionError(
+                f"online step={global_step} has "
+                f"{audit['sessions_seen']} distinct (uid,session_id), "
+                f"expected exactly {expected_sessions} for a complete N=8 batch"
             )
+        if sum(len(row_indices) for row_indices in keep) != expected_sessions:
+            raise AssertionError("session dedup did not retain exactly one row per Session")
+
+        selected_parts, provenance, identities = [], [], []
+        lengths, ppo_counts, advantages = [], [], []
+        for path, raw, row_indices in zip(paths, sources, keep):
+            if not row_indices:
+                continue
+            batch = raw["tensordict"]
+            row_sessions, _, _ = session_rows(batch)
+            for row in row_indices:
+                input_ids = batch["input_ids"][row]
+                prompt = batch["prompts"][row]
+                response = batch["responses"][row]
+                mask = batch["response_mask"][row].bool()
+                loss_mask = batch["loss_mask"][row]
+                old = batch["old_log_probs"][row]
+                adv = batch["advantages"][row]
+                size = int(input_ids.numel())
+                if size > max_seq_len:
+                    raise AssertionError(
+                        f"online step={global_step} session={row_sessions[row]} "
+                        f"first trajectory length {size} exceeds {max_seq_len}. "
+                        "Do not silently replace first trajectory with a shorter sibling."
+                    )
+                if (not torch.equal(input_ids, torch.cat((prompt, response)))
+                        or mask.numel() != response.numel()
+                        or old.numel() != response.numel()
+                        or adv.numel() != response.numel()
+                        or loss_mask.numel() != response.numel()):
+                    raise AssertionError(
+                        f"online step={global_step} session={row_sessions[row]}: "
+                        "original PPO token/label alignment mismatch"
+                    )
+                selected_parts.append(tu.index_select_tensor_dict(batch, [row]))
+                identities.append(row_sessions[row])
+                provenance.append({
+                    "source_capture": str(path),
+                    "source_capture_index": int(raw["capture_index"]),
+                    "source_mini_batch_idx": int(raw["capture_mini_batch_idx"]),
+                    "source_row": row,
+                    "uid": row_sessions[row][0],
+                    "session_id": row_sessions[row][1],
+                })
+                lengths.append(size)
+                ppo_counts.append(int(mask.sum().item()))
+                advantages.append(adv[mask].float())
+
+        if len(selected_parts) != expected_sessions or len(set(identities)) != expected_sessions:
+            raise AssertionError("missing or duplicate selected original Sessions")
+        if sum(ppo_counts) == 0:
+            raise AssertionError(f"online step={global_step}: no supervised PPO tokens")
+
+        # IMPORTANT: concatenate the ORIGINAL selected TensorDict rows, never
+        # reconstruct logits, advantages, masks, temperatures or rewards.
+        # A failed merge is a hard error; silently losing TensorDict fields is
+        # unacceptable for a real PPO correctness comparison.
+        try:
+            merged = torch.cat(selected_parts, dim=0)
+        except Exception as exc:
+            raise RuntimeError(
+                f"step={global_step}: cannot concatenate original captured "
+                "TensorDict rows losslessly; inspect non-tensor fields"
+            ) from exc
+        if merged.batch_size[0] != expected_sessions:
+            raise AssertionError("merged Actor batch does not have all eight rows")
+        # The raw capture's per-mini-batch '_tpr_<row>' suffix may repeat across
+        # source mini-batches, so regenerate only trajectory KEYS from original
+        # UIDs and new stable row ordinals. Input tensors remain untouched.
+        keys = tuple(f"{uid}_tpr_{row}" for row,(uid,_) in enumerate(identities))
+        target = merged_dir / f"actor_update_step{global_step:06d}_session_first8.pt"
+        if target.exists():
+            raise FileExistsError(target)
+        payload = {
+            "capture_stage": "actor_update_mini_batch",
+            "tensordict": merged,
+            "keys": keys,
+            "capture_global_step": global_step,
+            "capture_index": 0,
+            "capture_mini_batch_idx": 0,
+            "offline_session_first_merge": True,
+            "source_row_provenance": provenance,
+        }
+        tmp = target.with_suffix(".pt.tmp")
+        if tmp.exists():
+            raise FileExistsError(tmp)
+        try:
+            torch.save(payload, tmp)
+            os.replace(tmp, target)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+        replay_step = len(items)+1
+        item = {
+            "step": replay_step,  # exactly one replay update per online step
+            "source_global_step": global_step,
+            "source_capture_index": 0,
+            "source_capture_indices": sorted(set(
+                p["source_capture_index"] for p in provenance
+            )),
+            "capture": str(target.resolve()),
+            "rows": list(range(expected_sessions)),
+            "original_capture_count": len(paths),
+            "original_rows": sum(len(raw["keys"]) for raw in sources),
+            "session_count": len(identities),
+            "source_row_provenance": provenance,
+            "logical_full_tokens": sum(lengths),
+            "ppo_tokens": sum(ppo_counts),
+            "positive_advantage_present": any(bool((adv>0).any()) for adv in advantages),
+            "negative_advantage_present": any(bool((adv<0).any()) for adv in advantages),
+            "max_abs_advantage": max(
+                (float(adv.abs().max()) for adv in advantages if adv.numel()), default=0
+            ),
+            "max_sequence_length": max(lengths),
+            "min_sequence_length": min(lengths),
+        }
+        items.append(item)
+        audit.update({
+            "online_global_step": global_step,
+            "original_capture_count": len(paths),
+            "original_rows": item["original_rows"],
+            "chosen_rows": len(identities),
+            "chosen_total_tokens": sum(lengths),
+            "merged_capture": str(target),
+        })
         if audit["capture_first_fallback_sessions"]:
             print(
-                f"TPR_SESSION_ORDER_WARNING step={global_step} "
-                f"sessions_without_original_trajectory_ordinal="
-                f"{audit['capture_first_fallback_sessions']}; "
-                "using first encounter in captured mini-batch order "
-                "(not provably the original Gateway first chain)",
+                f"TPR_SESSION_ORDER_WARNING online_step={global_step}: "
+                f"{audit['capture_first_fallback_sessions']} Sessions lack "
+                "original TQ trajectory ordinal; deterministic first CAPTURE "
+                "encounter is not proof of Gateway first chain",
                 flush=True,
             )
         audits.append(audit)
-        del originals
-    if not items:
-        raise AssertionError("No valid offline PPO updates")
-    result={
-        "protocol":"real_actor_session_first_multicapture_v2",
-        "online_steps":steps,
-        "steps":len(items), # total OFFLINE optimizer updates
-        "max_seq_len":max_seq_len,"max_rows":max_rows,
-        "max_total_tokens":max_total_tokens,
-        "session_selection":"one_first_available_per_uid_session_id_across_capture_files",
-        "historical_ppo_labels_modified":False,
-        "items":items,
-        "session_audits":audits,
+        print(
+            f"TPR_20STEP_FULL_N8 step={global_step} sessions={len(identities)} "
+            f"capture_files={len(paths)} discarded_sibling_rows="
+            f"{audit['discarded_trajectory_rows']} total_tokens={sum(lengths)} "
+            f"longest={max(lengths)} ppo_tokens={sum(ppo_counts)} "
+            f"merged={target}", flush=True,
+        )
+        del sources, selected_parts, merged
+
+    result = {
+        "protocol": "real_actor_session_first_8merged_v3",
+        "online_steps": steps,
+        "steps": len(items),
+        "expected_sessions": expected_sessions,
+        "max_seq_len": max_seq_len,
+        "max_rows": None,
+        "max_total_tokens": None,
+        "session_selection": "one_per_uid_session_id_across_all_captures",
+        "historical_ppo_labels_modified": False,
+        "items": items,
+        "session_audits": audits,
     }
-    if output.exists():
-        raise FileExistsError(output)
-    output.parent.mkdir(parents=True,exist_ok=True)
-    output.write_text(json.dumps(result,indent=2))
-    print(f"TPR_20STEP_SESSION_FIRST_SUMMARY online_steps={steps} "
-          f"captured_optimizer_updates={sum(len(x) for x in found.values())} "
-          f"selected_replay_updates={len(items)} "
-          f"selected_full_trajectories={sum(len(x['rows']) for x in items)} "
-          f"manifest={output}",flush=True)
+    output.write_text(json.dumps(result, indent=2))
+    print(
+        f"TPR_20STEP_FULL_N8_READY online_steps={steps} "
+        f"replay_steps={len(items)} sessions_per_step={expected_sessions} "
+        f"manifest={output}", flush=True,
+    )
     return result
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     p=argparse.ArgumentParser()
-    p.add_argument("capture_dir",type=Path)
-    p.add_argument("output",type=Path)
-    p.add_argument("--steps",type=int,default=20)
-    p.add_argument("--max-seq-len",type=int,default=49152)
-    p.add_argument("--max-rows",type=int,default=3)
-    p.add_argument("--max-total-tokens",type=int,default=130000)
-    a=p.parse_args()
-    prepare(a.capture_dir,a.output,steps=a.steps,
-            max_seq_len=a.max_seq_len,max_rows=a.max_rows,
-            max_total_tokens=a.max_total_tokens)
+    p.add_argument("capture_dir", type=Path)
+    p.add_argument("output", type=Path)
+    p.add_argument("--steps", type=int, default=20)
+    p.add_argument("--max-seq-len", type=int, default=49152)
+    p.add_argument("--expected-sessions", type=int, default=8)
+    args=p.parse_args()
+    prepare(args.capture_dir, args.output,
+            steps=args.steps, max_seq_len=args.max_seq_len,
+            expected_sessions=args.expected_sessions)
