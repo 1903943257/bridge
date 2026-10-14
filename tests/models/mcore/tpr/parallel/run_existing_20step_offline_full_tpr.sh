@@ -24,6 +24,9 @@ export TPR_OFFLINE_OUTPUT_DIR="$RUN_ROOT/offline"
 export TPR_OFFLINE_STEPS=20
 export TPR_OFFLINE_ADAMW_LR=2e-5
 export TPR_OFFLINE_ADAMW_CLIP_NORM=1.0
+# Strict parity run: disable Native Full recompute, matching the TPR route.
+# Dedicated capacity experiments can invoke the native runner separately.
+export TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS=0
 export TPR_OFFLINE_SAVE_FULL_GRADS=0
 unset TPR_OFFLINE_FULL_GRAD_STEPS || true
 export TPR_EXEC_PROFILE=1
