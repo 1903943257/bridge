@@ -59,15 +59,18 @@ def _concat_original_rows(parts):
             else:
                 combined[key] = torch.cat(values, dim=0)
         elif isinstance(first, NonTensorStack):
-            combined[key] = NonTensorStack(
-                *(tu.unwrap_non_tensor_data(v[0]) for v in values)
-            )
+            combined[key] = NonTensorStack.from_list([
+                NonTensorData(tu.unwrap_non_tensor_data(v[0]))
+                for v in values
+            ])
         elif isinstance(first, NonTensorData):
             originals = [tu.unwrap_non_tensor_data(v) for v in values]
             if any(v != originals[0] for v in originals[1:]):
                 # A scalar NonTensorData cannot hold per-row differences.
                 # Promote only this field to row-wise stack.
-                combined[key] = NonTensorStack(*originals)
+                combined[key] = NonTensorStack.from_list([
+                    NonTensorData(value) for value in originals
+                ])
             else:
                 combined[key] = first
         else:
