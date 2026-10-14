@@ -11,7 +11,6 @@ optimizer trajectories.  Run a single step first using the wrapper shell.
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
@@ -23,7 +22,7 @@ import torch
 import torch.distributed as dist
 
 from verl.utils import tensordict_utils as tu
-from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _load_real_pair, _witness
+from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _load_real_pair
 
 
 pytestmark = pytest.mark.skipif(
