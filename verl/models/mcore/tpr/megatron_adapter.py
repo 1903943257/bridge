@@ -362,8 +362,19 @@ def run_tpr_forward_backward_batch(
         stage_ms["tp_plan_collective_ms"] = (time.perf_counter()-tp_check_start)*1000
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
+    # DP2+CP2 has twice the per-rank local sequence of the CP4 baseline.
+    # Default this *isolated* experiment to recomputable PPO logprob chunks;
+    # ordinary TPR and all other topologies remain unchanged.
+    default_lp_chunk = "512" if sizes["DP"] == 2 and sizes["CP"] == 2 else "0"
+    try:
+        lp_chunk_tokens = int(os.getenv("TPR_PPO_LOGPROB_CHUNK_TOKENS", default_lp_chunk))
+    except ValueError as exc:
+        raise ValueError("TPR_PPO_LOGPROB_CHUNK_TOKENS must be a nonnegative integer") from exc
+    if lp_chunk_tokens < 0:
+        raise ValueError("TPR_PPO_LOGPROB_CHUNK_TOKENS must be nonnegative")
     objective = SegmentPPOObjectiveAdapter(
-        data, loss_function, dp_group=engine.get_data_parallel_group()
+        data, loss_function, dp_group=engine.get_data_parallel_group(),
+        log_prob_chunk_size=lp_chunk_tokens or None,
     )
 
     # Native Megatron uses /M inside its PP schedule. That schedule is bypassed;
