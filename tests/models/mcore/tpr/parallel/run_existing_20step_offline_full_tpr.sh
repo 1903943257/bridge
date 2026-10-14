@@ -29,7 +29,7 @@ unset TPR_OFFLINE_FULL_GRAD_STEPS || true
 export TPR_EXEC_PROFILE=1
 export TPR_TREE_POLICY=qwen_turn
 export TPR_TURN_MIN_SEGMENT_TOKENS=128
-export TPR_OFFLINE_FULL_RING_BACKEND=native
+export TPR_OFFLINE_FULL_RING_BACKEND="${TPR_OFFLINE_FULL_RING_BACKEND:-custom}"
 unset TPR_MEM_TRACE || true
 RUNNER=tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_multistep.sh
 SELECTOR=tests/models/mcore/tpr/parallel/prepare_real_actor_20step_manifest.py
