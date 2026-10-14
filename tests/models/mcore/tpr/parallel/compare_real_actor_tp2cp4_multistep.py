@@ -165,8 +165,12 @@ def compare(outdir: Path, steps: int):
         if any(x.get("execution_backend", "tpr_segment_executor") != "tpr_segment_executor" for x in t):
             raise AssertionError("TPR baseline must remain the original segment executor")
         native_recompute = {x.get("native_recompute_layers") for x in f}
-        if len(native_recompute) != 1:
-            raise AssertionError("Native Full recompute settings disagree across ranks")
+        if native_recompute != {0}:
+            raise AssertionError(
+                "Fair Native Full vs TPR replay requires recompute OFF on both "
+                f"paths, found Native Full recompute settings {native_recompute}. "
+                "Do not compare a capacity-only recompute run as parity."
+            )
         for a, b in zip(f, t):
             for field in (
                 "step", "steps", "source_capture", "source_rows", "source_keys",
