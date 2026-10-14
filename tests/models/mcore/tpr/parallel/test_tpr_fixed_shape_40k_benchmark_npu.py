@@ -67,6 +67,20 @@ def test_fixed_shape_40k_one_mode():
     output_dir = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
     checkpoint = Path(os.environ.get("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
     runtime = _runtime()
+    # The Full reference needs the same supported FP32 collective gate as
+    # the TPR DP2 benchmark; FP64 HCCL reductions cannot be trusted on 910B.
+    probe = torch.tensor(
+        float(dist.get_rank() + 1), dtype=torch.float32, device=runtime.device,
+    )
+    dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+    torch.npu.synchronize()
+    if float(probe.item()) != 36.0:
+        raise AssertionError(
+            f"Full WORLD FP32 AllReduce failed on rank {dist.get_rank()}: "
+            f"rank_sum={probe.item()} expected=36"
+        )
+    if dist.get_rank() == 0:
+        print("TPR_FULL_WORLD_FP32_REDUCE_PASS rank_sum=36", flush=True)
     try:
         from verl.workers.utils.losses import ppo_loss
         # Reuse existing original PPO-capture loader. Its original source_keys
@@ -202,6 +216,7 @@ def test_fixed_shape_40k_one_mode():
                 "input_sha256": data_sha, "source_capture": str(capture),
                 "checkpoint": str(checkpoint), "warmups": warmups,
                 "repeats": repeats, "updated_weights": False,
+                "hccl_stats_reduce_dtype": "float32",
                 "capture_logprobs": capture_logprobs,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
                 "median_fwd_bwd_s": statistics.median(measured),
