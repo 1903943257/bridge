@@ -24,6 +24,12 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
                   "capture_logprobs", "profiler_enabled"):
         if full[field] != tpr[field]:
             raise AssertionError(f"Full vs TPR comparison rejected: {field} differs")
+    full_cap = int(full.get("effective_sequence_cap", 40960))
+    tpr_cap = int(tpr.get("effective_sequence_cap", 40960))
+    if full_cap != tpr_cap:
+        raise AssertionError(
+            f"Full vs TPR sequence cap mismatch: {full_cap} vs {tpr_cap}"
+        )
     if full.get("updated_weights") is not False or tpr.get("updated_weights") is not False:
         raise AssertionError("Both experiments must be fixed-weight F/B without AdamW")
     if full["runs"][0]["ppo_tokens"] != tpr["global_ppo_tokens"]:
@@ -59,6 +65,7 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
     tl = tpr["runs"][-1]["loss"]
     result = {
         "source_step": tpr["source_step"],
+        "effective_sequence_cap": tpr_cap,
         "source_capture": tpr["source_capture"],
         "input_sha256": tpr["input_sha256"],
         "full_topology": "TP2_CP4_DP1",
