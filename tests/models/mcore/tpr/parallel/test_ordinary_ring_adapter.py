@@ -49,3 +49,32 @@ def test_native_adapter_rejects_padding_before_import(monkeypatch):
     with pytest.raises(ValueError, match="unpadded"):
         ring.ordinary_ring_cp_attention(None, None, None,
             current_shard=SimpleNamespace(global_length=127, padded_length=128), cp_group=None)
+
+def test_native_whole_ring_opt_in_virtual_right_padding(monkeypatch):
+    """A virtual causal tail is accepted ONLY with explicit Full opt-in."""
+    group = object()
+    shard = SimpleNamespace(global_length=127, padded_length=128)
+    config = SimpleNamespace(cp_size=2, cp_rank=0, global_ranks=(0,1),
+                             query_heads=8, softmax_scale=0.0625)
+    monkeypatch.setattr(ring, "_normalize_inputs", lambda *args, **kwargs: ((), config))
+    monkeypatch.setattr(ring.dist, "get_rank", lambda: 0)
+    observed = []
+
+    def native(q, k, v, n, cp_para, **kwargs):
+        observed.append((q.shape, k.shape, v.shape, cp_para["cp_size"]))
+        return q + (k.sum() + v.sum()) * 0
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mindspeed.core.context_parallel.ring_context_parallel.ring_context_parallel",
+        SimpleNamespace(ringattn_context_parallel=native)
+    )
+    q = torch.ones(64, 1, 8, 256, requires_grad=True)
+    k = torch.ones(64, 1, 2, 256, requires_grad=True)
+    v = torch.ones(64, 1, 2, 256, requires_grad=True)
+    out = ring.ordinary_ring_cp_attention(
+        q,k,v,current_shard=shard,cp_group=group,allow_trailing_padding=True
+    )
+    out.sum().backward()
+    assert observed == [((64,1,2048),(64,1,512),(64,1,512),2)]
+    assert torch.all(q.grad == 1)
