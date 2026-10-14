@@ -979,8 +979,9 @@ def ordinary_ring_cp_attention(
     current_shard: SequenceShard,
     cp_group: Any,
     softmax_scale: float | None = None,
+    allow_trailing_padding: bool = False,
 ) -> Tensor:
-    """Whole, unpadded causal attention using paired MindSpeed's native Ring.
+    """Whole causal attention using paired MindSpeed native Ring.
 
     Explicit entry point: an empty prefix alone does NOT identify whole mode
     (a segmented execution's root also has no prefix). Keep that root on the
@@ -995,7 +996,15 @@ def ordinary_ring_cp_attention(
         softmax_scale=softmax_scale,
     )
     if current_shard.global_length != current_shard.padded_length:
-        raise ValueError("ordinary whole Ring requires an unpadded sequence")
+        if not allow_trailing_padding:
+            raise ValueError("ordinary whole Ring requires an unpadded sequence")
+        # The SegmentExecutor's Ring sequence shard has only VIRTUAL right-
+        # padding after the final real token. For causal attention every real
+        # query is earlier than these virtual tokens, so padded keys cannot
+        # contribute to any real query; the PPO mask excludes padded queries.
+        # Never allow this option when Prefix blocks are present.
+        if not (0 < current_shard.global_length < current_shard.padded_length):
+            raise ValueError("native whole Ring requires strictly trailing padding")
     from mindspeed.core.context_parallel.ring_context_parallel.ring_context_parallel import (
         ringattn_context_parallel,
     )
