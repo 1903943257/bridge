@@ -55,18 +55,26 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 
 
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
-    """TP+RingCP DP1 acceptance scope; unsupported configurations fail closed."""
+    """Keep DP1 production scope; gate the isolated TP2/CP2/DP2 replay."""
+    import os
+
     tp, cp = sizes["TP"], sizes["CP"]
+    experimental_dp2 = (
+        ppo and tp == 2 and cp == 2 and sizes["DP"] == 2
+        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
+        and os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1"
+    )
     supported_cp = (
         (cp in (1, 2) if tp == 1 else cp in (1, 2, 4))
         if ppo else (cp >= 1 if tp == 1 else cp in (1, 2, 4))
     )
     if (tp not in (1, 2) or not supported_cp
-            or any(sizes[k] != 1 for k in ("PP", "EP", "DP"))):
+            or any(sizes[k] != 1 for k in ("PP", "EP"))
+            or (sizes["DP"] != 1 and not experimental_dp2)):
         raise NotImplementedError(
             "TPR PPO: TP1 CP1/2 or TP2 CP1/2/4; "
             "thin entry: TP1 CP>=1 or TP2 CP1/2/4; "
-            f"PP=EP=DP=1, got {sizes}"
+            f"PP=EP=1, DP=1 (or explicitly gated offline TP2/CP2/DP2), got {sizes}"
         )
     return tp
 
@@ -254,7 +262,9 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    TP=1/2, CP=1/2/4, PP=EP=DP=1. Ring required for CP>1,
+    TP=1/2, CP=1/2/4, PP=EP=DP=1 in production. Only the isolated
+    TP2/CP2/DP2 replay may opt in through TPR_EXPERIMENTAL_OFFLINE_DP2=1.
+    Ring required for CP>1,
     and native SP is restricted to CP=1 at TP2.
     Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
@@ -316,8 +326,12 @@ def run_tpr_forward_backward_batch(
 
     token_count = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
     dp_size = tu.get_non_tensor_data(data, key="dp_size", default=None)
-    if token_count is None or token_count <= 0 or dp_size != 1:
-        raise ValueError("Engine must attach positive batch_num_tokens and dp_size=1 before TPR routing")
+    if (token_count is None or token_count <= 0
+            or dp_size != sizes["DP"]):
+        raise ValueError(
+            "Engine must attach positive GLOBAL batch_num_tokens and the "
+            f"actual dp_size={sizes['DP']} before TPR routing"
+        )
 
     import os
     import time
