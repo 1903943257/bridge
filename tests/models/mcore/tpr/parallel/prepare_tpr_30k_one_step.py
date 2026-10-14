@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 
 import torch
-from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 
 _RESPONSE_FIELDS = {
@@ -109,23 +108,32 @@ def derive_capture(source: Path, target: Path, cap: int):
     if not any(new < old for new, old in zip(cap_lengths, original_lengths)):
         raise ValueError(f"No trajectory exceeds cap {cap}; refusing a misleading 30K run")
 
-    modified = {}
+    # Never reconstruct an existing Actor TensorDict from a plain dict.
+    # The captured batch can contain scalar/zero-dimensional Tensor values
+    # and NonTensorData metadata already accepted by its own TensorDict
+    # representation. Passing those unchanged values back through
+    # TensorDict(..., batch_size=[8]) spuriously rejects shape=[] fields.
+    # Shallow clone retains the original batch semantics, then replace ONLY
+    # the jagged time-aligned tensors. No original capture is mutated.
+    cropped = data.clone(recurse=False)
+    if tuple(cropped.batch_size) != (8,):
+        raise AssertionError("Derived TensorDict must keep original batch_size=[8]")
     for name in data.keys():
         value = data[name]
         if isinstance(value, torch.Tensor) and value.is_nested:
-            modified[name] = _truncate_nested_field(
+            cropped.set(name, _truncate_nested_field(
                 name, value, original_lengths, cap_lengths, prompt_lengths,
                 response_lengths, retained
-            )
+            ))
         elif isinstance(value, torch.Tensor) and name in (
             _FULL_FIELDS | _RESPONSE_FIELDS | _PROMPT_FIELDS
-        ) and value.ndim >= 2:
-            # These are expected to be jagged in genuine captures. Never
-            # accidentally retain a dense, untruncated time dimension.
-            raise TypeError(f"Sequence field {name} is unexpectedly non-nested")
-        else:
-            modified[name] = value
-    cropped = TensorDict(modified, batch_size=[8])
+        ):
+            raise TypeError(
+                f"Sequence field {name} is unexpectedly non-nested: "
+                f"shape={tuple(value.shape)}"
+            )
+    if set(cropped.keys()) != set(data.keys()):
+        raise AssertionError("Truncating a capture must preserve all PPO fields")
     actual_tokens = 0
     kept_advantages = []
     for i in range(8):
