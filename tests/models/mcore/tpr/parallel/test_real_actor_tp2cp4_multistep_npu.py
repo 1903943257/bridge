@@ -336,7 +336,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     f"clip_scale={scale:.6g} fwd_bwd_s={fwd_seconds:.3f} "
                     f"cpu_adamw_s={update_seconds:.3f} peak_gib={peak/2**30:.3f} "
                     f"source_step={step if manifest_items is not None else 'fixed'} "
-                    f"segments={forest.segment_count}",
+                    f"segments={forest.segment_count} ring_impl={ring_impl}",
                     flush=True,
                 )
             dist.barrier()
