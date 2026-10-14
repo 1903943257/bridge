@@ -44,6 +44,18 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
         enable_activation_offload=False,
         use_remove_padding=True,
     )
+    # Use EXACTLY the bridge backend proven by the online UniAgent E2E:
+    #   use_mbridge=True, vanilla_mbridge=True -> verl.models.mcore.mbridge
+    # The non-vanilla Megatron-Bridge path imports NVIDIA TransformerEngine
+    # even for Dense Qwen without LoRA; it is NOT installed on this Ascend stack.
+    import inspect
+    if "vanilla_mbridge" not in inspect.signature(McoreEngineConfig).parameters:
+        raise RuntimeError(
+            "Installed VERL McoreEngineConfig lacks vanilla_mbridge. "
+            "This is not the VERL configuration used by the successful E2E "
+            "script (use_mbridge=True, vanilla_mbridge=True); synchronize "
+            "the ORIGINAL working VERL code, do not install TransformerEngine."
+        )
     engine_cfg = McoreEngineConfig(
         dtype="bfloat16",
         tensor_model_parallel_size=2,
@@ -54,6 +66,7 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
         dynamic_context_parallel=False,
         use_remove_padding=True,
         use_mbridge=True,
+        vanilla_mbridge=True,
         use_fused_kernels=False,
         forward_only=False,
         use_distributed_optimizer=True,
@@ -98,6 +111,9 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
         )
     finally:
         sys.argv[:] = old_argv
+    if not engine.engine_config.vanilla_mbridge:
+        raise AssertionError("Offline Full must follow online E2E vanilla_mbridge=True")
+    print("VERL_FULL_BRIDGE_SELECTED backend=legacy_mbridge vanilla_mbridge=True", flush=True)
     engine.initialize()
 
     from megatron.core import parallel_state as mpu
