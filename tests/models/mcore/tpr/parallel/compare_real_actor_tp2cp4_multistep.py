@@ -153,6 +153,15 @@ def compare(outdir: Path, steps: int):
                 "Full baseline must be the genuine Megatron schedule; old "
                 "unshared TPR snapshots are not interchangeable"
             )
+        if any(
+            x.get("native_loss_scaling") != "megatron_cp_once_global_token_mean_v2"
+            for x in f
+        ):
+            raise AssertionError(
+                "Native Full snapshots use obsolete/unknown CP loss scaling. "
+                "Earlier runs multiplied CP=4 twice and must be replayed "
+                "from the original checkpoint before comparison."
+            )
         if any(x.get("execution_backend", "tpr_segment_executor") != "tpr_segment_executor" for x in t):
             raise AssertionError("TPR baseline must remain the original segment executor")
         native_recompute = {x.get("native_recompute_layers") for x in f}
@@ -194,6 +203,7 @@ def compare(outdir: Path, steps: int):
             "full_execution_backend":f[0]["execution_backend"],
             "tpr_execution_backend":t[0].get("execution_backend", "tpr_segment_executor"),
             "full_native_recompute_layers":f[0]["native_recompute_layers"],
+            "full_native_loss_scaling":f[0]["native_loss_scaling"],
             "tpr_attention_impl":t[0].get("ring_attention_impl","legacy_custom"),
             "full_loss":f[0]["loss"], "tpr_loss":t[0]["loss"],
             "loss_gap":t[0]["loss"]-f[0]["loss"],
