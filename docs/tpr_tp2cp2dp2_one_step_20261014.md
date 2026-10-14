@@ -39,10 +39,12 @@ verl/models/mcore/tpr/dp_placement.py::plan_tpr_dta_dp.
 4. Keep metadata batch_num_tokens equal to **all eight trajectories' original
    supervised tokens**, dp_size=2 and global_batch_size=8 on both replicas.
    VERL's original token-mean PPO loss scales each local contribution by DP=2.
-5. In the isolated benchmark only, finalize each parameter with CP SUM/2 and
-   DP SUM/2. Native Megatron TP collectives remain untouched. No per-segment
-   DP collective is introduced, so different-size local forests can finish
-   independently before the shared gradient finalize.
+5. In the isolated benchmark only, finalize each parameter with a single
+   Megatron DP-with-context-parallel SUM/4 over four weight replicas (the
+   mathematical equivalent of CP SUM/2 then DP SUM/2, allowing BF16 reduction
+   order differences). HCCL CP/DP/DP-with-CP communicators are prewarmed
+   before model loading. Native Megatron TP collectives remain untouched.
+   No per-segment DP collective is introduced.
 6. After timing, reconstruct global PPO loss by averaging the two DP replicas
    and verify all eight ranks agree. Rank/row ownership, global token count,
    input digest and actual logical tree-token metrics are recorded.
@@ -71,7 +73,16 @@ Example:
       /workspace/existing_full_fixed_shape/step6_full_fixed_shape.json
 
 Defaults: physical NPU 8-15, Qwen3-4B-128K checkpoint, source step 6,
-one warmup and three measured F/B passes, profiler off, captured logprobs on.
+one warmup and three measured F/B passes, profiler off, captured logprobs on,
+and TPR_PPO_LOGPROB_CHUNK_TOKENS=512 (experimental PPO logprob activation
+checkpointing; set 0 to disable). This checkpoint only rematerializes
+selected-logprob/softmax intermediate tensors on backward; it is NOT
+Megatron per-layer recompute or MindSpeed swap-attention. Both modes use
+the same original PPO labels/token normalization, but the chunk shape and
+extra rematerialization may change BF16 numerics and runtime. Compare the
+PPO loss gap before treating the speedup as a viable configuration.
+TPR_BENCH_MEM_TRACE=1 enables a per-segment forward memory trace only for
+debugging; leave off for timing.
 Those timing defaults match the existing fixed-shape Full benchmark. They are
 repeated execution of ONE source step without any weight update, not four
 optimizer steps. To execute literally one forward/backward invocation, set
@@ -105,4 +116,12 @@ Outputs:
   native VERL Trainer batch dispatch, no_sync/DDP, or distributed optimizer
   already supports unequal per-DP row counts.
 - If CP2 OOMs for a particular 40K capture, report it as a capacity limitation
-  of that configuration, not a speedup result.
+  of that configuration, not a speedup result. Native recompute remains
+  unsupported by TPR's engine adapter. MindSpeed SwapAttention in the current
+  TPR implementation requires TP=1 and cannot be enabled for TP2CP2DP2.
+- The optional logprob checkpoint chunks do NOT reduce the base decoder
+  activation footprint, KV cache, or full-model-output logits. If the
+  backward peak remains above 60 GiB after chunking, this topology needs a
+  deeper activation-memory change (e.g. validated TP-aware swap/recompute)
+  or smaller single-trajectory length; changing capture length invalidates
+  the original 40K fixed-source comparison.
