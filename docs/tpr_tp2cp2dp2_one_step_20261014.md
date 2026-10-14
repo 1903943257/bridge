@@ -260,3 +260,56 @@ rerun BOTH Full TP2CP4 and TPR TP2CP2DP2 on the *same* derived 30K
 capture, with a clean output directory. A quick TPR-only smoke
 test may reuse the derived manifest, but it cannot be used as a
 reliable speedup against a stale Full result.
+
+
+## Step 6 actual 30K performance and gradient-replica diagnostic
+
+The 8-NPU Qwen3-4B 30Ki replay measured:
+
+- Full TP2/CP4/DP1 median 16.361464 s, worst-rank peak 34.638 GiB
+- TPR TP2/CP2/DP2 three measured durations:
+  12.322243 / 12.332244 / 12.327386 s, median 12.327386 s;
+  worst-rank peak 41.071 GiB
+- Performance (indicative, with gradient witness *after* timing):
+  speedup 16.361464/12.327386 ~= 1.3273x.
+  TPR uses ~6.433 GiB extra peak vs Full (~18.6%).
+- PPO loss Full 0.151394129 vs TPR ~0.15156628
+  (absolute difference ~0.00017215). These are source Step 6,
+  identical 30720-token cap with different CP/DP topologies.
+- DTA-DP partitions ((2,3,0,6),(5,1,4,7)), tree costs
+  (59493,70125). Local PPO scalar contributions 0.0137382671
+  vs 0.289394289, correctly different because DP shards see
+  different trajectories. CP replicas match, TP-local gap 0;
+  global report agrees across ranks within 1.49e-8.
+- The final gradient witness failed:
+  TP2CP2DP2 sampled max_abs 1.52587891e-05
+  (around 0.31%~0.36% sampled relative L2 spread);
+  Full CP4 reference itself also had a 3.05175781e-05
+  sampled max_abs (~0.47%~0.51% relative L2 spread).
+  The highlighted TPR parameter was
+  `decoder.layers.1.input_layernorm.weight`.
+
+Because these differences appear *after* BF16 gradient SUM/divide,
+but both Full and TPR show them, do **not** conclude gradient parity
+is satisfied, or that TPR alone is defective. The previous diagnostic
+used additional FP32 HCCL MIN/MAX AllReduce and may not independently
+establish what each rank originally held. The revised witness:
+1. FP32 all-gathers *read-only* original post-finalize gradient samples
+   from the four CP×DP replicas, reconstructing min/max on CPU.
+2. Logs the exact per-rank values and count of differing sampled
+   elements; for a small worst offending parameter (<=8192 elements)
+   also gathers its entire original BF16 gradient from all replicas.
+3. Keeps `TPR_BENCH_GRAD_REPLICA_POLICY=strict` by default. Setting
+   `TPR_BENCH_GRAD_REPLICA_POLICY=diagnostic` is an explicit
+   diagnostic-only override that writes performance and sampled-gradient
+   parity JSON while marking `gradient_replica_validation_passed=false`
+   and `result_is_diagnostic_only=true` if discrepancies persist.
+   It does NOT change the original gradient or falsely mark correctness
+   as passed.
+
+The next decision is grounded by these actual per-rank BF16 values:
+if the samples are exactly identical, the old HCCL MIN/MAX-based
+checker was faulty; if they differ, trace the BF16 gradient finalization
+output and compare FP32 reduction / synchronization as a separate
+controlled experiment, without altering the measured TPR algorithm
+before diagnosis.
