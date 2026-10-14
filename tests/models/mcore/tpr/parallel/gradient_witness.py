@@ -46,8 +46,8 @@ def collect_tp2_gradient_witness(
     spread = (high - low).abs()
     local_max, worst_idx = spread.max(dim=0)
     local_relative = float(
-        (torch.linalg.vector_norm(spread.double()) /
-         torch.linalg.vector_norm(high.double()).clamp_min(1e-30)).item()
+        (torch.linalg.vector_norm(spread.float()) /
+         torch.linalg.vector_norm(high.float()).clamp_min(1e-30)).item()
     )
     offset = 0
     worst_param = "<unknown>"
