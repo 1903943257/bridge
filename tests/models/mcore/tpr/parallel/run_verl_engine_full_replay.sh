@@ -19,6 +19,52 @@ fi
   echo "Missing original model checkpoint" >&2
   exit 2
 }
+# The legacy online capture stack used the separate "mbridge" package.
+# This genuine VERL Engine imports "megatron.bridge" from Megatron-Bridge.
+# Do NOT install/upgrade arbitrary Megatron or MindSpeed packages here:
+# first reuse the exact local Megatron-Bridge source when it exists.
+if [[ -n "${TPR_MEGATRON_BRIDGE_SRC:-}" ]]; then
+  [[ -f "${TPR_MEGATRON_BRIDGE_SRC}/megatron/bridge/__init__.py" ]] || {
+    echo "Invalid TPR_MEGATRON_BRIDGE_SRC: ${TPR_MEGATRON_BRIDGE_SRC}" >&2
+    exit 2
+  }
+  export PYTHONPATH="${TPR_MEGATRON_BRIDGE_SRC}:${PYTHONPATH:-}"
+elif [[ -f /workspace/Megatron-Bridge/src/megatron/bridge/__init__.py ]]; then
+  # Prefer a locally installed package, but allow the known local source tree
+  # when the megatron.bridge submodule is missing.
+  if ! python - <<'PY' >/dev/null 2>&1
+import importlib.util
+assert importlib.util.find_spec("megatron.bridge") is not None
+PY
+  then
+    export PYTHONPATH="/workspace/Megatron-Bridge/src:${PYTHONPATH:-}"
+  fi
+fi
+
+# Fail before launching eight NPU workers if the true Engine dependency is
+# missing or incompatible.  mbridge != megatron.bridge.
+python - <<'PY'
+import importlib.util
+import sys
+try:
+    import megatron.core as core
+    from megatron.bridge import AutoBridge
+except (ImportError, ModuleNotFoundError) as exc:
+    raise SystemExit(
+        "VERL_FULL_PREFLIGHT_FAIL: genuine VERL/MBridge Engine requires "
+        "'megatron.bridge.AutoBridge', which is NOT the separate 'mbridge' "
+        "package used by the older capture script. Set "
+        "TPR_MEGATRON_BRIDGE_SRC=/path/to/Megatron-Bridge/src if that "
+        "source tree is already available; otherwise install a "
+        "Megatron-Bridge version compatible with this NPU/Megatron-Core "
+        "environment. Do not upgrade Megatron-Core/MindSpeed blindly. "
+        f"Original error: {exc!r}"
+    ) from exc
+print("VERL_FULL_PREFLIGHT_PASS", "python=", sys.executable,
+      "megatron_core=", getattr(core, "__file__", None),
+      "AutoBridge=", AutoBridge, flush=True)
+PY
+
 export PYTHONUNBUFFERED=1
 export TPR_RUN_VERL_ENGINE_FULL_REPLAY=1
 export TPR_OFFLINE_CAPTURE_MANIFEST="$RUN_ROOT/capture_manifest.json"
