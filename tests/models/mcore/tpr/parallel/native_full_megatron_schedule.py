@@ -161,10 +161,9 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     def forward_step(data_iterator, module):
         row, length, response_offsets, local_indices, temperature = next(data_iterator)
         calls[0] += 1
-        if dist.get_rank() == 0:
-            print(f"NATIVE_FULL_MB_BEGIN row={row} length={length} "
-                  f"ppo_local={len(response_offsets)} "
-                  f"allocated_gib={torch.npu.memory_allocated()/2**30:.3f}", flush=True)
+        print(f"NATIVE_FULL_MB_BEGIN rank={dist.get_rank()} row={row} length={length} "
+              f"ppo_local={len(response_offsets)} "
+              f"allocated_gib={torch.npu.memory_allocated()/2**30:.3f}", flush=True)
         nested = tu.nested_tensor_from_tensor_list(
             [input_rows[row].to(runtime.device)], ragged_idx=1
         )
@@ -241,11 +240,10 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
                 local_loss = physical_logits.sum() * 0.0
                 metrics = {}
             loss_parts.append(local_loss.detach())
-            if dist.get_rank() == 0:
-                print(f"NATIVE_FULL_MB_END row={row} "
-                      f"allocated_gib={torch.npu.memory_allocated()/2**30:.3f} "
-                      f"peak_gib={torch.npu.max_memory_allocated()/2**30:.3f}",
-                      flush=True)
+            print(f"NATIVE_FULL_MB_LOSS_DONE rank={dist.get_rank()} row={row} "
+                  f"allocated_gib={torch.npu.memory_allocated()/2**30:.3f} "
+                  f"peak_gib={torch.npu.max_memory_allocated()/2**30:.3f}",
+                  flush=True)
             # Megatron divides each microbatch's loss by M; cancel that
             # normalization, and offset CP's replicated-gradient averaging.
             return local_loss * (count * 4), {"metrics": metrics}
