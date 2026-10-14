@@ -241,15 +241,20 @@ def make_real_qwen3_tp_model(
     )
     if native_attention:
         # Native Megatron/MindSpeed Ring CP path: no TPR layer replacement.
-        # Enable checkpointing at model construction time, before forward.
+        # Match the TPR replay: native activation recomputation is OFF by default.
+        # Opt-in only for capacity diagnostics; not for the parity comparison.
         import os
-        recompute_layers = int(os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "1"))
+        recompute_layers = int(os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0"))
         if recompute_layers < 0:
             raise ValueError("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS must be >= 0")
         if recompute_layers:
             config.recompute_granularity = "full"
             config.recompute_method = "uniform"
             config.recompute_num_layers = recompute_layers
+        else:
+            config.recompute_granularity = None
+            config.recompute_method = None
+            config.recompute_num_layers = None
         config.use_flash_attn = True
     # IMPORTANT: setting use_flash_attn=True on a TransformerConfig does
     # not replace Megatron's DotProductAttention implementation. The latter
