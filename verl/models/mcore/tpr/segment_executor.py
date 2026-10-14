@@ -329,6 +329,44 @@ class SegmentExecutor:
         """Forward/backward one leaf without writing its new KV to the path stack."""
 
         self._ensure_healthy()
+        # Opt-in first-leaf troubleshooting only. Default is a no-op and
+        # changes neither autograd nor the steady-state execution schedule.
+        # Start with CPU wall timing; explicit NPU synchronization is a
+        # SECOND, separate diagnostic mode because it perturbs scheduling.
+        diagnose = (
+            os.getenv("TPR_FIRST_LEAF_DIAG", "0") == "1"
+            and not getattr(self, "_first_leaf_diagnosed", False)
+        )
+        if diagnose:
+            import time
+            import torch.distributed as dist
+
+            self._first_leaf_diagnosed = True
+            force_sync = os.getenv("TPR_FIRST_LEAF_DIAG_SYNC", "0") == "1"
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+            diagnostic_start = time.perf_counter()
+            previous = diagnostic_start
+
+            def diag_mark(phase: str) -> None:
+                nonlocal previous
+                host_done = time.perf_counter()
+                if force_sync:
+                    torch.npu.synchronize()
+                synced_done = time.perf_counter()
+                print(
+                    f"TPR_FIRST_LEAF_DIAG rank={rank} segment={segment_id} "
+                    f"phase={phase} sync_enabled={int(force_sync)} "
+                    f"host_s={host_done - previous:.6f} "
+                    f"sync_wait_s={synced_done - host_done:.6f} "
+                    f"elapsed_s={synced_done - diagnostic_start:.6f} "
+                    f"allocated_gib={torch.npu.memory_allocated()/2**30:.3f}",
+                    flush=True,
+                )
+                previous = synced_done
+        else:
+            def diag_mark(phase: str) -> None:
+                pass
+
         try:
             segment = self.plan.get(segment_id)
             if self.plan.children_of(segment_id):
@@ -353,6 +391,7 @@ class SegmentExecutor:
                 anchors = self.kv_stack.build_past_anchors()
                 past_key_values = anchors.key_values
             gdn_parent, gdn_anchors = self._gdn_parent_anchors()
+            diag_mark("anchors_ready")
             context, logits = self._forward(
                 segment,
                 past_key_values=past_key_values,
@@ -362,7 +401,9 @@ class SegmentExecutor:
                 capture_gdn_final_state=False,
             )
             self._assert_collected_layers(context, expect_gdn_states=False)
+            diag_mark("forward_done")
             loss_sum, normalized_loss = self._compute_loss(segment, logits)
+            diag_mark("ppo_loss_done")
             owned_loss_term_count = self._owned_loss_count(segment)
 
             # Every CP rank must traverse the same backward graph even when
@@ -374,11 +415,14 @@ class SegmentExecutor:
             )
             if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
                 raise TypeError("loss_scale_func must return a scalar tensor")
+            diag_mark("backward_ready")
 
             torch.autograd.backward(backward_loss)
+            diag_mark("backward_done")
             self._accumulate_past_anchor_gradients(anchors)
             if gdn_anchors is not None:
                 gdn_parent.accumulate_anchor_gradients(gdn_anchors)
+            diag_mark("anchor_gradients_done")
 
             return LeafVisitResult(
                 forward=SegmentForwardResult(
