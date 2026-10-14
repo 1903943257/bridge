@@ -69,12 +69,38 @@ def _runtime():
     tp = parallel_state.get_tensor_model_parallel_group()
     cp = parallel_state.get_context_parallel_group()
     dp = parallel_state.get_data_parallel_group()
+    # Reuse the native Megatron data+context group for weight-gradient
+    # synchronization. CP ranks hold replicated weights, just like DP ranks.
+    dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
     assert (dist.get_world_size(tp), dist.get_world_size(cp),
-            dist.get_world_size(dp)) == (2, 2, 2)
+            dist.get_world_size(dp), dist.get_world_size(dp_cp)) == (2, 2, 2, 4)
+    device = torch.device("npu", local_rank)
+
+    # Initialize the HCCL communicators BEFORE loading the Qwen3-4B model
+    # and entering 40K-token forward/backward. Otherwise the first DP
+    # all_reduce during finalize may lazily request ~1 GiB HCCL memory
+    # after the activation/gradient peak has already been reached.
+    for label, group, expected_size in (
+        ("cp", cp, 2), ("dp", dp, 2), ("dp_cp", dp_cp, 4),
+    ):
+        probe = torch.ones(1, device=device, dtype=torch.float32)
+        dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=group)
+        torch.npu.synchronize()
+        if float(probe.item()) != expected_size:
+            raise AssertionError(
+                f"Wrong {label} communicator: got {probe.item()} "
+                f"instead of {expected_size}"
+            )
+    if dist.get_rank() == 0:
+        print(
+            "TPR_DP2_HCCL_PREWARM cp=2 dp=2 dp_cp=4 "
+            "grad_sync=native_dp_with_cp before_model_load=true",
+            flush=True,
+        )
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     model_parallel_cuda_manual_seed(261013)
     return SimpleNamespace(
-        tp_group=tp, cp_group=cp, dp_group=dp,
+        tp_group=tp, cp_group=cp, dp_group=dp, dp_cp_group=dp_cp,
         pp_group=parallel_state.get_pipeline_model_parallel_group(),
         tp_rank=parallel_state.get_tensor_model_parallel_rank(),
         cp_rank=parallel_state.get_context_parallel_rank(),
@@ -85,7 +111,7 @@ def _runtime():
 
 
 def _engine_with_dp_finalize(model, runtime):
-    """CP-average then native DP-average; never transfer or sync Prefix KV."""
+    """Native DP-with-CP weight-gradient average; never sync Prefix KV."""
     model.config.no_sync_func = None
     model.config.grad_scale_func = None
     model.config.calculate_per_token_loss = False
@@ -93,16 +119,30 @@ def _engine_with_dp_finalize(model, runtime):
 
     def finalize(chunks, num_tokens, *, force_all_reduce=False, **kwargs):
         assert chunks == [model] and num_tokens is None and force_all_reduce
-        # All CP ranks participate in one logical local forest.
-        # Local loss is normalized with GLOBAL tokens and multiplied by DP=2
-        # by VERL's token-mean PPO. Two DP gradients are then AVERAGED.
+        # Each of the two CP ranks contributes a shard's gradients, and
+        # VERL's token-mean PPO scales each DP replica by dp_size=2.
+        # (CP SUM / 2) followed by (DP SUM / 2) equals the native
+        # DP-with-CP SUM / 4, apart from BF16 reduction-order rounding.
+        # A single four-rank collective avoids two HCCL communicator
+        # switches per parameter.
         for name, param in model.named_parameters():
             if param.grad is None:
                 raise RuntimeError(f"Missing gradient before DP finalize: {name}")
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=runtime.cp_group)
-            param.grad.div_(2)
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=runtime.dp_group)
-            param.grad.div_(2)
+            try:
+                dist.all_reduce(
+                    param.grad, op=dist.ReduceOp.SUM, group=runtime.dp_cp_group,
+                )
+                param.grad.div_(dist.get_world_size(runtime.dp_cp_group))
+            except RuntimeError:
+                print(
+                    f"TPR_DP2_GRAD_SYNC_FAILED rank={dist.get_rank()} "
+                    f"param={name} shape={tuple(param.grad.shape)} "
+                    f"dtype={param.grad.dtype} "
+                    f"alloc_gib={torch.npu.memory_allocated()/2**30:.3f} "
+                    f"reserved_gib={torch.npu.memory_reserved()/2**30:.3f}",
+                    flush=True,
+                )
+                raise
 
     model.config.finalize_model_grads_func = finalize
     return SimpleNamespace(
