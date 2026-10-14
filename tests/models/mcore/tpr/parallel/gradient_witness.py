@@ -38,37 +38,46 @@ def collect_tp2_gradient_witness(
         raise AssertionError("Empty sampled gradient witness")
     samples = torch.cat(chunks)
     cpdp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-    # MIN/MAX on FP32 samples is a *diagnostic* of finalized replica
-    # consistency, not part of training or performance timing.
-    low, high = samples.clone(), samples.clone()
-    dist.all_reduce(low, op=dist.ReduceOp.MIN, group=cpdp)
-    dist.all_reduce(high, op=dist.ReduceOp.MAX, group=cpdp)
+    # Read-only witness: gather the ACTUAL post-finalize gradients rather
+    # than relying on additional HCCL MIN/MAX reductions to determine their
+    # equality. This also reveals the exact values held by every CP/DP rank.
+    # FP32 only converts the original BF16 sample losslessly.
+    group_members = tuple(dist.get_process_group_ranks(cpdp))
+    peers = [torch.empty_like(samples) for _ in group_members]
+    dist.all_gather(peers, samples, group=cpdp)
+    peer_values = torch.stack(peers, dim=0).cpu()
+    low = peer_values.min(dim=0).values
+    high = peer_values.max(dim=0).values
     spread = (high - low).abs()
-    local_max, worst_idx = spread.max(dim=0)
+    local_max, worst_idx_tensor = spread.max(dim=0)
+    worst_sample = int(worst_idx_tensor.item())
     local_relative = float(
         (torch.linalg.vector_norm(spread.float()) /
          torch.linalg.vector_norm(high.float()).clamp_min(1e-30)).item()
     )
+    differing_samples = int((spread != 0).sum().item())
+    exact_local = all(torch.equal(peer_values[0], x) for x in peer_values[1:])
+    worst_peer_values = [
+        [int(rank), float(peer_values[i, worst_sample].item())]
+        for i, rank in enumerate(group_members)
+    ]
     offset = 0
     worst_param = "<unknown>"
     worst_param_index = -1
-    worst_sample = int(worst_idx.item())
     for param_index, (name, count) in enumerate(zip(names, sample_sizes, strict=True)):
         if offset <= worst_sample < offset + count:
             worst_param = name
             worst_param_index = param_index
             break
         offset += count
-    group_members = tuple(
-        dist.get_global_rank(cpdp, i) for i in range(dist.get_world_size(cpdp))
-    )
-    # Gather a fixed-size diagnostics vector across all eight ranks so the
-    # earliest failing rank and TP shard are visible in the error.
+
+    # Fixed-width WORLD all-gather only; no unsupported FP64 AllReduce.
     state = torch.tensor(
         [dist.get_rank(), runtime.tp_rank, runtime.cp_rank,
          getattr(runtime, "dp_rank", 0), float(local_max.item()),
-         local_relative, float(worst_sample), float(worst_param_index)],
-        device=samples.device, dtype=torch.float64,
+         local_relative, float(worst_sample), float(worst_param_index),
+         float(differing_samples), float(int(exact_local))],
+        device=samples.device, dtype=torch.float32,
     )
     all_states = [torch.empty_like(state) for _ in range(dist.get_world_size())]
     dist.all_gather(all_states, state)
@@ -78,28 +87,28 @@ def collect_tp2_gradient_witness(
         affected = [
             f"rank={int(x[0])}/tp={int(x[1])}/cp={int(x[2])}/dp={int(x[3])}:"
             f"max_abs={x[4]:.9g},rel_l2={x[5]:.9g},"
+            f"changed_samples={int(x[8])},"
             f"param={names[int(x[7])] if 0 <= int(x[7]) < len(names) else '<unknown>'},"
             f"sample_idx={int(x[6])}"
             for x in rank_states if x[4] > 0
         ]
         print(
-            f"TPR_GRAD_REPLICA_DIAG mode={mode} "
+            f"TPR_GRAD_REPLICA_GATHER_DIAG mode={mode} "
             f"require_exact={int(require_exact_replicas)} "
             f"world_max_abs={error:.9g} "
             f"rank0_cpdp_group={group_members} "
+            f"rank0_worst_peer_values={worst_peer_values} "
             f"affected={'; '.join(affected)}",
             flush=True,
         )
-    # Full CP4 is the *reference*, not evidence that DP2 failed.
-    # Preserve its tiny replica drift in the output rather than silently
-    # passing an exactness check or aborting before the DP2 job can execute.
-    # TPR DP2 retains its original strict sync correctness gate.
     if error != 0.0 and require_exact_replicas:
         raise AssertionError(
-            f"TPR replica gradient mismatch in mode={mode}: "
+            f"TPR replica gradient mismatch confirmed by raw AllGather in mode={mode}: "
             f"world_sample_max_abs={error:.9g}, rank={dist.get_rank()}, "
             f"cpdp_group={group_members}, local_worst_param={worst_param}, "
-            f"local_worst_sample={int(worst_idx.item())}, "
+            f"local_worst_sample={worst_sample}, "
+            f"local_worst_peer_values={worst_peer_values}, "
+            f"local_differing_samples={differing_samples}, "
             f"local_rel_l2={local_relative:.9g}"
         )
 
@@ -120,8 +129,13 @@ def collect_tp2_gradient_witness(
         "replica_sample_max_abs": error,
         "replica_exact": error == 0,
         "replica_consistency_enforced": require_exact_replicas,
+        "replica_validation_passed": error == 0,
         "replica_diagnostics": {
+            "method": "FP32 AllGather of original post-finalize BF16 gradient samples",
             "world_rank_states": rank_states,
             "cpdp_group_rank0": list(group_members),
+            "rank0_worst_peer_values": worst_peer_values,
+            "rank0_worst_param": worst_param,
+            "rank0_differing_samples": differing_samples,
         },
     }
