@@ -193,3 +193,53 @@ trajectory index.
 **Important:** This new `v2` manifest is not compatible with an old
 already-created `v1` manifest; use a fresh offline output directory to
 regenerate preflight. No need to re-run the 20-step online experiment.
+
+## 2026-10-14 final correction: preserve the FULL N=8 session set
+
+The previously implemented **max 3 rows / 130,000 aggregate tokens**
+was an overly conservative OOM-avoidance heuristic. It is REMOVED from
+the current offline-only runner. The correct experimental sample for N=8
+is one original first trajectory from EACH of eight `(uid,session_id)`
+pairs, for EACH of 20 online global steps. No short-trajectory or
+Advantage-sign prioritization takes place.
+
+Multiple Actor `captureXXXXXXXX_batchY.pt` files in one online step
+are **not different rollout steps**. The preflight groups all of them,
+identifies the 8 original Sessions (or fails), selects each Session's
+first available captured chain, verifies every one is <=49,152 tokens,
+then concatenates all 8 **original TensorDict rows** into ONE newly saved
+`session_first_batches/actor_update_stepXXXXXX_session_first8.pt`.
+No old capture is overwritten. The one merged sample is passed to the
+independent Full Native-Ring and Turn TPR replay as the SAME eight-row
+minibatch; this preserves TPR prefix sharing across all eight children.
+
+The manifest uses protocol `real_actor_session_first_8merged_v3`,
+`online_steps=20`, `steps=20`, `expected_sessions=8`,
+`max_rows=null` and `max_total_tokens=null`. Each item records source
+row provenance from every input capture, original Session ids, total
+logical tokens, old PPO token count, and the merged file path.
+Missing Session or a first trajectory over the 48Ki-token limit
+is an explicit error; no replacement with a later/shorter chain.
+
+Use a NEW output directory to avoid reusing a v1/v2 manifest:
+
+```bash
+cd /workspace/uni-agent-cc/verl
+python tests/models/mcore/tpr/parallel/prepare_real_actor_20step_manifest.py \
+  /workspace/tpr_actor_capture_4b_n8_run5 \
+  /workspace/tpr_offline_run5_full8_v1/capture_manifest.json \
+  --steps 20 --max-seq-len 49152 --expected-sessions 8
+bash tests/models/mcore/tpr/parallel/run_existing_20step_offline_full_tpr.sh \
+  /workspace/tpr_actor_capture_4b_n8_run5 \
+  /workspace/tpr_offline_run5_full8_v1 \
+  both
+```
+
+Note: per-trajectory hard cap does NOT mathematically guarantee that
+eight concurrently selected trajectories fit GPU memory. Full may OOM
+even when all eight are <=49,152 tokens. Full and TPR modes can still
+be launched separately to retain all failure/performance evidence.
+The original TQ trajectory ordinal often is absent from Actor Capture,
+so first-in-capture is a documented approximation rather than a proven
+original Gateway chain order. The historical Advantage and rewards are
+unaltered; this modification touches ONLY offline data selection.
