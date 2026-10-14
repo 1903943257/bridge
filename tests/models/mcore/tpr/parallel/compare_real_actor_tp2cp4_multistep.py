@@ -160,6 +160,9 @@ def compare(outdir: Path, steps: int):
             if max(abs(x["global_grad_norm_preclip"] -
                        items[0]["global_grad_norm_preclip"]) for x in items) >= 1e-5:
                 raise AssertionError(f"{label} global norm differs across ranks")
+        for label, items in mode.items():
+            if len({x.get("ring_attention_impl","legacy_custom") for x in items}) != 1:
+                raise AssertionError(f"inconsistent {label} Ring backend among ranks")
         master = _master_update(f,t)
         lps = _lp_compare(f,t)
         sampled_grad = _l2_pair(f,t)
@@ -170,6 +173,8 @@ def compare(outdir: Path, steps: int):
         tpr_norm = t[0]["global_grad_norm_preclip"]
         record = {
             "step":step,
+            "full_attention_impl":f[0].get("ring_attention_impl","legacy_custom"),
+            "tpr_attention_impl":t[0].get("ring_attention_impl","legacy_custom"),
             "full_loss":f[0]["loss"], "tpr_loss":t[0]["loss"],
             "loss_gap":t[0]["loss"]-f[0]["loss"],
             "full_grad_norm":f[0]["global_grad_norm_preclip"],
