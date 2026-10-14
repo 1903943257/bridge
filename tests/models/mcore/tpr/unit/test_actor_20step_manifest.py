@@ -88,6 +88,25 @@ def test_complete_eight_sessions_keep_all_without_token_budget(tmp_path):
     assert sum(int(x.numel()) for x in td["input_ids"].unbind(0))==sum(14+i for i in range(8))
 
 
+def test_padding_uid_excluded_before_eight_session_count(tmp_path):
+    a=tmp_path/"actor_update_step000001_rank0_capture000000_batch0.pt"
+    b=tmp_path/"actor_update_step000001_rank0_capture000001_batch0.pt"
+    _capture(a,1,[(i,0,1) for i in range(5)])
+    _capture(b,1,[(i,0,1) for i in range(5,8)]+[(7,1,1),(7,2,1)])
+    second=torch.load(b,weights_only=False)
+    # Keep two synthetic padding rows but DO NOT count them as Sessions.
+    from verl.utils import tensordict_utils as tu
+    tu.assign_non_tensor(second["tensordict"],uid=[
+        "same_prompt","same_prompt","same_prompt",
+        "pad754d4dd491864b9db6d9d560c0afd5ef",
+        "pad754d4dd491864b9db6d9d560c0afd5ef",
+    ])
+    torch.save(second,b)
+    result=prepare(tmp_path,tmp_path/"out"/"manifest.json",steps=1,max_seq_len=100)
+    assert result["session_audits"][0]["excluded_padding_rows"]==2
+    assert result["items"][0]["session_count"]==8
+
+
 def test_reject_missing_one_of_eight_sessions(tmp_path):
     f=tmp_path/"actor_update_step000001_rank0_capture000000_batch0.pt"
     _capture(f,1,[(i,0,1) for i in range(7)])
