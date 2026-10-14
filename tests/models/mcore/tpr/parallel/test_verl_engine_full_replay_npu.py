@@ -210,6 +210,42 @@ def _capture_logprobs(output: dict, batch, row_count: int):
     return result
 
 
+def _native_witness(engine, *, grads: bool):
+    """Same bounded parameter-sample schema as existing TPR comparisons.
+
+    Wrapped Megatron DDP stores finalized gradients in main_grad rather than
+    param.grad; using the latter would silently report missing gradients.
+    """
+    from verl.utils.megatron_utils import unwrap_model
+    from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+
+    unwrapped = unwrap_model(engine.module[0])
+    result = {}
+    for name, param in unwrapped.named_parameters():
+        if grads:
+            source = getattr(param, "main_grad", None)
+            if source is None:
+                source = param.grad
+            if source is None:
+                raise AssertionError(f"Native Megatron main_grad missing: {name}")
+        else:
+            source = param.detach()
+        flat = source.detach().reshape(-1)
+        idx = torch.as_tensor(
+            exact_sample_indices(flat.numel(), 32),
+            dtype=torch.long, device=flat.device,
+        )
+        result[name] = {
+            "shape": tuple(flat.shape) if grads else tuple(param.shape),
+            "indices": idx.cpu(),
+            "values": flat.index_select(0, idx).float().cpu(),
+        }
+        # The logical param shape, not any flat DDP buffer shape, identifies
+        # comparable TP shards.
+        result[name]["shape"] = tuple(param.shape)
+    return result
+
+
 def test_verl_engine_full_replay():
     if int(os.getenv("WORLD_SIZE", "1")) != 8:
         raise RuntimeError("Native VERL Full replay requires exactly 8 ranks TP2*CP4*DP1")
@@ -244,8 +280,8 @@ def test_verl_engine_full_replay():
             if (output_dir / f"{prefix}_step{step}_rank{dist.get_rank()}.pt").exists():
                 raise FileExistsError(f"Do not overwrite VERL Full step {step} rank {dist.get_rank()}")
         engine = _construct_real_engine(checkpoint, lr=lr, clip_norm=clip_norm, steps=20)
-        result_model = engine.module[0]
         ppo_config = _PPO()
+        initial_param_witness = _native_witness(engine, grads=False)
         with engine.train_mode():
             for step, item in enumerate(manifest["items"][:run_steps], start=1):
                 batch, original_keys, tokens, digest, rows, capture = _load_step(item)
@@ -268,11 +304,13 @@ def test_verl_engine_full_replay():
                     _capture_logprobs(outputs, batch, len(rows))
                     if engine.is_mp_src_rank_with_outputs() else {}
                 )
+                grad_witness = _native_witness(engine, grads=True)
                 t1 = time.perf_counter()
                 grad_norm = engine.optimizer_step()
                 engine.lr_scheduler_step()
                 torch.npu.synchronize()
                 optimizer_seconds = time.perf_counter() - t1
+                param_after = _native_witness(engine, grads=False)
                 snapshot = {
                     "execution_backend": "verl_mindspeed_megatron_engine_full",
                     "mode": "verl_full",
@@ -296,6 +334,9 @@ def test_verl_engine_full_replay():
                     "loss": [float(x) for x in losses],
                     "metrics": _cpu_metrics(outputs.get("metrics", {})) if outputs is not None else {},
                     "logprobs": logprobs,
+                    "param_initial": initial_param_witness,
+                    "param_after": param_after,
+                    "gradient_samples": grad_witness,
                     "grad_norm_preclip": float(grad_norm) if grad_norm is not None else None,
                     "fwd_bwd_seconds": fb_seconds,
                     "optimizer_seconds": optimizer_seconds,
