@@ -178,7 +178,10 @@ def test_fixed_shape_40k_one_mode():
         gradient_witness = None
         if os.getenv("TPR_BENCH_GRAD_WITNESS", "0") == "1":
             from .gradient_witness import collect_tp2_gradient_witness
-            gradient_witness = collect_tp2_gradient_witness(model, runtime)
+            gradient_witness = collect_tp2_gradient_witness(
+                model, runtime, mode=mode,
+                require_exact_replicas=(mode == "tpr"),
+            )
         if dist.get_rank() == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
             target = output_dir / f"step{step}_{mode}_fixed_shape.json"
