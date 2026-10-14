@@ -49,7 +49,7 @@ def native_cp_query_indices(length: int, cp_rank: int, cp_size: int = 4,
 
 
 def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
-                        global_tokens: int, device):
+                        global_tokens: int, device, dp_group):
     """Call the *same* VERL PPO loss as the TPR objective adapter.
 
     A one-token bookkeeping prompt is only for VERL's packed logprob unpadding;
@@ -80,7 +80,7 @@ def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
     logits_for_loss = torch.cat((logprobs, logprobs.new_zeros(1)))
     return loss_function(
         model_output={"log_probs": logits_for_loss},
-        data=compact, dp_group=dist.group.WORLD if dist.get_world_size() == 1 else None,
+        data=compact, dp_group=dp_group,
     )
 
 
@@ -94,7 +94,7 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from verl.models.mcore.util import preprocess_thd_engine
     from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
-    from verl.models.mcore.tpr.self_attention import TPRSelfAttention
+    from verl.models.mcore.tpr import TPRSelfAttention
 
     if any(isinstance(m, TPRSelfAttention) for m in model.modules()):
         raise AssertionError("Native Full must not contain TPRSelfAttention")
@@ -207,7 +207,7 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
                 log_probs = torch.cat(all_lp)
                 local_loss, metrics = _compact_native_ppo(
                     loss_function, log_probs, response_offsets,
-                    batch, row, global_tokens, runtime.device,
+                    batch, row, global_tokens, runtime.device, runtime.dp_group,
                 )
                 if capture_logprobs:
                     values = log_probs.detach().float().cpu().tolist()
