@@ -110,7 +110,10 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     prompts = batch["prompts"].unbind(0)
     responses = batch["responses"].unbind(0)
     temps = tu.get_non_tensor_data(batch, key="temperature", default=1.0)
-    global_tokens = int(tu.get_non_tensor_data(batch, key="batch_num_tokens"))
+    global_tokens = tu.get_non_tensor_data(batch, key="batch_num_tokens", default=None)
+    if global_tokens is None:
+        raise ValueError("Native Full requires original global batch_num_tokens")
+    global_tokens = int(global_tokens)
     count = len(input_rows)
     if count != 8 or global_tokens <= 0:
         raise AssertionError("Native Full expects complete 8-Session PPO mini-batch")
