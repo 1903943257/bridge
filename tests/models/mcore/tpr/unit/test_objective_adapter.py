@@ -207,3 +207,37 @@ def test_bind_tree_exposes_loss_hook_and_ref_counts():
         losses.append(loss)
     assert losses
     torch.stack(losses).sum().backward()
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 4])
+@pytest.mark.parametrize("temps", [(1.0, 1.0), (1.0, 2.0)])
+def test_chunked_ppo_logprob_matches_unchunked_loss_and_gradient(chunk_size, temps):
+    # Multiple physical queries, a duplicated logical ref, per-row
+    # temperatures, and a native PPO loss must all stay numerically aligned.
+    torch.manual_seed(17)
+    batch = _batch(temperatures=temps)
+    baseline = torch.randn(1, 2, 5, requires_grad=True)
+    chunked = baseline.detach().clone().requires_grad_(True)
+    native = partial(ppo_loss, config=_ActorConfig())
+    full_adapter = SegmentPPOObjectiveAdapter(
+        batch, native, log_prob_fn=_cpu_log_probs
+    )
+    chunk_adapter = SegmentPPOObjectiveAdapter(
+        batch, native, log_prob_fn=_cpu_log_probs,
+        log_prob_chunk_size=chunk_size,
+    )
+    full_loss, _ = full_adapter.compute_loss(_segment(), baseline, _refs())
+    chunk_loss, _ = chunk_adapter.compute_loss(_segment(), chunked, _refs())
+    torch.testing.assert_close(chunk_loss, full_loss, rtol=1e-6, atol=1e-7)
+    full_loss.backward()
+    chunk_loss.backward()
+    torch.testing.assert_close(chunked.grad, baseline.grad, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("invalid_size", [0, -1, 1.0, True])
+def test_reject_invalid_ppo_logprob_chunk_size(invalid_size):
+    with pytest.raises(ValueError, match="log_prob_chunk_size"):
+        SegmentPPOObjectiveAdapter(
+            _batch(), partial(ppo_loss, config=_ActorConfig()),
+            log_prob_fn=_cpu_log_probs, log_prob_chunk_size=invalid_size,
+        )
