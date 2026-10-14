@@ -41,6 +41,13 @@ export TPR_TURN_MIN_SEGMENT_TOKENS=128
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 export TPR_BENCH_CAPTURE_LOGPROBS="${TPR_BENCH_CAPTURE_LOGPROBS:-1}"
+# Isolated benchmark knob, NOT a VERL production flag. Use fp32 only
+# after the standalone HCCL FP32 control has passed on this machine.
+export TPR_OFFLINE_GRAD_SYNC_DTYPE="${TPR_OFFLINE_GRAD_SYNC_DTYPE:-bf16}"
+[[ "$TPR_OFFLINE_GRAD_SYNC_DTYPE" == "bf16" || "$TPR_OFFLINE_GRAD_SYNC_DTYPE" == "fp32" ]] || {
+  echo "TPR_OFFLINE_GRAD_SYNC_DTYPE must be bf16 or fp32" >&2
+  exit 2
+}
 # Recompute PPO logprob intermediates per chunk instead of retaining the
 # whole CP2 local-vocabulary softmax workspace until backward. Set 0 to
 # reproduce the original code path; chunking is not native Megatron recompute.
