@@ -235,8 +235,13 @@ def test_verl_engine_full_replay():
         lr = float(os.getenv("TPR_OFFLINE_ADAMW_LR", "2e-5"))
         clip_norm = float(os.getenv("TPR_OFFLINE_ADAMW_CLIP_NORM", "1.0"))
         output_dir.mkdir(parents=True, exist_ok=True)
+        prefix = os.getenv("TPR_VERL_FULL_REPLAY_PREFIX", "verl_full_smoke")
+        if not prefix.startswith("verl_full") or any(
+            char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in prefix
+        ):
+            raise ValueError(f"Invalid Full snapshot prefix {prefix!r}")
         for step in range(1, run_steps + 1):
-            if (output_dir / f"verl_full_step{step}_rank{dist.get_rank()}.pt").exists():
+            if (output_dir / f"{prefix}_step{step}_rank{dist.get_rank()}.pt").exists():
                 raise FileExistsError(f"Do not overwrite VERL Full step {step} rank {dist.get_rank()}")
         engine = _construct_real_engine(checkpoint, lr=lr, clip_norm=clip_norm, steps=20)
         result_model = engine.module[0]
@@ -271,6 +276,7 @@ def test_verl_engine_full_replay():
                 snapshot = {
                     "execution_backend": "verl_mindspeed_megatron_engine_full",
                     "mode": "verl_full",
+                    "run_prefix": prefix,
                     "step": step,
                     "steps": run_steps,
                     "rank": dist.get_rank(),
@@ -300,7 +306,7 @@ def test_verl_engine_full_replay():
                     "optimizer_lr": lr,
                     "optimizer_clip_norm": clip_norm,
                 }
-                target = output_dir / f"verl_full_step{step}_rank{dist.get_rank()}.pt"
+                target = output_dir / f"{prefix}_step{step}_rank{dist.get_rank()}.pt"
                 if target.exists():
                     raise FileExistsError(target)
                 torch.save(snapshot, target)
