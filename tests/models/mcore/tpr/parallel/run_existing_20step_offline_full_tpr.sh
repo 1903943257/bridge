@@ -76,7 +76,6 @@ from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from verl.models.mcore.util import preprocess_thd_engine
 from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
 from verl.models.mcore.tpr import TPRSelfAttention
-from tests.models.mcore.tpr.parallel.native_full_megatron_schedule import run_native_full_step
 print("NATIVE_FULL_PREFLIGHT=PASS megatron_schedule=available verl_thd=available")
 PY
 fi
