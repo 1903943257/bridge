@@ -60,8 +60,8 @@ def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
         raise ValueError("native PPO compact batch requires nonempty refs")
     offsets = torch.tensor(response_offsets, dtype=torch.long,
                            device=batch["old_log_probs"][row].device)
-    old = batch["old_log_probs"][row].index_select(0, offsets).to(device)
-    adv = batch["advantages"][row].index_select(0, offsets).to(device)
+    old = batch["old_log_probs"][row].index_select(0, offsets).to(device=device, dtype=logprobs.dtype)
+    adv = batch["advantages"][row].index_select(0, offsets).to(device=device, dtype=logprobs.dtype)
     fields = {
         "prompts": torch.zeros((1, 1), dtype=torch.long, device=device),
         "responses": batch["responses"][row].index_select(0, offsets).to(device).unsqueeze(0),
@@ -72,7 +72,7 @@ def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
     }
     for key in ("ref_log_prob", "rollout_is_weights"):
         if key in batch:
-            fields[key] = batch[key][row].index_select(0, offsets).to(device).unsqueeze(0)
+            fields[key] = batch[key][row].index_select(0, offsets).to(device=device, dtype=logprobs.dtype).unsqueeze(0)
     compact = TensorDict(fields, batch_size=[1], device=device)
     tu.assign_non_tensor(compact, dp_size=1, batch_num_tokens=global_tokens,
                          global_batch_size=len(batch["input_ids"]))
@@ -122,6 +122,7 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     model.config.calculate_per_token_loss = False
 
     loss_parts = []
+    metric_lists = {}
     logprob_parts = {}
     calls = [0]
     prepared = []
@@ -209,6 +210,14 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
                     loss_function, log_probs, response_offsets,
                     batch, row, global_tokens, runtime.device, runtime.dp_group,
                 )
+                from verl.utils.metric import AggregationType, Metric
+                for key, metric in metrics.items():
+                    if isinstance(metric, Metric) and metric.aggregation is AggregationType.MEAN:
+                        metric = Metric(
+                            aggregation=AggregationType.SUM,
+                            value=metric.aggregate() * len(response_offsets) / global_tokens,
+                        )
+                    metric_lists.setdefault(key, []).append(metric)
                 if capture_logprobs:
                     values = log_probs.detach().float().cpu().tolist()
                     logprob_parts.update({
@@ -257,7 +266,7 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     dist.all_reduce(loss_value, op=dist.ReduceOp.SUM, group=runtime.cp_group)
     return NativeFullResult(
         loss=float(loss_value.item()),
-        metrics={"native_microbatches": count},
+        metrics=metric_lists,
         logprobs=logprob_parts,
         microbatches=count,
         finalize_seconds=finalize_seconds,
