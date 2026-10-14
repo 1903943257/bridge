@@ -30,6 +30,7 @@ from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .test_real_actor_tp2cp4_offline_ppo_npu import (
     _PPO, _runtime, _load_real_pair, _witness,
     _global_bf16_gradient_norm, _save_complete_grads,
+    _install_offline_full_ring_backend,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -211,6 +212,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
             if len(forest.trees) != 1:
                 raise AssertionError("Exact TPR must have one shared tree")
 
+        ring_impl = _install_offline_full_ring_backend(mode)
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=4,
             sequence_parallel=False, profile="4b"
@@ -315,6 +317,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     "cpu_optimizer_seconds":update_seconds,
                     "forest_trees":len(forest.trees),
                     "forest_segments":forest.segment_count,
+                    "ring_attention_impl":ring_impl,
                     "run_kind":(
                         "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
                         if manifest_items is not None
