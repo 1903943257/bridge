@@ -300,6 +300,24 @@ class SegmentPPOObjectiveAdapter:
         model_output = {"log_probs": torch.cat(packed_lp, dim=0)}
         if entropy is not None:
             model_output["entropy"] = torch.cat(packed_entropy, dim=0)
+        # Fail at the TPR/native-PPO boundary with the actual local shapes,
+        # rather than inside no_padding_2_padding's opaque offsets assert.
+        packed_lengths = output_fields["attention_mask"].sum(dim=1, dtype=torch.int64)
+        expected_packed = int(packed_lengths.sum().item())
+        actual_packed = int(model_output["log_probs"].shape[0])
+        if actual_packed != expected_packed:
+            raise RuntimeError(
+                "TPR compact PPO logprob pack mismatch: "
+                f"actual={actual_packed} expected={expected_packed} "
+                f"row_lengths={packed_lengths.tolist()} "
+                f"refs={len(refs)} rows={rows} "
+                f"logprob_shape={tuple(model_output['log_probs'].shape)}"
+            )
+        if entropy is not None and int(model_output["entropy"].shape[0]) != expected_packed:
+            raise RuntimeError(
+                "TPR compact PPO entropy pack mismatch: "
+                f"actual={int(model_output['entropy'].shape[0])} expected={expected_packed}"
+            )
         loss, metrics = self.loss_function(
             model_output=model_output,
             data=compact,
