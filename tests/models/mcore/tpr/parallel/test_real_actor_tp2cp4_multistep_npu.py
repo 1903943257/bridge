@@ -187,19 +187,33 @@ def test_recorded_fixed_ppo_optimizer_drift():
         if (manifest.get("protocol") not in (
                 "real_actor_20_distinct_captures_v1",
                 "real_actor_session_first_multicapture_v2",
+                "real_actor_session_first_8merged_v3",
             ) or manifest.get("steps") != steps
                 or len(manifest.get("items", [])) != steps):
             raise ValueError("offline manifest must contain exactly N valid real PPO updates")
         manifest_items = manifest["items"]
         if [item["step"] for item in manifest_items] != list(range(1, steps+1)):
             raise ValueError("offline replay optimizer update ordinals must be 1..N")
-        if manifest.get("protocol") == "real_actor_session_first_multicapture_v2":
+        if manifest.get("protocol") in (
+            "real_actor_session_first_multicapture_v2",
+            "real_actor_session_first_8merged_v3",
+        ):
             online_steps = [int(item["source_global_step"]) for item in manifest_items]
             if (online_steps != sorted(online_steps)
                     or set(online_steps) != set(range(1,manifest["online_steps"]+1))):
                 raise ValueError("session-first manifest must cover all original online steps")
             if manifest.get("historical_ppo_labels_modified") is not False:
                 raise ValueError("historical PPO advantages and old logprobs must remain immutable")
+            if manifest.get("protocol") == "real_actor_session_first_8merged_v3":
+                if manifest.get("expected_sessions") != 8 or steps != manifest["online_steps"]:
+                    raise ValueError("merged PPO replay must have exactly eight Sessions for every online step")
+                if any(
+                    len(item["rows"]) != 8 or item.get("session_count") != 8
+                    or not item.get("source_row_provenance")
+                    for item in manifest_items
+                ):
+                    raise ValueError("merged PPO replay requires all eight original Session rows")
+
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
