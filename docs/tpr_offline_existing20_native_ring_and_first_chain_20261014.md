@@ -131,3 +131,65 @@ not yet passed your live Ray/NPU integration gates.
 Measure real E2/E3 numerical parity and performance independently.
 A non-zero PPO loss/logprob/gradnorm gap is useful diagnostic data;
 no threshold has been relaxed.
+
+## 2026-10-14 amendment: process historical multi-chain Sessions OFFLINE only
+
+**No Uni-Agent patch or new rollout is required for run5.** For the run5
+capture directory, invoke the revised stand-alone script:
+
+```bash
+cd /workspace/uni-agent-cc/verl
+bash tests/models/mcore/tpr/parallel/run_existing_20step_offline_full_tpr.sh \
+  /workspace/tpr_actor_capture_4b_n8_run5 \
+  /workspace/tpr_offline_run5_session_first \
+  both
+```
+
+Preflight is CPU-only and uses *all* `actor_update_stepXXXXXX_rank0_captureYYYYYY_batchZ.pt`
+files for each online step 1–20; `capture000020` is the 21st captured
+actor mini-batch, **not** Session trajectory index 20. It does not
+discard multiple Actor optimizer updates per online step.
+
+Original `session_id` and `uid` in TensorDict form the session identity.
+Before selecting up to 3 complete trajectories per captured mini-batch, the
+preprocessor deduplicates **across all captures of that online step**:
+
+- If the capture retained a true per-row `trajectory_index`,
+  `trajectory_idx` or `tq_trajectory_index`, keep minimum original
+  ordinal for each Session.
+- If the original TQ key/ordinal has already been lost by Actor mini-batch
+  shuffling, select the **first observed** in ascending capture_index,
+  batch_idx, then original mini-batch row. **That is deterministic but
+  not provably the Gateway's chronological first trajectory.**
+  Preflight emits `TPR_SESSION_ORDER_WARNING` and records fallback counts.
+- Never switch to a later chain merely because the selected first chain is
+  too long. That session is excluded if its first selected trajectory is
+  >49152 tokens or has no supervised PPO tokens.
+- If a mini-batch has no selected first-of-session rows, skip that mini-batch
+  with an explicit audit entry. Fail if an online step has no eligible
+  trajectory at all; no missing online global step is hidden.
+- Preserve the original actor-update boundaries of retained mini-batches,
+  hence the number of *offline optimizer replay updates* may be >20.
+  `capture_manifest.json` records both `online_steps=20` and
+  `steps=<retained offline optimizer updates>`, the original source global
+  step, capture index, source rows and multi-chain session counts.
+- One retained trajectory in a mini-batch is valid for Full/TPR parity but
+  provides no prefix reuse; no fake sibling is synthesized.
+- Raw `.pt` files are never modified. Both E2 and E3 load exactly the same
+  manifest, original old logprobs, advantages, temperature, and masks.
+
+**Do not set historical reward to zero without re-deriving GRPO Advantage.**
+These are captures taken *after* online GRPO reward processing. The
+`session-first` replay performs deterministic row selection, not retroactive
+reward relabeling. Changing just `rm_scores` would be numerically
+inconsistent and is deliberately not implemented here.
+
+If you require the true first *Gateway* trajectory rather than first observed
+Actor row, use the original TQ key suffix `uid_session_index_trajectory_index`
+or persist original `trajectory_index` in future captures. The old Actor
+capture `keys` generated as `uid_tpr_row` do **not** encode the TQ
+trajectory index.
+
+**Important:** This new `v2` manifest is not compatible with an old
+already-created `v1` manifest; use a fresh offline output directory to
+regenerate preflight. No need to re-run the 20-step online experiment.
