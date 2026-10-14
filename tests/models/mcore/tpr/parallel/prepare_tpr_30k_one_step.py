@@ -202,7 +202,9 @@ def prepare(manifest_path: Path, output_dir: Path, *, step: int = 6, cap: int = 
     if item["step"] != step or item["rows"] != list(range(8)):
         raise ValueError("Source step does not preserve eight original rows")
     source = Path(item["capture"])
-    output_dir.mkdir(parents=True)
+    # derive_capture creates the directory only after all input and
+    # TensorDict validations pass. A failed preparation must not leave an
+    # empty output directory that prevents a clean retry.
     stats = derive_capture(source, output_dir / f"step{step}_cap{cap}.pt", cap)
     derived = copy.deepcopy(manifest)
     derived["experimental_sequence_cap"] = cap
