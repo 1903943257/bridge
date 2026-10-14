@@ -8,7 +8,6 @@ an isolated research experiment, NOT a production VERL DP2 enablement.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import statistics
@@ -235,6 +234,11 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             dist.all_reduce(peak, op=dist.ReduceOp.MAX)
             # local loss is scaled by DP=2; DP-averaged losses reconstruct
             # the one global token-mean PPO objective of the Full baseline.
+            local_ppo_tokens = sum(
+                int(x.bool().sum()) for x in batch["response_mask"].unbind(0)
+            )
+            if int(result["metrics"]["tpr/logical_loss_tokens"][0]) != local_ppo_tokens:
+                raise AssertionError("TPR forest dropped or duplicated supervised PPO tokens")
             local_loss = float(result["loss"][0])
             global_loss = torch.tensor(local_loss, dtype=torch.float64, device=runtime.device)
             dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=runtime.dp_group)
@@ -248,7 +252,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "local_loss_dp_scaled": local_loss,
                 "global_loss": float(global_loss.item()),
                 "local_unique_tree_tokens": int(result["metrics"]["tpr/unique_tree_tokens"][0]),
-                "local_ppo_tokens": sum(int(x.bool().sum()) for x in batch["response_mask"].unbind(0)),
+                "local_ppo_tokens": local_ppo_tokens,
                 "stage_ms": stages,
             }
             gathered = [None] * dist.get_world_size()
