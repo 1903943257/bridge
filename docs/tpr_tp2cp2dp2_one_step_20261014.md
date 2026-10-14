@@ -1,0 +1,107 @@
+# TP2 / RingCP2 / DP2: one recorded PPO source step (TPR vs Full TP2/CP4)
+
+Status: code added as an **isolated benchmark**, not yet executed on an eight-NPU node.
+Do not confuse this with production VERL Trainer DP2 support or a native multi-step PPO run.
+
+## Question
+
+Compare a single previously captured, original eight-Session Qwen3-4B-128K
+Actor PPO update using:
+
+| | Existing Full | New TPR |
+|---|---|---|
+| Total NPUs | 8 | 8 |
+| TP | 2 | 2 |
+| CP | 4 (native MindSpeed Ring) | 2 (existing TPR Ring) |
+| DP | 1 | 2 |
+| Sample source | Existing session-first 40K manifest | Exactly the same source step and 8 rows |
+| PPO | Original captured advantages, old logprobs, masks, temperature | Identical |
+| Model | Identical real Qwen3-4B-128K checkpoint | Identical |
+| Loss | Global token-mean vanilla PPO | Global token-mean vanilla PPO |
+| Timing | F/B + gradient finalize | F/B + CP + DP gradient finalize |
+| Optimizer/recompute | No updates / disabled | No updates / disabled |
+
+The new topology intentionally changes both CP and DP: a speedup cannot be
+ascribed to DP placement alone without additional controls.
+
+## DP scheduling and normalization
+
+The placement code is reused, unchanged, from PR #5
+(feat/tpr-tp2-dp-placement-audit):
+verl/models/mcore/tpr/dp_placement.py::plan_tpr_dta_dp.
+
+1. Read all eight original trajectories and original keys once per rank.
+2. Use TPR UID-scoped DFS minimax for two partitions. The result is a complete,
+   disjoint assignment. The planner is allowed to choose unequal cardinalities
+   (for example 5/3), unlike VERL's current ordinary equal-row Trainer dispatch.
+3. Each TP2/CP2 group independently builds and executes an ordinary TPR forest
+   on its own trajectories. No Prefix KV crosses DP replicas.
+4. Keep metadata batch_num_tokens equal to **all eight trajectories' original
+   supervised tokens**, dp_size=2 and global_batch_size=8 on both replicas.
+   VERL's original token-mean PPO loss scales each local contribution by DP=2.
+5. In the isolated benchmark only, finalize each parameter with CP SUM/2 and
+   DP SUM/2. Native Megatron TP collectives remain untouched. No per-segment
+   DP collective is introduced, so different-size local forests can finish
+   independently before the shared gradient finalize.
+6. After timing, reconstruct global PPO loss by averaging the two DP replicas
+   and verify all eight ranks agree. Rank/row ownership, global token count,
+   input digest and actual logical tree-token metrics are recorded.
+
+The only Engine code change is the opt-in
+TPR_EXPERIMENTAL_OFFLINE_DP2=1 gate for PPO TP2/CP2/DP2 and matching dp_size
+metadata. DP1 production behavior and unsupported topologies are unchanged.
+
+## Run
+
+Sync the feature branch's relevant files into the actual Docker VERL checkout
+using the same Bridge-sync method as the prior TP2CP4 experiments.
+
+A comparable Full JSON must already exist from
+run_tpr_fixed_shape_40k_benchmark.sh with the same 40K manifest/step.
+The original full baseline outputs are named step6_full_fixed_shape.json,
+step16_full_fixed_shape.json, etc.
+
+Example:
+
+    bash tests/models/mcore/tpr/parallel/run_tpr_tp2cp2dp2_one_step.sh \
+      /workspace/40k_manifest.json \
+      /workspace/tpr_dp2_step6_new \
+      6 \
+      /workspace/existing_full_fixed_shape/step6_full_fixed_shape.json
+
+Defaults: physical NPU 8-15, Qwen3-4B-128K checkpoint, source step 6,
+one warmup and three measured F/B passes, profiler off, captured logprobs on.
+Those timing defaults match the existing fixed-shape Full benchmark. They are
+repeated execution of ONE source step without any weight update, not four
+optimizer steps. To execute literally one forward/backward invocation, set
+TPR_BENCH_WARMUPS=0 and TPR_BENCH_REPEATS=1; in that case the Full baseline
+must have the same settings for strict comparison.
+
+Without a fourth argument, the TPR result JSON is saved, and the baseline
+comparison can be invoked separately:
+
+    python tests/models/mcore/tpr/parallel/compare_tpr_tp2cp2dp2_one_step.py \
+      FULL_STEP_JSON TPR_STEP_JSON COMPARISON_OUTPUT_JSON
+
+Outputs:
+
+- step6_tpr_tp2cp2dp2.json: per-rank DP rows, critical-path duration, peak
+  allocated per NPU, global PPO loss, estimated/actual forest token costs.
+- comparison.json: strict input SHA/checkpoint/step/timing settings check,
+  median Full/TPR F/B+finalize speedup, peak-memory comparison, PPO loss gap.
+- tpr_tp2cp2dp2_step6.log: torchrun/pytest output.
+
+## Acceptance / interpretation
+
+- CPU: PR #5 placement regressions and offline PPO parallel-size gate tests.
+- Eight NPUs: must actually run before claiming that TP2CP2DP2 is supported.
+- Checks: full/TPR input SHA equality, Session disjointness and completeness,
+  all eight PPO-token sets, global loss agreement across TP/CP/DP ranks,
+  finite timing and nonzero runtime fields.
+- Report the global PPO loss gap to Full; **this benchmark does not compare
+  complete Full vs TPR parameter-gradient tensors or AdamW updates**.
+- Unequal DP partitions are deliberately experiment-only; do not infer that
+  native VERL Trainer batch dispatch, no_sync/DDP, or distributed optimizer
+  already supports unequal per-DP row counts.
+- If CP2 OOMs for a particular 40K capture, report it as a capacity limitation
+  of that configuration, not a speedup result.
