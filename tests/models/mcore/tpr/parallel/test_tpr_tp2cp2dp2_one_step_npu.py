@@ -249,6 +249,9 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
     if not 0 <= warmups <= 10 or not 1 <= repeats <= 20:
         raise ValueError("warmups=0..10 and repeats=1..20 required")
     capture_lp = os.getenv("TPR_BENCH_CAPTURE_LOGPROBS", "1") == "1"
+    lp_chunk_tokens = int(os.getenv("TPR_PPO_LOGPROB_CHUNK_TOKENS", "512"))
+    if lp_chunk_tokens < 0:
+        raise ValueError("TPR_PPO_LOGPROB_CHUNK_TOKENS must be nonnegative")
     profile = os.getenv("TPR_EXEC_PROFILE", "0") == "1"
     output = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
     checkpoint = Path(os.getenv("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
@@ -344,6 +347,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     f"critical_fwd_bwd_s={item['critical_fwd_bwd_s']:.6f} "
                     f"peak_gib={item['peak_allocated_gib']:.3f} "
                     f"global_loss={item['loss']:.9g} "
+                    f"ppo_logprob_chunk_tokens={lp_chunk_tokens} "
                     f"rows={plan.partitions} costs={plan.tree_tokens_by_rank}",
                     flush=True,
                 )
@@ -368,6 +372,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "equal_rows_per_rank": plan.equal_rows_per_rank,
                 "warmups": warmups, "repeats": repeats,
                 "capture_logprobs": capture_lp, "profiler_enabled": profile,
+                "ppo_logprob_chunk_tokens": lp_chunk_tokens,
                 "recompute": False, "updated_weights": False,
                 "median_fwd_bwd_s": statistics.median(times),
                 "runs": runs,
