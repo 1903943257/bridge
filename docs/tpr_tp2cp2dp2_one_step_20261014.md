@@ -313,3 +313,22 @@ checker was faulty; if they differ, trace the BF16 gradient finalization
 output and compare FP32 reduction / synchronization as a separate
 controlled experiment, without altering the measured TPR algorithm
 before diagnosis.
+
+
+### Fast HCCL BF16 isolation probe (no Qwen3 checkpoint)
+
+Before another expensive 30K replay, run:
+
+    TPR_RUN_HCCL_BF16_GRAD_PROBE=1 \
+    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 \
+    torchrun --nproc_per_node=8 --master_port=29917 -m pytest -q -s -x \
+      tests/models/mcore/tpr/parallel/test_hccl_bf16_replica_probe_npu.py
+
+This initializes the identical Megatron TP2/CP2/DP2 groups without
+loading model weights. For BF16 tensors with 2560 and 1048576 elements,
+it runs the original DP-with-CP SUM/4 and gathers the post-reduction
+BF16 tensors to all four group members. Exact bitwise identity is
+required. A PASS excludes a simple isolated BF16 collective defect,
+but does not prove autograd's long-sequence parameter-gradient
+buffer or asynchronous execution is correct. A FAIL identifies
+a backend/collective identity issue worth investigating first.
