@@ -1,8 +1,8 @@
 """Recorded, off-policy 50-step PPO replay on real Qwen3-4B TP2 RingCP4.
 
-Two separate jobs load identical original HF weights, original real rollout
-tokens/advantages/old logprobs. "Full" uses unshared whole-trajectory tree
-roots; "TPR" shares Prefix KV. Neither uses native MindSpeed Full attention.
+Two jobs load identical HF weights, original real PPO tokens/labels. Native Full
+uses Megatron/MindSpeed attention and Megatron forward/backward schedule,
+never TPRSelfAttention or SegmentExecutor; TPR retains shared Prefix KV.
 This is FIXED-DATA PPO objective drift, not on-policy rollout convergence.
 
 Optimizer: CP leader only, CPU FP32-master AdamW with CPU FP32 moments;
@@ -27,6 +27,7 @@ from megatron.core import parallel_state
 from verl.utils import tensordict_utils as tu
 from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+from .native_full_megatron_schedule import run_native_full_step
 from .test_real_actor_tp2cp4_offline_ppo_npu import (
     _PPO, _runtime, _load_real_pair, _witness,
     _global_bf16_gradient_norm, _save_complete_grads,
@@ -224,25 +225,33 @@ def test_recorded_fixed_ppo_optimizer_drift():
             capture = Path(first["capture"])
             rows = tuple(first["rows"])
         batch, original_keys, token_count, sha = _load_real_pair(capture, rows, mode)
-        forest = build_tree_execution_plans(
-            _trajectory_keys_from_minibatch(batch), batch,
-            tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
-            turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
-        )
-        if mode == "full" and len(forest.trees) != len(rows):
-            raise AssertionError("Full run unexpectedly shares physical trees")
-        if mode == "tpr" and os.getenv("TPR_TREE_POLICY", "exact") == "exact":
-            if len(forest.trees) != 1:
+        if mode == "tpr":
+            forest = build_tree_execution_plans(
+                _trajectory_keys_from_minibatch(batch), batch,
+                tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
+                turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
+            )
+            if os.getenv("TPR_TREE_POLICY", "exact") == "exact" and len(forest.trees) != 1:
                 raise AssertionError("Exact TPR must have one shared tree")
+        else:
+            forest = SimpleNamespace(trees=(None,) * len(rows), segment_count=len(rows))
 
-        ring_impl = _install_offline_full_ring_backend(mode)
+        ring_impl = (
+            "mindspeed_native_megatron_schedule_thd_zigzag" if mode == "full"
+            else _install_offline_full_ring_backend(mode)
+        )
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=4,
-            sequence_parallel=False, profile="4b"
+            sequence_parallel=False, profile="4b",
+            native_attention=(mode == "full"),
         )
         assert hf.num_hidden_layers == 36
         finalize_seconds = [0.0]
-        engine = _make_engine(model, runtime, finalize_seconds)
+        engine = (
+            SimpleNamespace(_tpr_captured_log_probs={})
+            if mode == "full"
+            else _make_engine(model, runtime, finalize_seconds)
+        )
         before = _witness(model, grads=False)
         optimizer = _CPLeaderCpuMasterAdamW(model, runtime, lr, clip_norm)
         initial_master = optimizer.sample_master()
@@ -264,11 +273,14 @@ def test_recorded_fixed_ppo_optimizer_drift():
                         f"step {step}: PPO captured token count differs from manifest"
                     )
                 # Trace the precise physical topology of THIS real step.
-                forest = build_tree_execution_plans(
-                    _trajectory_keys_from_minibatch(batch), batch,
-                    tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
-                    turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
-                )
+                if mode == "tpr":
+                    forest = build_tree_execution_plans(
+                        _trajectory_keys_from_minibatch(batch), batch,
+                        tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
+                        turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
+                    )
+                else:
+                    forest = SimpleNamespace(trees=(None,) * len(rows), segment_count=len(rows))
             model.zero_grad(set_to_none=True)
             capture_lp = step in milestones
             tu.assign_non_tensor(batch, tpr_capture_log_probs=capture_lp)
@@ -278,10 +290,19 @@ def test_recorded_fixed_ppo_optimizer_drift():
             start_alloc = torch.npu.memory_allocated()
             fwd_start = time.perf_counter()
             prior_finalize_seconds = finalize_seconds[0]
-            out = run_tpr_forward_backward_batch(
-                engine, batch, partial(ppo_loss, config=_PPO()),
-                forward_only=False,
-            )
+            if mode == "full":
+                result = run_native_full_step(
+                    model, batch, runtime, partial(ppo_loss, config=_PPO()),
+                    capture_logprobs=capture_lp,
+                )
+                finalize_seconds[0] += result.finalize_seconds
+                engine._tpr_captured_log_probs = result.logprobs
+                out = {"loss": (result.loss,), "metrics": result.metrics}
+            else:
+                out = run_tpr_forward_backward_batch(
+                    engine, batch, partial(ppo_loss, config=_PPO()),
+                    forward_only=False,
+                )
             torch.npu.synchronize()
             fwd_seconds = time.perf_counter() - fwd_start
             profile = (
@@ -349,6 +370,14 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     "forest_trees":len(forest.trees),
                     "forest_segments":forest.segment_count,
                     "ring_attention_impl":ring_impl,
+                    "execution_backend": (
+                        "native_megatron_schedule" if mode == "full"
+                        else "tpr_segment_executor"
+                    ),
+                    "native_recompute_layers": (
+                        int(os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "1"))
+                        if mode == "full" else None
+                    ),
                     "run_kind":(
                         "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
                         if manifest_items is not None
