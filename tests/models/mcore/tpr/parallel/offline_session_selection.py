@@ -86,6 +86,7 @@ def first_session_indices(ordered_batches):
     candidates = {}
     counts = {}
     descriptions = []
+    padding_rows = 0
     for capture_order, (path,batch) in enumerate(ordered_batches):
         ids, ordinals, field = session_rows(batch)
         descriptions.append({
@@ -94,6 +95,11 @@ def first_session_indices(ordered_batches):
             "trajectory_ordinal_field":field,
         })
         for row,identity in enumerate(ids):
+            # VERL adds pad<random> synthetic rows to complete Actor mini-batches.
+            # These are not real Uni-Agent Sessions and must not be selected.
+            if identity[0].startswith("pad"):
+                padding_rows += 1
+                continue
             counts[identity] = counts.get(identity, 0) + 1
             if ordinals is None:
                 order=(1,capture_order,row)
@@ -115,6 +121,7 @@ def first_session_indices(ordered_batches):
         indices.sort()
     return kept_by_capture,{
         "sessions_seen":len(candidates),
+        "excluded_padding_rows":padding_rows,
         "sessions_with_multiple_captured_trajectories":sum(
             1 for count in counts.values() if count > 1
         ),
