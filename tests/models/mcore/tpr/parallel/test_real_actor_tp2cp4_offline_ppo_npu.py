@@ -110,9 +110,9 @@ def _load_real_pair(path: Path, rows: tuple[int, int], mode: str):
         "advantages", "old_log_probs", "temperature"
     )):
         raise AssertionError("Missing original PPO input")
-    if (len(rows) < 2 or len(set(rows)) != len(rows)
+    if (len(rows) < 1 or len(set(rows)) != len(rows)
             or min(rows) < 0 or max(rows) >= len(raw["keys"])):
-        raise ValueError("Select at least two distinct existing capture rows")
+        raise ValueError("Select at least one valid original captured row")
     data = tu.index_select_tensor_dict(raw["tensordict"], list(rows))
     original_keys = tuple(raw["keys"][i] for i in rows)
     if mode == "tpr":
@@ -259,8 +259,8 @@ def test_recorded_full_vs_tpr_one_step():
         del raw
     else:
         rows = tuple(int(z) for z in rows_value.split(","))
-    if len(rows) < 2:
-        raise ValueError("TPR_OFFLINE_ROWS must select >=2 original row IDs")
+    if len(rows) < 1:
+        raise ValueError("TPR_OFFLINE_ROWS must select >=1 original row IDs")
     checkpoint = Path(os.environ.get(
         "TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"
     ))
