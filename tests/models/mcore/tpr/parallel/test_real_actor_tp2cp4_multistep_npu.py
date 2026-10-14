@@ -378,6 +378,10 @@ def test_recorded_fixed_ppo_optimizer_drift():
                         int(os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "1"))
                         if mode == "full" else None
                     ),
+                    "native_loss_scaling": (
+                        "megatron_cp_once_global_token_mean_v2"
+                        if mode == "full" else None
+                    ),
                     "run_kind":(
                         "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
                         if manifest_items is not None
