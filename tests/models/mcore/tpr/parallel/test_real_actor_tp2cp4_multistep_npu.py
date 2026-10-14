@@ -148,8 +148,8 @@ def test_recorded_fixed_ppo_optimizer_drift():
     if mode not in ("full", "tpr"):
         raise ValueError("TPR_OFFLINE_MODE must be full or tpr")
     steps = int(os.getenv("TPR_OFFLINE_STEPS", "50"))
-    if not 1 <= steps <= 50:
-        raise ValueError("Allowed fixed replay steps: 1..50")
+    if not 1 <= steps <= 1000:
+        raise ValueError("Allowed offline replay optimizer updates: 1..1000")
     raw_rows = os.getenv("TPR_OFFLINE_ROWS", "0,1")
     capture = Path(os.environ["TPR_REAL_ACTOR_MINIBATCH"])
     if raw_rows == "all":
@@ -184,13 +184,22 @@ def test_recorded_fixed_ppo_optimizer_drift():
     manifest_items = None
     if manifest_path:
         manifest = json.loads(Path(manifest_path).read_text())
-        if (manifest.get("protocol") != "real_actor_20_distinct_captures_v1"
-                or manifest.get("steps") != steps
+        if (manifest.get("protocol") not in (
+                "real_actor_20_distinct_captures_v1",
+                "real_actor_session_first_multicapture_v2",
+            ) or manifest.get("steps") != steps
                 or len(manifest.get("items", [])) != steps):
-            raise ValueError("offline manifest must contain exact 1..N genuine capture steps")
+            raise ValueError("offline manifest must contain exactly N valid real PPO updates")
         manifest_items = manifest["items"]
         if [item["step"] for item in manifest_items] != list(range(1, steps+1)):
-            raise ValueError("offline manifest steps must be exactly 1..N")
+            raise ValueError("offline replay optimizer update ordinals must be 1..N")
+        if manifest.get("protocol") == "real_actor_session_first_multicapture_v2":
+            online_steps = [int(item["source_global_step"]) for item in manifest_items]
+            if (online_steps != sorted(online_steps)
+                    or set(online_steps) != set(range(1,manifest["online_steps"]+1))):
+                raise ValueError("session-first manifest must cover all original online steps")
+            if manifest.get("historical_ppo_labels_modified") is not False:
+                raise ValueError("historical PPO advantages and old logprobs must remain immutable")
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
@@ -296,6 +305,14 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     "rank":dist.get_rank(), "tp_rank":runtime.tp_rank,
                     "cp_rank":runtime.cp_rank, "checkpoint":str(checkpoint),
                     "source_capture":str(capture), "source_rows":rows,
+                    "source_online_global_step": (
+                        manifest_items[step-1].get("source_global_step",step)
+                        if manifest_items is not None else None
+                    ),
+                    "source_capture_index": (
+                        manifest_items[step-1].get("source_capture_index")
+                        if manifest_items is not None else None
+                    ),
                     "source_keys":original_keys, "data_sha256":sha,
                     "optimizer":"cpu_fp32_master_adamw_0.9_0.95_eps1e-8_wd0",
                     "lr":lr, "clip_norm":clip_norm, "grad_clip_factor":scale,
@@ -335,7 +352,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
                     f"loss={float(out['loss'][0]):.9g} gradnorm={grad_norm:.9g} "
                     f"clip_scale={scale:.6g} fwd_bwd_s={fwd_seconds:.3f} "
                     f"cpu_adamw_s={update_seconds:.3f} peak_gib={peak/2**30:.3f} "
-                    f"source_step={step if manifest_items is not None else 'fixed'} "
+                    f"source_step={manifest_items[step-1].get('source_global_step',step) if manifest_items is not None else 'fixed'} "
                     f"segments={forest.segment_count} ring_impl={ring_impl}",
                     flush=True,
                 )
