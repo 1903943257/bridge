@@ -272,12 +272,15 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     if calls[0] != count or len(loss_parts) != count:
         raise AssertionError(f"Native Megatron schedule executed {calls[0]}/{count} rows")
 
+    from .grad_sync_precision import (
+        offline_grad_sync_dtype, reduce_average_weight_grad,
+    )
+    grad_dtype = offline_grad_sync_dtype()
     t0 = time.perf_counter()
     for name, param in model.named_parameters():
-        if param.grad is None:
-            raise AssertionError(f"Missing native gradient: {name}")
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=runtime.cp_group)
-        param.grad.div_(4)
+        reduce_average_weight_grad(
+            param, runtime.cp_group, name=name, reduce_dtype=grad_dtype,
+        )
     torch.npu.synchronize()
     finalize_seconds = time.perf_counter() - t0
 
