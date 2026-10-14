@@ -218,8 +218,9 @@ def make_real_qwen3_tp_model(
     runtime, *, model_path: Path, tp_size: int = 2, load_weights: bool = True,
     sequence_parallel: bool = False, cp_size: int = 1,
     profile: str = "1.7b",
+    native_attention: bool = False,
 ):
-    """Construct Qwen3-1.7B with real native TP=1 or 2 layout.
+    """Construct real Qwen3 TP shards; optionally use unmodified MCore attention.
 
     When load_weights=False, the caller MUST load the already-sharded
     state_dict of a checkpoint-loaded peer BEFORE performing any forward.
@@ -238,6 +239,18 @@ def make_real_qwen3_tp_model(
         bias_dropout_fusion=False,
         use_cpu_initialization=True,
     )
+    if native_attention:
+        # Native Megatron/MindSpeed Ring CP path: no TPR layer replacement.
+        # Enable checkpointing at model construction time, before forward.
+        import os
+        recompute_layers = int(os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "1"))
+        if recompute_layers < 0:
+            raise ValueError("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS must be >= 0")
+        if recompute_layers:
+            config.recompute_granularity = "full"
+            config.recompute_method = "uniform"
+            config.recompute_num_layers = recompute_layers
+        config.use_flash_attn = True
     # IMPORTANT: setting use_flash_attn=True on a TransformerConfig does
     # not replace Megatron's DotProductAttention implementation. The latter
     # still invokes MindSpeed's ScaledMaskedSoftmax and rejects the 2D mask
@@ -247,16 +260,15 @@ def make_real_qwen3_tp_model(
     # attention with the CANN rectangular kernel, independently of the TPR
     # Prefix/Suffix cache path. This is a *controlled square-causal oracle*,
     # not a claim of equality to MindSpeed's unmodified native FA kernel.
-    spec = replace_self_attention_with_tpr(
-        get_gpt_decoder_block_spec(
-            config, use_transformer_engine=False, pp_rank=0
-        )
+    vanilla_spec = get_gpt_decoder_block_spec(
+        config, use_transformer_engine=False, pp_rank=0
     )
+    spec = vanilla_spec if native_attention else replace_self_attention_with_tpr(vanilla_spec)
     # For CP>1, the ordinary square-CANN reference core is invalid because
     # its DotProductAttention parent constructor only supports CP=1.
     # Every reference and TPR segment in the Ring-combination test must
     # execute inside SegmentExecutor's explicit Ring attention context.
-    core_attention_cls = (
+    core_attention_cls = None if native_attention else (
         _ProfileFusedCausalAttention if cp_size == 1
         else _RingCPOnlyCoreAttention
     )
@@ -265,10 +277,11 @@ def make_real_qwen3_tp_model(
     # ModuleSpec (with .submodules.layer_specs). Use the same tested
     # resolver as replace_self_attention_with_tpr above.
     layer_specs = _get_layer_specs(spec)
-    for layer_spec in layer_specs:
-        layer_spec.submodules.self_attention.submodules.core_attention = (
-            core_attention_cls
-        )
+    if not native_attention:
+        for layer_spec in layer_specs:
+            layer_spec.submodules.self_attention.submodules.core_attention = (
+                core_attention_cls
+            )
     from types import SimpleNamespace
     pg = SimpleNamespace(
         tp=runtime.tp_group, cp=runtime.cp_group,
@@ -301,7 +314,11 @@ def make_real_qwen3_tp_model(
     # and TPR's tree branch must use the expected CANN attention operator.
     # If a future MindSpeed/Megatron spec bypasses our replacement, fail
     # here rather than entering an incompatible ScaledMaskedSoftmax kernel.
-    if not all(
+    if native_attention:
+        from verl.models.mcore.tpr import TPRSelfAttention
+        if any(isinstance(m, TPRSelfAttention) for m in model.modules()):
+            raise AssertionError("Native Full must never construct a TPR attention module")
+    elif not all(
         isinstance(layer.self_attention.core_attention, core_attention_cls)
         for layer in model.decoder.layers
     ):

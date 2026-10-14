@@ -68,22 +68,19 @@ export TPR_OFFLINE_STEPS="${manifest_info[0]}"
 export TPR_REAL_ACTOR_MINIBATCH="${manifest_info[1]}"
 export TPR_OFFLINE_ROWS="${manifest_info[2]}"
 echo "TPR_SESSION_FIRST_CAPTURE_SELECTION online_steps=20 replay_updates=$TPR_OFFLINE_STEPS sessions_per_step=8, NO total-token cap"
-if [[ "$TPR_OFFLINE_FULL_RING_BACKEND" == native && ( "$RUN_MODE" == both || "$RUN_MODE" == full ) ]]; then
+# Full uses the genuine Megatron schedule + unmodified MindSpeed attention.
+# Do not require the old TPR ring monkeypatch's trailing-padding API here.
+if [[ "$RUN_MODE" == both || "$RUN_MODE" == full ]]; then
   python - <<'PY'
-import inspect
-from verl.models.mcore.tpr.parallel.ring_attention import ordinary_ring_cp_attention
-if "allow_trailing_padding" not in inspect.signature(ordinary_ring_cp_attention).parameters:
-    raise SystemExit(
-        "ERROR: Docker VERL ring_attention.py is outdated: native Full requires "
-        "ordinary_ring_cp_attention(..., allow_trailing_padding=...). "
-        "Sync bridge/main verl/models/mcore/tpr/parallel/ring_attention.py "
-        "into this checkout before running the 8-NPU job."
-    )
-print("TPR_NATIVE_RING_PREFLIGHT=PASS")
+from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from verl.models.mcore.util import preprocess_thd_engine
+from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
+from verl.models.mcore.tpr import TPRSelfAttention
+print("NATIVE_FULL_PREFLIGHT=PASS megatron_schedule=available verl_thd=available")
 PY
 fi
 echo "TPR_20STEP_OFFLINE_START capture_dir=$CAPTURE_DIR root=$RUN_ROOT mode=$RUN_MODE"
-echo "E2: Native MindSpeed Ring core attention on FULL complete sequences"
+echo "E2: Native Megatron F/B schedule + MindSpeed Ring on FULL complete sequences"
 echo "E3: Custom TPR Ring with Turn-based prefix reuse"
 full_exit=0
 tpr_exit=0
@@ -98,7 +95,9 @@ if [[ "$RUN_MODE" == "both" || "$RUN_MODE" == "tpr" ]]; then
   echo "E3_FINISHED status=$tpr_exit"
 fi
 if [[ "$full_exit" == "0" && "$tpr_exit" == "0" ]] && \
-  { [[ "$RUN_MODE" == "both" ]] || [[ "$RUN_MODE" == "compare" ]]; }; then
+  { [[ "$RUN_MODE" == "both" ]] || [[ "$RUN_MODE" == "compare" ]] ||
+    { [[ "$RUN_MODE" == "full" ]] &&
+      [[ -f "$RUN_ROOT/offline/tpr_step${TPR_OFFLINE_STEPS}_rank7.pt" ]]; }; }; then
   export TPR_OFFLINE_RUN_MODES=compare
   bash "$RUNNER" 2>&1 | tee "$RUN_ROOT/logs/final_comparison.log"
 fi

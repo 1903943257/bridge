@@ -148,6 +148,16 @@ def compare(outdir: Path, steps: int):
                 for path in expected
             ]
         f, t = mode["full"], mode["tpr"]
+        if any(x.get("execution_backend") != "native_megatron_schedule" for x in f):
+            raise AssertionError(
+                "Full baseline must be the genuine Megatron schedule; old "
+                "unshared TPR snapshots are not interchangeable"
+            )
+        if any(x.get("execution_backend", "tpr_segment_executor") != "tpr_segment_executor" for x in t):
+            raise AssertionError("TPR baseline must remain the original segment executor")
+        native_recompute = {x.get("native_recompute_layers") for x in f}
+        if len(native_recompute) != 1:
+            raise AssertionError("Native Full recompute settings disagree across ranks")
         for a, b in zip(f, t):
             for field in (
                 "step", "steps", "source_capture", "source_rows", "source_keys",
@@ -181,6 +191,9 @@ def compare(outdir: Path, steps: int):
             "source_online_global_step":f[0].get("source_online_global_step"),
             "source_capture_index":f[0].get("source_capture_index"),
             "full_attention_impl":f[0].get("ring_attention_impl","legacy_custom"),
+            "full_execution_backend":f[0]["execution_backend"],
+            "tpr_execution_backend":t[0].get("execution_backend", "tpr_segment_executor"),
+            "full_native_recompute_layers":f[0]["native_recompute_layers"],
             "tpr_attention_impl":t[0].get("ring_attention_impl","legacy_custom"),
             "full_loss":f[0]["loss"], "tpr_loss":t[0]["loss"],
             "loss_gap":t[0]["loss"]-f[0]["loss"],
@@ -251,7 +264,11 @@ def compare(outdir: Path, steps: int):
             "The replay policies are separately trained from the same initial "
             "weights and are NOT resampled online at each replay step. "
             "CPU FP32-master AdamW is diagnostic and not production optimizer. "
-            "Full is unshared RingCP and not native MindSpeed attention."
+            "Native Full uses the original Megatron forward/backward schedule, "
+            "unmodified MindSpeed model attention, and VERL THD/PPO helpers. "
+            "TPR uses its custom SegmentExecutor and TPR Ring backend. "
+            "Native Full recompute is separately reported: its performance "
+            "must not be labeled an equal-recompute ablation when enabled."
         ),
     }
     target = outdir / "multistep_comparison.json"
