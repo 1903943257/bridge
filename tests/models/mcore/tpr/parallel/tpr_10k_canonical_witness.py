@@ -87,6 +87,9 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         raise ValueError("10K parity supports TP=1/2 only")
     names=[]; shapes=[]; offsets=[]; counts=[]
     pieces=[]
+    norm_pieces=[]
+    norm_names=[]
+    norm_shapes=[]
     tp_sum_slices=[]
     offset=0
     for name,param in model.named_parameters():
@@ -107,6 +110,19 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
                 0,torch.tensor(local_pos,dtype=torch.int64,device=device)
             ).float()
             chunk[torch.tensor(output_pos,dtype=torch.int64,device=device)]=picks
+        if "layernorm" in name or name.endswith(".norm.weight"):
+            # Small complete Norm tensors, unlike huge GEMM weights, can
+            # be captured in full for an actual Norm-only L2 comparison.
+            whole=param.grad.detach().reshape(-1).float()
+            # Q/K TP replicas have per-head partial gradients that must be
+            # summed; other Norm params are TP replicas counted once.
+            if cp_rank!=0 or dp_rank!=0 or (
+                tp_rank!=0 and shard_kind(name)!="tp_sum"
+            ):
+                whole=torch.zeros_like(whole)
+            norm_pieces.append(whole)
+            norm_names.append(name)
+            norm_shapes.append(list(logical_shape))
         names.append(name)
         shapes.append(list(logical_shape))
         offsets.append(offset)
@@ -160,9 +176,14 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
     if cp_rank!=0 or dp_rank!=0:
         local.zero_()
     dist.all_reduce(local,op=dist.ReduceOp.SUM)
+    if not norm_pieces:
+        raise AssertionError("No complete Norm gradients captured")
+    norm_vector=torch.cat(norm_pieces)
+    dist.all_reduce(norm_vector,op=dist.ReduceOp.SUM)
     if dist.get_rank()!=0:
         return None
     arr=local.cpu().tolist()
+    norm_values=norm_vector.cpu().tolist()
     if not all(math.isfinite(x) for x in arr):
         raise ValueError("Nonfinite sampled parameter gradients")
     return {
@@ -170,6 +191,17 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         "samples_per_name":counts,
         "samples_per_parameter":SAMPLES,
         "values":arr,"replica_max_abs":max_replica_abs,
+        "complete_norm_gradients":{
+            "names":norm_names,
+            "shapes":norm_shapes,
+            "values":norm_values,
+            "elements":len(norm_values),
+            "note":(
+                "EXACT complete Norm parameter gradients only; "
+                "TP shared Q/K partial head grads summed across TP in witness. "
+                "No optimizer update or physical TP sync is applied."
+            ),
+        },
         "qk_norm_tp_local_gradient_max_abs":tp_sum_sample_max_abs,
         "qk_norm_tp_sum_applied_to_witness":True,
         "qk_norm_tp_sum_applied_to_model_grads":False,
