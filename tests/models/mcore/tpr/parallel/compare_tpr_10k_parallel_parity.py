@@ -85,6 +85,10 @@ def compare_pair(ref:dict,cur:dict,labels:dict) -> dict:
     if lw["replica_max_abs"]!=0 or rw["replica_max_abs"]!=0:
         raise AssertionError("CP/DP gradient replicas must agree exactly")
     grads=_vector_metrics(lw["values"],rw["values"])
+    an,bn=lw["complete_norm_gradients"],rw["complete_norm_gradients"]
+    if an["names"]!=bn["names"] or an["shapes"]!=bn["shapes"]:
+        raise AssertionError("Full Norm gradient coordinate layouts differ")
+    complete_norm=_vector_metrics(an["values"],bn["values"])
     a={(int(x),int(y)):float(v) for x,y,v in ref["token_logprobs"]}
     b={(int(x),int(y)):float(v) for x,y,v in cur["token_logprobs"]}
     if set(a)!=set(b) or set(a)!=set(labels):
@@ -114,6 +118,7 @@ def compare_pair(ref:dict,cur:dict,labels:dict) -> dict:
         "loss_ref":ref["global_loss"],
         "loss_candidate":cur["global_loss"],
         "canonical_sampled_parameter_gradient":grads,
+        "complete_norm_gradient":complete_norm,
         "token_logprob":_vector_metrics(lpa,lpb),
         "clip_state_changes":clip_changed,
         "ref_clipped_tokens":clipped_a,
@@ -190,9 +195,12 @@ def main():
         grad=values["canonical_sampled_parameter_gradient"]
         lp=values["token_logprob"]
         eff=values["effective_dloss_dlogprob"]
+        norm=values["complete_norm_gradient"]
         print(
             f"TPR_10K_PARITY_COMPARE axis={name} loss_gap={values['loss_abs_gap']:.9g} "
             f"grad_rel_l2={grad['relative_l2']:.9g} grad_cos={grad['cosine']} "
+            f"norm_full_rel_l2={norm['relative_l2']:.9g} "
+            f"norm_full_cos={norm['cosine']} "
             f"logprob_max_abs={lp['max_abs']:.9g} "
             f"clip_changes={values['clip_state_changes']} "
             f"effective_grad_rel_l2={eff['relative_l2']:.9g}",
