@@ -66,6 +66,14 @@ while read -r NAME TP CP DP MODE; do
     echo "Refusing partial or unrelated case directory: $ROOT/$NAME" >&2
     exit 2
   fi
+  if [[ "$NAME" == "tpr_tp1cp1dp1" && "${TPR_10K_SKIP_TP1_OOM:-0}" == "1" ]]; then
+    if [[ ! -f "$ROOT/$NAME.log" ]] || ! grep -qi 'out of memory' "$ROOT/$NAME.log"; then
+      echo "Cannot skip TP1: $ROOT/$NAME.log must contain the actual OOM" >&2
+      exit 2
+    fi
+    echo "TPR_10K_CASE_NOT_EVALUATED name=$NAME reason=confirmed_NPU_OOM"
+    continue
+  fi
   export TPR_10K_TP="$TP"
   export TPR_10K_CP="$CP"
   export TPR_10K_DP="$DP"
@@ -88,8 +96,13 @@ tpr_tp2cp2dp2 2 2 2 tpr
 CASES
 
 if [[ ! -e "$ROOT/comparison_10k.json" ]]; then
-  python -m tests.models.mcore.tpr.parallel.compare_tpr_10k_parallel_parity \
-    "$ROOT" | tee "$ROOT/comparison_10k.log"
+  if [[ "${TPR_10K_SKIP_TP1_OOM:-0}" == "1" ]]; then
+    python -m tests.models.mcore.tpr.parallel.compare_tpr_10k_parallel_parity \
+      "$ROOT" --allow-missing-tp1 | tee "$ROOT/comparison_10k.log"
+  else
+    python -m tests.models.mcore.tpr.parallel.compare_tpr_10k_parallel_parity \
+      "$ROOT" | tee "$ROOT/comparison_10k.log"
+  fi
 else
   echo "TPR_10K_PARITY_COMPARISON_REUSE=$ROOT/comparison_10k.json"
 fi
