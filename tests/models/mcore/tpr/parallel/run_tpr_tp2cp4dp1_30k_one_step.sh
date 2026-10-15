@@ -57,7 +57,8 @@ unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 # FAIL BEFORE loading the checkpoint if any comparison dimension differs.
 python - "$MANIFEST" "$FULL_JSON" "$DP2_JSON" "$STEP" <<'PY'
 import json, os, pathlib, sys
-manifest_path, full_path, dp_path, step = sys.argv[1:4], sys.argv[2], sys.argv[3], int(sys.argv[4])
+manifest_path, full_path, dp_path, step_arg = sys.argv[1:5]
+step = int(step_arg)
 m = json.loads(pathlib.Path(manifest_path).read_text())
 full = json.loads(pathlib.Path(full_path).read_text())
 dp2 = json.loads(pathlib.Path(dp_path).read_text())
