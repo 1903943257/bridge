@@ -795,3 +795,34 @@ short input. Preserve genuine shared Prefix, original retained PPO
 labels, identical model weights, and corrected Q/K Norm TP gradient
 semantics. The original 10K unshared TP2 PASS cannot substitute
 for this paired numerical comparison.
+
+
+### 2026-10-15 final 10K protocol: permanently remove TP1 case
+
+**This section supersedes the earlier six-case and OOM-log skip protocols.**
+Following TP1CP1DP1 backward OOM, the user elected to exclude TP
+correctness isolation from this 10K matrix entirely.
+
+The experiment now has exactly FIVE arms, ALL at TP2:
+`unshared_tp2cp1dp1`, `tpr_tp2cp1dp1`,
+`tpr_tp2cp2dp1`, `tpr_tp2cp1dp2`, and
+`tpr_tp2cp2dp2`.
+
+No `TPR_10K_SKIP_TP1_OOM` flag is needed, no TP1 OOM log is
+read, and no TP1 artifacts are required. The five-way comparator
+omits `tp_only` and explicitly marks
+`tp_correctness_status=NOT_EVALUATED_TP_FIXED_AT_2`.
+`complete_matrix=true` means all **five CP/DP arms** completed,
+not that TP numerical correctness was established.
+
+Run with the existing Step6 10K workspace, reusing all completed
+results without overwriting or rebuilding the capture:
+
+    cd /workspace/uni-agent-cc/verl
+    # Sync latest bridge/main to container first.
+    bash tests/models/mcore/tpr/parallel/run_tpr_10k_parallel_parity.sh \
+      /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1 \
+      /workspace/tpr_10k_axes_correctness_v1
+
+Remaining comparisons: unshared-vs-TPR with CP1, CP-only,
+DP-only with CP1, DP-only with CP2, and CP2DP2-vs-CP1.
