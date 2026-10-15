@@ -30,12 +30,18 @@ def test_canonical_qwen_tp_layouts(name,shape,tp,expected):
         assert 0<=owner<tp
         assert 0<=pos<local_size
         visited.append((owner,pos))
-    if shard_kind(name)=="replicated":
+    if shard_kind(name) in ("replicated","tp_sum"):
         assert all(owner==0 for owner,_ in visited)
         assert len(set(visited))==global_size
     else:
         assert len(set(visited))==global_size
         assert len(set(visited))==local_size*tp
+
+
+def test_qk_layernorm_requires_tp_sum_for_gradients():
+    assert shard_kind("decoder.layers.7.self_attention.q_layernorm.weight")=="tp_sum"
+    assert shard_kind("decoder.layers.7.self_attention.k_layernorm.weight")=="tp_sum"
+    assert shard_kind("decoder.layers.7.input_layernorm.weight")=="replicated"
 
 
 def test_gate_up_interleaved_tp2_shard_mapping():
