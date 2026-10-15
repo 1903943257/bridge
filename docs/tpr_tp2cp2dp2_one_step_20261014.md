@@ -526,8 +526,11 @@ without changing the default BF16 calculation.
 
 Run exactly one new benchmark, reusing original Step6 Full + DP2 files:
 
+    # First sync bridge main into /workspace/uni-agent-cc/verl
+    # with the existing bridge-to-container sync flow. The container's
+    # native verl git origin may point to upstream verl-project/verl,
+    # NOT the writable bridge repository; do not git pull that origin.
     cd /workspace/uni-agent-cc/verl
-    git pull origin main
     pytest -q tests/models/mcore/tpr/unit/test_tpr_30k_three_way_comparison.py
     HCCL_DETERMINISTIC=true TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16 \
     bash tests/models/mcore/tpr/parallel/run_tpr_tp2cp4dp1_30k_one_step.sh \
