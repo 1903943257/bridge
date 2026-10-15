@@ -565,3 +565,82 @@ it. The paired baseline's deterministic setting was confirmed by
 the original launch command, not independently recoverable solely
 from old JSON fields; the three-way report marks these as
 `not_recorded`. No invented NPU measurements or parity claims.
+
+
+## Completed deterministic BF16 30K three-way Step 6 (2026-10-15)
+
+All three artifacts use the SAME immutable source:
+`/workspace/tpr_dp2_30k_bf16_deterministic_pair_v1/step6_cap30720.pt`;
+SHA256 `1741463fa53ace991da29efd444d00b7a1272477b7fe789d9d27ddb0302b9d60`.
+Qwen3-4B-128K, 8 NPUs, 36,933 supervised PPO tokens,
+1 warmup + 3 timed replays, BF16 gradient SUM/4, no AdamW.
+New CP4 TPR explicitly stamped HCCL_DETERMINISTIC=true;
+prior paired Full and DP2 jobs were launched with this setting
+but did not record it in their individual JSON files.
+
+| Mode | Topology | Median F/B+finalize s | Worst-rank measured peak GiB | PPO loss |
+|---|---|---:|---:|---:|
+| Native Full | TP2CP4DP1 | 16.454548 | 34.638256 | 0.151394129 |
+| TPR | TP2CP4DP1 | 15.035786 | 24.657299 | 0.151653767 |
+| TPR + DTA-style DP placement | TP2CP2DP2 | 12.401572 | 41.070560 | 0.151566282 |
+
+Measured speedups:
+- TPR CP4 vs Full CP4: 1.094359x (save 1.419 seconds)
+- TPR CP2DP2 vs TPR CP4: 1.212410x (save 2.634 seconds)
+- TPR CP2DP2 vs Full CP4: 1.326811x (save 4.053 seconds)
+- DP2 memory: +66.57% vs TPR CP4; +18.57% vs Full CP4.
+- TPR CP4 memory: -28.81% vs Full CP4.
+
+DP2 planner assigns rows (2,3,0,6) vs (5,1,4,7);
+local tree costs 59,493 vs 70,125 (largest 17.87% above smaller);
+local total 129,618 vs global TPR tree 112,089, hence
+17,529 duplicated Prefix tokens (~15.64% of global tree).
+Thus adding DP2 on same 8 NPUs also halves CP from 4 to 2,
+loses cross-DP Prefix reuse, and may incur load imbalance.
+It is NOT a pure extra 2x compute resource. Actual CP Ring,
+GEMM, activation and communication effects require profiling;
+tree-token counts alone cannot predict FLOP-level runtime.
+
+**All three gradient witnesses have exact CP/DP replica agreement,
+BUT numeric Full/TPR parity is NOT PASSED.**
+Each witness uses only 4,640 deterministic, unweighted samples:
+- Full CP4 vs TPR CP4 rel-L2=0.455813, cosine=0.898021
+- Full CP4 vs TPR CP2DP2 rel-L2=0.502732, cosine=0.870341
+- TPR CP4 vs TPR CP2DP2 rel-L2=0.416250, cosine=0.910348
+
+The surprisingly large 41.63% *between TPR topologies* is critical:
+DP/CP topology change, forest segmentation and BF16 numerical
+paths produce substantial sampled gradient differences. This is
+not the difference 50.27%-45.58%=4.69 percentage points interpreted
+as an additive DP error, because L2 vector errors do not add.
+The original Full-vs-TPR CP4 error is already ~45.58%.
+Sampled gradients heavily overweight Norm vectors: 8 samples
+per tiny Norm and 8 per huge matrix; no full-model tensor-level
+error magnitude can be inferred. Small PPO loss gaps do not prove
+gradient parity.
+
+Next priorities:
+1. Existing three witness JSONs can be fed into the two-way
+   gradient breakdown analyzer three times (including CP4 vs DP2)
+   at ZERO NPU cost, to see whether TP/CP changes specifically
+   affect RMSNorm or attention / MLP sampled directions.
+2. At equal CP4 topology, compare tokenwise PPO new logprobs,
+   ratio, clip decisions (and relevant d(loss)/d(logprob)),
+   against TPR CP4. Then compare TPR CP4 vs DP2.
+3. For definitive gradient parity, collect full-parameter
+   FP32 squared-error accumulation across runs (one TP shard
+   each, TP replicas de-duplicated); don't rely on strided
+   8-per-parameter samples alone.
+4. Investigate why DP2 peak is 41.07 GiB while TPR CP4 is
+   24.66 GiB: inspect rank-local and per-DP peaks and separately
+   profile activations, Prefix-KV retention and HCCL group buffers.
+   Current per-run JSON records only WORLD worst rank and
+   cannot attribute memory delta by component.
+5. Before optimizing placement, assess per-DP compute-only
+   critical path separately from synchronous finalize; simple
+   rank wall time that includes gradient AllReduce can obscure
+   idle time waiting for the slower DP forest.
+
+Results are isolated frozen-weights F/B+manual finalization only,
+not proof of PPO e2e training correctness, reward, or production
+Megatron-DDP performance.
