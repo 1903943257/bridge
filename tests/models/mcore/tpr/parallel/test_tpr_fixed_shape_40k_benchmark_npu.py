@@ -112,8 +112,8 @@ def test_fixed_shape_40k_one_mode():
         grad_sync_dtype = offline_grad_sync_dtype()
         if dist.get_rank() == 0:
             print(
-                f"TPR_FULL_GRAD_REDUCE_MODE dtype={grad_sync_dtype} "
-                "cp_group_size=4",
+                f"TPR_FIXED_SHAPE_GRAD_REDUCE_MODE mode={mode} "
+                f"dtype={grad_sync_dtype} cp_group_size=4",
                 flush=True,
             )
         runs = []
@@ -220,11 +220,13 @@ def test_fixed_shape_40k_one_mode():
             measured = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             target.write_text(json.dumps({
                 "source_step": step, "mode": mode,
+                "topology": {"tp": 2, "cp": 4, "dp": 1, "world": 8},
                 "effective_sequence_cap": int(item.get("effective_sequence_cap", 40960)),
                 "input_sha256": data_sha, "source_capture": str(capture),
                 "checkpoint": str(checkpoint), "warmups": warmups,
                 "repeats": repeats, "updated_weights": False,
                 "gradient_sync_reduce_dtype": grad_sync_dtype,
+                "hccl_deterministic": os.getenv("HCCL_DETERMINISTIC", "unset"),
                 "hccl_stats_reduce_dtype": "float32",
                 "capture_logprobs": capture_logprobs,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
