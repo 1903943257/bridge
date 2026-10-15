@@ -73,8 +73,14 @@ def _runtime(tp: int,cp: int,dp: int):
     ranks=(parallel_state.get_tensor_model_parallel_rank(),
            parallel_state.get_context_parallel_rank(),
            parallel_state.get_data_parallel_rank())
-    actual=(dist.get_world_size(t),dist.get_world_size(c),dist.get_world_size(d),
-            dist.get_world_size(dc))
+    group_specs=(("tp",t,tp),("cp",c,cp),("dp",d,dp),("dp_cp",dc,cp*dp))
+    def _size(group, expected_size):
+        if group is None:
+            if expected_size != 1:
+                raise AssertionError("Missing process group for nontrivial parallel dimension")
+            return 1
+        return dist.get_world_size(group)
+    actual=tuple(_size(group,n) for _,group,n in group_specs)
     if actual!=(tp,cp,dp,cp*dp):
         raise AssertionError(f"Wrong Megatron group sizes {actual} for {(tp,cp,dp)}")
     dev=torch.device("npu",local_rank)
@@ -90,8 +96,9 @@ def _runtime(tp: int,cp: int,dp: int):
         "dp": {i for i,(tt,cc,dd) in enumerate(layout) if (tt,cc)==ranks[:2]},
         "dp_cp": {i for i,(tt,cc,dd) in enumerate(layout) if tt==ranks[0]},
     }
-    for name,group in (("tp",t),("cp",c),("dp",d),("dp_cp",dc)):
-        got=set(dist.get_process_group_ranks(group))
+    for name,group,n in group_specs:
+        got=({dist.get_rank()} if group is None else
+             set(dist.get_process_group_ranks(group)))
         if got!=expected[name]:
             raise AssertionError(f"{name} group wrong {got} != {expected[name]}")
         if len(got)>1:
