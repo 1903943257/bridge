@@ -91,6 +91,7 @@ def analyze_gradient_witness(full: dict, tpr: dict, *, top: int = 25) -> dict:
     by_param = []
     by_kind = defaultdict(lambda: [[], []])
     by_layer = defaultdict(lambda: [[], []])
+    non_norm_full, non_norm_tpr = [], []
     by_tp = {}
     all_full, all_tpr = [], []
     for tp in (0,1):
@@ -116,10 +117,14 @@ def analyze_gradient_witness(full: dict, tpr: dict, *, top: int = 25) -> dict:
             })
             by_kind[kind][0].extend(f)
             by_kind[kind][1].extend(t)
+            if kind != "norm":
+                non_norm_full.extend(f)
+                non_norm_tpr.extend(t)
             by_layer[layer][0].extend(f)
             by_layer[layer][1].extend(t)
             offset += count
     global_metrics = _metrics(all_full, all_tpr)
+    non_norm_metrics = _metrics(non_norm_full, non_norm_tpr)
     denom = global_metrics["error_sq"]
     for item in by_param:
         item["share_of_total_error_sq"] = item["error_sq"] / denom if denom else 0.0
@@ -134,6 +139,20 @@ def analyze_gradient_witness(full: dict, tpr: dict, *, top: int = 25) -> dict:
               "share_of_total_error_sq": _metrics(pair[0],pair[1])["error_sq"] / denom if denom else 0.0}
         for key,pair in by_layer.items()
     }
+    # Identical strided TP0/TP1 Norm samples provide no independent
+    # evidence. Do not silently count this duplication as broader coverage.
+    repeated_norm_params = []
+    off = 0
+    for name, count in zip(names, counts, strict=True):
+        if _kind(name) == "norm":
+            a0 = left["tp_shards"][0][off:off+count]
+            a1 = left["tp_shards"][1][off:off+count]
+            b0 = right["tp_shards"][0][off:off+count]
+            b1 = right["tp_shards"][1][off:off+count]
+            if a0 == a1 and b0 == b1:
+                repeated_norm_params.append(name)
+        off += count
+    norm_metrics = _metrics(by_kind["norm"][0], by_kind["norm"][1])
     return {
         "source_step": tpr.get("source_step"),
         "source_sha_match": full.get("input_sha256") == tpr.get("input_sha256"),
@@ -143,6 +162,29 @@ def analyze_gradient_witness(full: dict, tpr: dict, *, top: int = 25) -> dict:
         "tpr_replica_exact": right.get("replica_exact"),
         "is_full_tensor_gradient_parity": False,
         "global_sampled": global_metrics,
+        "sampled_non_norm": non_norm_metrics,
+        "norm_share_of_full_sampled_gradient_energy": (
+            norm_metrics["full_sq"] / global_metrics["full_sq"]
+            if global_metrics["full_sq"] else None
+        ),
+        "norm_share_of_sampled_squared_error": (
+            norm_metrics["error_sq"] / denom if denom else 0.0
+        ),
+        "identical_norm_sample_pairs_across_tp": {
+            "count": len(repeated_norm_params),
+            "names": repeated_norm_params,
+            "warning": (
+                "These TP0/TP1 sampled values are identical, so the "
+                "unweighted 8-samples-per-parameter metric counts "
+                "replicated evidence twice; this does not establish "
+                "tensor-wide equality or the parameter sharding policy."
+            ),
+        },
+        "sampling_warning": (
+            "Eight deterministic, evenly spaced samples per named parameter "
+            "bias the global metric toward small parameters such as LayerNorm. "
+            "These numbers are NOT full-gradient rel-L2 or full-model error energy."
+        ),
         "per_tp": by_tp,
         "per_kind": dict(sorted(kinds.items(), key=lambda p:p[1]["error_sq"],reverse=True)),
         "per_layer": dict(sorted(layers.items(), key=lambda p:p[1]["error_sq"],reverse=True)),
@@ -173,6 +215,16 @@ def main() -> None:
         f"best_scale={g['best_tpr_over_full_scale']:.9g} "
         f"residual_rel_l2={g['relative_l2_after_best_scalar_rescale']:.9g}"
     )
+    nn=report["sampled_non_norm"]
+    print(
+        "TPR_GRAD_PARITY_NON_NORM "
+        f"rel_l2={nn['relative_l2']:.9g} cosine={nn['cosine']} "
+        f"norm_full_sample_energy_share="
+        f"{report['norm_share_of_full_sampled_gradient_energy']:.2%} "
+        f"duplicated_norm_tp_sample_pairs="
+        f"{report['identical_norm_sample_pairs_across_tp']['count']}"
+    )
+    print("TPR_GRAD_SAMPLING_CAVEAT " + report["sampling_warning"])
     for tp,m in report["per_tp"].items():
         print(
             f"  TP{tp}: rel_l2={m['relative_l2']:.6g} "
