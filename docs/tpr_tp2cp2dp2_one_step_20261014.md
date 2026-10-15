@@ -644,3 +644,97 @@ Next priorities:
 Results are isolated frozen-weights F/B+manual finalization only,
 not proof of PPO e2e training correctness, reward, or production
 Megatron-DDP performance.
+
+ 
+## Controlled 10K TP/CP/DP correctness isolation (added 2026-10-15)
+
+Goal: isolate *factor-by-factor* numerical effects of prefix reuse,
+TP1→TP2, CP1→RingCP2, DP1→DTA-placement DP2, and CP2+DP2.
+**These are correctness probes, not benchmarks or online training.**
+
+Run exactly six isolated Qwen3-4B/Ascend NPU topology arms:
+
+| Case | Model/algorithm | TP | CP | DP | NPU ranks |
+|---|---|---:|---:|---:|---:|
+| unshared_tp2cp1dp1 | unshared TPR execution (control, not native Megatron Full) | 2 | 1 | 1 | 2 |
+| tpr_tp1cp1dp1 | shared TPR, no TP/CP/DP parallelism | 1 | 1 | 1 | 1 |
+| tpr_tp2cp1dp1 | shared TPR, no CP | 2 | 1 | 1 | 2 |
+| tpr_tp2cp2dp1 | shared TPR, Ring CP2 | 2 | 2 | 1 | 4 |
+| tpr_tp2cp1dp2 | shared TPR, DP2 but **no CP** | 2 | 1 | 2 | 4 |
+| tpr_tp2cp2dp2 | shared TPR, Ring CP2 plus DP2 | 2 | 2 | 2 | 8 |
+
+The **TP1CP1DP1** case is included even though it may have greater
+per-NPU memory demand. On a capacity error, report it explicitly,
+not as a numerical-correctness failure or silent downgrade.
+
+Use the existing Step6 matched *30K* frozen capture from
+`/workspace/tpr_dp2_30k_bf16_deterministic_pair_v1`.
+Construct ONE immutable shared 10,240-token controlled dataset and
+reuse it in all arms. Preserve original PPO response
+`old_log_probs`, `advantages` and masks for every retained token.
+
+**Critical disclosure:** Original prompts may themselves exceed 10K.
+In that case the 10K preparation retains at most the last 4,096
+prompt tokens and the following leading response window. This changes
+model conditioning and RoPE positions. The data is valid as
+a **same-input fixed-label numerical experiment**, but is **not**
+equivalent to the original online PPO run. Output
+`parity_capture_audit.json` records each row's prompt/response
+truncation and `changes_original_conditioning`.
+
+The NPU launcher runs from the bridge-synchronized VERL source tree:
+
+    cd /workspace/uni-agent-cc/verl
+    # Synchronize new bridge/main commits into this container as usual.
+    pytest -q tests/models/mcore/tpr/unit/test_tpr_10k_parallel_parity_cpu.py
+    HCCL_DETERMINISTIC=true \
+    bash tests/models/mcore/tpr/parallel/run_tpr_10k_parallel_parity.sh \
+      /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1 \
+      /workspace/tpr_10k_axes_correctness_v1
+
+The script is resumable: a completed case's `result.json` is reused;
+a failed case without a valid result must be diagnosed, not
+overwritten. Six-case CPU comparison runs automatically on success:
+
+    /workspace/tpr_10k_axes_correctness_v1/comparison_10k.json
+
+Pairwise checks:
+- `unshared_vs_tpr_no_cp`: prefix-reuse effect without CP.
+- `tp_only`: TP1→TP2 at CP=1, DP=1.
+- `cp_only`: CP1→RingCP2 with TP=2, DP=1.
+- `dp_only_cp1`: DP1→DP2 with **CP=1**, TP=2.
+- `dp_only_cp2`: DP1→DP2 under TP2 RingCP2.
+- `cp2dp2_vs_no_cp`: combined effect.
+
+Each result preserves source fingerprint, global supervised PPO
+token count, topology, DP original-row assignments, global PPO
+loss, **every selected logical token new_logprob**, and 64 canonical
+full-coordinate sparse parameter-gradient samples for each weight.
+The comparator reconstructs host-FP64 PPO ratio/clip decisions and
+effective dLoss/dLogprob from original saved labels. Reports:
+loss gap, gradient relative-L2/cosine, per-token logprob difference,
+Clip status switches and effective PPO-gradient relative-L2.
+
+The canonical gradient witness accounts for TP-sharded QKV/FC1
+gate+up/FC2/linear projection/embedding layouts; avoids counting
+identical CP/DP replicas twice; audits CP/DP sampled replica exactness.
+Q/K RMSNorm weights are replicated among TP ranks but get **per-head
+local gradients**. Witness explicitly sums those TP contributions
+for comparison against TP1; it ALSO reports
+`qk_norm_tp_local_gradient_max_abs`. This **does not modify the
+actual optimizer gradient**. Any necessary TP synchronization of the
+physical Q/K Norm gradient must be addressed separately before
+production optimizer updates.
+
+All arms use BF16 gradients, HCCL_DETERMINISTIC=true, no activation
+recompute, no optimizer/rollout. Experimental DP2 exception is
+allowed **only** when both `TPR_RUN_10K_PARALLEL_PARITY=1` and
+`TPR_10K_PARITY_ONLY=1` are set in addition to the separate
+DP2 experimental flag. Production DP gate is otherwise unchanged.
+
+Caveats: the control `unshared_tp2cp1dp1` disables shared prefixes
+inside the SAME TPR Segment backend. It is not the independent native
+Megatron Full schedule. The canonical 64-samples/parameter gradient
+comparison is sparse (but comparable across TP1/TP2), not
+full-model Rel L2. This matrix therefore isolates plausible sources
+of error but does not alone certify full-gradient optimizer parity.
