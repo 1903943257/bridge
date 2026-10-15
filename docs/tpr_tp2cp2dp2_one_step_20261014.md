@@ -458,3 +458,43 @@ per-token logprobs/clip decisions, and, if necessary, BF16
 per-segment parameter-gradient accumulation vs Full's microbatch path.
 Do NOT certify TPR DP2 training correctness based on small Loss gap
 or matching replica gradients alone.
+
+
+### Step 6 deterministic-BF16 sampled-gradient attribution
+
+The 4,640-value (8 evenly spaced positions per parameter per TP)
+Full/TPR gradient witness was decomposed by the postprocessing script.
+Global sampled rel-L2=0.502731789, cosine=0.870340669;
+best scalar TPR~=0.845531325*Full still leaves rel-L2=0.478412667.
+Thus the drift is **not** a uniform DP/CP scale factor.
+
+Of the *sampled squared error*, 95.78% belongs to norm parameters,
+4.03% to other attention params, 0.17% to QKV, 0.02% to MLP.
+Important: the script samples the same eight indices of EACH parameter
+regardless of tensor size; these proportions are not actual
+whole-model squared-error shares! Tiny LayerNorm vectors receive the
+same eight samples as giant matrices. Some LayerNorm samples are also
+exactly repeated on the two TP shards. Do not infer the location
+of the whole model's error from this unweighted sparse witness.
+
+High-impact examples, per TP: layer13 input_layernorm sampled
+Full L2 0.00476552 vs TPR 0.00186141 (cos ~0.996);
+layer1 input_layernorm Full 0.000766952 vs TPR 0.00276119
+(cos ~0.977). Their ratio differs in *opposite directions*,
+so a global /CP or /DP correction cannot reconcile them.
+Layer14 input_layernorm sampled cosine -0.73 indicates
+at least some selected low-magnitude elements diverge in direction.
+QKV/MLP sampled rel-L2 still ~35%-41%, so the issue cannot be
+certified as exclusively RMSNorm either.
+
+The analyzer now additionally reports `sampled_non_norm`,
+`norm_share_of_full_sampled_gradient_energy`, and repeated
+TP Norm sample counts using the ALREADY SAVED witnesses; zero
+additional NPU run required.
+
+Next diagnosis should independently isolate:
+(1) same topology Full TP2CP4 vs TPR TP2CP4 on this SAME 30K capture;
+(2) per-token PPO logprob/ratio and clipped-gradient indicator parity;
+(3) BF16 local parameter-gradient accumulation across Full microbatches
+vs TPR tree segments. FP32 communication alone only addresses the
+final SUM, not the previous BF16 local accumulation.
