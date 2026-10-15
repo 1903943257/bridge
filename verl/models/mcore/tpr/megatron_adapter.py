@@ -59,11 +59,20 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
     import os
 
     tp, cp = sizes["TP"], sizes["CP"]
-    experimental_dp2 = (
+    existing_dp2 = (
         ppo and tp == 2 and cp == 2 and sizes["DP"] == 2
         and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
         and os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1"
     )
+    # Isolated 10K correctness matrix only. This deliberately does NOT
+    # expand the supported production VERL DP topology.
+    parity_10k_dp2 = (
+        ppo and tp in (1, 2) and cp in (1, 2) and sizes["DP"] == 2
+        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
+        and os.getenv("TPR_RUN_10K_PARALLEL_PARITY") == "1"
+        and os.getenv("TPR_10K_PARITY_ONLY") == "1"
+    )
+    experimental_dp2 = existing_dp2 or parity_10k_dp2
     supported_cp = (
         (cp in (1, 2) if tp == 1 else cp in (1, 2, 4))
         if ppo else (cp >= 1 if tp == 1 else cp in (1, 2, 4))
