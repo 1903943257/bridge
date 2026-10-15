@@ -756,3 +756,42 @@ prints `norm_full_rel_l2` / `norm_full_cos`, a genuine all-element
 Norm-only metric. Non-Norm large matrices remain canonical sparse
 (64 full-coordinate samples per parameter). The actual TP-shared
 Q/K Norm optimizer-state synchronization remains out of scope.
+
+
+### 10K TP1 OOM and safe resume protocol (2026-10-15)
+
+Observed `unshared_tp2cp1dp1` succeeds and prints 22,680 PPO
+tokens, loss `0.0142083429`, 18,560 canonical sparse gradient
+elements and 22,680 token logprobs.
+The next `tpr_tp1cp1dp1` fails in backward due to NPU OOM:
+56.48 GiB active on a 60.95 GiB card, 1.74 GiB allocation
+attempt, 384.51 MiB free. **Do NOT call TP parity PASS**:
+a successful `unshared TP2` only establishes one runnable TP2
+control; both shared TPR TP1 and shared TPR TP2 must have comparable
+gradient/logprob witnesses to isolate TP.
+
+The six-arm runner now supports opt-in `TPR_10K_SKIP_TP1_OOM=1`:
+it REQUIRES `tpr_tp1cp1dp1.log` to contain the actual
+"out of memory" text before skipping only TP1, and resumes
+the four pending TP2 CP/DP topologies, reusing the finished
+unshared result. The resulting `comparison_10k.json`
+will mark `complete_matrix=false`,
+`tp_correctness_status=NOT_EVALUATED_TP1_OOM`,
+and exclude only the `tp_only` pair from measured metrics.
+Other individual checks (unshared-vs-shared CP1, CP-only,
+DP-only CP1, DP-only CP2) can still be quantified.
+
+    # First sync updated bridge/main into the VERL container.
+    cd /workspace/uni-agent-cc/verl
+    TPR_10K_SKIP_TP1_OOM=1 HCCL_DETERMINISTIC=true \
+      bash tests/models/mcore/tpr/parallel/run_tpr_10k_parallel_parity.sh \
+        /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1 \
+        /workspace/tpr_10k_axes_correctness_v1
+
+To finish TP1-vs-TP2 parity, create a separate much shorter
+controlled shared capture (2K-4K per trajectory, or fewer complete
+selected trees) and run both TP1CP1DP1 and TP2CP1DP1 on the SAME
+short input. Preserve genuine shared Prefix, original retained PPO
+labels, identical model weights, and corrected Q/K Norm TP gradient
+semantics. The original 10K unshared TP2 PASS cannot substitute
+for this paired numerical comparison.
