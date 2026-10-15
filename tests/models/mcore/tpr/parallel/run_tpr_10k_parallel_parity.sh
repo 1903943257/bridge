@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Controlled Step6 10,240-token Qwen3-4B TP/CP/DP correctness factorial.
+# Controlled Step6 10,240-token Qwen3-4B TPR CP/DP correctness matrix (TP fixed at 2).
 # One-time 10K capture from previous matched 30K pair. Repeatable/resumable;
 # no model updates, no performance comparison, strict BF16 replica agreement.
 # Usage: bash tests/models/mcore/tpr/parallel/run_tpr_10k_parallel_parity.sh \
@@ -51,7 +51,7 @@ export TPR_10K_CAPTURE="$ROOT/step6_cap10240_parity.pt"
 
 # One-factor-at-a-time comparisons:
 #   TPR algorithm (with CP=1): unshared TP2 vs shared TP2
-#   TP only:   TP1CP1DP1 vs TP2CP1DP1
+#   TP1 is intentionally NOT part of this matrix (single-NPU OOM).
 #   CP only:   TP2CP1DP1 vs TP2CP2DP1
 #   DP only:   TP2CP1DP1 vs TP2CP1DP2
 #   DP @ CP2:  TP2CP2DP1 vs TP2CP2DP2
@@ -65,14 +65,6 @@ while read -r NAME TP CP DP MODE; do
   if [[ -e "$ROOT/$NAME" ]]; then
     echo "Refusing partial or unrelated case directory: $ROOT/$NAME" >&2
     exit 2
-  fi
-  if [[ "$NAME" == "tpr_tp1cp1dp1" && "${TPR_10K_SKIP_TP1_OOM:-0}" == "1" ]]; then
-    if [[ ! -f "$ROOT/$NAME.log" ]] || ! grep -qi 'out of memory' "$ROOT/$NAME.log"; then
-      echo "Cannot skip TP1: $ROOT/$NAME.log must contain the actual OOM" >&2
-      exit 2
-    fi
-    echo "TPR_10K_CASE_NOT_EVALUATED name=$NAME reason=confirmed_NPU_OOM"
-    continue
   fi
   export TPR_10K_TP="$TP"
   export TPR_10K_CP="$CP"
@@ -88,7 +80,6 @@ while read -r NAME TP CP DP MODE; do
     2>&1 | tee "$ROOT/$NAME.log"
 done <<'CASES'
 unshared_tp2cp1dp1 2 1 1 unshared
-tpr_tp1cp1dp1 1 1 1 tpr
 tpr_tp2cp1dp1 2 1 1 tpr
 tpr_tp2cp2dp1 2 2 1 tpr
 tpr_tp2cp1dp2 2 1 2 tpr
@@ -96,13 +87,8 @@ tpr_tp2cp2dp2 2 2 2 tpr
 CASES
 
 if [[ ! -e "$ROOT/comparison_10k.json" ]]; then
-  if [[ "${TPR_10K_SKIP_TP1_OOM:-0}" == "1" ]]; then
-    python -m tests.models.mcore.tpr.parallel.compare_tpr_10k_parallel_parity \
-      "$ROOT" --allow-missing-tp1 | tee "$ROOT/comparison_10k.log"
-  else
-    python -m tests.models.mcore.tpr.parallel.compare_tpr_10k_parallel_parity \
-      "$ROOT" | tee "$ROOT/comparison_10k.log"
-  fi
+  python -m tests.models.mcore.tpr.parallel.compare_tpr_10k_parallel_parity \
+    "$ROOT" | tee "$ROOT/comparison_10k.log"
 else
   echo "TPR_10K_PARITY_COMPARISON_REUSE=$ROOT/comparison_10k.json"
 fi
