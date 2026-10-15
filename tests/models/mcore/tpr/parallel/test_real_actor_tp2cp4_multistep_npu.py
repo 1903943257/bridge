@@ -115,14 +115,16 @@ def _make_engine(model, runtime, finalize_time):
 
     def finalize(chunks, num_tokens, *, force_all_reduce=False, **kwargs):
         assert chunks == [model] and num_tokens is None and force_all_reduce
+        from .grad_sync_precision import (
+            offline_grad_sync_dtype, reduce_average_weight_grad,
+        )
+        grad_dtype = offline_grad_sync_dtype()
         torch.npu.synchronize()
         start = time.perf_counter()
         for name, param in model.named_parameters():
-            if param.grad is None:
-                raise RuntimeError(f"No gradient for {name}")
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM,
-                            group=runtime.cp_group)
-            param.grad.div_(4)
+            reduce_average_weight_grad(
+                param, runtime.cp_group, name=name, reduce_dtype=grad_dtype,
+            )
         torch.npu.synchronize()
         finalize_time[0] += time.perf_counter()-start
 
