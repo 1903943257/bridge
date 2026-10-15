@@ -128,13 +128,28 @@ def compare_pair(ref:dict,cur:dict,labels:dict) -> dict:
     }
 
 
-def compare(root: Path):
+def compare(root: Path, *, allow_missing_tp1: bool=False):
     cases={}
+    missing=[]
     for name in CASES:
         file=root/name/"result.json"
         if not file.is_file():
-            raise FileNotFoundError(file)
+            missing.append(name)
+            continue
         cases[name]=json.loads(file.read_text())
+    if missing:
+        if not (allow_missing_tp1 and missing==["tpr_tp1cp1dp1"]):
+            raise FileNotFoundError(
+                "Missing 10K topology result(s): "+", ".join(missing)
+            )
+        log=root/"tpr_tp1cp1dp1.log"
+        if not log.is_file() or "out of memory" not in log.read_text(errors="replace").lower():
+            raise AssertionError(
+                "Skipping TP1 is permitted only if its original log "
+                "explicitly records NPU out of memory"
+            )
+    if not cases:
+        raise AssertionError("No 10K results to compare")
     inputs={(z["source_capture"],z["input_sha256"],z["checkpoint"],
              z["global_ppo_tokens"],z["gradient_sync_reduce_dtype"],
              z["hccl_deterministic"])
@@ -161,6 +176,17 @@ def compare(root: Path):
     labels=_labels(Path(src))
     if len(labels)!=next(iter(cases.values()))["global_ppo_tokens"]:
         raise AssertionError("PPO token-count mismatch with original labels")
+    computed_pairs={}
+    skipped_pairs={}
+    for name,a,b in PAIRS:
+        if a in cases and b in cases:
+            computed_pairs[name]=compare_pair(cases[a],cases[b],labels)
+        else:
+            skipped_pairs[name]={
+                "status":"NOT_EVALUATED",
+                "missing_cases":[x for x in (a,b) if x not in cases],
+                "reason":"TP1 OOM blocks TP1-vs-TP2 parity",
+            }
     result={
         "source_capture":src,
         "input_sha256":next(iter(cases.values()))["input_sha256"],
@@ -172,10 +198,14 @@ def compare(root: Path):
                  "grad_replica_max_abs":v["gradient_witness"]["replica_max_abs"]}
             for key,v in cases.items()
         },
-        "pairwise":{
-            name:compare_pair(cases[a],cases[b],labels)
-            for name,a,b in PAIRS
-        },
+        "pairwise":computed_pairs,
+        "skipped_pairs":skipped_pairs,
+        "missing_cases":missing,
+        "complete_matrix":not bool(missing),
+        "tp_correctness_status": (
+            "NOT_EVALUATED_TP1_OOM" if "tpr_tp1cp1dp1" in missing
+            else "MEASURED_REQUIRES_NUMERIC_THRESHOLD_REVIEW"
+        ),
         "witness_warning":"Canonical sparse gradient samples only, no optimizer or multi-step validation.",
         "reference_warning":"unshared is TPR codepath with prefix sharing disabled, not Megatron Full",
     }
@@ -185,8 +215,12 @@ def compare(root: Path):
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("output_root",type=Path)
+    ap.add_argument(
+        "--allow-missing-tp1",action="store_true",
+        help="Allow ONLY an OOM-logged TP1 case to be absent; TP correctness remains unverified",
+    )
     args=ap.parse_args()
-    result=compare(args.output_root)
+    result=compare(args.output_root,allow_missing_tp1=args.allow_missing_tp1)
     path=args.output_root/"comparison_10k.json"
     if path.exists():
         raise FileExistsError(path)
@@ -204,6 +238,14 @@ def main():
             f"logprob_max_abs={lp['max_abs']:.9g} "
             f"clip_changes={values['clip_state_changes']} "
             f"effective_grad_rel_l2={eff['relative_l2']:.9g}",
+            flush=True,
+        )
+    if result["missing_cases"]:
+        print(
+            "TPR_10K_INCOMPLETE_MATRIX "
+            f"missing={result['missing_cases']} "
+            f"tp_status={result['tp_correctness_status']} "
+            f"skipped_pairs={list(result['skipped_pairs'])}",
             flush=True,
         )
     print("TPR_10K_PARITY_COMPARISON="+str(path))
