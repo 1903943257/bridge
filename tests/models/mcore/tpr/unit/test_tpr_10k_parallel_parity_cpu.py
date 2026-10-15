@@ -69,7 +69,7 @@ def test_clip_branch_change_with_small_logprob_difference():
     active,eff,ratio=_effective_ppo(math.log(1.21),0.0,1.0)
     assert active and eff==0.0 and ratio>1.2
     active,eff,ratio=_effective_ppo(math.log(1.19),0.0,1.0)
-    assert not active and eff==-pytest.approx(1.19)
+    assert not active and eff==pytest.approx(-1.19)
     active,eff,ratio=_effective_ppo(math.log(0.79),0.0,-1.0)
     assert active and eff==0.0
 
