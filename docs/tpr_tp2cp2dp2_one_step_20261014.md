@@ -498,3 +498,67 @@ Next diagnosis should independently isolate:
 (3) BF16 local parameter-gradient accumulation across Full microbatches
 vs TPR tree segments. FP32 communication alone only addresses the
 final SUM, not the previous BF16 local accumulation.
+
+
+## Additional isolated 30K TPR TP2CP4DP1 comparison (2026-10-15)
+
+A third eight-NPU experiment is now available to isolate the
+*incremental DP=2 benefit* from TPR's prefix reuse. Do NOT infer
+this incremental gain from unrelated 40K/other-step measurements.
+
+Experiment uses the SAME existing immutable Step 6 derived
+30,720-token capture and frozen HF Qwen3-4B-128K checkpoint:
+- A (existing): Native Full, TP2/CP4/DP1.
+- B (NEW NPU run): **TPR, TP2/RingCP4/DP1**.
+- C (existing): TPR, TP2/RingCP2/DP2 with DTA-style DP placement.
+
+B uses the existing `test_tpr_fixed_shape_40k_benchmark_npu.py`
+in `TPR_OFFLINE_MODE=tpr`. The test already accepts a derived
+30K manifest and original eight rows, enables the same
+`TPR_TREE_POLICY=qwen_turn` and
+`TPR_PPO_LOGPROB_CHUNK_TOKENS=512`, runs 1 warmup + 3 measured
+iterations and captures the same deterministic gradient-witness
+layout after timing. It runs BF16 gradient SUM/4 with
+`HCCL_DETERMINISTIC=true`, NO optimizer updates/recompute/rollout.
+The CP4 TPR offline finalize has also been adapted to respect
+`TPR_OFFLINE_GRAD_SYNC_DTYPE` in the SAME way as Full and DP2
+without changing the default BF16 calculation.
+
+Run exactly one new benchmark, reusing original Step6 Full + DP2 files:
+
+    cd /workspace/uni-agent-cc/verl
+    git pull origin main
+    pytest -q tests/models/mcore/tpr/unit/test_tpr_30k_three_way_comparison.py
+    HCCL_DETERMINISTIC=true TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16 \
+    bash tests/models/mcore/tpr/parallel/run_tpr_tp2cp4dp1_30k_one_step.sh \
+      /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1 \
+      /workspace/tpr_30k_cp4_deterministic_v1 6
+
+The launcher verifies both archived JSON inputs BEFORE any NPU model
+loading and refuses to overwrite the output. B's result is at:
+
+    /workspace/tpr_30k_cp4_deterministic_v1/step6_tpr_fixed_shape.json
+
+The automatic three-way comparison is at:
+
+    /workspace/tpr_30k_cp4_deterministic_v1/comparison_three_way.json
+
+Its independent time ratios are:
+- TPR algorithm contribution at fixed CP4:
+  `full_cp4_median_s / tpr_cp4_median_s`.
+- **Incremental DP switch** CP4→CP2DP2:
+  `tpr_cp4_median_s / tpr_cp2dp2_median_s`.
+- Total Full CP4→TPR CP2DP2:
+  `full_cp4_median_s / tpr_cp2dp2_median_s`.
+
+It also reports all three PPO losses, worst-rank allocated-memory
+peaks, and sparse gradient comparisons A/B, A/C and B/C. This is
+important since Full/DP2 was already at ~50% sampled gradient rel-L2;
+matching gradient replicas do NOT establish algorithmic parity.
+
+**Fairness caveat:** the archived Full and DP2 JSONs predate the
+`hccl_deterministic` metadata marker. New CP4 JSON explicitly stamps
+it. The paired baseline's deterministic setting was confirmed by
+the original launch command, not independently recoverable solely
+from old JSON fields; the three-way report marks these as
+`not_recorded`. No invented NPU measurements or parity claims.
