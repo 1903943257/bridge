@@ -166,6 +166,25 @@ def _load(capture: Path,runtime,mode: str,dp:int):
     all_batch,all_keys,global_tokens,global_sha=_load_real_pair(
         capture,tuple(range(8)), "tpr"
     )
+    # Retaining TPR prefix sharing in the cropped 10K source matters:
+    # otherwise an 'isolated TP/CP/DP TPR test' degenerates to eight Full rows.
+    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    full_forest=build_tree_execution_plans(
+        all_keys,all_batch,
+        tree_policy=os.getenv("TPR_TREE_POLICY","qwen_turn"),
+        turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS","128")),
+    )
+    logical_full=sum(int(x.numel()) for x in all_batch["input_ids"].unbind())
+    unique_full=sum(
+        segment.length for tree in full_forest.trees
+        for segment in tree.segment_plan.segments.values()
+    )
+    if unique_full>=logical_full:
+        raise AssertionError(
+            "The controlled 10K source has no actual TPR Prefix reuse: "
+            f"logical={logical_full} unique={unique_full}. "
+            "Do not treat a no-sharing dataset as a TPR correctness gate."
+        )
     if dp==1:
         partitions=[list(range(8))]
     else:
@@ -207,7 +226,11 @@ def _load(capture: Path,runtime,mode: str,dp:int):
             raise AssertionError(f"Invalid DP{d} membership/sample ownership: {entries}")
     if sum(next(x[2] for x in decoded if x[0]==d) for d in range(dp))!=global_tokens:
         raise AssertionError("DP shards do not cover exact same global tokens")
-    return batch,local_rows,partitions,global_tokens,global_sha
+    return batch,local_rows,partitions,global_tokens,global_sha,{
+        "global_logical_tokens":logical_full,
+        "global_unique_tree_tokens":unique_full,
+        "global_reuse_ratio":logical_full/unique_full,
+    }
 
 
 def test_10k_parallel_factorial_one_topology():
@@ -232,7 +255,7 @@ def test_10k_parallel_factorial_one_topology():
     runtime.world_replicas=tp*cp
     try:
         from verl.workers.utils.losses import ppo_loss
-        batch,local_rows,partitions,global_tokens,sha=_load(
+        batch,local_rows,partitions,global_tokens,sha,reuse=_load(
             cap,runtime,mode,dp,
         )
         if max(int(x.numel()) for x in batch["input_ids"].unbind())>10240:
@@ -281,6 +304,7 @@ def test_10k_parallel_factorial_one_topology():
                 "input_sha256":sha,"checkpoint":str(checkpoint),
                 "topology":{"tp":tp,"cp":cp,"dp":dp,"world":tp*cp*dp},
                 "dp_partitions":partitions,
+                "global_tpr_reuse_audit":reuse,
                 "global_ppo_tokens":global_tokens,
                 "global_loss":float(loss.item()),
                 "gradient_sync_reduce_dtype":offline_grad_sync_dtype(),
