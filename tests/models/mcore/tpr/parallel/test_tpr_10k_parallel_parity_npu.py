@@ -239,7 +239,7 @@ def test_10k_parallel_factorial_one_topology():
     dp=int(os.getenv("TPR_10K_DP","1"))
     mode=os.getenv("TPR_10K_MODE","tpr")
     if (tp,cp,dp) not in (
-        (1,1,1),(2,1,1),(2,2,1),(2,1,2),(2,2,2)
+        (2,1,1),(2,2,1),(2,1,2),(2,2,2)
     ):
         raise ValueError("Unsupported isolated 10K parity topology")
     if mode not in ("tpr","unshared"):
