@@ -131,3 +131,13 @@ def test_10k_dp2_isolation_gate_does_not_open_production_dp(monkeypatch):
     assert _validate_tpr_parallel_sizes(sizes,ppo=True)==2
     with pytest.raises(NotImplementedError):
         _validate_tpr_parallel_sizes(sizes,ppo=False)
+
+
+def test_10k_cp_dp_matrix_has_no_tp1_case_or_pair():
+    from ..parallel.compare_tpr_10k_parallel_parity import CASES, PAIRS
+    assert len(CASES) == 5
+    assert len(PAIRS) == 5
+    assert "tpr_tp1cp1dp1" not in CASES
+    assert not any("tpr_tp1cp1dp1" in pair for pair in PAIRS)
+    assert all(case.startswith("tpr_tp2") or case == "unshared_tp2cp1dp1"
+               for case in CASES)
