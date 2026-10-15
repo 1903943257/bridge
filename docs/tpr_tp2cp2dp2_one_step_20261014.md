@@ -738,3 +738,11 @@ Megatron Full schedule. The canonical 64-samples/parameter gradient
 comparison is sparse (but comparable across TP1/TP2), not
 full-model Rel L2. This matrix therefore isolates plausible sources
 of error but does not alone certify full-gradient optimizer parity.
+
+ 
+Additional safety gate: before each 10K arm, the exact eight-row
+controlled input is independently planned with `qwen_turn`.
+If `global_unique_tree_tokens >= global_logical_tokens`, the run
+aborts rather than quietly claiming TPR correctness on data with no
+actual shared Prefix. The reuse ratio is stored in
+`global_tpr_reuse_audit` for each result.
