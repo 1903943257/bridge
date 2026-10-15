@@ -1,0 +1,98 @@
+"""CPU-only correctness of canonical TP witness and PPO parity comparator."""
+import math
+
+import pytest
+
+from ..parallel.tpr_10k_canonical_witness import (
+    canonical_shape,owner_and_local_flat,shard_kind,
+)
+from ..parallel.compare_tpr_10k_parallel_parity import (
+    _effective_ppo,_vector_metrics,compare_pair,
+)
+
+
+@pytest.mark.parametrize("name,shape,tp,expected", [
+    ("embedding.word_embeddings.weight",(4,3),2,(8,3)),
+    ("decoder.layers.0.self_attention.linear_qkv.weight",(4,3),2,(8,3)),
+    ("decoder.layers.0.self_attention.linear_proj.weight",(4,3),2,(4,6)),
+    ("decoder.layers.0.mlp.linear_fc1.weight",(8,3),2,(16,3)),
+    ("decoder.layers.0.mlp.linear_fc2.weight",(4,3),2,(4,6)),
+    ("decoder.layers.0.input_layernorm.weight",(3,),2,(3,)),
+    ("decoder.layers.0.self_attention.q_layernorm.weight",(3,),2,(3,)),
+])
+def test_canonical_qwen_tp_layouts(name,shape,tp,expected):
+    assert canonical_shape(name,shape,tp)==expected
+    visited=[]
+    local_size=math.prod(shape)
+    global_size=math.prod(expected)
+    for index in range(global_size):
+        owner,pos=owner_and_local_flat(name,index,shape,tp)
+        assert 0<=owner<tp
+        assert 0<=pos<local_size
+        visited.append((owner,pos))
+    if shard_kind(name)=="replicated":
+        assert all(owner==0 for owner,_ in visited)
+        assert len(set(visited))==global_size
+    else:
+        assert len(set(visited))==global_size
+        assert len(set(visited))==local_size*tp
+
+
+def test_gate_up_interleaved_tp2_shard_mapping():
+    name="decoder.layers.0.mlp.linear_fc1.weight"
+    shape=(8,3)
+    tp=2
+    # Global gate rows 0..7, up rows 8..15:
+    # TP0 gate 0..3 / up 8..11; TP1 gate 4..7 / up 12..15.
+    assert owner_and_local_flat(name,4*3,shape,tp)==(1,0)
+    assert owner_and_local_flat(name,8*3,shape,tp)==(0,4*3)
+    assert owner_and_local_flat(name,12*3,shape,tp)==(1,4*3)
+
+
+def _result(vals,logprobs):
+    return {
+        "gradient_witness":{
+            "names":["decoder.layers.0.input_layernorm.weight"],
+            "canonical_shapes":[[2]],
+            "samples_per_name":[2],
+            "samples_per_parameter":64,
+            "values":vals,
+            "replica_max_abs":0.0,
+        },
+        "global_loss":0.1,
+        "token_logprobs":logprobs,
+    }
+
+
+def test_clip_branch_change_with_small_logprob_difference():
+    # positive advantage, old=0: PPO clip becomes active for ratio>1.2.
+    active,eff,ratio=_effective_ppo(math.log(1.21),0.0,1.0)
+    assert active and eff==0.0 and ratio>1.2
+    active,eff,ratio=_effective_ppo(math.log(1.19),0.0,1.0)
+    assert not active and eff==-pytest.approx(1.19)
+    active,eff,ratio=_effective_ppo(math.log(0.79),0.0,-1.0)
+    assert active and eff==0.0
+
+
+def test_compare_pair_exact_and_clip_changes():
+    labels={(0,0):(0.0,1.0),(0,1):(0.0,-1.0)}
+    left=_result([1.0,2.0],[[0,0,math.log(1.19)],[0,1,math.log(0.79)]])
+    right=_result([1.0,2.0],[[0,0,math.log(1.21)],[0,1,math.log(0.81)]])
+    r=compare_pair(left,right,labels)
+    assert r["canonical_sampled_parameter_gradient"]["relative_l2"]==0
+    assert r["clip_state_changes"]==2
+    assert r["effective_dloss_dlogprob"]["relative_l2"]>0
+
+
+def test_compare_pair_different_canonical_coordinate_layout_fails():
+    a=_result([1.0,2.0],[[0,0,0.0]])
+    b=_result([1.0,2.0],[[0,0,0.0]])
+    b["gradient_witness"]["canonical_shapes"]=[[3]]
+    with pytest.raises(AssertionError,match="coordinates"):
+        compare_pair(a,b,{(0,0):(0.0,1.0)})
+
+
+def test_vector_metrics_detect_opposite_direction():
+    m=_vector_metrics([1.0,-1.0],[-1.0,1.0])
+    assert m["cosine"]==pytest.approx(-1.0)
+    assert m["relative_l2"]==pytest.approx(2.0)
