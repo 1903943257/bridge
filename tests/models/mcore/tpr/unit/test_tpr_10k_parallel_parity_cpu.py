@@ -102,3 +102,26 @@ def test_vector_metrics_detect_opposite_direction():
     m=_vector_metrics([1.0,-1.0],[-1.0,1.0])
     assert m["cosine"]==pytest.approx(-1.0)
     assert m["relative_l2"]==pytest.approx(2.0)
+
+
+
+def test_10k_dp2_isolation_gate_does_not_open_production_dp(monkeypatch):
+    from verl.models.mcore.tpr.megatron_adapter import _validate_tpr_parallel_sizes
+    sizes = {"TP":2, "CP":1, "DP":2, "PP":1, "EP":1}
+    for key in (
+        "TPR_EXPERIMENTAL_OFFLINE_DP2",
+        "TPR_RUN_10K_PARALLEL_PARITY",
+        "TPR_10K_PARITY_ONLY",
+        "TPR_RUN_TP2CP2DP2_ONE_STEP",
+    ):
+        monkeypatch.delenv(key,raising=False)
+    with pytest.raises(NotImplementedError):
+        _validate_tpr_parallel_sizes(sizes,ppo=True)
+    monkeypatch.setenv("TPR_EXPERIMENTAL_OFFLINE_DP2","1")
+    monkeypatch.setenv("TPR_RUN_10K_PARALLEL_PARITY","1")
+    with pytest.raises(NotImplementedError):
+        _validate_tpr_parallel_sizes(sizes,ppo=True)
+    monkeypatch.setenv("TPR_10K_PARITY_ONLY","1")
+    assert _validate_tpr_parallel_sizes(sizes,ppo=True)==2
+    with pytest.raises(NotImplementedError):
+        _validate_tpr_parallel_sizes(sizes,ppo=False)
