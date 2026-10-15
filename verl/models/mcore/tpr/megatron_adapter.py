@@ -55,7 +55,7 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 
 
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
-    """Keep DP1 production scope; gate the isolated TP2/CP2/DP2 replay."""
+    """Keep DP1 production scope; explicitly gate isolated DP2 parity experiments."""
     import os
 
     tp, cp = sizes["TP"], sizes["CP"]
@@ -83,7 +83,7 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
         raise NotImplementedError(
             "TPR PPO: TP1 CP1/2 or TP2 CP1/2/4; "
             "thin entry: TP1 CP>=1 or TP2 CP1/2/4; "
-            f"PP=EP=1, DP=1 (or explicitly gated offline TP2/CP2/DP2), got {sizes}"
+            f"PP=EP=1, DP=1 (or explicitly gated offline DP2 parity), got {sizes}"
         )
     return tp
 
