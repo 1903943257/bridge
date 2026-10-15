@@ -402,3 +402,59 @@ Matched pair (after successful probe and smoke test):
     bash tests/models/mcore/tpr/parallel/run_tpr_dp2_vs_full_30k_one_step.sh \
       /workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json \
       /workspace/tpr_dp2_30k_fp32_grad_sync_pair_v1 6
+
+
+## Matched deterministic-BF16 30K Full vs TPR: forward pass/perf passes; gradient parity fails
+
+Source step 6, exact same 30,720-token-cap capture, global PPO tokens 36,933.
+Topology Full TP2/CP4/DP1 vs TPR TP2/CP2/DP2, fixed initial
+Qwen3-4B-128K weights, HCCL_DETERMINISTIC=true,
+TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16, no optimizer step.
+
+Full F/B+manual CP4 gradient finalize median = 16.454547882080078 s.
+TPR F/B+manual CP×DP4 gradient finalize median = 12.401572227478027 s.
+Matched speedup = 1.3268114381x. Worst-rank mean allocated peak:
+Full 34.6382561 GiB; TPR 41.0705605 GiB (+18.57%).
+Neither benchmark uses production Megatron DDP bucket overlap;
+the measured speedup must not be claimed against the fully
+optimized production Megatron DDP path.
+
+PPO loss Full 0.15139412879943848; TPR 0.151566281914711;
+absolute difference 0.00017215311527252197.
+TPR local DP contributions differ as expected
+(0.013738267123699188 vs 0.2893942892551422),
+while both TP and CP replica reporting gaps are zero.
+
+Both sides' *sampled* post-finalize gradients are exactly replicated
+across CP×DP groups (sampled replica max_abs=0).
+**This is NOT the same as Full-vs-TPR gradient parity**:
+290 parameter names, eight samples per parameter per TP shard,
+4,640 gradient samples in all. Sampled gradient rel-L2=0.5027317891,
+cosine=0.8703406694, max_abs=0.00291442871;
+sample L2 norms Full=0.01367750568, TPR=0.01328762393.
+This large error fails any meaningful algorithmic gradient gate.
+Neither parameter updates nor multi-step training were tested.
+
+The current Megatron schedule/TPR scaling equations agree in
+expectation: Full local token-mean loss (dp_size=1) receives
+CP4 backward scaling and manual CP4 SUM/4; TPR uses local
+dp_size=2 plus SegmentExecutor's CP2 backward scaling and
+manual DP×CP SUM/4. Thus the large gradient gap is not explained
+by an obvious missing 1/2 factor in the inspected code. A global
+scalar correction cannot repair the observed cosine of 0.8703.
+
+Next *without any NPU rerun*, inspect attribution of the existing
+gradient witnesses (per-layer, attention/MLP/norm, TP ranks,
+single best-fit global scalar and residual):
+
+    python -m tests.models.mcore.tpr.parallel.analyze_tpr_dp2_gradient_parity \
+      /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1/full/step6_full_fixed_shape.json \
+      /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1/tpr/step6_tpr_tp2cp2dp2.json \
+      --top 25 --output /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1/tpr/grad_breakdown.json
+
+Report is *sampled* error attribution, NOT whole-model rel-L2.
+Depending on contributors, the next targeted experiment should compare
+per-token logprobs/clip decisions, and, if necessary, BF16
+per-segment parameter-gradient accumulation vs Full's microbatch path.
+Do NOT certify TPR DP2 training correctness based on small Loss gap
+or matching replica gradients alone.
