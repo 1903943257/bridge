@@ -18,6 +18,11 @@ SAMPLES = 64
 
 
 def shard_kind(name: str) -> str:
+    if name.endswith(("self_attention.q_layernorm.weight",
+                      "self_attention.k_layernorm.weight")):
+        # Q/K RMSNorm weight is shared among heads but each TP rank owns
+        # a subset of those heads. Its gradient requires a TP SUM.
+        return "tp_sum"
     if name.endswith("embedding.word_embeddings.weight"):
         return "rows"
     if name.endswith("self_attention.linear_qkv.weight"):
@@ -47,7 +52,7 @@ def owner_and_local_flat(
 ) -> tuple[int, int]:
     """Map one global logical flattened index to owning TP and local index."""
     kind=shard_kind(name)
-    if kind=="replicated":
+    if kind in ("replicated","tp_sum"):
         return 0,full_index
     if kind=="rows":
         block=math.prod(shape)
@@ -82,6 +87,7 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         raise ValueError("10K parity supports TP=1/2 only")
     names=[]; shapes=[]; offsets=[]; counts=[]
     pieces=[]
+    tp_sum_slices=[]
     offset=0
     for name,param in model.named_parameters():
         if param.grad is None:
@@ -92,7 +98,7 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         local_pos=[]; output_pos=[]
         for i,index in enumerate(indices):
             owner,loc=owner_and_local_flat(name,index,local_shape,tp_size)
-            if owner==tp_rank:
+            if owner==tp_rank or shard_kind(name)=="tp_sum":
                 local_pos.append(loc)
                 output_pos.append(i)
         chunk=torch.zeros((len(indices),),dtype=torch.float32,device=device)
@@ -105,6 +111,8 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         shapes.append(list(logical_shape))
         offsets.append(offset)
         counts.append(len(indices))
+        if shard_kind(name)=="tp_sum":
+            tp_sum_slices.append((name,offset,offset+len(indices)))
         offset+=len(indices)
         pieces.append(chunk)
     local=torch.cat(pieces)
@@ -133,6 +141,22 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         raise AssertionError(
             f"10K gradient replicas mismatch after finalize: {max_replica_abs}"
         )
+    # A TP-shared Q/K Norm parameter can have different local gradients
+    # because each rank processes different heads. Report raw TP difference
+    # separately; the canonical *mathematical* gradient sums these
+    # contributions, even though this offline finalize does not add a TP
+    # synchronization to the model's actual .grad state.
+    tp_sum_sample_max_abs=0.0
+    for _,start,end in tp_sum_slices:
+        refs={
+            t:all_cpu[i][start:end]
+            for i,(t,c,d) in enumerate(topology) if c==0 and d==0
+        }
+        if len(refs)==2:
+            tp_sum_sample_max_abs=max(
+                tp_sum_sample_max_abs,
+                float((refs[0]-refs[1]).abs().max().item()),
+            )
     if cp_rank!=0 or dp_rank!=0:
         local.zero_()
     dist.all_reduce(local,op=dist.ReduceOp.SUM)
@@ -146,10 +170,15 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         "samples_per_name":counts,
         "samples_per_parameter":SAMPLES,
         "values":arr,"replica_max_abs":max_replica_abs,
+        "qk_norm_tp_local_gradient_max_abs":tp_sum_sample_max_abs,
+        "qk_norm_tp_sum_applied_to_witness":True,
+        "qk_norm_tp_sum_applied_to_model_grads":False,
         "sampling":(
             "64 integer-strided logical full-parameter positions per parameter; "
             "TP-sharded weights are mapped to canonical TP1 coordinates, "
-            "TP-replicated parameters counted once. NOT a full-gradient metric."
+            "TP-replicated parameters counted once except Q/K RMSNorm, "
+            "whose per-head TP contributions are summed in the witness only. "
+            "Actual model .grad is unmodified. NOT a full-gradient metric."
         ),
     }
 
