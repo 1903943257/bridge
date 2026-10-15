@@ -60,3 +60,15 @@ def test_missing_witness_and_layout_mismatch_fail():
     t["gradient_witness"]["samples_per_name"] = [4, 4]
     with pytest.raises(AssertionError, match="samples_per_name"):
         analyze_gradient_witness(f, t)
+
+
+
+def test_non_norm_breakdown_and_repeated_tp_norm_samples_are_explicit():
+    f = [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 5.0, 6.0]]
+    t = [[2.0, 4.0, 3.0, 4.0], [2.0, 4.0, 5.0, 6.0]]
+    report = analyze_gradient_witness(*_results(f, t))
+    assert report["sampled_non_norm"]["relative_l2"] == 0
+    assert report["norm_share_of_sampled_squared_error"] == pytest.approx(1.0)
+    assert report["identical_norm_sample_pairs_across_tp"]["count"] == 1
+    assert report["norm_share_of_full_sampled_gradient_energy"] > 0
+    assert "NOT full-gradient rel-L2" in report["sampling_warning"]
