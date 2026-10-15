@@ -64,6 +64,12 @@ def _result(vals,logprobs):
             "samples_per_parameter":64,
             "values":vals,
             "replica_max_abs":0.0,
+            "complete_norm_gradients":{
+                "names":["decoder.layers.0.input_layernorm.weight"],
+                "shapes":[[2]],
+                "values":vals,
+                "elements":2,
+            },
         },
         "global_loss":0.1,
         "token_logprobs":logprobs,
