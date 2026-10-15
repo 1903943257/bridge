@@ -746,3 +746,13 @@ If `global_unique_tree_tokens >= global_logical_tokens`, the run
 aborts rather than quietly claiming TPR correctness on data with no
 actual shared Prefix. The reuse ratio is stored in
 `global_tpr_reuse_audit` for each result.
+
+ 
+Improved 10K correctness witness: **every** trainable Norm parameter
+(`input_layernorm`, `pre_mlp_layernorm`, final Norm and
+per-head Q/K Norm) is now compared using its complete gradient tensor,
+not eight or 64 sparsely selected elements. The cross-topology report
+prints `norm_full_rel_l2` / `norm_full_cos`, a genuine all-element
+Norm-only metric. Non-Norm large matrices remain canonical sparse
+(64 full-coordinate samples per parameter). The actual TP-shared
+Q/K Norm optimizer-state synchronization remains out of scope.
